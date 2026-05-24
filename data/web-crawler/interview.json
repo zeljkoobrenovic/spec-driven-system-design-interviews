@@ -1,0 +1,2343 @@
+{
+  "title": "Web Crawler - System Design",
+  "description": "A step-by-step walkthrough of designing a scalable web crawler for search indexing: seed discovery, URL scheduling, polite fetching, duplicate suppression, freshness, and distributed operation.",
+  "requirementsDiagram": [
+    "graph TB",
+    "  Admin((Crawler Operator))",
+    "  Seeds[/Seed URLs/]",
+    "  Web[(Public Web)]",
+    "  Crawler[[Web Crawler]]",
+    "  Index[/Search Indexing Pipeline/]",
+    "  Store[(HTML Archive)]",
+    "  Admin -->|configure scope| Crawler",
+    "  Seeds --> Crawler",
+    "  Crawler -->|fetch HTML| Web",
+    "  Web -->|pages and links| Crawler",
+    "  Crawler --> Index",
+    "  Crawler --> Store"
+  ],
+  "capacityDiagram": [
+    "graph TB",
+    "  Goal[1B pages / month]",
+    "  QPS[~400 avg pages/sec\\n~800 peak pages/sec]",
+    "  Net[~1.6 Gbps avg\\n~3.2 Gbps peak]",
+    "  Raw[~500 TB / month raw HTML]",
+    "  Archive[(~30 PB / 5 years)]",
+    "  Frontier[[URL Frontier\\nhundreds of millions of URLs]]",
+    "  Goal --> QPS",
+    "  QPS --> Net",
+    "  QPS --> Frontier",
+    "  Net --> Raw",
+    "  Raw --> Archive"
+  ],
+  "requirements": {
+    "functional": [
+      "Start from seed URLs, download HTML pages, extract links, and keep discovering new pages.",
+      "Support search-engine indexing as the primary use case.",
+      "Fetch HTML content only; other content types such as images, videos, and PDFs are out of scope for this version.",
+      "Store crawled HTML content for up to 5 years.",
+      "Discover newly added pages and revisit changed pages.",
+      "Ignore pages whose content is duplicate of content already seen."
+    ],
+    "nonFunctional": [
+      "Scale to roughly 1 billion pages per month: about 400 pages/sec on average and 800 pages/sec at peak.",
+      "Be robust against malformed HTML, timeouts, redirects, server errors, crawler traps, and malicious links.",
+      "Be polite: respect robots.txt and avoid sending too many requests to the same host in a short interval.",
+      "Be extensible so new content types or extraction rules can be added without redesigning the crawler.",
+      "Keep the fetch pipeline observable with crawl status, error reasons, backlog size, and per-host rate metrics."
+    ]
+  },
+  "capacity": [
+    {
+      "label": "Pages crawled",
+      "value": "1B / month",
+      "note": "Problem scope from the interview input."
+    },
+    {
+      "label": "Average crawl rate",
+      "value": "~400 pages/sec",
+      "note": "1,000,000,000 / 30 / 24 / 3600."
+    },
+    {
+      "label": "Peak crawl rate",
+      "value": "~800 pages/sec",
+      "note": "Assume 2x average."
+    },
+    {
+      "label": "Average page size",
+      "value": "~500 KB",
+      "note": "HTML only; excludes images, videos, and PDFs."
+    },
+    {
+      "label": "Raw HTML storage",
+      "value": "~500 TB / month",
+      "note": "1B pages x 500 KB."
+    },
+    {
+      "label": "5-year archive",
+      "value": "~30 PB raw",
+      "note": "500 TB x 12 months x 5 years before compression and dedupe."
+    },
+    {
+      "label": "Fetch bandwidth",
+      "value": "~1.6 Gbps avg",
+      "note": "400 pages/sec x 500 KB; peak roughly 3.2 Gbps."
+    },
+    {
+      "label": "Frontier size",
+      "value": "100M+ pending URLs",
+      "note": "Large enough to require durable queues and partitioning."
+    }
+  ],
+  "api": [
+    {
+      "method": "POST",
+      "path": "/api/v1/seeds",
+      "description": "Add seed URLs or a scoped crawl campaign. This is an operator/control-plane API, not a public web product API.",
+      "request": "{ \"urls\": [\"https://example.com/\"], \"scope\": \"web\", \"priority\": 50 }",
+      "response": "{ \"accepted\": 1, \"rejected\": 0, \"campaignId\": \"crawl_2026_05\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant O as Operator",
+        "  participant API as Control API",
+        "  participant NF as URL Normalizer",
+        "  participant F as URL Frontier",
+        "  participant S as URL Store",
+        "  O->>API: POST /api/v1/seeds",
+        "  API->>NF: normalize and validate URLs",
+        "  NF-->>API: canonical URLs",
+        "  API->>S: upsert seed metadata",
+        "  API->>F: enqueue seed URLs",
+        "  API-->>O: 202 { accepted, campaignId }"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/pages/{urlHash}",
+      "description": "Fetch crawl metadata and archive pointers for a known URL.",
+      "request": "-",
+      "response": "{ \"url\": \"https://example.com/\", \"status\": \"fetched\", \"lastFetchedAt\": \"ISO-8601\", \"contentHash\": \"sha256:...\", \"archiveKey\": \"pages/ab/cd/...\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant O as Operator",
+        "  participant API as Control API",
+        "  participant S as URL Store",
+        "  participant A as HTML Archive",
+        "  O->>API: GET /api/v1/pages/:urlHash",
+        "  API->>S: SELECT crawl metadata",
+        "  S-->>API: URL row + archive pointer",
+        "  opt preview requested",
+        "    API->>A: read archived HTML metadata",
+        "    A-->>API: size, checksum, storage key",
+        "  end",
+        "  API-->>O: 200 { page metadata }"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/frontier/stats",
+      "description": "Inspect crawl backlog, per-host readiness, politeness delays, and failed URL counts.",
+      "request": "-",
+      "response": "{ \"pending\": 184000000, \"ready\": 900000, \"delayedByPoliteness\": 3200000, \"failedLastHour\": 12000 }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant O as Operator",
+        "  participant API as Control API",
+        "  participant F as URL Frontier",
+        "  participant H as Host Policy Store",
+        "  participant M as Metrics Store",
+        "  O->>API: GET /api/v1/frontier/stats",
+        "  API->>F: read queue depth by shard",
+        "  F-->>API: pending and ready counts",
+        "  API->>H: read host delay counts",
+        "  H-->>API: delayed hosts",
+        "  API->>M: read recent failures",
+        "  M-->>API: error counters",
+        "  API-->>O: 200 { frontier stats }"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/recrawl",
+      "description": "Ask the scheduler to revisit a URL or host sooner than its normal freshness policy.",
+      "request": "{ \"url\": \"https://example.com/news\", \"reason\": \"manual_refresh\", \"priority\": 90 }",
+      "response": "{ \"scheduled\": true, \"nextFetchAfter\": \"ISO-8601\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant O as Operator",
+        "  participant API as Control API",
+        "  participant S as Scheduler",
+        "  participant H as Host Policy Store",
+        "  participant F as URL Frontier",
+        "  O->>API: POST /api/v1/recrawl",
+        "  API->>S: request priority recrawl",
+        "  S->>H: check robots and host delay",
+        "  H-->>S: next allowed fetch time",
+        "  S->>F: enqueue URL with due time",
+        "  API-->>O: 202 { scheduled, nextFetchAfter }"
+      ]
+    }
+  ],
+  "dataModelDiagram": [
+    "erDiagram",
+    "  urls ||--o{ crawl_attempts : has",
+    "  urls ||--o{ outlinks : links_to",
+    "  urls ||--o{ page_versions : stores",
+    "  hosts ||--o{ urls : owns",
+    "  content_fingerprints ||--o{ page_versions : identifies",
+    "  urls {",
+    "    char url_hash PK",
+    "    text canonical_url",
+    "    varchar host",
+    "    varchar status",
+    "    timestamp next_fetch_after",
+    "    timestamp last_fetched_at",
+    "    int priority",
+    "  }",
+    "  hosts {",
+    "    varchar host PK",
+    "    text robots_rules",
+    "    timestamp robots_fetched_at",
+    "    int min_delay_ms",
+    "    timestamp next_allowed_at",
+    "  }",
+    "  page_versions {",
+    "    uuid version_id PK",
+    "    char url_hash FK",
+    "    char content_hash FK",
+    "    text archive_key",
+    "    timestamp fetched_at",
+    "    int http_status",
+    "  }",
+    "  content_fingerprints {",
+    "    char content_hash PK",
+    "    bigint first_seen_url_hash",
+    "    timestamp first_seen_at",
+    "    bigint duplicate_count",
+    "  }",
+    "  crawl_attempts {",
+    "    uuid attempt_id PK",
+    "    char url_hash FK",
+    "    timestamp started_at",
+    "    varchar result",
+    "    int http_status",
+    "    text error_code",
+    "  }",
+    "  outlinks {",
+    "    char source_url_hash FK",
+    "    char target_url_hash FK",
+    "    timestamp discovered_at",
+    "  }"
+  ],
+  "dataModel": [
+    {
+      "name": "urls",
+      "note": "Canonical URL registry and scheduling state. Sharded by url_hash.",
+      "fields": [
+        {
+          "name": "url_hash",
+          "type": "char(32) PK",
+          "note": "Hash of canonical_url; partition key"
+        },
+        {
+          "name": "canonical_url",
+          "type": "text NOT NULL"
+        },
+        {
+          "name": "host",
+          "type": "varchar(255)",
+          "note": "Used for politeness grouping"
+        },
+        {
+          "name": "status",
+          "type": "varchar(24)",
+          "note": "new | queued | fetched | failed | blocked | duplicate"
+        },
+        {
+          "name": "priority",
+          "type": "int"
+        },
+        {
+          "name": "next_fetch_after",
+          "type": "timestamp"
+        },
+        {
+          "name": "last_fetched_at",
+          "type": "timestamp NULL"
+        },
+        {
+          "name": "etag",
+          "type": "varchar(255) NULL"
+        },
+        {
+          "name": "last_modified",
+          "type": "timestamp NULL"
+        }
+      ]
+    },
+    {
+      "name": "hosts",
+      "note": "Per-host crawling rules, robots.txt cache, and politeness throttle.",
+      "fields": [
+        {
+          "name": "host",
+          "type": "varchar(255) PK"
+        },
+        {
+          "name": "robots_rules",
+          "type": "text"
+        },
+        {
+          "name": "robots_fetched_at",
+          "type": "timestamp"
+        },
+        {
+          "name": "crawl_delay_ms",
+          "type": "int"
+        },
+        {
+          "name": "next_allowed_at",
+          "type": "timestamp"
+        },
+        {
+          "name": "failure_score",
+          "type": "float"
+        }
+      ]
+    },
+    {
+      "name": "page_versions",
+      "note": "Append-only records for fetched HTML versions. The HTML body itself lives in object storage.",
+      "fields": [
+        {
+          "name": "version_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "url_hash",
+          "type": "char(32) FK"
+        },
+        {
+          "name": "content_hash",
+          "type": "char(64) FK"
+        },
+        {
+          "name": "archive_key",
+          "type": "text",
+          "note": "Object-store key for compressed HTML"
+        },
+        {
+          "name": "fetched_at",
+          "type": "timestamp"
+        },
+        {
+          "name": "http_status",
+          "type": "int"
+        },
+        {
+          "name": "content_type",
+          "type": "varchar(128)"
+        },
+        {
+          "name": "bytes",
+          "type": "bigint"
+        }
+      ]
+    },
+    {
+      "name": "content_fingerprints",
+      "note": "Exact and near-duplicate detection index.",
+      "fields": [
+        {
+          "name": "content_hash",
+          "type": "char(64) PK",
+          "note": "SHA-256 or normalized-content hash"
+        },
+        {
+          "name": "simhash",
+          "type": "bigint",
+          "note": "Optional near-duplicate fingerprint"
+        },
+        {
+          "name": "first_seen_url_hash",
+          "type": "char(32)"
+        },
+        {
+          "name": "first_seen_at",
+          "type": "timestamp"
+        },
+        {
+          "name": "duplicate_count",
+          "type": "bigint"
+        }
+      ]
+    },
+    {
+      "name": "crawl_attempts",
+      "note": "Operational history for debugging, retry policy, and metrics.",
+      "fields": [
+        {
+          "name": "attempt_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "url_hash",
+          "type": "char(32) FK"
+        },
+        {
+          "name": "worker_id",
+          "type": "varchar(64)"
+        },
+        {
+          "name": "started_at",
+          "type": "timestamp"
+        },
+        {
+          "name": "finished_at",
+          "type": "timestamp"
+        },
+        {
+          "name": "result",
+          "type": "varchar(24)"
+        },
+        {
+          "name": "http_status",
+          "type": "int NULL"
+        },
+        {
+          "name": "error_code",
+          "type": "varchar(64) NULL"
+        }
+      ]
+    },
+    {
+      "name": "outlinks",
+      "note": "Discovered graph edges. Can be sampled or TTL-retained if the full graph is too large.",
+      "fields": [
+        {
+          "name": "source_url_hash",
+          "type": "char(32) FK"
+        },
+        {
+          "name": "target_url_hash",
+          "type": "char(32) FK"
+        },
+        {
+          "name": "anchor_text",
+          "type": "text NULL"
+        },
+        {
+          "name": "discovered_at",
+          "type": "timestamp"
+        }
+      ]
+    }
+  ],
+  "satisfies": {
+    "functional": [
+      {
+        "requirement": "Start from seed URLs, download pages, extract links, and keep discovering new pages.",
+        "how": "Seeds enter the URL Frontier; downloader workers fetch ready URLs; parser workers extract links; the normalizer and dedupe layer enqueue unseen URLs back into the frontier.",
+        "steps": [
+          "basic-loop",
+          "url-frontier",
+          "parser-and-url-dedupe"
+        ]
+      },
+      {
+        "requirement": "Support search-engine indexing.",
+        "how": "Fetched, non-duplicate HTML is stored in the archive and published to the indexing feed with URL metadata, content hash, and crawl timestamp.",
+        "steps": [
+          "storage-and-content-dedupe",
+          "distributed-crawler"
+        ]
+      },
+      {
+        "requirement": "Fetch HTML content only.",
+        "how": "The downloader follows redirects, checks HTTP status and Content-Type, and drops non-HTML responses before storage and parsing.",
+        "steps": [
+          "downloader-pool",
+          "parser-and-url-dedupe"
+        ]
+      },
+      {
+        "requirement": "Store crawled HTML for up to 5 years.",
+        "how": "Compressed HTML bodies are written to object storage with version records in metadata storage; duplicate bodies reuse fingerprints instead of storing repeated payloads.",
+        "steps": [
+          "storage-and-content-dedupe"
+        ]
+      },
+      {
+        "requirement": "Discover newly added and changed pages.",
+        "how": "The freshness scheduler computes next_fetch_after from page importance, historical change rate, cache validators, and manual recrawl requests.",
+        "steps": [
+          "freshness-scheduler"
+        ]
+      },
+      {
+        "requirement": "Ignore duplicate content.",
+        "how": "Content is normalized and hashed after fetch. Already-seen fingerprints are marked duplicate, not emitted as new documents to the index.",
+        "steps": [
+          "storage-and-content-dedupe"
+        ]
+      }
+    ],
+    "nonFunctional": [
+      {
+        "requirement": "Scale to roughly 1 billion pages per month.",
+        "how": "The final architecture partitions the frontier, URL store, fingerprint index, and worker pools by hash so capacity grows by adding shards and workers.",
+        "steps": [
+          "url-frontier",
+          "downloader-pool",
+          "distributed-crawler"
+        ]
+      },
+      {
+        "requirement": "Be robust against bad HTML, timeouts, redirects, traps, and malicious links.",
+        "how": "Workers isolate fetch failures into crawl_attempts, enforce size/time limits, cap redirect chains, normalize URLs, and use trap filters before enqueueing new work.",
+        "steps": [
+          "downloader-pool",
+          "parser-and-url-dedupe",
+          "distributed-crawler"
+        ]
+      },
+      {
+        "requirement": "Be polite to websites.",
+        "how": "The host policy store caches robots.txt and per-host next_allowed_at. The scheduler only releases URLs when host-level delay constraints allow another fetch.",
+        "steps": [
+          "politeness"
+        ]
+      },
+      {
+        "requirement": "Be extensible for future content types.",
+        "how": "The pipeline separates fetching, type filtering, parsing, storage, and indexing emission, so new parsers can be added behind the same worker interfaces.",
+        "steps": [
+          "parser-and-url-dedupe",
+          "distributed-crawler"
+        ]
+      },
+      {
+        "requirement": "Keep the fetch pipeline observable.",
+        "how": "Crawl attempts, frontier stats, per-host delay state, worker metrics, and indexing-feed lag expose bottlenecks and error patterns.",
+        "steps": [
+          "distributed-crawler"
+        ]
+      }
+    ]
+  },
+  "followUps": [
+    "How would you detect and escape crawler traps such as infinite calendars or session-id URLs?",
+    "How would you choose recrawl frequency for high-change news sites versus mostly static pages?",
+    "How would you implement near-duplicate detection beyond exact content hashing?",
+    "How would you partition the URL frontier so a single hot domain cannot starve other hosts?",
+    "How would you recover from a queue shard failure without losing pending URLs?",
+    "How would you change the design to crawl PDFs and images later?",
+    "How would you prevent the crawler from fetching private IP ranges or internal metadata endpoints?",
+    "How would you keep a 30 PB archive cost-effective over 5 years?",
+    "What metrics should page the on-call engineer first?"
+  ],
+  "steps": [
+    {
+      "id": "basic-loop",
+      "title": "1. Basic Crawler Loop",
+      "description": "Start with the simplest model: a small seed list feeds one crawler process. The crawler downloads a page, extracts links from the HTML, and appends new links to an in-memory list. This proves the algorithm, but it is not durable, polite, or scalable.",
+      "decisionPrompt": "Define the smallest correct crawl loop: how does one worker fetch a page, extract links, remember visited URLs, and stop immediate cycles?",
+      "concepts": [
+        {
+          "term": "Seed URL",
+          "definition": "An initial URL used to start crawling a site or topic.",
+          "whyItMatters": "Seeds determine the first frontier and strongly influence crawl coverage."
+        },
+        {
+          "term": "Seen set",
+          "definition": "A record of URLs already discovered or fetched.",
+          "whyItMatters": "It prevents immediate loops and repeated work."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Seeds[/Seed URLs/]",
+        "  Crawler[Single Crawler Process]",
+        "  Web[(Public Web)]",
+        "  Parser[Link Extractor]",
+        "  Seen[(In-memory Seen Set)]",
+        "  Seeds -->|seed URLs| Crawler",
+        "  Crawler -->|HTTP GET| Web",
+        "  Web -->|HTML| Crawler",
+        "  Crawler --> Parser",
+        "  Parser -->|new URLs| Seen",
+        "  Seen --> Crawler"
+      ],
+      "highlight": [
+        "Seeds",
+        "Crawler",
+        "Web",
+        "Parser",
+        "Seen"
+      ],
+      "options": [
+        {
+          "name": "In-memory queue (default)",
+          "pros": [
+            "Fastest way to explain and test the crawl loop",
+            "No external dependencies for a prototype",
+            "Easy to reason about ordering and duplicate checks"
+          ],
+          "cons": [
+            "Loses pending URLs on restart",
+            "Cannot support multiple workers safely",
+            "No place to persist retry or priority state"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Seeds[/Seed URLs/]",
+            "  Crawler[Single Crawler Process]",
+            "  Web[(Public Web)]",
+            "  Parser[Link Extractor]",
+            "  Seen[(In-memory Seen Set)]",
+            "  Seeds -->|seed URLs| Crawler",
+            "  Crawler -->|HTTP GET| Web",
+            "  Web -->|HTML| Crawler",
+            "  Crawler --> Parser",
+            "  Parser -->|new URLs| Seen",
+            "  Seen --> Crawler"
+          ],
+          "highlight": [
+            "Seeds",
+            "Crawler",
+            "Web",
+            "Parser",
+            "Seen"
+          ]
+        },
+        {
+          "name": "Local durable queue",
+          "pros": [
+            "Survives process restarts during early testing",
+            "Introduces the durable-work concept before distributed queues",
+            "Makes retry and resume behavior visible"
+          ],
+          "cons": [
+            "Still a single-machine bottleneck",
+            "Queue locking limits concurrency",
+            "Not enough for host-level politeness or web-scale partitioning"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Seeds[/Seed URLs/]",
+            "  Queue[(Local Durable Queue)]",
+            "  Crawler[Single Crawler Process]",
+            "  Web[(Public Web)]",
+            "  Parser[Link Extractor]",
+            "  Seen[(Local Seen Store)]",
+            "  Seeds -->|seed URLs| Queue",
+            "  Queue -->|consume| Crawler",
+            "  Crawler -->|HTTP GET| Web",
+            "  Web -->|HTML| Crawler",
+            "  Crawler --> Parser",
+            "  Parser --> Seen",
+            "  Seen -->|unseen URLs| Queue"
+          ],
+          "highlight": [
+            "Queue"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Basic algorithm",
+          "points": [
+            "Given seed URLs, download each page.",
+            "Extract URLs from the downloaded HTML.",
+            "Add unseen URLs to the list and repeat."
+          ]
+        },
+        {
+          "title": "Why this is only a starting point",
+          "points": [
+            "The in-memory queue is lost on restart.",
+            "One process cannot reach the required 400 pages/sec average rate reliably.",
+            "It can accidentally hammer one host because there is no per-host scheduling."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "In-memory queue and seen set are not durable.",
+          "mitigation": "Move discovered URLs into a persistent URL frontier and URL store."
+        },
+        {
+          "issue": "No politeness enforcement.",
+          "mitigation": "Introduce per-host scheduling and robots.txt handling before scaling fetch workers."
+        }
+      ],
+      "talkingPoints": [
+        "Clarify that this design is useful only to explain the crawl loop.",
+        "State that large-scale crawling is mostly scheduling, dedupe, and operational control rather than just HTTP fetching."
+      ],
+      "flows": [
+        {
+          "name": "Single-process crawl",
+          "note": "The first version downloads one page and immediately feeds newly extracted links back into the local queue.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant S as Seed List",
+            "  participant C as Crawler",
+            "  participant W as Web Server",
+            "  participant P as Parser",
+            "  participant M as Seen Set",
+            "  S->>C: next seed URL",
+            "  C->>W: GET URL",
+            "  W-->>C: HTML",
+            "  C->>P: parse links",
+            "  P-->>C: extracted URLs",
+            "  C->>M: add unseen URLs",
+            "  M-->>C: next URLs"
+          ]
+        },
+        {
+          "name": "Prototype duplicate skip",
+          "note": "Even the prototype needs a seen set; otherwise one cycle of links can loop forever.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Crawler",
+            "  participant P as Parser",
+            "  participant M as Seen Set",
+            "  participant Q as Local Queue",
+            "  C->>P: parse fetched HTML",
+            "  P-->>C: extracted URL",
+            "  C->>M: check URL",
+            "  alt already seen",
+            "    M-->>C: duplicate",
+            "    C-->>Q: do not enqueue",
+            "  else new URL",
+            "    M-->>C: unseen",
+            "    C->>M: mark seen",
+            "    C->>Q: enqueue URL",
+            "  end"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "url-frontier",
+      "title": "2. Add a Durable URL Frontier",
+      "description": "Replace the in-memory list with a durable URL Frontier. The frontier tracks pending URLs, priority, due time, and retry state. A separate URL Store remembers canonical URLs that have already been seen, preventing repeated enqueueing.",
+      "decisionPrompt": "Choose the durable URL frontier contract: what state is stored per URL, how are leases and retries handled, and how does crawl progress survive crashes?",
+      "concepts": [
+        {
+          "term": "URL frontier",
+          "definition": "The durable queue or scheduler that owns pending URLs and their crawl state.",
+          "whyItMatters": "Crawler progress must survive worker crashes and restarts."
+        },
+        {
+          "term": "Lease",
+          "definition": "A temporary claim that lets one worker fetch a URL before another worker can take it.",
+          "whyItMatters": "Leases prevent duplicate fetches while allowing retry after worker failure."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Seeds[/Seed URLs/]",
+        "  API[Seed API]",
+        "  Frontier[[URL Frontier\\npriority + due time]]",
+        "  URLStore[(URL Store\\nseen canonical URLs)]",
+        "  Worker[Crawler Worker]",
+        "  Web[(Public Web)]",
+        "  Parser[Link Extractor]",
+        "  Seeds -->|seed URLs| API",
+        "  API -->|upsert URL| URLStore",
+        "  API -->|enqueue| Frontier",
+        "  Frontier -->|lease URLs| Worker",
+        "  Worker -->|fetch| Web",
+        "  Web -->|HTML| Worker",
+        "  Worker --> Parser",
+        "  Parser -->|discovered URLs| URLStore",
+        "  URLStore -->|unseen URLs| Frontier"
+      ],
+      "highlight": [
+        "API",
+        "Frontier",
+        "URLStore",
+        "Worker"
+      ],
+      "options": [
+        {
+          "name": "Priority frontier (default)",
+          "pros": [
+            "Directly models priority, due time, retries, and leases",
+            "Good fit for crawl scheduling and recrawl freshness",
+            "Easy for workers to lease ready URLs"
+          ],
+          "cons": [
+            "Queue shards must be carefully partitioned",
+            "Large delayed queues require custom storage strategy",
+            "Operationally more complex than a simple append-only log"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Seeds[/Seed URLs/]",
+            "  API[Seed API]",
+            "  Frontier[[URL Frontier\\npriority + due time]]",
+            "  URLStore[(URL Store\\nseen canonical URLs)]",
+            "  Worker[Crawler Worker]",
+            "  Web[(Public Web)]",
+            "  Parser[Link Extractor]",
+            "  Seeds -->|seed URLs| API",
+            "  API -->|upsert URL| URLStore",
+            "  API -->|enqueue| Frontier",
+            "  Frontier -->|lease URLs| Worker",
+            "  Worker -->|fetch| Web",
+            "  Web -->|HTML| Worker",
+            "  Worker --> Parser",
+            "  Parser -->|discovered URLs| URLStore",
+            "  URLStore -->|unseen URLs| Frontier"
+          ],
+          "highlight": [
+            "API",
+            "Frontier",
+            "URLStore",
+            "Worker"
+          ]
+        },
+        {
+          "name": "Log-backed frontier",
+          "pros": [
+            "Append-only ingestion has high throughput",
+            "Replay makes recovery and auditing straightforward",
+            "Compaction can remove obsolete duplicate URL events"
+          ],
+          "cons": [
+            "Due-time scheduling and priority reads are awkward on a plain log",
+            "Workers can waste effort scanning events that are not ready",
+            "Requires an extra materialized scheduler view"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Seeds[/Seed URLs/]",
+            "  API[Seed API]",
+            "  Log[[URL Event Log]]",
+            "  Scheduler[Materialized Scheduler]",
+            "  URLStore[(URL Store)]",
+            "  Worker[Crawler Worker]",
+            "  Web[(Public Web)]",
+            "  Parser[Link Extractor]",
+            "  Seeds -->|seed URLs| API",
+            "  API -->|enqueue| Log",
+            "  Log -->|materialize| URLStore",
+            "  Log -->|events| Scheduler",
+            "  Scheduler -->|release| Worker",
+            "  Worker --> Web",
+            "  Web -->|HTML| Worker",
+            "  Worker --> Parser",
+            "  Parser --> Log"
+          ],
+          "highlight": [
+            "Log",
+            "Scheduler"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Frontier responsibilities",
+          "points": [
+            "Order URLs by priority and next_fetch_after.",
+            "Persist pending work so a worker crash does not lose URLs.",
+            "Support retries with backoff and dead-letter handling for repeated failures."
+          ]
+        },
+        {
+          "title": "URL canonicalization",
+          "points": [
+            "Normalize scheme and host case, remove URL fragments, sort safe query parameters, and resolve relative links.",
+            "Reject invalid schemes such as mailto:, javascript:, and data:.",
+            "Hash canonical_url to create the partition key and dedupe key."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "A single queue partition becomes a throughput and availability bottleneck.",
+          "mitigation": "Partition the frontier by URL hash or host hash, then assign worker pools per partition."
+        },
+        {
+          "issue": "URL dedupe can be expensive at web scale.",
+          "mitigation": "Use a durable key-value URL store, optionally fronted by a Bloom filter to reduce read load."
+        }
+      ],
+      "talkingPoints": [
+        "Separate URL dedupe from content dedupe: two different URLs can have identical HTML.",
+        "The frontier is a scheduler, not just a FIFO queue."
+      ],
+      "flows": [
+        {
+          "name": "Seed ingestion",
+          "note": "Seeds are normalized and deduped before entering the frontier.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant O as Operator",
+            "  participant API as Seed API",
+            "  participant N as URL Normalizer",
+            "  participant S as URL Store",
+            "  participant F as URL Frontier",
+            "  O->>API: POST seeds",
+            "  API->>N: normalize URLs",
+            "  N-->>API: canonical URLs",
+            "  API->>S: put-if-absent URL hash",
+            "  alt unseen",
+            "    S-->>API: inserted",
+            "    API->>F: enqueue with priority",
+            "  else already known",
+            "    S-->>API: duplicate",
+            "  end",
+            "  API-->>O: accepted count"
+          ]
+        },
+        {
+          "name": "Lease timeout and retry",
+          "note": "A durable frontier can recover leased URLs when a worker crashes mid-fetch.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant W1 as Worker 1",
+            "  participant F as URL Frontier",
+            "  participant L as Crawl Attempts",
+            "  participant W2 as Worker 2",
+            "  W1->>F: lease URL",
+            "  F-->>W1: URL + lease deadline",
+            "  W1-xW1: crash before ack",
+            "  F->>F: lease deadline expires",
+            "  F->>L: record abandoned attempt",
+            "  F->>F: increment retry count",
+            "  W2->>F: request work",
+            "  F-->>W2: same URL with later due time"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "downloader-pool",
+      "title": "3. Scale Fetching with Downloader Workers",
+      "description": "Add a pool of stateless downloader workers. Workers lease ready URLs from the frontier, resolve DNS through a shared resolver cache, enforce connection and response-size limits, follow bounded redirects, and drop non-HTML responses.",
+      "decisionPrompt": "Scale fetching with workers without being rude or wasteful: how are hosts scheduled, DNS and redirects handled, and what limits protect the crawler?",
+      "concepts": [
+        {
+          "term": "Downloader worker",
+          "definition": "A stateless process that leases URLs and performs network fetches.",
+          "whyItMatters": "Fetch throughput scales by adding workers, not by making one crawler loop larger."
+        },
+        {
+          "term": "DNS cache",
+          "definition": "A cache of hostname to IP lookups shared by crawler workers.",
+          "whyItMatters": "Repeated DNS lookups can dominate latency and overload resolvers at crawl scale."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Frontier[[URL Frontier]]",
+        "  W1[Downloader 1]",
+        "  W2[Downloader 2]",
+        "  W3[Downloader 3]",
+        "  DNS[(DNS Resolver Cache)]",
+        "  Web[(Public Web)]",
+        "  FetchLog[(Crawl Attempts)]",
+        "  Parser[Parser Queue]",
+        "  Frontier -->|lease URLs| W1",
+        "  Frontier --> W2",
+        "  Frontier --> W3",
+        "  W1 -->|resolve| DNS",
+        "  W2 --> DNS",
+        "  W3 --> DNS",
+        "  DNS -->|fetch| Web",
+        "  W1 --> Web",
+        "  W2 --> Web",
+        "  W3 --> Web",
+        "  W1 -->|fetch result| FetchLog",
+        "  W2 --> FetchLog",
+        "  W3 --> FetchLog",
+        "  W1 -->|HTML| Parser",
+        "  W2 --> Parser",
+        "  W3 --> Parser"
+      ],
+      "highlight": [
+        "W1",
+        "W2",
+        "W3",
+        "DNS",
+        "FetchLog"
+      ],
+      "options": [
+        {
+          "name": "Central worker pool (default)",
+          "pros": [
+            "Simple autoscaling model",
+            "Workers are stateless and interchangeable",
+            "Shared resolver cache reduces repeated DNS lookups"
+          ],
+          "cons": [
+            "A regional outage can stop all fetching",
+            "Egress bandwidth is concentrated in one location",
+            "Long-distance fetches can add latency"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Frontier[[URL Frontier]]",
+            "  W1[Downloader 1]",
+            "  W2[Downloader 2]",
+            "  W3[Downloader 3]",
+            "  DNS[(DNS Resolver Cache)]",
+            "  Web[(Public Web)]",
+            "  FetchLog[(Crawl Attempts)]",
+            "  Parser[Parser Queue]",
+            "  Frontier -->|lease URLs| W1",
+            "  Frontier --> W2",
+            "  Frontier --> W3",
+            "  W1 -->|resolve| DNS",
+            "  W2 --> DNS",
+            "  W3 --> DNS",
+            "  DNS -->|fetch| Web",
+            "  W1 --> Web",
+            "  W2 --> Web",
+            "  W3 --> Web",
+            "  W1 -->|fetch result| FetchLog",
+            "  W2 --> FetchLog",
+            "  W3 --> FetchLog",
+            "  W1 -->|HTML| Parser",
+            "  W2 --> Parser",
+            "  W3 --> Parser"
+          ],
+          "highlight": [
+            "W1",
+            "W2",
+            "W3",
+            "DNS",
+            "FetchLog"
+          ]
+        },
+        {
+          "name": "Regional worker pools",
+          "pros": [
+            "Scales egress bandwidth across regions",
+            "Can fetch closer to origin servers",
+            "Region failure does not stop the whole crawl"
+          ],
+          "cons": [
+            "Requires global lease coordination",
+            "Duplicate fetches are easier to introduce",
+            "Per-host politeness must still be globally enforced"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Frontier[[URL Frontier]]",
+            "  RA[Region A Downloaders]",
+            "  RB[Region B Downloaders]",
+            "  DNSA[(Region A DNS Cache)]",
+            "  DNSB[(Region B DNS Cache)]",
+            "  Web[(Public Web)]",
+            "  FetchLog[(Crawl Attempts)]",
+            "  Parser[Parser Queue]",
+            "  Frontier -->|lease URLs| RA",
+            "  Frontier --> RB",
+            "  RA --> DNSA",
+            "  RB --> DNSB",
+            "  RA -->|fetch| Web",
+            "  RB --> Web",
+            "  RA -->|fetch result| FetchLog",
+            "  RB --> FetchLog",
+            "  RA -->|HTML| Parser",
+            "  RB --> Parser"
+          ],
+          "highlight": [
+            "RA",
+            "RB",
+            "DNSA",
+            "DNSB"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Downloader guardrails",
+          "points": [
+            "Set connect, read, and total request timeouts.",
+            "Cap response size and redirect depth.",
+            "Only pass HTTP 200 HTML responses to the parser; record other outcomes as crawl attempts."
+          ]
+        },
+        {
+          "title": "DNS strategy",
+          "points": [
+            "A resolver cache avoids repeated DNS lookups for popular hosts.",
+            "Respect DNS TTLs and handle DNS failures as retryable crawl attempts.",
+            "Protect workers from slow resolver calls with circuit breakers and timeouts."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Outbound bandwidth and connection counts cap crawl rate.",
+          "mitigation": "Scale downloader pools horizontally and place them close to egress capacity."
+        },
+        {
+          "issue": "Slow or malicious servers tie up worker slots.",
+          "mitigation": "Aggressive timeouts, byte limits, redirect caps, and per-host failure backoff."
+        },
+        {
+          "issue": "DNS resolver overload adds latency to every fetch.",
+          "mitigation": "Shared resolver cache and batching popular host lookups."
+        }
+      ],
+      "talkingPoints": [
+        "At 400 pages/sec and 500 KB average page size, fetch bandwidth is roughly 1.6 Gbps before protocol overhead.",
+        "Treat network failures as normal data, not exceptional crashes."
+      ],
+      "flows": [
+        {
+          "name": "Fetch ready URL",
+          "note": "Workers lease URLs from the frontier and record every outcome for retry policy and observability.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant W as Downloader Worker",
+            "  participant F as URL Frontier",
+            "  participant D as DNS Cache",
+            "  participant H as Web Host",
+            "  participant L as Crawl Attempts",
+            "  participant P as Parser Queue",
+            "  W->>F: lease next ready URL",
+            "  F-->>W: URL + crawl metadata",
+            "  W->>D: resolve host",
+            "  D-->>W: IP",
+            "  W->>H: GET URL",
+            "  alt HTML response",
+            "    H-->>W: 200 text/html",
+            "    W->>L: record success",
+            "    W->>P: publish HTML parse job",
+            "  else timeout or non-HTML",
+            "    H-->>W: failure / ignored type",
+            "    W->>L: record failure reason",
+            "    W->>F: retry later or mark failed",
+            "  end"
+          ]
+        },
+        {
+          "name": "Redirect and content-type guard",
+          "note": "The downloader follows only bounded redirects and drops responses outside the HTML scope.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant W as Downloader Worker",
+            "  participant H as Web Host",
+            "  participant L as Crawl Attempts",
+            "  participant P as Parser Queue",
+            "  W->>H: GET URL",
+            "  alt redirect within limit",
+            "    H-->>W: 301 / 302 Location",
+            "    W->>H: GET redirected URL",
+            "  else redirect loop or too many hops",
+            "    H-->>W: redirect chain",
+            "    W->>L: record redirect_limit",
+            "  end",
+            "  alt text/html",
+            "    H-->>W: 200 text/html",
+            "    W->>P: publish parse job",
+            "  else PDF, image, video, or huge body",
+            "    H-->>W: non-HTML / oversized",
+            "    W->>L: record ignored_content_type",
+            "  end"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "parser-and-url-dedupe",
+      "title": "4. Parse HTML and Deduplicate URLs",
+      "description": "Parser workers extract links, canonicalize them, filter unsafe or out-of-scope URLs, and write graph edges. Only URLs not already present in the URL Store are sent back to the frontier. This prevents the crawler from revisiting the same URL endlessly.",
+      "decisionPrompt": "Design URL discovery and canonicalization: when do you normalize, deduplicate, and enqueue links so equivalent URLs do not explode the frontier?",
+      "concepts": [
+        {
+          "term": "Canonical URL",
+          "definition": "A normalized URL form used to compare equivalent links.",
+          "whyItMatters": "Without canonicalization, the crawler may treat the same page as many URLs."
+        },
+        {
+          "term": "Bloom filter",
+          "definition": "A memory-efficient probabilistic set that can say an item is probably present.",
+          "whyItMatters": "It reduces duplicate enqueue attempts at very large URL volumes, with acceptable false positives in some paths."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  ParserQ[[Parser Queue]]",
+        "  Parser[HTML Parser Workers]",
+        "  Filter[URL Filter\\nrobots scope + traps]",
+        "  Normalizer[URL Normalizer]",
+        "  URLStore[(URL Store)]",
+        "  Outlinks[(Outlink Graph)]",
+        "  Frontier[[URL Frontier]]",
+        "  ParserQ -->|consume| Parser",
+        "  Parser -->|raw links| Filter",
+        "  Filter -->|accepted| Normalizer",
+        "  Normalizer -->|upsert| URLStore",
+        "  Parser -->|extract links| Outlinks",
+        "  URLStore -->|unseen URLs| Frontier"
+      ],
+      "highlight": [
+        "ParserQ",
+        "Filter",
+        "Normalizer",
+        "Outlinks"
+      ],
+      "options": [
+        {
+          "name": "Durable URL store (default)",
+          "pros": [
+            "Exact dedupe with no false positives",
+            "Simple correctness story for canonical URLs",
+            "Works well with batch put-if-absent writes"
+          ],
+          "cons": [
+            "Every candidate URL can become a storage lookup",
+            "Needs sharding and write batching at scale",
+            "Higher latency than in-memory probabilistic checks"
+          ],
+          "diagram": [
+            "graph TB",
+            "  ParserQ[[Parser Queue]]",
+            "  Parser[HTML Parser Workers]",
+            "  Filter[URL Filter\\nrobots scope + traps]",
+            "  Normalizer[URL Normalizer]",
+            "  URLStore[(URL Store)]",
+            "  Outlinks[(Outlink Graph)]",
+            "  Frontier[[URL Frontier]]",
+            "  ParserQ -->|consume| Parser",
+            "  Parser -->|raw links| Filter",
+            "  Filter -->|accepted| Normalizer",
+            "  Normalizer -->|upsert| URLStore",
+            "  Parser -->|extract links| Outlinks",
+            "  URLStore -->|unseen URLs| Frontier"
+          ],
+          "highlight": [
+            "ParserQ",
+            "Filter",
+            "Normalizer",
+            "Outlinks"
+          ]
+        },
+        {
+          "name": "Bloom filter + URL store",
+          "pros": [
+            "Cuts read load for URLs that are obviously already known",
+            "Keeps exactness by confirming misses in the durable store",
+            "Useful when extracted-link volume is much larger than fetch volume"
+          ],
+          "cons": [
+            "False positives can hide new URLs if used as the only check",
+            "Filter rebuilds and rotation add operational complexity",
+            "Still needs the durable URL Store as source of truth"
+          ],
+          "diagram": [
+            "graph TB",
+            "  ParserQ[[Parser Queue]]",
+            "  Parser[HTML Parser Workers]",
+            "  Filter[URL Filter\\nrobots scope + traps]",
+            "  Normalizer[URL Normalizer]",
+            "  Bloom[(Bloom Filter)]",
+            "  URLStore[(URL Store)]",
+            "  Outlinks[(Outlink Graph)]",
+            "  Frontier[[URL Frontier]]",
+            "  ParserQ -->|consume| Parser",
+            "  Parser -->|links| Filter",
+            "  Filter -->|accepted| Normalizer",
+            "  Normalizer -->|canonical URL| Bloom",
+            "  Bloom -->|maybe new| URLStore",
+            "  Bloom -->|known| Parser",
+            "  Parser -->|extract links| Outlinks",
+            "  URLStore -->|unseen URLs| Frontier"
+          ],
+          "highlight": [
+            "Bloom"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Trap and safety filters",
+          "points": [
+            "Reject unsupported schemes, malformed URLs, private IP ranges, and extremely long URLs.",
+            "Detect patterns that create infinite spaces, such as calendar next links or session IDs.",
+            "Limit per-page and per-host discovered URL fanout so one page cannot flood the frontier."
+          ]
+        },
+        {
+          "title": "HTML parsing reality",
+          "points": [
+            "The web contains broken markup, wrong encodings, and duplicate links.",
+            "Use a tolerant parser and normalize relative links against the fetched page URL.",
+            "Parsing failures should mark the page as fetched-but-unparsed, not crash the worker."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Pages with thousands of links can overload the frontier.",
+          "mitigation": "Apply per-page link caps and priority scoring before enqueueing."
+        },
+        {
+          "issue": "URL Store lookup volume grows with every extracted link.",
+          "mitigation": "Batch put-if-absent calls and use a Bloom filter to skip obvious repeats."
+        }
+      ],
+      "talkingPoints": [
+        "This step is about URL uniqueness; duplicate content is handled after HTML body hashing.",
+        "URL normalization rules must be conservative because over-normalization can merge distinct pages."
+      ],
+      "flows": [
+        {
+          "name": "Extract and enqueue links",
+          "note": "Only canonical URLs that pass filters and are absent from the URL Store re-enter the frontier.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant Q as Parser Queue",
+            "  participant P as Parser Worker",
+            "  participant N as URL Normalizer",
+            "  participant S as URL Store",
+            "  participant G as Outlink Graph",
+            "  participant F as URL Frontier",
+            "  Q->>P: HTML parse job",
+            "  P->>P: extract anchor hrefs",
+            "  P->>N: normalize and filter links",
+            "  N-->>P: canonical URLs",
+            "  P->>G: write source -> target edges",
+            "  P->>S: batch put-if-absent URL hashes",
+            "  S-->>P: unseen URL hashes",
+            "  P->>F: enqueue unseen URLs"
+          ]
+        },
+        {
+          "name": "Trap or duplicate rejected",
+          "note": "Bad, cyclic, or already-known URLs are stopped before they expand the frontier.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant P as Parser Worker",
+            "  participant Flt as URL Filter",
+            "  participant N as URL Normalizer",
+            "  participant S as URL Store",
+            "  participant Q as URL Frontier",
+            "  P->>Flt: candidate link",
+            "  alt trap or unsafe URL",
+            "    Flt-->>P: reject with reason",
+            "  else valid URL",
+            "    Flt->>N: normalize",
+            "    N-->>P: canonical URL",
+            "    P->>S: put-if-absent URL hash",
+            "    alt already known",
+            "      S-->>P: duplicate",
+            "    else unseen",
+            "      S-->>P: inserted",
+            "      P->>Q: enqueue URL",
+            "    end",
+            "  end"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "storage-and-content-dedupe",
+      "title": "5. Store HTML and Suppress Duplicate Content",
+      "description": "Fetched HTML must be retained for up to 5 years, but pages with duplicate content should be ignored by the indexing pipeline. Normalize the HTML body, compute a content fingerprint, store only unique versions, and emit unique documents to the search indexing pipeline.",
+      "decisionPrompt": "Choose what fetched content to persist and index: how do you separate raw HTML, parsed metadata, and duplicate content fingerprints?",
+      "concepts": [
+        {
+          "term": "Content fingerprint",
+          "definition": "A hash or signature of fetched page content.",
+          "whyItMatters": "Fingerprints detect duplicate or near-duplicate pages even when URLs differ."
+        },
+        {
+          "term": "Raw archive",
+          "definition": "Storage for the fetched HTML or response body before downstream indexing.",
+          "whyItMatters": "It lets parsing, indexing, and debugging replay the original crawl result."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  ParserQ[[Parser Queue]]",
+        "  Fingerprint[Content Fingerprinter]",
+        "  FPIndex[(Fingerprint Index)]",
+        "  Archive[(Compressed HTML Archive\\nobject storage)]",
+        "  Versions[(Page Versions)]",
+        "  IndexFeed[[Indexer Feed]]",
+        "  ParserQ -->|consume| Fingerprint",
+        "  Fingerprint -->|content hash| FPIndex",
+        "  FPIndex -->|new content| Archive",
+        "  Archive -->|raw HTML| Versions",
+        "  Versions -->|index docs| IndexFeed",
+        "  FPIndex -->|duplicate| Versions"
+      ],
+      "highlight": [
+        "Fingerprint",
+        "FPIndex",
+        "Archive",
+        "Versions",
+        "IndexFeed"
+      ],
+      "options": [
+        {
+          "name": "Exact hash dedupe (default)",
+          "pros": [
+            "Deterministic and easy to explain",
+            "No false positives for distinct HTML bodies",
+            "Cheap key-value lookup by content_hash"
+          ],
+          "cons": [
+            "Misses near-duplicates with small template or ad changes",
+            "Requires careful normalization to avoid noisy hashes",
+            "Does not cluster mirrors with lightly rewritten content"
+          ],
+          "diagram": [
+            "graph TB",
+            "  ParserQ[[Parser Queue]]",
+            "  Fingerprint[Content Fingerprinter]",
+            "  FPIndex[(Fingerprint Index)]",
+            "  Archive[(Compressed HTML Archive\\nobject storage)]",
+            "  Versions[(Page Versions)]",
+            "  IndexFeed[[Indexer Feed]]",
+            "  ParserQ -->|consume| Fingerprint",
+            "  Fingerprint -->|content hash| FPIndex",
+            "  FPIndex -->|new content| Archive",
+            "  Archive -->|raw HTML| Versions",
+            "  Versions -->|index docs| IndexFeed",
+            "  FPIndex -->|duplicate| Versions"
+          ],
+          "highlight": [
+            "Fingerprint",
+            "FPIndex",
+            "Archive",
+            "Versions",
+            "IndexFeed"
+          ]
+        },
+        {
+          "name": "Exact + near-duplicate",
+          "pros": [
+            "Suppresses mirrored pages and template-level duplicates",
+            "Improves index quality for search use cases",
+            "Can be introduced after exact hashing as a second-stage scorer"
+          ],
+          "cons": [
+            "False positives can remove distinct useful pages",
+            "More CPU-heavy than exact hashing",
+            "Needs threshold tuning and quality evaluation"
+          ],
+          "diagram": [
+            "graph TB",
+            "  ParserQ[[Parser Queue]]",
+            "  Fingerprint[Content Fingerprinter]",
+            "  FPIndex[(Fingerprint Index)]",
+            "  SimHash[Near-duplicate Scorer]",
+            "  Archive[(Compressed HTML Archive)]",
+            "  Versions[(Page Versions)]",
+            "  IndexFeed[[Indexer Feed]]",
+            "  ParserQ -->|consume| Fingerprint",
+            "  Fingerprint -->|content hash| FPIndex",
+            "  FPIndex -->|new exact hash| SimHash",
+            "  SimHash -->|unique enough| Archive",
+            "  Archive -->|raw HTML| Versions",
+            "  Versions -->|index docs| IndexFeed",
+            "  SimHash -->|near duplicate| Versions"
+          ],
+          "highlight": [
+            "SimHash"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Exact duplicate detection",
+          "points": [
+            "Normalize volatile markup where safe, then compute a SHA-256 hash of the HTML body.",
+            "If the hash already exists, mark this URL version as duplicate and avoid emitting a new indexing document.",
+            "Keep the URL metadata even for duplicates so crawl coverage remains visible."
+          ]
+        },
+        {
+          "title": "Storage layout",
+          "points": [
+            "Compress HTML before writing to object storage.",
+            "Partition archive keys by content hash prefix or crawl date to avoid hot object-store prefixes.",
+            "Keep metadata in a queryable store; keep large HTML bodies in cheaper object storage."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "30 PB raw retention is expensive.",
+          "mitigation": "Use compression, duplicate suppression, lifecycle tiers, and selective retention policies."
+        },
+        {
+          "issue": "Fingerprint index becomes a high-QPS key-value workload.",
+          "mitigation": "Shard by content_hash and cache recently seen fingerprints."
+        },
+        {
+          "issue": "Indexer lag hides fresh pages from search.",
+          "mitigation": "Expose Indexer Feed lag and scale downstream consumers independently."
+        }
+      ],
+      "talkingPoints": [
+        "Distinguish archive retention from index freshness: the archive can store versions while the index only consumes unique/current content.",
+        "Near-duplicate detection such as SimHash can be added later, but exact hashing is the first interview-safe answer."
+      ],
+      "flows": [
+        {
+          "name": "Archive unique HTML",
+          "note": "Duplicate bodies are not emitted as new indexing documents.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant P as Parser Queue",
+            "  participant F as Fingerprinter",
+            "  participant I as Fingerprint Index",
+            "  participant A as HTML Archive",
+            "  participant V as Page Versions",
+            "  participant X as Indexer Feed",
+            "  P->>F: fetched HTML",
+            "  F->>F: normalize + hash content",
+            "  F->>I: put-if-absent content_hash",
+            "  alt new content",
+            "    I-->>F: inserted",
+            "    F->>A: write compressed HTML",
+            "    A-->>F: archive key",
+            "    F->>V: record page version",
+            "    F->>X: publish indexable document",
+            "  else duplicate",
+            "    I-->>F: already seen",
+            "    F->>V: record duplicate version",
+            "  end"
+          ]
+        },
+        {
+          "name": "Near-duplicate scoring",
+          "note": "A second-stage scorer can suppress pages that are not byte-identical but are redundant for the index.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant F as Fingerprinter",
+            "  participant I as Fingerprint Index",
+            "  participant N as Near-duplicate Scorer",
+            "  participant V as Page Versions",
+            "  participant X as Indexer Feed",
+            "  F->>I: exact hash lookup",
+            "  I-->>F: no exact match",
+            "  F->>N: compare simhash / shingles",
+            "  alt similar above threshold",
+            "    N-->>F: near duplicate of known page",
+            "    F->>V: record duplicate cluster",
+            "  else unique enough",
+            "    N-->>F: unique content",
+            "    F->>V: record canonical version",
+            "    F->>X: publish document",
+            "  end"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "politeness",
+      "title": "6. Enforce Robots.txt and Politeness",
+      "description": "A scalable crawler must not overwhelm websites. Introduce a Host Policy Store that caches robots.txt, crawl-delay rules, and next_allowed_at per host. The frontier only releases a URL when both global capacity and host-level politeness allow it.",
+      "decisionPrompt": "Place the robots.txt and politeness gate: how does a URL move from eligible to fetchable while respecting per-host delay and disallow rules?",
+      "concepts": [
+        {
+          "term": "robots.txt",
+          "definition": "A site-provided policy file that tells crawlers which paths they may fetch.",
+          "whyItMatters": "Respecting it is a core correctness and trust requirement for crawlers."
+        },
+        {
+          "term": "Crawl delay",
+          "definition": "A minimum wait time between requests to the same host.",
+          "whyItMatters": "It prevents the crawler from overwhelming websites."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Frontier[[URL Frontier]]",
+        "  Scheduler[Polite Scheduler]",
+        "  HostPolicy[(Host Policy Store\\nrobots + delay)]",
+        "  Robots[Robots Fetcher]",
+        "  Workers[Downloader Workers]",
+        "  Web[(Public Web)]",
+        "  Frontier -->|lease URLs| Scheduler",
+        "  Scheduler -->|check host| HostPolicy",
+        "  HostPolicy -->|allowed time| Scheduler",
+        "  Scheduler -->|ready URL| Workers",
+        "  Robots -->|rules| HostPolicy",
+        "  Robots -->|fetch| Web",
+        "  Workers --> Web",
+        "  Workers -->|host feedback| HostPolicy"
+      ],
+      "highlight": [
+        "Scheduler",
+        "HostPolicy",
+        "Robots"
+      ],
+      "options": [
+        {
+          "name": "Central host policy (default)",
+          "pros": [
+            "Strong per-host politeness because all leases consult one logical state",
+            "Simple robots.txt cache ownership",
+            "Clear place to track next_allowed_at and host failure score"
+          ],
+          "cons": [
+            "Host policy store becomes a high-QPS dependency",
+            "Needs careful partitioning by host",
+            "Scheduler latency can block worker utilization"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Frontier[[URL Frontier]]",
+            "  Scheduler[Polite Scheduler]",
+            "  HostPolicy[(Host Policy Store\\nrobots + delay)]",
+            "  Robots[Robots Fetcher]",
+            "  Workers[Downloader Workers]",
+            "  Web[(Public Web)]",
+            "  Frontier -->|lease URLs| Scheduler",
+            "  Scheduler -->|check host| HostPolicy",
+            "  HostPolicy -->|allowed time| Scheduler",
+            "  Scheduler -->|ready URL| Workers",
+            "  Robots -->|rules| HostPolicy",
+            "  Robots -->|fetch| Web",
+            "  Workers --> Web",
+            "  Workers -->|host feedback| HostPolicy"
+          ],
+          "highlight": [
+            "Scheduler",
+            "HostPolicy",
+            "Robots"
+          ]
+        },
+        {
+          "name": "Per-host ready queues",
+          "pros": [
+            "Politeness is encoded directly in queue release times",
+            "Large delayed hosts do not crowd out ready hosts",
+            "Natural fit for fairness across domains"
+          ],
+          "cons": [
+            "Millions of host queues require compact metadata",
+            "Hot hosts need special splitting without breaking delay guarantees",
+            "Global priority is harder to optimize"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Frontier[[URL Frontier]]",
+            "  HostQueues[[Per-host Queues]]",
+            "  ReadyHeap[[Ready-time Heap]]",
+            "  HostPolicy[(Host Policy Store)]",
+            "  Robots[Robots Fetcher]",
+            "  Workers[Downloader Workers]",
+            "  Web[(Public Web)]",
+            "  Frontier -->|lease URLs| HostQueues",
+            "  HostQueues -->|next allowed| ReadyHeap",
+            "  ReadyHeap -->|ready URLs| Workers",
+            "  HostQueues -->|host state| HostPolicy",
+            "  Robots -->|rules| HostPolicy",
+            "  Robots --> Web",
+            "  Workers --> Web",
+            "  Workers -->|feedback| HostPolicy"
+          ],
+          "highlight": [
+            "HostQueues",
+            "ReadyHeap"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Politeness mechanics",
+          "points": [
+            "Group URLs by host and release at most one request per host per configured delay window.",
+            "Honor robots.txt disallow rules and crawl-delay where available.",
+            "Use exponential backoff when a host returns repeated 429, 503, timeout, or connection errors."
+          ]
+        },
+        {
+          "title": "Scheduling tradeoff",
+          "points": [
+            "A global priority queue maximizes freshness but can cluster requests on popular hosts.",
+            "Per-host queues preserve politeness and fairness.",
+            "The practical design combines per-host queues with a global ready-time heap."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Popular hosts create large delayed queues.",
+          "mitigation": "Store per-host queues separately and release only due items into worker-visible partitions."
+        },
+        {
+          "issue": "Robots.txt fetch failures block large sites.",
+          "mitigation": "Cache previous rules, use short retry backoff, and fail closed or conservative for unknown rules."
+        },
+        {
+          "issue": "Clock skew between schedulers can violate delay windows.",
+          "mitigation": "Centralize per-host next_allowed_at updates or use compare-and-set leases."
+        }
+      ],
+      "talkingPoints": [
+        "Politeness is a hard requirement, not an optimization.",
+        "Scaling workers without host-aware scheduling makes the crawler more dangerous, not better."
+      ],
+      "flows": [
+        {
+          "name": "Polite lease",
+          "note": "The scheduler checks host policy before handing a URL to a downloader.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant W as Downloader Worker",
+            "  participant F as URL Frontier",
+            "  participant S as Polite Scheduler",
+            "  participant H as Host Policy Store",
+            "  participant R as Robots Fetcher",
+            "  W->>F: request work",
+            "  F->>S: find ready URL",
+            "  S->>H: check host rules + next_allowed_at",
+            "  alt robots missing or stale",
+            "    S->>R: refresh robots.txt",
+            "    R->>H: update rules",
+            "  end",
+            "  alt allowed now",
+            "    H-->>S: allowed",
+            "    S->>H: set next_allowed_at",
+            "    S-->>W: lease URL",
+            "  else must wait",
+            "    H-->>S: delay until timestamp",
+            "    S-->>F: keep URL delayed",
+            "  end"
+          ]
+        },
+        {
+          "name": "Host backoff after 429",
+          "note": "Host feedback updates the same policy state used by future leases.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant W as Downloader Worker",
+            "  participant H as Web Host",
+            "  participant P as Host Policy Store",
+            "  participant F as URL Frontier",
+            "  W->>H: GET URL",
+            "  H-->>W: 429 Too Many Requests",
+            "  W->>P: increase host backoff",
+            "  P-->>W: next_allowed_at updated",
+            "  W->>F: requeue URL after delay",
+            "  F->>P: future lease check",
+            "  P-->>F: wait until next_allowed_at"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "freshness-scheduler",
+      "title": "7. Recrawl for Freshness",
+      "description": "The crawler must handle newly added and edited pages. Add a freshness scheduler that revisits known URLs based on importance, historical change rate, previous HTTP validators, and manual recrawl requests. Conditional GETs reduce bandwidth when pages have not changed.",
+      "decisionPrompt": "Design recrawl scheduling: which signals decide next_fetch_after, and how do you balance freshness against crawl budget and host politeness?",
+      "concepts": [
+        {
+          "term": "Freshness",
+          "definition": "How current the stored copy of a page is compared with the live web page.",
+          "whyItMatters": "Important or frequently changing pages need recrawls sooner than stable pages."
+        },
+        {
+          "term": "Recrawl budget",
+          "definition": "The limited fetch capacity allocated to revisiting known URLs.",
+          "whyItMatters": "Every recrawl competes with discovering new pages and with politeness constraints."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  URLStore[(URL Store)]",
+        "  ChangeStats[(Change History)]",
+        "  Freshness[Freshness Scheduler]",
+        "  Frontier[[URL Frontier]]",
+        "  Workers[Downloader Workers]",
+        "  Web[(Public Web)]",
+        "  Versions[(Page Versions)]",
+        "  URLStore -->|known URLs| Freshness",
+        "  ChangeStats -->|change rate| Freshness",
+        "  Freshness -->|next_fetch_after| URLStore",
+        "  Freshness -->|schedule| Frontier",
+        "  Frontier -->|lease URLs| Workers",
+        "  Workers -->|If-None-Match / If-Modified-Since| Web",
+        "  Web -->|response| Workers",
+        "  Workers --> Versions",
+        "  Versions --> ChangeStats"
+      ],
+      "highlight": [
+        "ChangeStats",
+        "Freshness"
+      ],
+      "options": [
+        {
+          "name": "Adaptive recrawl (default)",
+          "pros": [
+            "Uses observed change history to spend crawl budget where it matters",
+            "Balances discovery and freshness explicitly",
+            "Works even when sites provide no external change signals"
+          ],
+          "cons": [
+            "Can be slow to notice sudden changes on historically stable pages",
+            "Needs tuning by page importance and host behavior",
+            "Consumes capacity on pages that may not have changed"
+          ],
+          "diagram": [
+            "graph TB",
+            "  URLStore[(URL Store)]",
+            "  ChangeStats[(Change History)]",
+            "  Freshness[Freshness Scheduler]",
+            "  Frontier[[URL Frontier]]",
+            "  Workers[Downloader Workers]",
+            "  Web[(Public Web)]",
+            "  Versions[(Page Versions)]",
+            "  URLStore -->|known URLs| Freshness",
+            "  ChangeStats -->|change rate| Freshness",
+            "  Freshness -->|next_fetch_after| URLStore",
+            "  Freshness -->|schedule| Frontier",
+            "  Frontier -->|lease URLs| Workers",
+            "  Workers -->|If-None-Match / If-Modified-Since| Web",
+            "  Web -->|response| Workers",
+            "  Workers --> Versions",
+            "  Versions --> ChangeStats"
+          ],
+          "highlight": [
+            "ChangeStats",
+            "Freshness"
+          ]
+        },
+        {
+          "name": "Signal-assisted recrawl",
+          "pros": [
+            "Sitemaps, feeds, and manual signals can surface new or changed pages quickly",
+            "Reduces wasted recrawls on stable pages",
+            "Good fit for high-value publishers and news sources"
+          ],
+          "cons": [
+            "Signals are incomplete and not uniformly available",
+            "Bad or spammy feeds can poison priority",
+            "Still needs adaptive fallback for the rest of the web"
+          ],
+          "diagram": [
+            "graph TB",
+            "  URLStore[(URL Store)]",
+            "  Signals[/Sitemaps RSS Change Feeds Manual Recrawl/]",
+            "  ChangeStats[(Change History)]",
+            "  Freshness[Freshness Scheduler]",
+            "  Frontier[[URL Frontier]]",
+            "  Workers[Downloader Workers]",
+            "  Web[(Public Web)]",
+            "  Versions[(Page Versions)]",
+            "  Signals -->|priority| Freshness",
+            "  URLStore -->|known URLs| Freshness",
+            "  ChangeStats -->|change rate| Freshness",
+            "  Freshness -->|schedule| Frontier",
+            "  Frontier -->|lease URLs| Workers",
+            "  Workers --> Web",
+            "  Web --> Workers",
+            "  Workers --> Versions",
+            "  Versions --> ChangeStats"
+          ],
+          "highlight": [
+            "Signals"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Recrawl policy",
+          "points": [
+            "Frequently changing or high-importance pages get shorter recrawl intervals.",
+            "Stable pages get longer intervals to preserve capacity.",
+            "HTTP 304 responses update last_checked_at without writing a new page version."
+          ]
+        },
+        {
+          "title": "Freshness vs coverage",
+          "points": [
+            "Capacity spent on recrawling cannot be spent discovering brand-new pages.",
+            "The scheduler should reserve separate budgets for discovery and freshness.",
+            "Manual recrawl requests enter with higher priority but still obey politeness."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Over-recrawling stable pages wastes bandwidth and worker slots.",
+          "mitigation": "Use adaptive intervals driven by observed change frequency."
+        },
+        {
+          "issue": "Under-recrawling important pages makes the search index stale.",
+          "mitigation": "Weight recrawl priority by page importance and update velocity."
+        }
+      ],
+      "talkingPoints": [
+        "Freshness is an explicit scheduling problem, not something solved by the downloader.",
+        "Use ETag and Last-Modified when hosts provide them, but do not rely on them being correct everywhere."
+      ],
+      "flows": [
+        {
+          "name": "Conditional recrawl",
+          "note": "Known pages can be revisited cheaply when HTTP validators are available.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant S as Freshness Scheduler",
+            "  participant U as URL Store",
+            "  participant F as URL Frontier",
+            "  participant W as Downloader Worker",
+            "  participant H as Web Host",
+            "  participant V as Page Versions",
+            "  S->>U: find URLs due for recrawl",
+            "  U-->>S: URL + ETag / Last-Modified",
+            "  S->>F: enqueue recrawl job",
+            "  F-->>W: lease due URL",
+            "  W->>H: GET with conditional headers",
+            "  alt not modified",
+            "    H-->>W: 304 Not Modified",
+            "    W->>U: update last_checked_at",
+            "  else changed",
+            "    H-->>W: 200 HTML",
+            "    W->>V: store new version",
+            "    W->>U: update last_fetched_at + validators",
+            "  end"
+          ]
+        },
+        {
+          "name": "Manual priority recrawl",
+          "note": "Operator-triggered recrawls raise priority but still pass through the same politeness gate.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant O as Operator",
+            "  participant API as Control API",
+            "  participant S as Freshness Scheduler",
+            "  participant H as Host Policy Store",
+            "  participant F as URL Frontier",
+            "  participant W as Downloader Worker",
+            "  O->>API: POST /api/v1/recrawl",
+            "  API->>S: request high-priority recrawl",
+            "  S->>H: check host delay and robots state",
+            "  H-->>S: next allowed timestamp",
+            "  S->>F: enqueue URL with priority and due time",
+            "  F-->>W: lease when due",
+            "  W-->>API: crawl attempt recorded asynchronously"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "distributed-crawler",
+      "title": "8. Distributed Crawler at Web Scale",
+      "description": "At the target scale, every major component is partitioned: the frontier, URL Store, fingerprint index, parser queue, downloader workers, and archive. Workers are stateless and horizontally scalable; durable stores own the crawl state. Metrics and backpressure keep the system controllable.",
+      "decisionPrompt": "Partition the crawler at web scale: choose ownership for hosts, frontier shards, fetch workers, and storage so duplicates and cross-region contention stay bounded.",
+      "concepts": [
+        {
+          "term": "Host ownership",
+          "definition": "Assign all URLs for a host to a specific shard or scheduler owner.",
+          "whyItMatters": "It keeps politeness decisions local and avoids cross-shard coordination for one site."
+        },
+        {
+          "term": "Shard router",
+          "definition": "A component that maps URLs or hosts to the partition responsible for them.",
+          "whyItMatters": "Routing determines where work, dedupe state, and metrics are updated."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Seeds[/Seeds and Recrawl Requests/]",
+        "  API[Control API]",
+        "  Router[Shard Router]",
+        "  F1[[Frontier Shard A]]",
+        "  F2[[Frontier Shard B]]",
+        "  F3[[Frontier Shard C]]",
+        "  Workers[Downloader + Parser Pools]",
+        "  HostPolicy[(Host Policy Store)]",
+        "  URLStore[(Sharded URL Store)]",
+        "  FPIndex[(Sharded Fingerprint Index)]",
+        "  Archive[(HTML Archive\\nobject storage)]",
+        "  IndexFeed[[Search Index Feed]]",
+        "  Metrics[/Metrics and Alerts/]",
+        "  Seeds -->|seed URLs| API",
+        "  API --> Router",
+        "  Router -->|shard| F1",
+        "  Router --> F2",
+        "  Router --> F3",
+        "  F1 -->|owned URLs| Workers",
+        "  F2 --> Workers",
+        "  F3 --> Workers",
+        "  Workers -->|politeness| HostPolicy",
+        "  Workers -->|URL updates| URLStore",
+        "  Workers --> FPIndex",
+        "  Workers --> Archive",
+        "  Workers --> IndexFeed",
+        "  Workers --> Metrics",
+        "  F1 --> Metrics",
+        "  F2 --> Metrics",
+        "  F3 --> Metrics"
+      ],
+      "highlight": [
+        "Router",
+        "F1",
+        "F2",
+        "F3",
+        "Metrics"
+      ],
+      "options": [
+        {
+          "name": "Hash-sharded pipeline (default)",
+          "pros": [
+            "Evenly distributes URL and content-fingerprint workloads",
+            "Straightforward to add partitions as crawl volume grows",
+            "Works well for stateless worker pools"
+          ],
+          "cons": [
+            "Per-host politeness must coordinate across shards",
+            "Hot hosts can still concentrate delayed work",
+            "Resharding requires careful migration of pending leases"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Seeds[/Seeds and Recrawl Requests/]",
+            "  API[Control API]",
+            "  Router[Shard Router]",
+            "  F1[[Frontier Shard A]]",
+            "  F2[[Frontier Shard B]]",
+            "  F3[[Frontier Shard C]]",
+            "  Workers[Downloader + Parser Pools]",
+            "  HostPolicy[(Host Policy Store)]",
+            "  URLStore[(Sharded URL Store)]",
+            "  FPIndex[(Sharded Fingerprint Index)]",
+            "  Archive[(HTML Archive\\nobject storage)]",
+            "  IndexFeed[[Search Index Feed]]",
+            "  Metrics[/Metrics and Alerts/]",
+            "  Seeds -->|seed URLs| API",
+            "  API --> Router",
+            "  Router -->|shard| F1",
+            "  Router --> F2",
+            "  Router --> F3",
+            "  F1 -->|owned URLs| Workers",
+            "  F2 --> Workers",
+            "  F3 --> Workers",
+            "  Workers -->|politeness| HostPolicy",
+            "  Workers -->|URL updates| URLStore",
+            "  Workers --> FPIndex",
+            "  Workers --> Archive",
+            "  Workers --> IndexFeed",
+            "  Workers --> Metrics",
+            "  F1 --> Metrics",
+            "  F2 --> Metrics",
+            "  F3 --> Metrics"
+          ],
+          "highlight": [
+            "Router",
+            "F1",
+            "F2",
+            "F3",
+            "Metrics"
+          ]
+        },
+        {
+          "name": "Host-sharded frontier",
+          "pros": [
+            "Keeps per-host ordering and politeness local to one shard",
+            "Reduces cross-shard coordination for next_allowed_at",
+            "Makes host-level debugging easier"
+          ],
+          "cons": [
+            "Host popularity creates uneven shard load",
+            "Hot-host splitting is harder without violating politeness",
+            "URL Store and Fingerprint Index may still need independent hash sharding"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Seeds[/Seeds and Recrawl Requests/]",
+            "  API[Control API]",
+            "  HostRouter[Host Router]",
+            "  HS1[[Host Frontier Shard A]]",
+            "  HS2[[Host Frontier Shard B]]",
+            "  HS3[[Host Frontier Shard C]]",
+            "  Workers[Downloader + Parser Pools]",
+            "  LocalPolicy[(Shard-local Host Policy)]",
+            "  URLStore[(Hash-sharded URL Store)]",
+            "  FPIndex[(Hash-sharded Fingerprint Index)]",
+            "  Archive[(HTML Archive)]",
+            "  IndexFeed[[Search Index Feed]]",
+            "  Metrics[/Metrics and Alerts/]",
+            "  Seeds -->|seed URLs| API",
+            "  API --> HostRouter",
+            "  HostRouter -->|shard| HS1",
+            "  HostRouter --> HS2",
+            "  HostRouter --> HS3",
+            "  HS1 -->|owned URLs| Workers",
+            "  HS2 --> Workers",
+            "  HS3 --> Workers",
+            "  HS1 -->|owned URLs| LocalPolicy",
+            "  HS2 --> LocalPolicy",
+            "  HS3 --> LocalPolicy",
+            "  Workers -->|URL updates| URLStore",
+            "  Workers --> FPIndex",
+            "  Workers --> Archive",
+            "  Workers --> IndexFeed",
+            "  Workers --> Metrics"
+          ],
+          "highlight": [
+            "HostRouter",
+            "HS1",
+            "HS2",
+            "HS3",
+            "LocalPolicy"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Partitioning",
+          "points": [
+            "Shard URL Store by url_hash for even distribution.",
+            "Shard Host Policy by host so politeness updates are serialized per host.",
+            "Shard the Fingerprint Index by content_hash to distribute duplicate checks."
+          ]
+        },
+        {
+          "title": "Backpressure",
+          "points": [
+            "If parser lag grows, downloader workers slow down or stop leasing new URLs.",
+            "If archive writes slow down, unique-content processing queues apply backpressure.",
+            "If a host error rate spikes, its host policy delays future fetches."
+          ]
+        },
+        {
+          "title": "Observability",
+          "points": [
+            "Track frontier depth, ready URLs, delayed URLs, fetch QPS, success rate, bytes/sec, parser lag, archive write latency, duplicate ratio, and index feed lag.",
+            "Expose per-host metrics to detect accidental hammering.",
+            "Record crawl_attempts so operators can debug why a URL was not indexed."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "A shard can become hot because many URLs belong to one host or one campaign.",
+          "mitigation": "Use host-aware scheduling plus enough partitions; split hot host queues if needed while preserving per-host delay."
+        },
+        {
+          "issue": "Large queue replays after outage can violate politeness.",
+          "mitigation": "Rehydrate delayed queues through the scheduler rather than dumping all pending URLs directly to workers."
+        },
+        {
+          "issue": "Downstream indexer or archive outage causes unbounded backlog.",
+          "mitigation": "Apply backpressure, preserve durable queues, and shed low-priority recrawls first."
+        }
+      ],
+      "talkingPoints": [
+        "At this point the crawler is a distributed data pipeline with HTTP at the edge.",
+        "The critical correctness properties are dedupe, durability of pending work, and politeness."
+      ],
+      "flows": [
+        {
+          "name": "Distributed crawl path",
+          "note": "The full pipeline keeps workers stateless and pushes state into partitioned durable systems.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant F as Frontier Shard",
+            "  participant H as Host Policy Store",
+            "  participant W as Worker Pool",
+            "  participant U as URL Store",
+            "  participant I as Fingerprint Index",
+            "  participant A as HTML Archive",
+            "  participant X as Index Feed",
+            "  participant M as Metrics",
+            "  W->>F: lease work",
+            "  F->>H: validate host delay",
+            "  H-->>F: allowed URL",
+            "  F-->>W: URL lease",
+            "  W->>W: fetch + parse + normalize",
+            "  W->>U: upsert discovered URLs",
+            "  U-->>W: unseen URLs",
+            "  W->>F: enqueue unseen URLs",
+            "  W->>I: check content hash",
+            "  alt unique content",
+            "    I-->>W: new fingerprint",
+            "    W->>A: write compressed HTML",
+            "    W->>X: publish document",
+            "  else duplicate content",
+            "    I-->>W: already seen",
+            "  end",
+            "  W->>M: emit crawl metrics"
+          ]
+        },
+        {
+          "name": "Backpressure control",
+          "note": "The control loop slows leasing before archive or index lag turns into an unbounded backlog.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant W as Worker Pool",
+            "  participant A as HTML Archive",
+            "  participant X as Index Feed",
+            "  participant M as Metrics",
+            "  participant C as Crawl Controller",
+            "  participant F as Frontier Shards",
+            "  W->>A: write compressed HTML",
+            "  A-->>W: slow writes",
+            "  W->>X: publish documents",
+            "  X-->>M: feed lag increases",
+            "  A-->>M: write latency increases",
+            "  M->>C: alert on lag and latency",
+            "  C->>F: reduce lease budget for low-priority work",
+            "  F-->>W: fewer ready URLs",
+            "  W->>M: backlog stabilizes"
+          ]
+        }
+      ]
+    }
+  ],
+  "finalDesign": {
+    "title": "Final Design",
+    "description": "End-to-end crawler architecture: seed ingestion, durable frontier, host-aware scheduling, robots and politeness enforcement, downloader workers, URL parsing and dedupe, content fingerprinting, archival storage, freshness scheduling, distributed ownership, and observability.",
+    "diagram": [
+      "graph TB",
+      "  Seeds[Seed URLs / Recrawl Requests]",
+      "  API[URL Ingestion API]",
+      "  Router[Host / URL Shard Router]",
+      "  Frontier[[Durable URL Frontier Shards]]",
+      "  Scheduler[Politeness Scheduler]",
+      "  HostPolicy[(Host Policy / Robots Cache)]",
+      "  DNS([DNS Resolver Cache])",
+      "  Downloaders[Downloader Worker Pool]",
+      "  Web[Public Websites]",
+      "  ParserQ[[Parser Queue]]",
+      "  Parser[HTML Parser / Normalizer]",
+      "  URLStore[(Canonical URL Store)]",
+      "  Bloom([Dedupe Filter])",
+      "  Fingerprint[Content Fingerprinter]",
+      "  FPIndex[(Fingerprint Index)]",
+      "  Archive[(Raw HTML Archive)]",
+      "  Versions[(Content Versions)]",
+      "  IndexFeed[[Indexing Feed]]",
+      "  Freshness[Freshness Scheduler]",
+      "  Metrics[Metrics / Backpressure]",
+      "  Seeds -->|submit URLs| API",
+      "  API -->|route host| Router",
+      "  Router -->|owned URLs| Frontier",
+      "  Frontier -->|lease URLs| Scheduler",
+      "  Scheduler -->|check host| HostPolicy",
+      "  Scheduler -->|ready URLs| Downloaders",
+      "  Downloaders -->|resolve| DNS",
+      "  Downloaders -->|fetch| Web",
+      "  Downloaders -->|HTML| ParserQ",
+      "  ParserQ -->|consume| Parser",
+      "  Parser -->|canonical URL| URLStore",
+      "  Parser -->|probable seen| Bloom",
+      "  Parser -->|page body| Fingerprint",
+      "  Fingerprint -->|content hash| FPIndex",
+      "  Fingerprint -->|raw HTML| Archive",
+      "  Archive -->|versions| Versions",
+      "  Versions -->|documents| IndexFeed",
+      "  Versions -->|change signals| Freshness",
+      "  Freshness -->|schedule recrawl| Frontier",
+      "  Downloaders -->|crawl stats| Metrics",
+      "  Frontier -->|queue depth| Metrics"
+    ],
+    "highlight": [],
+    "options": [
+      {
+        "name": "Host-owned distributed crawler",
+        "pros": [
+          "Politeness decisions stay local to host ownership",
+          "Frontier and workers scale horizontally",
+          "Dedupe and freshness are explicit",
+          "Backpressure can be applied per host or shard"
+        ],
+        "cons": [
+          "More routing and ownership machinery",
+          "Hot hosts can still require special handling",
+          "Distributed frontier operations need careful lease semantics"
+        ],
+        "diagram": [
+          "graph TB",
+          "  Seeds[Seed URLs / Recrawl Requests]",
+          "  API[URL Ingestion API]",
+          "  Router[Host / URL Shard Router]",
+          "  Frontier[[Durable URL Frontier Shards]]",
+          "  Scheduler[Politeness Scheduler]",
+          "  HostPolicy[(Host Policy / Robots Cache)]",
+          "  DNS([DNS Resolver Cache])",
+          "  Downloaders[Downloader Worker Pool]",
+          "  Web[Public Websites]",
+          "  ParserQ[[Parser Queue]]",
+          "  Parser[HTML Parser / Normalizer]",
+          "  URLStore[(Canonical URL Store)]",
+          "  Bloom([Dedupe Filter])",
+          "  Fingerprint[Content Fingerprinter]",
+          "  FPIndex[(Fingerprint Index)]",
+          "  Archive[(Raw HTML Archive)]",
+          "  Versions[(Content Versions)]",
+          "  IndexFeed[[Indexing Feed]]",
+          "  Freshness[Freshness Scheduler]",
+          "  Metrics[Metrics / Backpressure]",
+          "  Seeds -->|submit URLs| API",
+          "  API -->|route host| Router",
+          "  Router -->|owned URLs| Frontier",
+          "  Frontier -->|lease URLs| Scheduler",
+          "  Scheduler -->|check host| HostPolicy",
+          "  Scheduler -->|ready URLs| Downloaders",
+          "  Downloaders -->|resolve| DNS",
+          "  Downloaders -->|fetch| Web",
+          "  Downloaders -->|HTML| ParserQ",
+          "  ParserQ -->|consume| Parser",
+          "  Parser -->|canonical URL| URLStore",
+          "  Parser -->|probable seen| Bloom",
+          "  Parser -->|page body| Fingerprint",
+          "  Fingerprint -->|content hash| FPIndex",
+          "  Fingerprint -->|raw HTML| Archive",
+          "  Archive -->|versions| Versions",
+          "  Versions -->|documents| IndexFeed",
+          "  Versions -->|change signals| Freshness",
+          "  Freshness -->|schedule recrawl| Frontier",
+          "  Downloaders -->|crawl stats| Metrics",
+          "  Frontier -->|queue depth| Metrics"
+        ],
+        "highlight": []
+      },
+      {
+        "name": "Single-region frontier with worker pool",
+        "pros": [
+          "Simpler deployment and debugging",
+          "Enough for a focused or smaller crawler",
+          "Still supports durable leases and parsing pipeline"
+        ],
+        "cons": [
+          "Lower global scale ceiling",
+          "Frontier can become a central bottleneck",
+          "Politeness and host state are harder to partition later"
+        ],
+        "diagram": [
+          "graph TB",
+          "  Seeds[Seed URLs]",
+          "  Frontier[[Durable Frontier]]",
+          "  HostPolicy[(Robots / Politeness Store)]",
+          "  Workers[Downloader Workers]",
+          "  Web[Websites]",
+          "  Parser[Parser + URL Dedupe]",
+          "  URLStore[(URL Store)]",
+          "  Archive[(HTML Archive)]",
+          "  IndexFeed[[Indexing Feed]]",
+          "  Freshness[Freshness Scheduler]",
+          "  Seeds -->|enqueue| Frontier",
+          "  Frontier -->|lease URLs| Workers",
+          "  Workers -->|check host| HostPolicy",
+          "  Workers -->|fetch| Web",
+          "  Workers -->|HTML| Parser",
+          "  Parser -->|new URLs| URLStore",
+          "  Parser -->|enqueue outlinks| Frontier",
+          "  Parser -->|raw HTML| Archive",
+          "  Archive -->|documents| IndexFeed",
+          "  Freshness -->|recrawl| Frontier"
+        ],
+        "highlight": []
+      }
+    ]
+  }
+}

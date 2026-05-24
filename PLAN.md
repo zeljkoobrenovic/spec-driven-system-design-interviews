@@ -1,0 +1,278 @@
+# System Design Step-by-Step Explorer
+
+A lightweight static-HTML app for walking through system design problems
+interview-style: requirements first, then capacity, API contract, data model,
+the architecture evolution as a sequence of steps, and finally a wrap-up that
+ties the design back to the requirements.
+
+## Goals
+
+- Zero build tooling. Open `index.html` via any static server.
+- Vanilla HTML / CSS / JS. One external dependency: Mermaid (loaded from CDN).
+- Data-driven: every interview is one JSON file; the app reads it and renders.
+- Graceful: invalid JSON, missing fields, and Mermaid render errors must not
+  break the page. They surface as inline errors.
+
+## Running
+
+Open `index.html` via a static server so the JSON files can be fetched:
+
+```bash
+python3 -m http.server 8000
+# then visit http://localhost:8000/
+```
+
+Opening `index.html` directly via `file://` will fail to fetch the JSON
+because of browser CORS rules — use a static server.
+
+## Layout
+
+The page is a two-column layout:
+
+- **Left sidebar** — a navigation list grouped into three sections:
+  - **Overview**: Requirements · Capacity Estimation · API Design · Data Model
+  - **Architecture**: the sequence of design steps (sub-steps with a
+    `parent` field render indented under their parent — useful for focused
+    deep-dives on one aspect of a step, like an algorithm choice)
+  - **Wrap-up**: API Flows · Design vs. Requirements · Follow-up Questions
+
+  Each item is clickable. The selected item drives the right pane.
+
+- **Right pane** — title, prev/next buttons, step counter, and the rendered
+  content for the selected entry (intro section, architecture step, or
+  wrap-up section).
+
+Navigation:
+- Click any sidebar entry.
+- ← / → arrow keys move between entries.
+- Prev/Next buttons do the same.
+- The URL hash is `#<datasetId>/<entryId>` and is shareable.
+
+## Dataset shape
+
+A dataset is a JSON file in `data/<dataset-id>/interview.json`. The manifest
+`data/index.json` lists available datasets so the dataset dropdown can offer a
+choice.
+
+All fields below are optional except `steps`.
+
+```jsonc
+{
+  "title": "URL Shortener — System Design",
+  "description": "Short blurb shown under the title.",
+
+  // ---- Overview ----
+  // Mermaid fields are arrays of source lines. The renderer joins with "\n".
+  "requirementsDiagram": ["graph TB", "  ..."],   // optional; rendered above Requirements
+  "capacityDiagram":     ["graph TB", "  ..."],   // optional; rendered above Capacity
+  "dataModelDiagram":    ["erDiagram", "  ..."],  // optional explicit ER; otherwise auto-derived
+
+  "requirements": {
+    "functional":    ["...", "..."],
+    "nonFunctional": ["...", "..."]
+  },
+
+  "capacity": [
+    { "label": "Redirects per second", "value": "~100,000", "note": "100:1 read/write" }
+  ],
+
+  "api": [
+    {
+      "method":      "POST",
+      "path":        "/api/v1/shorten",
+      "description": "...",
+      "request":     "{ \"longUrl\": \"...\" }",
+      "response":    "{ \"shortUrl\": \"...\" }",
+      "diagram":     ["sequenceDiagram", "  ..."]   // optional; appears in Wrap-up > API Flows only
+    }
+  ],
+
+  "dataModel": [
+    {
+      "name": "urls",
+      "note": "Primary mapping table.",
+      "fields": [
+        { "name": "short_code", "type": "varchar(10) PK" },
+        { "name": "long_url",   "type": "text" }
+      ]
+    }
+  ],
+
+  // ---- Architecture steps ----
+  "steps": [
+    {
+      "id":          "cache",
+      "title":       "4. Add a Cache for Hot URLs",
+      "description": "...",                       // string OR array; strings are auto-bulleted
+      "parent":      "load-balancer",             // optional; mark as sub-step of another step (indented in sidebar)
+
+      // EITHER a step-level diagram + highlight ...
+      "diagram":   ["graph TB", "  ..."],
+      "highlight": ["Cache"],                     // explicit nodeIds to highlight as "new"
+
+      // ... OR options with their own diagram/highlight/pros/cons (tabs above the diagram)
+      "options": [
+        {
+          "name":      "Redis (default)",
+          "pros":      ["..."],
+          "cons":      ["..."],
+          "diagram":   ["graph TB", "  ..."],
+          "highlight": ["Cache"]
+        },
+        { "name": "Memcached", "pros": ["..."], "cons": ["..."], "diagram": ["..."], "highlight": ["..."] }
+      ],
+
+      // Per-step education and extras (each optional)
+      "decisionPrompt": "What decision should the candidate make at this step?",
+      "concepts": [
+        {
+          "term": "Cache-aside",
+          "definition": "The application checks cache first, reads the database on a miss, then backfills the cache.",
+          "whyItMatters": "The candidate sees the concept before using it in the design.",
+          "example": "GET /short-code reads Redis, then the URL table on cache miss."
+        }
+      ],
+      "whyNow": ["Why this step belongs here in the build order."],
+      "recap": {
+        "before": "What the system could do before this step.",
+        "after": "What the system can do now.",
+        "newRisk": "The tradeoff or risk introduced by this step."
+      },
+      "failureDrills": [
+        {
+          "scenario": "A concrete failure to reason through.",
+          "expectedBehavior": "What a good design should do.",
+          "mitigation": "How the design absorbs or recovers."
+        }
+      ],
+      "flows": [
+        {
+          "name":      "Redirect — cache-aside read",
+          "note":      "...",
+          "diagram":   ["sequenceDiagram", "  ..."],
+          "highlight": ["K"]   // optional; explicit participant IDs to mark as new
+        }
+      ],
+      "deepDives":     [{ "title": "Caching policy", "points": ["...", "..."],
+                          "diagram": ["graph TB", "  ..."] }],  // optional escape hatch:
+                        // a structural diagram for the rare deep dive the main/option/flow
+                        // diagrams don't cover. Prefer a sub-step or flow when the depth is
+                        // a sub-decision or a sequence; reserve dd.diagram for pure structure.
+      "bottlenecks":   [{ "issue": "...", "mitigation": "..." }],
+      "talkingPoints": ["...", "..."],
+      "interviewerSignals": {
+        "strong": ["Evidence the candidate understands the tradeoff."],
+        "weak": ["Warning signs or shallow reasoning to watch for."]
+      },
+      "followUps":     ["..."]
+    }
+  ],
+
+  // ---- Wrap-up ----
+  "finalDesign": {                              // optional; if omitted, no Final Design wrap-up entry is shown
+    "title":       "Final Design",
+    "description": "End-to-end architecture summary.",
+    "diagram":     ["graph TB", "  ..."],
+    "highlight":   [],                         // usually empty: final design is a review, not a diff
+    "options": [                               // optional; same shape/renderer as step.options
+      {
+        "name":      "Recommended design",
+        "pros":      ["..."],
+        "cons":      ["..."],
+        "diagram":   ["graph TB", "  ..."],
+        "highlight": []
+      }
+    ]
+  },
+
+  "satisfies": {
+    "functional": [
+      { "requirement": "...", "how": "...", "steps": ["cache", "id-generator"] }
+    ],
+    "nonFunctional": [ /* same shape */ ]
+  },
+  "followUps": ["Dataset-wide follow-up questions..."]
+}
+```
+
+### Highlighting "new" elements
+
+Mermaid source fields (`requirementsDiagram`, `capacityDiagram`,
+`dataModelDiagram`, and every `diagram`) are stored as string arrays with one
+array element per Mermaid source line. `app.js` joins those arrays with `\n`
+before rendering. The renderer still accepts legacy string values, but new
+datasets should use arrays.
+
+The main step diagram (a flowchart) marks nodes that are new or changed
+relative to the previous step:
+
+- If `step.highlight` (or `step.options[i].highlight`) is present, those IDs
+  are highlighted.
+- Otherwise the app auto-diffs node IDs against the previous step's
+  default-option diagram and highlights the additions.
+- Applied by appending Mermaid `classDef newNode ...; class A,B,C newNode;`
+  to the source. CSS in `styles.css` targets the rendered SVG.
+
+Per-step flow diagrams (sequence diagrams) get the same treatment for
+**participants**, but via a different mechanism (the sequence-diagram parser
+rejects `classDef`/`class`):
+
+- If `flow.highlight` is present, those participant IDs are highlighted.
+- Otherwise the union of:
+  - Participants new to this step (not present in any earlier step's flows), and
+  - Participants whose ID matches a node in `step.highlight` (inheritance —
+    so "we introduced X" stays consistent between the architecture diagram
+    and the flow).
+- Applied by patching the rendered SVG after Mermaid renders (adding the
+  `newNode` class to the matching participant `<rect>` and `<text>`).
+
+### Where flow diagrams live
+
+- **Per-step flows** (`step.flows`) appear under each architecture step as a
+  **tab strip** — one tab per flow, one flow visible at a time. Tab state
+  resets to the first flow on step/dataset change.
+- **Per-endpoint flows** (`api[i].diagram`) appear in the **Wrap-up → API
+  Flows** section, not in the Overview → API Design section. Flows belong
+  after the architecture is established. Endpoints without a `diagram` still
+  render in the API Flows section but show an inline placeholder.
+
+## File map
+
+- `index.html`     — DOM shell; sidebar, content panes, mount points.
+- `styles.css`     — All styling, including the `.newNode` highlight rules
+                     applied to Mermaid-rendered SVG nodes.
+- `app.js`         — Dataset loading, sidebar grouping, all rendering, Mermaid
+                     orchestration, hash routing, keyboard nav, error capture.
+- `data/index.json`                          — Manifest of available datasets.
+- `data/<id>/interview.json`                 — One dataset per directory.
+
+Existing dataset: `data/url-shortener/interview.json` — a fully populated
+URL shortener walkthrough used as the worked example.
+
+## Implementation notes
+
+- Mermaid `securityLevel: 'strict'`. Diagrams are static; bumping to `loose`
+  would only matter if we wanted clickable nodes inside diagrams.
+- Each Mermaid render gets a unique element id (`mermaid-…-<seq>`); render
+  errors are caught per-diagram and shown inline so one bad source doesn't
+  break the page.
+- The dataset validator only requires a non-empty `steps[]` and that each
+  step has either a step-level `diagram` or non-empty `options[].diagram`.
+  Every other field is optional and renders only if present.
+- Sentence-splitting of `description` strings tolerates common abbreviations
+  (`e.g.`, `i.e.`, `etc.`, etc.) so they don't break into separate bullets.
+
+## Extending
+
+Adding a new dataset:
+1. Create `data/<id>/interview.json` following the schema above.
+2. Add it to `data/index.json` (`id`, `name`, `path`).
+3. Reload. It appears in the dataset dropdown.
+
+Adding a new section type:
+1. Add a slug to `INTRO_SLUGS` in `app.js`.
+2. Add a builder branch in `buildEntries()`.
+3. Add the section to the `Overview` or `Wrap-up` group via `WRAPUP_SLUGS`.
+4. Write a `renderIntro<Name>()` function returning a DOM node, and wire it
+   into the switch in `renderIntroEntry()`.
+5. Add CSS in `styles.css` if the section needs custom layout.

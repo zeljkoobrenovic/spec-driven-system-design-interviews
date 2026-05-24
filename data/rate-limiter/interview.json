@@ -1,0 +1,1246 @@
+{
+  "title": "Rate Limiter — System Design",
+  "description": "Designing a rate limiter that throttles API traffic per identity (user, IP, API key) according to configurable rules — starting from a single-process counter and evolving toward a distributed, edge-enforced limiter with a control plane.",
+  "requirementsDiagram": [
+    "graph TB",
+    "  Client((Client))",
+    "  Edge[Edge / Gateway]",
+    "  Service[[Backend Service]]",
+    "  RL[Rate Limiter]",
+    "  Rules[(Rule Store)]",
+    "  Metrics[/Metrics & Alerting/]",
+    "  Client --> Edge",
+    "  Edge --> RL",
+    "  RL -->|allow| Service",
+    "  RL -->|reject 429| Client",
+    "  Rules --> RL",
+    "  RL --> Metrics"
+  ],
+  "capacityDiagram": [
+    "graph TB",
+    "  Clients[~1M req/sec across fleet]",
+    "  Edge[Edge / Gateway\\nallow-or-deny per request]",
+    "  Counter[(Counter Store\\n~10M keys, sub-ms ops)]",
+    "  Rules[(Rule Store\\nrarely-changing)]",
+    "  Metrics[[Decision Stream\\n~1M events/sec]]",
+    "  Analytics[(Analytics / Dashboards)]",
+    "  Clients --> Edge",
+    "  Edge --> Counter",
+    "  Edge --> Rules",
+    "  Edge --> Metrics",
+    "  Metrics --> Analytics"
+  ],
+  "requirements": {
+    "functional": [
+      "Reject requests that exceed a configurable threshold over a time window (e.g. 'user X: 100 req/min').",
+      "Support multiple scopes: per user, per IP, per API key, per endpoint, and combinations.",
+      "Return a clear rejection signal (HTTP 429) with Retry-After and remaining-quota headers.",
+      "Rules are configurable at runtime without redeploying the limiter.",
+      "Expose accurate metrics: allow/deny counts, top-limited principals, p99 decision latency."
+    ],
+    "nonFunctional": [
+      "Very low decision latency (target ≤ 5 ms p99) — sits on every request.",
+      "High availability (≥ 99.99%) — outage should fail-open or degrade gracefully, not block production traffic.",
+      "Horizontally scalable to ≥ 1M decisions/sec across the fleet.",
+      "Accuracy: allowed traffic should stay within ~10% of the configured limit even under bursts.",
+      "Fault-tolerant: counter store outages must not bring down the protected service.",
+      "Multi-region: a single global limit and per-region limits both need to be expressible."
+    ]
+  },
+  "capacity": [
+    {
+      "label": "Decisions per second",
+      "value": "~1,000,000",
+      "note": "One check per incoming request across the fleet"
+    },
+    {
+      "label": "Active keys (counters)",
+      "value": "~10,000,000",
+      "note": "Long tail of users/IPs/API keys"
+    },
+    {
+      "label": "Counter memory",
+      "value": "~2 GB",
+      "note": "~200 bytes per key (key + window state)"
+    },
+    {
+      "label": "Rule count",
+      "value": "~10,000",
+      "note": "Endpoints × tiers; rarely changing"
+    },
+    {
+      "label": "Decision latency budget",
+      "value": "≤ 5 ms p99",
+      "note": "Sits in the request path; must be cheap"
+    },
+    {
+      "label": "Metrics throughput",
+      "value": "~1M events/sec",
+      "note": "Async; one record per decision (sampled OK)"
+    }
+  ],
+  "api": [
+    {
+      "method": "GET",
+      "path": "(internal) /check?key=...&rule=...",
+      "description": "Synchronous check called by the gateway/middleware. Returns allow/deny + headers.",
+      "request": "{ key: \"user:42\", rule: \"posts.write\" }",
+      "response": "{ allowed: bool, remaining: int, retryAfterMs: int, ruleId: \"...\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant Client",
+        "  participant GW as Gateway",
+        "  participant RL as Rate Limiter",
+        "  participant CS as Counter Store",
+        "  Client->>GW: API request",
+        "  GW->>RL: /check key, rule",
+        "  RL->>CS: INCR counter, get window state",
+        "  CS-->>RL: count, ttl",
+        "  alt under limit",
+        "    RL-->>GW: allow + remaining",
+        "    GW->>GW: proxy to backend",
+        "  else over limit",
+        "    RL-->>GW: deny + retryAfterMs",
+        "    GW-->>Client: 429 Too Many Requests + Retry-After",
+        "  end"
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/rules/{id}",
+      "description": "Create or update a rate-limit rule (scope, threshold, window, action).",
+      "request": "{ scope: \"user|ip|apiKey|endpoint\", limit: 100, windowMs: 60000, action: \"reject|shape\" }",
+      "response": "{ id: \"...\", version: int, updatedAt: \"ISO-8601\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant Op as Operator",
+        "  participant CP as Control Plane API",
+        "  participant Rules as Rule Store",
+        "  participant RL as Rate Limiter Fleet",
+        "  Op->>CP: PUT /api/v1/rules/:id",
+        "  CP->>Rules: write rule (version++)",
+        "  Rules-->>CP: ok",
+        "  CP-->>Op: 200 { id, version }",
+        "  Rules-)RL: pub: rules-changed",
+        "  RL->>Rules: pull updated rule",
+        "  Rules-->>RL: new rule",
+        "  RL->>RL: hot-swap in-process cache"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/rules",
+      "description": "List all rules, optionally filtered by scope/endpoint.",
+      "request": "—",
+      "response": "[ { id, scope, limit, windowMs, action, version, updatedAt } ]",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant Op as Operator",
+        "  participant CP as Control Plane API",
+        "  participant Rules as Rule Store",
+        "  Op->>CP: GET /api/v1/rules",
+        "  CP->>Rules: SELECT rules",
+        "  Rules-->>CP: rows",
+        "  CP-->>Op: 200 [rules]"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/quota?key=...",
+      "description": "Inspect remaining quota for a principal (debug / customer dashboard).",
+      "request": "?key=user:42&rule=posts.write",
+      "response": "{ key, rule, remaining, resetAtMs }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant U as User / Dashboard",
+        "  participant CP as Control Plane API",
+        "  participant CS as Counter Store",
+        "  U->>CP: GET /api/v1/quota?key=...&rule=...",
+        "  CP->>CS: read counter (no INCR)",
+        "  CS-->>CP: count, ttl",
+        "  CP-->>U: 200 { remaining, resetAtMs }"
+      ]
+    }
+  ],
+  "dataModelDiagram": [
+    "erDiagram",
+    "  rules ||--o{ rule_history : tracks",
+    "  rules {",
+    "    string rule_id PK",
+    "    string scope",
+    "    int limit_count",
+    "    int window_ms",
+    "    string action",
+    "    int version",
+    "    timestamp updated_at",
+    "  }",
+    "  rule_history {",
+    "    bigint history_id PK",
+    "    string rule_id FK",
+    "    int version",
+    "    string changed_by",
+    "    timestamp changed_at",
+    "    text diff",
+    "  }",
+    "  counters {",
+    "    string key PK",
+    "    int count",
+    "    timestamp window_start",
+    "    timestamp ttl",
+    "  }",
+    "  decisions {",
+    "    uuid decision_id PK",
+    "    string key",
+    "    string rule_id",
+    "    bool allowed",
+    "    timestamp ts",
+    "    string region",
+    "  }"
+  ],
+  "dataModel": [
+    {
+      "name": "rules",
+      "note": "Authoritative store of rate-limit rules. Read-heavy; cached aggressively in the rate-limiter process.",
+      "fields": [
+        {
+          "name": "rule_id",
+          "type": "varchar(64) PK"
+        },
+        {
+          "name": "scope",
+          "type": "varchar(32)",
+          "note": "user | ip | apiKey | endpoint | composite"
+        },
+        {
+          "name": "limit_count",
+          "type": "int",
+          "note": "Max requests per window"
+        },
+        {
+          "name": "window_ms",
+          "type": "int",
+          "note": "Window size in milliseconds"
+        },
+        {
+          "name": "action",
+          "type": "varchar(16)",
+          "note": "reject | shape | log"
+        },
+        {
+          "name": "version",
+          "type": "int",
+          "note": "Monotonic; used for cache invalidation"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "rule_history",
+      "note": "Append-only audit log of rule changes. Operations only.",
+      "fields": [
+        {
+          "name": "history_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "rule_id",
+          "type": "varchar(64) FK"
+        },
+        {
+          "name": "version",
+          "type": "int"
+        },
+        {
+          "name": "changed_by",
+          "type": "varchar(128)"
+        },
+        {
+          "name": "changed_at",
+          "type": "timestamp"
+        },
+        {
+          "name": "diff",
+          "type": "text",
+          "note": "JSON patch of the change"
+        }
+      ]
+    },
+    {
+      "name": "counters (in-memory store)",
+      "note": "Lives in Redis or similar. Key = principal+rule; expires automatically when the window ends.",
+      "fields": [
+        {
+          "name": "key",
+          "type": "string PK",
+          "note": "e.g. 'user:42:posts.write'"
+        },
+        {
+          "name": "count",
+          "type": "int",
+          "note": "Current requests in the window"
+        },
+        {
+          "name": "window_start",
+          "type": "timestamp",
+          "note": "For sliding-window algorithms"
+        },
+        {
+          "name": "ttl",
+          "type": "timestamp",
+          "note": "Auto-expires at window end"
+        }
+      ]
+    },
+    {
+      "name": "decisions (analytics)",
+      "note": "Append-only stream of allow/deny outcomes. Written async via the metrics pipeline.",
+      "fields": [
+        {
+          "name": "decision_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "key",
+          "type": "string"
+        },
+        {
+          "name": "rule_id",
+          "type": "varchar(64)"
+        },
+        {
+          "name": "allowed",
+          "type": "bool"
+        },
+        {
+          "name": "ts",
+          "type": "timestamp"
+        },
+        {
+          "name": "region",
+          "type": "varchar(16)"
+        }
+      ]
+    }
+  ],
+  "satisfies": {
+    "functional": [
+      {
+        "requirement": "Reject requests exceeding a configurable threshold over a time window.",
+        "how": "Each request is mapped to a (principal, rule) counter key. INCR returns the current count; if it exceeds the rule's limit_count, the limiter returns deny + Retry-After.",
+        "steps": [
+          "centralized-counter",
+          "algorithm-choice"
+        ]
+      },
+      {
+        "requirement": "Support per-user, per-IP, per-API-key, per-endpoint, and combined scopes.",
+        "how": "Rule scope is a first-class field. The principal extractor builds the counter key from the configured scope (e.g. 'user:42:posts.write', 'ip:1.2.3.4:global'), so the same machinery serves any scope.",
+        "steps": [
+          "rules-engine"
+        ]
+      },
+      {
+        "requirement": "Clear rejection signal (HTTP 429) with Retry-After and remaining-quota headers.",
+        "how": "The gateway translates the limiter's deny response into 429 + Retry-After + X-RateLimit-Remaining headers based on the counter's TTL and the rule's limit_count.",
+        "steps": [
+          "edge-enforcement"
+        ]
+      },
+      {
+        "requirement": "Runtime-configurable rules without redeploying the limiter.",
+        "how": "Rules live in a dedicated store with a versioned schema. The control plane writes new versions and publishes a change event; limiter processes pull and hot-swap their in-process cache.",
+        "steps": [
+          "rules-engine"
+        ]
+      },
+      {
+        "requirement": "Expose accurate metrics for allow/deny, top-limited principals, decision latency.",
+        "how": "Every decision emits an async event to a metrics queue. A stream processor aggregates per-rule and per-principal counts; dashboards read from the analytics store.",
+        "steps": [
+          "edge-enforcement"
+        ]
+      }
+    ],
+    "nonFunctional": [
+      {
+        "requirement": "Decision latency ≤ 5 ms p99.",
+        "how": "Decisions are a single INCR against an in-memory counter store. Rules are cached in-process; the gateway path adds at most a few µs around the network round trip.",
+        "steps": [
+          "centralized-counter",
+          "edge-enforcement"
+        ]
+      },
+      {
+        "requirement": "≥ 99.99% availability — outage must not block production traffic.",
+        "how": "Counter-store failure trips a circuit breaker and the limiter fails open (allows traffic). Rule-store failure is masked by the in-process cache. Multi-AZ replicas for both stores.",
+        "steps": [
+          "centralized-counter",
+          "rules-engine"
+        ]
+      },
+      {
+        "requirement": "Scale horizontally to ≥ 1M decisions/sec.",
+        "how": "Stateless limiter processes behind a load balancer. The counter store shards by key; the rule store is replicated read-only. The gateway-embedded fast path avoids cross-DC hops.",
+        "steps": [
+          "distributed",
+          "centralized-counter",
+          "edge-enforcement"
+        ]
+      },
+      {
+        "requirement": "Accuracy: allowed traffic within ~10% of the configured limit.",
+        "how": "Use a sliding-window algorithm (or token bucket) rather than naive fixed window — these bound the bursting that fixed-window suffers at boundaries.",
+        "steps": [
+          "algorithm-choice"
+        ]
+      },
+      {
+        "requirement": "Counter-store outages must not take down the protected service.",
+        "how": "Circuit breaker around the counter calls. Local in-process counters serve as a degraded mode (less accurate but available). Operators can configure fail-open vs fail-closed per rule.",
+        "steps": [
+          "centralized-counter"
+        ]
+      },
+      {
+        "requirement": "Multi-region: global and per-region limits both expressible.",
+        "how": "Per-region limits use a local counter store. Global limits use a shared store with async replication (eventual; accept a few % over-allowance for the latency win). Rule schema includes a region scope.",
+        "steps": [
+          "edge-enforcement"
+        ]
+      }
+    ]
+  },
+  "followUps": [
+    "How do you handle a thundering herd when a popular key's window resets?",
+    "How do you fail-open vs fail-closed safely, and on what signal?",
+    "How would you implement per-tenant tiered limits (free / pro / enterprise)?",
+    "How would you support burst budgets (e.g. token bucket with capacity 200, refill 10/s)?",
+    "How would the limiter behave during a counter-store failover?",
+    "How would you make the decision available at the CDN edge for cacheable requests?",
+    "How would you detect and respond to a real DDoS that overwhelms the limiter itself?"
+  ],
+  "steps": [
+    {
+      "id": "in-process",
+      "title": "1. In-Process Counter (Single Server)",
+      "description": "Start with the simplest viable rate limiter: a single backend server keeps a counter per (principal, rule) in process memory. Each request increments the counter; if it exceeds the limit, the server returns 429.",
+      "decisionPrompt": "Start with the single-instance baseline: where is the counter checked, what correctness guarantee does it provide, and what traffic pattern breaks it?",
+      "concepts": [
+        {
+          "term": "In-process counter",
+          "definition": "A counter stored in the memory of one running limiter process.",
+          "whyItMatters": "It is fast and simple, but only correct while there is exactly one process."
+        },
+        {
+          "term": "Retry-After",
+          "definition": "An HTTP response hint telling clients when to try again after being limited.",
+          "whyItMatters": "Good rate limiters shape client behavior instead of only returning 429 errors."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client]",
+        "  Server[Backend Server\\n+ in-process counter]",
+        "  Client -->|API request| Server",
+        "  Server -->|429 when over limit| Client"
+      ],
+      "highlight": [
+        "Client",
+        "Server"
+      ],
+      "deepDives": [
+        {
+          "title": "Counter representation",
+          "points": [
+            "A map { key -> { count, windowStart } } updated on every request.",
+            "On window expiry, reset to zero. Simplest schedule: lazy reset checked at read time.",
+            "Memory cost is bounded by the number of active keys — a long-tail concern even on a single server."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "All traffic must hit one server.",
+          "mitigation": "Scale to a fleet (next step)."
+        },
+        {
+          "issue": "Counter lives in process — restart loses state and lets traffic burst.",
+          "mitigation": "Move counters to a durable, shared store."
+        }
+      ],
+      "talkingPoints": [
+        "Acknowledge that this design only works at small scale; the value is establishing the data flow.",
+        "Mention that even at this stage you'd return Retry-After so clients can back off correctly."
+      ],
+      "flows": [
+        {
+          "name": "Single-server decision",
+          "note": "INCR happens entirely in process — no network call. Latency is whatever the request handler costs.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant S as Backend Server",
+            "  C->>S: API request",
+            "  S->>S: increment counter[key]",
+            "  alt under limit",
+            "    S-->>C: 200 + remaining",
+            "  else over limit",
+            "    S-->>C: 429 Too Many Requests + Retry-After",
+            "  end"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "distributed",
+      "title": "2. Distributed Backend, Shared Counter Problem",
+      "description": "Add a fleet of stateless backend servers behind a load balancer. The in-process counter approach now diverges: each server has its own count, so the effective limit is N × the configured limit. We need a shared, authoritative counter.",
+      "decisionPrompt": "Analyze the first scale-out failure: why do local counters diverge across servers, and what user-visible behavior results?",
+      "concepts": [
+        {
+          "term": "Stateless backend fleet",
+          "definition": "A group of interchangeable servers that do not share local request state.",
+          "whyItMatters": "It scales request handling, but local counters diverge across instances."
+        },
+        {
+          "term": "Sticky sessions",
+          "definition": "A routing policy that sends the same client to the same server repeatedly.",
+          "whyItMatters": "It can hide local-counter problems temporarily, but hurts balancing and failover."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client]",
+        "  LB[Load Balancer]",
+        "  S1[Server 1\\nlocal counter]",
+        "  S2[Server 2\\nlocal counter]",
+        "  S3[Server 3\\nlocal counter]",
+        "  Client -->|request| LB",
+        "  LB --> S1",
+        "  LB --> S2",
+        "  LB --> S3"
+      ],
+      "highlight": [
+        "LB",
+        "S1",
+        "S2",
+        "S3"
+      ],
+      "deepDives": [
+        {
+          "title": "Why local counters break",
+          "points": [
+            "Round-robin LB sprays a single user's requests across N servers; each server only sees 1/N of their traffic.",
+            "Sticky sessions (IP-hash) keep one user on one server, but trade load balance and complicate scale-in.",
+            "Even with stickiness, fleet restarts reshuffle keys and reset counters."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Local counters allow up to N× the configured limit through.",
+          "mitigation": "Centralize the counter in a shared store (next step)."
+        },
+        {
+          "issue": "Sticky sessions hurt load distribution.",
+          "mitigation": "Use centralized storage and round-robin LB."
+        }
+      ],
+      "talkingPoints": [
+        "This step is mostly a motivation argument — the design hasn't changed except for the fleet, but the failure mode justifies what comes next.",
+        "Mention that gateways (envoy, nginx) face the same problem and adopt the same solution."
+      ],
+      "flows": [
+        {
+          "name": "Spray across the fleet (the broken case)",
+          "note": "Each server's local counter only sees a fraction of one user's traffic; the effective limit is N× higher than configured.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant LB as Load Balancer",
+            "  participant S1 as Server 1",
+            "  participant S2 as Server 2",
+            "  C->>LB: req #1",
+            "  LB->>S1: forward",
+            "  S1-->>C: 200 (counter S1=1)",
+            "  C->>LB: req #2",
+            "  LB->>S2: forward",
+            "  S2-->>C: 200 (counter S2=1)",
+            "  Note over S1,S2: Neither sees the global count"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "centralized-counter",
+      "title": "3. Centralized Counter Store",
+      "description": "Move counters to an in-memory shared store (Redis-style). Every limiter process executes an atomic INCR against a key derived from (principal, rule). The key has a TTL matching the window size so it auto-expires.",
+      "decisionPrompt": "Choose the shared counter store and request path: how does every limiter instance make an atomic decision without adding unacceptable latency?",
+      "concepts": [
+        {
+          "term": "Atomic increment",
+          "definition": "A read-modify-write operation that completes as one indivisible update.",
+          "whyItMatters": "Concurrent limiter processes must not all observe the same old count and allow too much traffic."
+        },
+        {
+          "term": "Counter store",
+          "definition": "A shared low-latency store, often Redis-like, that owns rate-limit counters.",
+          "whyItMatters": "It gives all limiter instances one authoritative decision point."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client]",
+        "  LB[Load Balancer]",
+        "  S1[Server 1]",
+        "  S2[Server 2]",
+        "  S3[Server 3]",
+        "  CS[(Counter Store)]",
+        "  Client -->|request| LB",
+        "  LB --> S1",
+        "  LB --> S2",
+        "  LB --> S3",
+        "  S1 -->|atomic incr| CS",
+        "  S2 --> CS",
+        "  S3 --> CS"
+      ],
+      "highlight": [
+        "CS"
+      ],
+      "deepDives": [
+        {
+          "title": "Atomicity",
+          "points": [
+            "A naïve GET+CHECK+SET races: two requests can both see count=99 and both write 100.",
+            "Use a single atomic operation: INCR then read result; reject if result > limit. Lua scripts can bundle INCR + EXPIRE atomically.",
+            "Token-bucket and sliding-window algorithms need slightly more state — a Lua script that does compare-and-update."
+          ]
+        },
+        {
+          "title": "Key TTL",
+          "points": [
+            "Set EXPIRE on first INCR equal to the window size. The key auto-deletes when the window ends.",
+            "On window rollover, the next request creates a fresh key. No background cleanup needed."
+          ]
+        },
+        {
+          "title": "Fault tolerance",
+          "points": [
+            "Counter-store outage is a critical risk — every API request now depends on it.",
+            "Wrap calls in a circuit breaker. On open, fall back to a local approximate counter or fail-open per rule policy.",
+            "Multi-AZ replicas; Cluster mode for sharding by key."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Counter store is on the critical path of every API request.",
+          "mitigation": "Circuit breaker + fail-open per rule; multi-AZ replicas; sharded cluster."
+        },
+        {
+          "issue": "Hot keys (a single principal with huge traffic) overload one shard.",
+          "mitigation": "Client-side request coalescing; promote hot keys to dedicated shards; degrade to local approximation."
+        },
+        {
+          "issue": "Fixed-window boundaries still allow bursts at edges.",
+          "mitigation": "Choose a better algorithm (next step)."
+        }
+      ],
+      "talkingPoints": [
+        "INCR + EXPIRE is the canonical pattern. Wrap it in a Lua script for atomicity.",
+        "Discuss the fail-open vs fail-closed decision — it depends on whether the service is more sensitive to outage or to abuse."
+      ],
+      "flows": [
+        {
+          "name": "Allowed request — shared INCR",
+          "note": "One atomic INCR per request; the response carries remaining quota for client headers.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant LB as Load Balancer",
+            "  participant S as Limiter Process",
+            "  participant CS as Counter Store",
+            "  C->>LB: API request",
+            "  LB->>S: forward",
+            "  S->>CS: INCR key (Lua: + EXPIRE if new)",
+            "  CS-->>S: count=42",
+            "  S-->>C: 200 + X-RateLimit-Remaining: 58"
+          ]
+        },
+        {
+          "name": "Rejected request — over limit",
+          "note": "If INCR returns a value above the rule's limit, deny and return Retry-After derived from the key's TTL.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant LB as Load Balancer",
+            "  participant S as Limiter Process",
+            "  participant CS as Counter Store",
+            "  C->>LB: API request",
+            "  LB->>S: forward",
+            "  S->>CS: INCR key",
+            "  CS-->>S: count=101 (> limit 100)",
+            "  S->>CS: TTL key",
+            "  CS-->>S: 12s remaining",
+            "  S-->>C: 429 Too Many Requests + Retry-After: 12"
+          ]
+        },
+        {
+          "name": "Counter-store outage — fail-open",
+          "note": "Circuit breaker trips after consecutive failures; the limiter allows traffic instead of taking down the API.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant S as Limiter Process",
+            "  participant CS as Counter Store",
+            "  C->>S: API request",
+            "  S->>CS: INCR key",
+            "  CS--xS: timeout",
+            "  S->>S: circuit breaker open",
+            "  S-->>C: 200 (fail-open per rule policy)",
+            "  Note over S: alert: limiter degraded"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "algorithm-choice",
+      "parent": "centralized-counter",
+      "title": "3a. Choose the Right Algorithm",
+      "description": "A focused look at one aspect of the previous step. Fixed-window counters are simple but allow up to 2× the configured limit at window boundaries. Pick an algorithm that fits the traffic shape and accuracy needs. The architecture stays the same — only the Lua script in the counter store changes.",
+      "decisionPrompt": "Select the limiting algorithm for the product promise: compare fixed window, sliding window, and token bucket in terms of burst tolerance, memory, and fairness.",
+      "concepts": [
+        {
+          "term": "Fixed window",
+          "definition": "Count requests inside discrete time buckets such as one minute.",
+          "whyItMatters": "It is simple but can allow bursts at bucket boundaries."
+        },
+        {
+          "term": "Token bucket",
+          "definition": "Refill tokens over time and spend one token per accepted request.",
+          "whyItMatters": "It supports controlled bursts while preserving a long-term rate."
+        }
+      ],
+      "options": [
+        {
+          "name": "Fixed Window (baseline)",
+          "pros": [
+            "Trivial to implement: INCR + EXPIRE",
+            "O(1) memory per key, sub-ms decision",
+            "Easy to reason about and explain"
+          ],
+          "cons": [
+            "Boundary bursting: up to 2× the limit in a 2-window span",
+            "Doesn't reflect actual rate over a rolling interval"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  LB[Load Balancer]",
+            "  S1[Limiter Process]",
+            "  CS[(Counter Store\\nINCR + EXPIRE)]",
+            "  Algo[Fixed Window\\n1 counter per key per window]",
+            "  Client -->|request| LB",
+            "  LB --> S1",
+            "  S1 -->|atomic incr| CS",
+            "  CS -.uses.-> Algo"
+          ],
+          "highlight": [
+            "Algo"
+          ]
+        },
+        {
+          "name": "Sliding Window",
+          "pros": [
+            "Smoother enforcement; no boundary bursts",
+            "Accurate over the rolling interval",
+            "Affordable approximation (weighted previous + current window) is O(1)"
+          ],
+          "cons": [
+            "Exact sliding window (log of timestamps) is O(N) memory per key",
+            "Slightly more Lua-script complexity"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  LB[Load Balancer]",
+            "  S1[Limiter Process]",
+            "  CS[(Counter Store\\n2 windows + weight)]",
+            "  Algo[Sliding Window\\napprox: w·prev + curr]",
+            "  Client -->|request| LB",
+            "  LB --> S1",
+            "  S1 -->|atomic incr| CS",
+            "  CS -.uses.-> Algo"
+          ],
+          "highlight": [
+            "Algo"
+          ]
+        },
+        {
+          "name": "Token Bucket",
+          "pros": [
+            "Allows controlled bursts up to bucket capacity",
+            "Natural fit for 'X req/sec sustained, burst Y'",
+            "Widely understood; implemented by most gateways"
+          ],
+          "cons": [
+            "Two parameters (capacity + refill rate) — more to tune",
+            "Slightly trickier to expose remaining quota in a human-friendly way"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  LB[Load Balancer]",
+            "  S1[Limiter Process]",
+            "  CS[(Counter Store\\nbucket: tokens + last_refill)]",
+            "  Algo[Token Bucket\\ncapacity + refill rate]",
+            "  Client -->|request| LB",
+            "  LB --> S1",
+            "  S1 -->|atomic incr| CS",
+            "  CS -.uses.-> Algo"
+          ],
+          "highlight": [
+            "Algo"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Other algorithms worth mentioning",
+          "points": [
+            "Leaky bucket: smooths bursts by treating requests as drops; backpressure-style, less common for HTTP APIs.",
+            "Sliding-log: stores every request timestamp — most accurate, most expensive.",
+            "GCRA (generic cell rate algorithm): single timestamp per key, equivalent to leaky bucket with constant cost."
+          ]
+        },
+        {
+          "title": "Picking one",
+          "points": [
+            "Default to sliding window approximation for most user-facing limits — best accuracy/cost trade.",
+            "Use token bucket when burst-tolerance is part of the contract (e.g. 'allow 200 burst, sustain 10/s').",
+            "Stay with fixed window only when accuracy is unimportant (debug, internal services)."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Different rules need different algorithms.",
+          "mitigation": "Rule schema includes 'algorithm' field; the limiter dispatches to the right Lua script per rule."
+        },
+        {
+          "issue": "Algorithm change is a behavior change.",
+          "mitigation": "Version the rule; dry-run new algo in shadow mode (decide but don't enforce) before flipping."
+        }
+      ],
+      "talkingPoints": [
+        "Demonstrate awareness that this is a knob, not a one-time choice.",
+        "Mention shadow mode — running a new algorithm in parallel for comparison without affecting traffic."
+      ],
+      "flows": [
+        {
+          "name": "Sliding-window approximation",
+          "note": "Single Lua script reads previous + current window counts, weights the previous by the elapsed fraction, and compares to the limit.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant S as Limiter Process",
+            "  participant CS as Counter Store",
+            "  S->>CS: EVAL slidingWindow(key, now, windowMs, limit)",
+            "  CS->>CS: prev = GET key:prev",
+            "  CS->>CS: curr = INCR key:curr",
+            "  CS->>CS: weighted = prev * (1 - elapsed/window) + curr",
+            "  alt weighted <= limit",
+            "    CS-->>S: allow, remaining",
+            "  else weighted > limit",
+            "    CS->>CS: DECR key:curr (undo)",
+            "    CS-->>S: deny, retryAfter",
+            "  end"
+          ]
+        },
+        {
+          "name": "Token bucket",
+          "note": "On each request, refill tokens proportional to elapsed time, then try to consume one. State is { tokens, lastRefill }.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant S as Limiter Process",
+            "  participant CS as Counter Store",
+            "  S->>CS: EVAL tokenBucket(key, now, capacity, refillPerMs)",
+            "  CS->>CS: bucket = GET key",
+            "  CS->>CS: tokens = min(capacity, bucket.tokens + (now - bucket.lastRefill) * refillPerMs)",
+            "  alt tokens >= 1",
+            "    CS->>CS: SET key {tokens - 1, now}",
+            "    CS-->>S: allow",
+            "  else tokens < 1",
+            "    CS-->>S: deny, retryAfter = (1 - tokens) / refillPerMs",
+            "  end"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "rules-engine",
+      "title": "4. Rules Engine + Control Plane",
+      "description": "So far the limit is a constant in the limiter process. Operators need to add/change rules at runtime — per endpoint, per user tier, per region. Introduce a rule store and a control-plane API. Limiter processes cache rules in memory and refresh on change events.",
+      "decisionPrompt": "Design the control plane for live rule changes: how are rules versioned, distributed, cached, and rolled back without redeploying limiters?",
+      "concepts": [
+        {
+          "term": "Control plane",
+          "definition": "The administrative path used to configure and distribute rules.",
+          "whyItMatters": "Operators need to change limits without redeploying every limiter."
+        },
+        {
+          "term": "Rule versioning",
+          "definition": "Attach a version to each rule so processes can tell which configuration they are using.",
+          "whyItMatters": "Versioning makes rollout, audit, reconciliation, and rollback possible."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client]",
+        "  LB[Load Balancer]",
+        "  S1[Limiter Process]",
+        "  CS[(Counter Store)]",
+        "  Rules[(Rule Store)]",
+        "  CP[Control Plane API]",
+        "  Op[Operator / CI]",
+        "  Bus[[Change Event Bus]]",
+        "  Client -->|request| LB",
+        "  LB --> S1",
+        "  S1 -->|atomic incr| CS",
+        "  S1 -->|read rules| Rules",
+        "  Op -->|edit rule| CP",
+        "  CP -->|write rules| Rules",
+        "  Rules --> Bus",
+        "  Bus --> S1"
+      ],
+      "highlight": [
+        "Rules",
+        "CP",
+        "Op",
+        "Bus"
+      ],
+      "deepDives": [
+        {
+          "title": "Rule schema",
+          "points": [
+            "rule_id, scope, limit_count, window_ms, action, algorithm, version, updated_at.",
+            "Scope can be composite: 'user AND endpoint' produces keys like 'user:42:endpoint:posts.write'.",
+            "Action: reject (429), shape (delay), log (count only). 'log' enables dry-run mode."
+          ]
+        },
+        {
+          "title": "Propagation",
+          "points": [
+            "On write, the control plane bumps version and publishes a 'rules-changed' event.",
+            "Limiter processes subscribe and pull the changed rule, hot-swapping their in-process cache.",
+            "Periodic full reconciliation (every 60s) guards against missed events."
+          ]
+        },
+        {
+          "title": "Audit & rollback",
+          "points": [
+            "Every change writes a row to rule_history with the diff and changed_by.",
+            "Rollback is a write of the previous version's body — same propagation path."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Rule-store outage starves new processes of rules.",
+          "mitigation": "Limiter pins last-known-good rules on disk; falls back to those on cold start."
+        },
+        {
+          "issue": "Event bus delivery isn't guaranteed.",
+          "mitigation": "Periodic full reconciliation + version check on every decision."
+        },
+        {
+          "issue": "A bad rule (limit=0) blocks all traffic instantly.",
+          "mitigation": "Validation in control plane + canary rollout to a subset of limiter processes."
+        }
+      ],
+      "talkingPoints": [
+        "Treat the rule store like a config-management system: changes are reviewable, auditable, and revertable.",
+        "Mention that 'shadow' / 'log-only' action lets you test new rules without traffic impact."
+      ],
+      "flows": [
+        {
+          "name": "Operator pushes a new rule",
+          "note": "Write goes to Rule Store, event bus notifies the fleet, processes pull and hot-swap.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant Op as Operator",
+            "  participant CP as Control Plane",
+            "  participant Rules as Rule Store",
+            "  participant Bus as Event Bus",
+            "  participant S as Limiter Process",
+            "  Op->>CP: PUT /api/v1/rules/posts.write",
+            "  CP->>CP: validate (limit > 0, window > 0)",
+            "  CP->>Rules: write rule v+1",
+            "  Rules-->>CP: ok",
+            "  CP-->>Op: 200",
+            "  Rules-)Bus: rules-changed { id, v }",
+            "  Bus-)S: rules-changed",
+            "  S->>Rules: GET rule by id, ver",
+            "  Rules-->>S: rule body",
+            "  S->>S: swap in-process cache"
+          ]
+        },
+        {
+          "name": "Decision with rule cache hit",
+          "note": "Hot path: the rule is in process; only the counter call touches the network.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant S as Limiter Process",
+            "  participant CS as Counter Store",
+            "  C->>S: API request",
+            "  S->>S: lookup rule (in-process cache)",
+            "  S->>CS: INCR / Lua",
+            "  CS-->>S: count",
+            "  alt under limit",
+            "    S-->>C: 200 + remaining",
+            "  else over limit",
+            "    S-->>C: 429 + retryAfter",
+            "  end"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "edge-enforcement",
+      "title": "5. Edge Enforcement + Async Analytics",
+      "description": "Move the limiter into the gateway / CDN edge so the decision happens before traffic crosses regions or hits the backend. Decisions are emitted asynchronously to an analytics pipeline for dashboards, alerts, and rule tuning. Multi-region splits global limits (shared counter store, eventually consistent) from per-region limits (local store, fast).",
+      "decisionPrompt": "Decide what enforcement can run at the gateway or CDN edge and what must remain central, especially for global limits, analytics, and failure mode.",
+      "concepts": [
+        {
+          "term": "Edge enforcement",
+          "definition": "Make allow/deny decisions at the gateway or CDN edge before traffic reaches backend services.",
+          "whyItMatters": "Rejected traffic consumes less regional and backend capacity."
+        },
+        {
+          "term": "Fail open vs fail closed",
+          "definition": "Choose whether requests are allowed or denied when the limiter dependency is unavailable.",
+          "whyItMatters": "The right failure mode depends on whether availability or abuse prevention matters more."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client]",
+        "  Edge[Edge / Gateway\\nembedded limiter]",
+        "  LB[Load Balancer]",
+        "  Service[Backend Service]",
+        "  CS[(Counter Store\\nlocal + global tiers)]",
+        "  Rules[(Rule Store)]",
+        "  Q[[Decision Stream]]",
+        "  Analytics[(Analytics Store)]",
+        "  Dash[/Dashboards & Alerts/]",
+        "  Client -->|request| Edge",
+        "  Edge -->|decision| CS",
+        "  Edge -->|read rules| Rules",
+        "  Edge -->|allow| LB",
+        "  LB --> Service",
+        "  Edge -->|log decision| Q",
+        "  Q -->|events| Analytics",
+        "  Analytics --> Dash"
+      ],
+      "highlight": [
+        "Edge",
+        "Q",
+        "Analytics",
+        "Dash"
+      ],
+      "deepDives": [
+        {
+          "title": "Edge enforcement",
+          "points": [
+            "Run the limiter as an Envoy filter, nginx module, or CDN edge function (Cloudflare Workers, Lambda@Edge).",
+            "Rejected requests don't cross the WAN — saves cost, reduces blast radius of abuse.",
+            "Edge processes still talk to the regional counter store; rules are pulled on a slow refresh."
+          ]
+        },
+        {
+          "title": "Multi-region",
+          "points": [
+            "Per-region limit: local counter store, sub-ms.",
+            "Global limit: a shared store with async replication; accept ~5% over-allowance as the cost of avoiding cross-region round trips on the hot path.",
+            "For strict global limits, route limited principals to a single 'home' region."
+          ]
+        },
+        {
+          "title": "Analytics & feedback loop",
+          "points": [
+            "Every decision (allow or deny) goes to a queue. Sample heavily under sustained DDoS to avoid amplifying load.",
+            "Stream processor aggregates per-rule, per-principal, per-region.",
+            "Dashboards show top-rejected principals and per-rule pressure; operators use this to tune limits without guessing."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Queue backpressure stalls the gateway.",
+          "mitigation": "Async emit with bounded in-process buffer; drop oldest on overflow (analytics is best-effort)."
+        },
+        {
+          "issue": "Cross-region counter sync lag allows brief over-allowance.",
+          "mitigation": "Explicit SLA on global limits ('within X% over Y minutes'); strict-global routes traffic to one region."
+        },
+        {
+          "issue": "Limiter itself becomes a target of abuse.",
+          "mitigation": "L3/L4 DDoS protection in front; cheap fast-path rejection for blocklisted IPs."
+        }
+      ],
+      "talkingPoints": [
+        "Mention that the decision stream feeds anomaly detection (sudden deny-rate spikes → adversarial traffic).",
+        "Discuss the consistency contract: a freshly-tightened rule may take a few seconds to propagate to all edges."
+      ],
+      "flows": [
+        {
+          "name": "Edge-enforced request — allowed",
+          "note": "Decision happens at the edge; backend never sees the request count.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant Edge as Edge / Gateway",
+            "  participant CS as Counter Store",
+            "  participant Service as Backend",
+            "  participant Q as Decision Stream",
+            "  C->>Edge: API request",
+            "  Edge->>CS: INCR key (regional)",
+            "  CS-->>Edge: count, ttl",
+            "  Edge->>Service: proxy (allowed)",
+            "  Service-->>C: 200 response",
+            "  Edge-)Q: decision { allowed:true }"
+          ]
+        },
+        {
+          "name": "Edge-enforced request — denied",
+          "note": "Rejected at the edge with 429; the backend is never contacted, and the decision still emits to analytics.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant Edge as Edge / Gateway",
+            "  participant CS as Counter Store",
+            "  participant Q as Decision Stream",
+            "  C->>Edge: API request",
+            "  Edge->>CS: INCR key",
+            "  CS-->>Edge: count=151 (> limit 100)",
+            "  Edge-->>C: 429 + Retry-After",
+            "  Edge-)Q: decision { allowed:false, ruleId }"
+          ]
+        }
+      ]
+    }
+  ],
+  "finalDesign": {
+    "title": "Final Design",
+    "description": "End-to-end rate limiter architecture: enforcement at the gateway or edge, shared low-latency counters, cached versioned rules, a control plane for operator changes, async analytics, dashboards, and clear fail-open/fail-closed behavior.",
+    "diagram": [
+      "graph TB",
+      "  Client[Client]",
+      "  Edge[Gateway / Edge Limiter]",
+      "  RulesCache([In-Process Rule Cache])",
+      "  Counter[(Shared Counter Store)]",
+      "  Backend[Protected Backend Service]",
+      "  CP[Control Plane API]",
+      "  Op[Operator / CI]",
+      "  Rules[(Rule Store)]",
+      "  Bus[[Change Event Bus]]",
+      "  Q[[Decision Event Queue]]",
+      "  Analytics[(Analytics Store)]",
+      "  Dash[Dashboards / Alerts]",
+      "  Client -->|request| Edge",
+      "  Edge -->|lookup rule| RulesCache",
+      "  Edge -->|atomic incr / Lua| Counter",
+      "  Edge -->|allowed traffic| Backend",
+      "  Edge -->|decision event| Q",
+      "  Q -->|events| Analytics",
+      "  Analytics -->|metrics| Dash",
+      "  Op -->|edit rule| CP",
+      "  CP -->|write version| Rules",
+      "  Rules -->|publish change| Bus",
+      "  Bus -->|rules-changed refresh| RulesCache",
+      "  RulesCache -.->|cold start pull| Rules"
+    ],
+    "highlight": [],
+    "options": [
+      {
+        "name": "Gateway/edge enforcement with shared counters",
+        "pros": [
+          "Rejected traffic is stopped before backend services",
+          "Rule changes propagate without redeploying limiters",
+          "Counters remain authoritative across limiter instances",
+          "Analytics is async and off the hot path"
+        ],
+        "cons": [
+          "Counter store latency is on the request path",
+          "Global limits are harder across regions",
+          "Needs careful fail-open/fail-closed policy"
+        ],
+        "diagram": [
+          "graph TB",
+          "  Client[Client]",
+          "  Edge[Gateway / Edge Limiter]",
+          "  RulesCache([In-Process Rule Cache])",
+          "  Counter[(Shared Counter Store)]",
+          "  Backend[Protected Backend Service]",
+          "  CP[Control Plane API]",
+          "  Op[Operator / CI]",
+          "  Rules[(Rule Store)]",
+          "  Bus[[Change Event Bus]]",
+          "  Q[[Decision Event Queue]]",
+          "  Analytics[(Analytics Store)]",
+          "  Dash[Dashboards / Alerts]",
+          "  Client -->|request| Edge",
+          "  Edge -->|lookup rule| RulesCache",
+          "  Edge -->|atomic incr / Lua| Counter",
+          "  Edge -->|allowed traffic| Backend",
+          "  Edge -->|decision event| Q",
+          "  Q -->|events| Analytics",
+          "  Analytics -->|metrics| Dash",
+          "  Op -->|edit rule| CP",
+          "  CP -->|write version| Rules",
+          "  Rules -->|publish change| Bus",
+          "  Bus -->|rules-changed refresh| RulesCache",
+          "  RulesCache -.->|cold start pull| Rules"
+        ],
+        "highlight": []
+      },
+      {
+        "name": "Backend-side limiter library",
+        "pros": [
+          "Simpler to integrate into existing services",
+          "Can make endpoint-specific decisions with local context",
+          "Avoids custom edge runtime constraints"
+        ],
+        "cons": [
+          "Unwanted traffic still reaches backend fleet",
+          "Every service must adopt the limiter consistently",
+          "Harder to protect shared downstream dependencies early"
+        ],
+        "diagram": [
+          "graph TB",
+          "  Client[Client]",
+          "  LB[Load Balancer]",
+          "  S1[Service Instance + Limiter]",
+          "  S2[Service Instance + Limiter]",
+          "  Counter[(Shared Counter Store)]",
+          "  Rules[(Rule Store)]",
+          "  Bus[[Change Event Bus]]",
+          "  Analytics[(Analytics Store)]",
+          "  Client -->|request| LB",
+          "  LB -->|route| S1",
+          "  LB -->|route| S2",
+          "  S1 -->|atomic incr| Counter",
+          "  S2 -->|atomic incr| Counter",
+          "  S1 -->|read cached rules| Rules",
+          "  Rules -->|publish change| Bus",
+          "  Bus -->|refresh cache| S1",
+          "  S1 -->|decision events| Analytics"
+        ],
+        "highlight": []
+      }
+    ]
+  }
+}

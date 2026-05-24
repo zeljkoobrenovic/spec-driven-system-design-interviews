@@ -1,0 +1,2273 @@
+{
+  "id": "youtube",
+  "title": "YouTube - System Design Interview",
+  "description": "A step-by-step walkthrough of designing a YouTube-scale video platform: scoping upload and playback as independent paths, creating durable video identity, uploading bytes directly to object storage, an asynchronous transcoding pipeline, CDN-backed adaptive streaming, security and cost controls, and failure handling.",
+  "requirements": {
+    "functional": [
+      "Upload videos up to about 1 GB from mobile, web, and smart-TV clients.",
+      "Watch videos with smooth, immediate streaming on those same clients.",
+      "Transcode uploads into multiple resolutions, codecs, and bitrates.",
+      "Serve videos globally through a CDN.",
+      "Let viewers change quality and stream adaptively as networks vary.",
+      "Store and retrieve video metadata and lifecycle state."
+    ],
+    "nonFunctional": [
+      "Fast, reliable, resumable uploads.",
+      "Smooth playback with low startup delay across devices and networks.",
+      "High availability and reliability for both paths.",
+      "Cost-aware storage and CDN strategy, since video bytes dominate spend.",
+      "Encryption in transit and at rest for upload, storage, and playback."
+    ],
+    "outOfScope": [
+      "Recommendation ranking and the home feed.",
+      "Comments, likes, subscriptions, and the social graph.",
+      "Copyright-detection internals (Content ID).",
+      "Live streaming (touched only as a follow-up)."
+    ],
+    "designPrompt": "Keep metadata APIs, media bytes, transcoding, and playback on separate paths. A strong answer makes uploads and streaming independent, meeting only at a video-readiness state, and keeps large bytes off application servers."
+  },
+  "requirementsDiagram": [
+    "graph LR",
+    "  Creator[Creator]",
+    "  Viewer[Viewer]",
+    "  Platform[[Video Platform]]",
+    "  Upload[Upload up to 1GB]",
+    "  Process[Transcode to renditions]",
+    "  Playback[Adaptive playback]",
+    "  Creator -->|upload| Upload",
+    "  Upload -->|store + process| Platform",
+    "  Platform -->|fan out renditions| Process",
+    "  Viewer -->|watch| Playback",
+    "  Playback -->|manifest + segments| Platform"
+  ],
+  "capacityDiagram": [
+    "graph LR",
+    "  DAU[5M daily active users]",
+    "  Watch[5 videos watched/user/day]",
+    "  Upload[10% of users upload 1/day]",
+    "  Size[~300MB avg, 1GB max]",
+    "  Storage[~150 TB/day new originals]",
+    "  CDNBytes[~7.5 PB/day egress]",
+    "  CDNCost[~$150K/day CDN at $0.02/GB]",
+    "  DAU -->|x 5 videos| Watch",
+    "  DAU -->|x 10% upload| Upload",
+    "  Upload -->|x 300MB| Storage",
+    "  Watch -->|x 300MB egress| CDNBytes",
+    "  CDNBytes -->|x $0.02/GB| CDNCost",
+    "  Size --> Storage"
+  ],
+  "capacity": [
+    {
+      "label": "Daily active users",
+      "value": "5,000,000",
+      "note": "Each watches ~5 videos/day; ~10% upload 1 video/day."
+    },
+    {
+      "label": "New upload storage",
+      "value": "~150 TB/day",
+      "note": "5M x 10% x 300MB average original. Renditions add a multiplier on top of this."
+    },
+    {
+      "label": "CDN egress",
+      "value": "~7.5 PB/day",
+      "note": "5M x 5 videos x ~300MB streamed. Reads dwarf writes by ~50x."
+    },
+    {
+      "label": "CDN cost",
+      "value": "~$150,000/day",
+      "note": "7.5 PB x ~$0.02/GB. This number is why cost optimization is a first-class part of the design."
+    },
+    {
+      "label": "Rendition multiplier",
+      "value": "~5-7x per video",
+      "note": "Each original becomes several encoded outputs (e.g. 240p-4k) plus thumbnails and audio."
+    },
+    {
+      "label": "Playback protocol",
+      "value": "Manifest + segments",
+      "note": "Segmented media over HTTP (HLS or DASH) so players can buffer, seek, and switch quality."
+    }
+  ],
+  "api": [
+    {
+      "method": "POST",
+      "path": "/v1/videos/uploads",
+      "description": "Create an upload session and return a direct, pre-signed upload target.",
+      "request": "{ \"fileName\": \"clip.mp4\", \"sizeBytes\": 524288000, \"title\": \"My clip\" }",
+      "response": "{ \"videoId\": \"v1\", \"uploadId\": \"u1\", \"uploadUrl\": \"https://...\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Creator",
+        "  participant U as Upload API",
+        "  participant M as Metadata DB",
+        "  participant S as Upload Session Store",
+        "  participant O as Object Storage",
+        "  C->>U: create upload session",
+        "  U->>M: create video in uploading state",
+        "  U->>S: create resumable session",
+        "  U->>O: create pre-signed multipart target",
+        "  U-->>C: videoId + uploadId + URL"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/videos/uploads/{uploadId}/complete",
+      "description": "Finalize the upload, verify the object, and enqueue processing.",
+      "request": "{ \"checksum\": \"sha256:...\" }",
+      "response": "{ \"videoId\": \"v1\", \"status\": \"processing\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Creator",
+        "  participant U as Upload API",
+        "  participant O as Object Storage",
+        "  participant E as Upload Event Bus",
+        "  participant M as Metadata DB",
+        "  C->>O: upload video parts",
+        "  C->>U: complete upload with checksum",
+        "  U->>O: verify object + checksum",
+        "  U->>M: mark processing",
+        "  U->>E: publish upload-complete",
+        "  U-->>C: status processing"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/videos/{videoId}",
+      "description": "Fetch video metadata and lifecycle state.",
+      "request": "Path: videoId",
+      "response": "{ \"title\": \"...\", \"status\": \"ready\", \"renditions\": [\"240p\",\"720p\",\"1080p\"] }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant V as Viewer",
+        "  participant A as Video API",
+        "  participant K as Metadata Cache",
+        "  participant M as Metadata DB",
+        "  V->>A: get video metadata",
+        "  A->>K: read cached metadata",
+        "  alt cache hit",
+        "    K-->>A: metadata",
+        "  else miss",
+        "    A->>M: read video state",
+        "    M-->>A: title, status, renditions",
+        "    A->>K: backfill cache",
+        "  end",
+        "  A-->>V: metadata"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/videos/{videoId}/playback?client=",
+      "description": "Authorize playback of a ready video and return a signed manifest URL.",
+      "request": "Query: client (mobile | web | tv)",
+      "response": "{ \"manifestUrl\": \"https://cdn/.../master.m3u8\", \"expiresAt\": \"...\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant V as Viewer",
+        "  participant P as Playback API",
+        "  participant M as Metadata DB",
+        "  participant Sg as Signed URL Service",
+        "  participant Cd as CDN",
+        "  V->>P: request playback manifest",
+        "  P->>M: verify ready + visibility",
+        "  P->>Sg: create signed manifest URL",
+        "  Sg-->>P: signed URL",
+        "  P-->>V: manifest URL",
+        "  V->>Cd: fetch manifest + segments"
+      ]
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/videos/{videoId}",
+      "description": "Update title, description, or visibility; invalidate cached metadata.",
+      "request": "{ \"title\": \"new title\", \"visibility\": \"public\" }",
+      "response": "{ \"ok\": true }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Creator",
+        "  participant A as Video API",
+        "  participant M as Metadata DB",
+        "  participant K as Metadata Cache",
+        "  C->>A: update title / visibility",
+        "  A->>M: update video row",
+        "  M-->>A: saved",
+        "  A->>K: invalidate cached metadata",
+        "  A-->>C: ok"
+      ]
+    }
+  ],
+  "dataModel": [
+    {
+      "name": "video",
+      "note": "Canonical metadata and lifecycle state; read on every playback.",
+      "fields": [
+        { "name": "video_id", "type": "string PK" },
+        { "name": "owner_id", "type": "string FK" },
+        { "name": "title", "type": "varchar" },
+        { "name": "description", "type": "text" },
+        { "name": "visibility", "type": "varchar" },
+        { "name": "status", "type": "varchar" },
+        { "name": "created_at", "type": "timestamp" }
+      ]
+    },
+    {
+      "name": "video_asset",
+      "note": "The original uploaded media object in blob storage.",
+      "fields": [
+        { "name": "asset_id", "type": "string PK" },
+        { "name": "video_id", "type": "string FK" },
+        { "name": "object_uri", "type": "text" },
+        { "name": "size_bytes", "type": "bigint" },
+        { "name": "checksum", "type": "string" }
+      ]
+    },
+    {
+      "name": "transcode_job",
+      "note": "One processing job per video; tracks retries and status.",
+      "fields": [
+        { "name": "job_id", "type": "string PK" },
+        { "name": "video_id", "type": "string FK" },
+        { "name": "profile", "type": "string" },
+        { "name": "status", "type": "varchar" },
+        { "name": "attempt_count", "type": "int" }
+      ]
+    },
+    {
+      "name": "rendition",
+      "note": "One playable encoded output at a specific resolution/bitrate.",
+      "fields": [
+        { "name": "rendition_id", "type": "string PK" },
+        { "name": "video_id", "type": "string FK" },
+        { "name": "resolution", "type": "string" },
+        { "name": "bitrate", "type": "int" },
+        { "name": "codec", "type": "string" },
+        { "name": "cdn_path", "type": "text" }
+      ]
+    },
+    {
+      "name": "playback_manifest",
+      "note": "Index of available renditions and segment URLs for a player.",
+      "fields": [
+        { "name": "manifest_id", "type": "string PK" },
+        { "name": "video_id", "type": "string FK" },
+        { "name": "format", "type": "string" },
+        { "name": "uri", "type": "text" },
+        { "name": "version", "type": "int" }
+      ]
+    }
+  ],
+  "dataModelDiagram": [
+    "erDiagram",
+    "  VIDEO ||--o{ VIDEO_ASSET : has",
+    "  VIDEO ||--o{ TRANSCODE_JOB : processed_by",
+    "  VIDEO ||--o{ RENDITION : produces",
+    "  VIDEO ||--o| PLAYBACK_MANIFEST : indexed_by",
+    "  VIDEO {",
+    "    string video_id PK",
+    "    string owner_id FK",
+    "    varchar title",
+    "    varchar visibility",
+    "    varchar status",
+    "    timestamp created_at",
+    "  }",
+    "  VIDEO_ASSET {",
+    "    string asset_id PK",
+    "    string video_id FK",
+    "    text object_uri",
+    "    bigint size_bytes",
+    "    string checksum",
+    "  }",
+    "  TRANSCODE_JOB {",
+    "    string job_id PK",
+    "    string video_id FK",
+    "    string profile",
+    "    varchar status",
+    "    int attempt_count",
+    "  }",
+    "  RENDITION {",
+    "    string rendition_id PK",
+    "    string video_id FK",
+    "    string resolution",
+    "    int bitrate",
+    "    string codec",
+    "    text cdn_path",
+    "  }",
+    "  PLAYBACK_MANIFEST {",
+    "    string manifest_id PK",
+    "    string video_id FK",
+    "    string format",
+    "    text uri",
+    "    int version",
+    "  }"
+  ],
+  "steps": [
+    {
+      "id": "scope-and-client-entry-points",
+      "title": "1. Scope Upload and Playback as Two Paths",
+      "description": "The platform has two distinct journeys: creators upload videos (write-heavy, asynchronous, CPU-intensive), and viewers watch them (read-heavy, latency-sensitive, ~50x more traffic). Keep them as independent paths so upload processing can never degrade playback availability. They meet only at the video's readiness state.",
+      "decisionPrompt": "What are the two core journeys, where do they diverge, and what single piece of shared state do they meet at?",
+      "whyNow": [
+        "Every later decision (storage, transcoding, CDN) follows from treating upload and playback as separate paths, so the split has to be drawn first.",
+        "The capacity funnel shows reads dwarf writes by ~50x, which justifies designing the two paths with different scaling and reliability goals."
+      ],
+      "recap": {
+        "before": "Nothing exists; uploads and views are an undifferentiated blob of traffic.",
+        "after": "Two independent paths share only a metadata store and a video lifecycle state.",
+        "newRisk": "Metadata becomes a dependency for both paths and must stay highly available."
+      },
+      "concepts": [
+        {
+          "term": "Creator path",
+          "definition": "The flow from upload-session creation through bytes, transcoding, and readiness.",
+          "whyItMatters": "It is write-heavy and asynchronous, so it must not block on slow processing.",
+          "example": "A 1GB upload returns 'processing' in seconds while transcoding runs for minutes."
+        },
+        {
+          "term": "Viewer path",
+          "definition": "The flow from metadata lookup to manifest retrieval to CDN streaming.",
+          "whyItMatters": "It is read-heavy and latency-sensitive; startup delay is the headline metric.",
+          "example": "Playback starts after one metadata read and the first CDN segment, not a full download."
+        },
+        {
+          "term": "Video lifecycle state",
+          "definition": "States such as uploading, processing, ready, failed, and blocked.",
+          "whyItMatters": "It is the one shared fact that makes asynchronous processing visible and debuggable."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Creator[Creator Client\\nuploads, write-heavy]",
+        "  Viewer[Viewer Client\\nweb / mobile / smart TV]",
+        "  API[API Gateway\\nauth, routing, rate limit]",
+        "  Upload[Upload API\\nwrite path]",
+        "  Playback[Playback API\\nread path]",
+        "  Metadata[(Metadata DB\\nshared lifecycle state)]",
+        "  Creator --> API",
+        "  Viewer --> API",
+        "  API --> Upload",
+        "  API --> Playback",
+        "  Upload --> Metadata",
+        "  Playback --> Metadata"
+      ],
+      "highlight": [
+        "Creator",
+        "Viewer",
+        "Upload",
+        "Playback",
+        "Metadata"
+      ],
+      "options": [
+        {
+          "name": "Split upload and playback paths (default)",
+          "pros": [
+            "Upload processing spikes cannot degrade playback latency",
+            "Each path scales on its own traffic shape (writes vs reads)",
+            "Clear ownership boundaries for later steps"
+          ],
+          "cons": [
+            "Two API surfaces to build and operate",
+            "Shared metadata store must be highly available for both"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Creator[Creator Client]",
+            "  Viewer[Viewer Client]",
+            "  API[API Gateway]",
+            "  Upload[Upload API]",
+            "  Playback[Playback API]",
+            "  Metadata[(Metadata DB)]",
+            "  Creator --> API",
+            "  Viewer --> API",
+            "  API --> Upload",
+            "  API --> Playback",
+            "  Upload --> Metadata",
+            "  Playback --> Metadata"
+          ],
+          "highlight": [
+            "Upload",
+            "Playback"
+          ]
+        },
+        {
+          "name": "One monolithic video service",
+          "pros": [
+            "Fewer moving parts for an early prototype",
+            "Single deployable, simpler local reasoning"
+          ],
+          "cons": [
+            "A transcoding or upload surge can starve playback",
+            "Read and write scaling are coupled even though they differ ~50x",
+            "Harder to evolve ownership as the system grows"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Creator[Creator Client]",
+            "  Viewer[Viewer Client]",
+            "  Mono[Video Service\\nupload + playback]",
+            "  Metadata[(Metadata DB)]",
+            "  Creator --> Mono",
+            "  Viewer --> Mono",
+            "  Mono --> Metadata"
+          ],
+          "highlight": [
+            "Mono"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Why the paths must not block each other",
+          "points": [
+            "Do not block upload completion on transcoding; the video moves to a processing state and finishes asynchronously.",
+            "Playback traffic can dwarf upload traffic, so the read path needs independent scaling headroom.",
+            "Metadata availability is required by both paths, so it is the first thing to make redundant."
+          ]
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "Transcoding capacity is saturated and processing backs up for an hour.",
+          "expectedBehavior": "Viewers keep watching already-ready videos with no latency change.",
+          "mitigation": "Because the playback path shares only the (highly available) metadata store, a processing backlog never touches playback serving."
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Playback traffic can dwarf upload traffic.",
+          "mitigation": "Scale the read path and CDN independently; never put it behind the upload path."
+        },
+        {
+          "issue": "Metadata is a shared dependency for both paths.",
+          "mitigation": "Replicate and cache metadata so neither path is a single point of failure."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "States upload and playback as separate paths and explains the ~50x read/write asymmetry.",
+          "Names the lifecycle state as the single shared coupling point."
+        ],
+        "weak": [
+          "Designs one service that proxies both bytes and reads.",
+          "Forgets to scope out recommendations, comments, and live streaming."
+        ]
+      },
+      "talkingPoints": [
+        "Explicitly scope out recommendations, comments, social graph, and live streaming.",
+        "It is acceptable and encouraged to lean on managed cloud object storage and CDN."
+      ]
+    },
+    {
+      "id": "video-upload-and-metadata",
+      "title": "2. Create Upload Sessions and Metadata Records",
+      "description": "Before large bytes arrive, the upload API creates a metadata record (giving the video a durable identity) and an upload session (authorizing and tracking the byte transfer). Creating identity early means failures are visible and recoverable instead of orphaning huge objects.",
+      "decisionPrompt": "When should the video ID be created: before bytes arrive, after upload, or after processing?",
+      "whyNow": [
+        "Bytes go straight to object storage in the next step, so the system needs an identity and a session to attach those bytes to first.",
+        "Retries and progress tracking are impossible without a server-side session record created up front."
+      ],
+      "recap": {
+        "before": "Two paths exist but there is no durable handle for an in-progress upload.",
+        "after": "Every upload has a video_id and a resumable session before a single byte is sent.",
+        "newRisk": "Abandoned sessions and orphaned partial objects accumulate and must be cleaned up."
+      },
+      "concepts": [
+        {
+          "term": "Upload session",
+          "definition": "A temporary server-side record that authorizes and tracks one media upload.",
+          "whyItMatters": "It enables retries, progress, and idempotent finalization.",
+          "example": "A dropped mobile connection resumes the same session instead of restarting the 1GB upload."
+        },
+        {
+          "term": "Metadata record",
+          "definition": "The database row for title, owner, visibility, and lifecycle state.",
+          "whyItMatters": "It lets the UI show upload and processing progress immediately.",
+          "example": "The video shows as 'uploading' then 'processing' before it is ever playable."
+        },
+        {
+          "term": "Idempotent finalization",
+          "definition": "Completing the same upload more than once yields the same video state.",
+          "whyItMatters": "It absorbs client retries after a lost completion response."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Creator[Creator Client\\nwants progress + retries]",
+        "  API[API Gateway\\nauth, routing]",
+        "  UploadAPI[Upload API\\ncoordinator, no bytes]",
+        "  Metadata[(Metadata DB\\nvideo identity + state)]",
+        "  Session[(Upload Session Store\\nresumable, TTL)]",
+        "  Creator <-->|API calls| API",
+        "  API --> UploadAPI",
+        "  UploadAPI --> Metadata",
+        "  UploadAPI --> Session",
+        "  UploadAPI -->|upload URL| API"
+      ],
+      "highlight": [
+        "UploadAPI",
+        "Session"
+      ],
+      "options": [
+        {
+          "name": "Create identity before bytes (default)",
+          "pros": [
+            "Failures are visible against a real video_id, not lost in the byte path",
+            "Supports progress UI, resumable uploads, and idempotent completion",
+            "Decouples metadata writes from the large media transfer"
+          ],
+          "cons": [
+            "Produces sessions and metadata rows that may never complete",
+            "Requires TTL expiry and orphan cleanup"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Creator[Creator Client]",
+            "  API[API Gateway]",
+            "  UploadAPI[Upload API]",
+            "  Metadata[(Metadata DB)]",
+            "  Session[(Upload Session Store)]",
+            "  Creator <-->|API calls| API",
+            "  API --> UploadAPI",
+            "  UploadAPI --> Metadata",
+            "  UploadAPI --> Session",
+            "  UploadAPI -->|upload URL| API"
+          ],
+          "highlight": [
+            "Session"
+          ]
+        },
+        {
+          "name": "Create identity after upload completes",
+          "pros": [
+            "No orphaned metadata for abandoned uploads",
+            "Slightly simpler session bookkeeping"
+          ],
+          "cons": [
+            "No durable handle while bytes are in flight, so progress and resumption are hard",
+            "A crash mid-upload leaves bytes with no owning record"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Creator[Creator Client]",
+            "  UploadAPI[Upload API]",
+            "  Storage[(Object Storage)]",
+            "  Metadata[(Metadata DB)]",
+            "  Creator -->|upload bytes| Storage",
+            "  Creator -->|then register| UploadAPI",
+            "  UploadAPI --> Metadata"
+          ],
+          "highlight": [
+            "Storage"
+          ]
+        }
+      ],
+      "flows": [
+        {
+          "name": "Create upload session",
+          "note": "The creator gets a video identity and an upload URL before sending any bytes.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Creator",
+            "  participant U as Upload API",
+            "  participant S as Session Store",
+            "  participant M as Metadata DB",
+            "  C->>U: create upload session",
+            "  U->>M: create video (uploading)",
+            "  U->>S: create resumable session",
+            "  U-->>C: videoId + upload URL"
+          ],
+          "highlight": [
+            "S"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Identity vs object name",
+          "points": [
+            "Keep the public video_id separate from the object-storage object name.",
+            "Creating metadata early turns a crash into a recoverable 'failed' state instead of an orphaned blob.",
+            "Metadata writes must stay out of the large-media transfer path."
+          ]
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The client never calls complete after uploading some parts.",
+          "expectedBehavior": "The session and partial object are reclaimed; the video lands in a terminal 'failed/expired' state.",
+          "mitigation": "Give sessions a TTL and run a cleanup job that aborts multipart uploads and marks the video failed."
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "The session store must tolerate frequent client retries.",
+          "mitigation": "Make session lookups idempotent and cheap; key by uploadId."
+        },
+        {
+          "issue": "Metadata writes could leak into the media path.",
+          "mitigation": "Keep the API a coordinator; bytes never flow through it."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Creates durable identity before bytes and justifies it with recoverability.",
+          "Separates video_id from the storage object name."
+        ],
+        "weak": [
+          "Routes the upload bytes through the API to 'keep it simple'.",
+          "Ignores abandoned-session cleanup."
+        ]
+      },
+      "talkingPoints": [
+        "Idempotent completion is what makes client retries safe.",
+        "Early metadata is the difference between a recoverable failure and a mystery blob."
+      ]
+    },
+    {
+      "id": "direct-object-upload",
+      "title": "3. Upload Video Bytes Directly to Object Storage",
+      "description": "Large video files must not pass through application servers. The client uploads directly to object (blob) storage using a pre-signed, resumable, multipart URL. App servers stay metadata coordinators; object storage absorbs the bytes and emits an event when an object is created.",
+      "decisionPrompt": "Should API servers proxy the video bytes, or should clients upload directly to storage with a pre-signed URL?",
+      "whyNow": [
+        "At ~150 TB/day, proxying bytes through stateless API servers would make them the bandwidth bottleneck and balloon cost.",
+        "The transcoding pipeline in the next step is triggered by the object-created event this step produces."
+      ],
+      "recap": {
+        "before": "An identity and session exist, but the bytes still have nowhere efficient to go.",
+        "after": "Clients write directly to durable object storage via pre-signed multipart URLs; an event signals completion.",
+        "newRisk": "Corrupt or abandoned uploads can enter the system and must be validated and cleaned up."
+      },
+      "concepts": [
+        {
+          "term": "Object storage",
+          "definition": "Durable, cheap storage for large immutable blobs.",
+          "whyItMatters": "It scales for media far better than application-server disks.",
+          "example": "The 1GB original lives as one object addressed by a URI in video_asset."
+        },
+        {
+          "term": "Pre-signed URL",
+          "definition": "A time-limited URL that grants upload permission to one object.",
+          "whyItMatters": "It keeps application servers entirely out of the byte path.",
+          "example": "The Upload API hands back a 15-minute signed URL; the client PUTs parts straight to storage."
+        },
+        {
+          "term": "Multipart upload",
+          "definition": "Splitting a large upload into independently retryable chunks (e.g. by GOP alignment).",
+          "whyItMatters": "It makes 1GB mobile uploads resilient to flaky networks.",
+          "example": "Part 7 of 40 fails and is retried alone instead of restarting the whole upload."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Creator[Creator Client\\nuploads bytes directly]",
+        "  API[API Gateway\\nauth, routing]",
+        "  UploadAPI[Upload API\\nissues signed URL only]",
+        "  OriginalStore[(Original Video Storage\\nblob, durable)]",
+        "  EventBus[Upload Event Bus\\nobject-created events]",
+        "  Creator <-->|get / receive URL| API",
+        "  API --> UploadAPI",
+        "  UploadAPI -->|signed URL| API",
+        "  Creator -->|multipart upload, bypasses API| OriginalStore",
+        "  OriginalStore -->|object created| EventBus"
+      ],
+      "highlight": [
+        "OriginalStore",
+        "EventBus"
+      ],
+      "options": [
+        {
+          "name": "Direct client-to-storage upload (default)",
+          "pros": [
+            "Bytes never touch app servers, so they stay cheap and stateless",
+            "Object storage handles durability and scale",
+            "Multipart enables resumable, parallel chunk uploads"
+          ],
+          "cons": [
+            "Clients need signed-URL handling and multipart logic",
+            "Requires checksum validation and abandoned-multipart cleanup"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Creator[Creator Client]",
+            "  API[API Gateway]",
+            "  UploadAPI[Upload API]",
+            "  OriginalStore[(Original Video Storage)]",
+            "  EventBus[Upload Event Bus]",
+            "  Creator <-->|get / receive URL| API",
+            "  API --> UploadAPI",
+            "  UploadAPI -->|signed URL| API",
+            "  Creator -->|multipart upload, bypasses API| OriginalStore",
+            "  OriginalStore -->|object created| EventBus"
+          ],
+          "highlight": [
+            "OriginalStore"
+          ]
+        },
+        {
+          "name": "Proxy bytes through API servers",
+          "pros": [
+            "Centralized validation and a single code path",
+            "Clients only speak to one endpoint"
+          ],
+          "cons": [
+            "API tier must carry ~150 TB/day of upload bandwidth",
+            "Stateless servers become stateful, expensive media relays",
+            "Doubles the bytes moved (client to API, API to storage)"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Creator[Creator Client]",
+            "  UploadAPI[Upload API\\nproxies bytes]",
+            "  OriginalStore[(Original Video Storage)]",
+            "  Creator -->|upload bytes| UploadAPI",
+            "  UploadAPI -->|relay bytes| OriginalStore"
+          ],
+          "highlight": [
+            "UploadAPI"
+          ]
+        }
+      ],
+      "flows": [
+        {
+          "name": "Direct upload",
+          "note": "The API authorizes; object storage receives the actual bytes and emits an event.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Creator",
+            "  participant U as Upload API",
+            "  participant O as Object Storage",
+            "  participant E as Upload Event Bus",
+            "  C->>U: request upload URL",
+            "  U-->>C: pre-signed multipart URL",
+            "  C->>O: upload video chunks",
+            "  C->>U: complete upload with checksum",
+            "  U->>O: verify object + checksum",
+            "  O-->>E: object created event"
+          ],
+          "highlight": [
+            "E"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Reliability and geography",
+          "points": [
+            "Checksum validation on completion keeps corrupt uploads out of transcoding.",
+            "GOP-aligned chunking lets failed parts retry independently and enables client-side splitting.",
+            "Upload acceleration or regional upload endpoints help distant users; abandoned multiparts need a cleanup job."
+          ]
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A multipart upload finishes but the object is truncated or corrupted.",
+          "expectedBehavior": "The video is rejected before any transcoding work is spent on it.",
+          "mitigation": "Verify size and checksum at completion; only then publish the object-created event."
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Distant users see slow uploads to a single region.",
+          "mitigation": "Use regional upload endpoints / CDN-based upload acceleration."
+        },
+        {
+          "issue": "Abandoned multipart uploads waste storage.",
+          "mitigation": "Lifecycle rule to abort incomplete multiparts after a TTL."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Keeps app servers out of the byte path and explains the cost/scale reason.",
+          "Validates checksum before admitting the upload to processing."
+        ],
+        "weak": [
+          "Proxies gigabyte uploads through the API tier.",
+          "Has no plan for corrupt or abandoned uploads."
+        ]
+      },
+      "talkingPoints": [
+        "App servers issue URLs and coordinate; they are not media proxies.",
+        "Pre-signed URLs are the standard primitive (S3 pre-signed, Azure SAS)."
+      ]
+    },
+    {
+      "id": "resumable-chunked-upload",
+      "parent": "direct-object-upload",
+      "title": "3a. Resumable, Chunked, Geo-Accelerated Upload",
+      "description": "A focused look at one aspect of the previous step. The direct-to-storage architecture is unchanged; this zooms into how the bytes actually move reliably for a 1 GB mobile upload. The client splits the file by GOP alignment into independently retryable parts, uploads them in parallel, and resumes only the failed parts. Regional upload endpoints shorten the network path for distant users.",
+      "decisionPrompt": "Within the same direct-upload design, how do we make a 1 GB upload over a flaky mobile network fast and resumable?",
+      "whyNow": [
+        "Step 3 chose direct multipart upload; this is the chunking and resumption detail that makes it reliable in practice.",
+        "GOP-aligned chunks also feed the transcoding pipeline's chunk-level parallelism in step 4."
+      ],
+      "recap": {
+        "before": "Bytes go directly to storage, but a single network drop could restart the whole 1 GB upload.",
+        "after": "The file is GOP-chunked and uploaded in parallel; only failed parts retry, optionally via a nearby regional endpoint.",
+        "newRisk": "Older clients cannot chunk, so the server must fall back to splitting; partial parts need cleanup."
+      },
+      "concepts": [
+        {
+          "term": "GOP-aligned chunking",
+          "definition": "Splitting the video on Group-of-Pictures boundaries so each chunk is an independently decodable unit.",
+          "whyItMatters": "Failed chunks retry alone, and the chunks are directly reusable by transcoding.",
+          "example": "A 1 GB file becomes 40 parts; part 7 fails and is retried without touching the other 39."
+        },
+        {
+          "term": "Resumable upload",
+          "definition": "The session tracks which parts have landed so an interrupted upload continues from where it stopped.",
+          "whyItMatters": "It turns a dropped connection into a brief pause instead of a full restart.",
+          "example": "A phone loses signal at 80%; the upload resumes the remaining parts on reconnect."
+        },
+        {
+          "term": "Regional upload endpoint",
+          "definition": "An upload center close to the user (often CDN-based) that shortens the network path to storage.",
+          "whyItMatters": "It reduces upload latency and failure rate for international users.",
+          "example": "A creator in Asia uploads to an Asian upload center rather than a US region."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Creator[Creator Client\\nsplits file by GOP]",
+        "  P1[Part 1]",
+        "  P2[Part 2]",
+        "  PN[Part N]",
+        "  Edge[Regional Upload Endpoint\\nnearest, CDN-based]",
+        "  OriginalStore[(Original Video Storage\\nassembles parts)]",
+        "  Session[(Upload Session\\ntracks received parts)]",
+        "  Creator --> P1",
+        "  Creator --> P2",
+        "  Creator --> PN",
+        "  P1 --> Edge",
+        "  P2 --> Edge",
+        "  PN --> Edge",
+        "  Edge --> OriginalStore",
+        "  OriginalStore -->|part acked| Session",
+        "  Session -->|resume missing parts| Creator"
+      ],
+      "highlight": [
+        "P1",
+        "P2",
+        "PN",
+        "Edge",
+        "Session"
+      ],
+      "options": [
+        {
+          "name": "Client-side GOP chunking + parallel parts (default)",
+          "pros": [
+            "Failed parts retry independently, so 1 GB uploads survive flaky networks",
+            "Parallel parts use available bandwidth and speed up the upload",
+            "GOP chunks are directly reusable by the transcoding pipeline"
+          ],
+          "cons": [
+            "Older clients may be unable to split and need a server fallback",
+            "Partial/abandoned parts require cleanup"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Creator[Creator Client\\nGOP split]",
+            "  Parts[Parallel Parts]",
+            "  OriginalStore[(Original Video Storage)]",
+            "  Session[(Upload Session)]",
+            "  Creator --> Parts",
+            "  Parts --> OriginalStore",
+            "  OriginalStore --> Session",
+            "  Session -->|resume gaps| Creator"
+          ],
+          "highlight": [
+            "Parts",
+            "Session"
+          ]
+        },
+        {
+          "name": "Single-stream whole-file upload",
+          "pros": [
+            "Trivial client logic: one PUT",
+            "No part bookkeeping or assembly"
+          ],
+          "cons": [
+            "Any network drop restarts the entire 1 GB transfer",
+            "No parallelism, so uploads are slower",
+            "Nothing to feed chunk-level transcoding parallelism"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Creator[Creator Client]",
+            "  OriginalStore[(Original Video Storage)]",
+            "  Creator -->|one stream, no resume| OriginalStore"
+          ],
+          "highlight": [
+            "Creator"
+          ]
+        }
+      ],
+      "flows": [
+        {
+          "name": "Resume after a dropped part",
+          "note": "The session knows which parts landed, so the client re-sends only the missing one.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Creator",
+            "  participant E as Regional Endpoint",
+            "  participant O as Object Storage",
+            "  participant S as Upload Session",
+            "  C->>E: upload parts 1..N in parallel",
+            "  E->>O: store parts",
+            "  O->>S: ack parts 1,2,4..N (part 3 lost)",
+            "  C->>S: query received parts",
+            "  S-->>C: missing part 3",
+            "  C->>E: re-upload part 3 only",
+            "  E->>O: store part 3",
+            "  O->>S: all parts present, assemble"
+          ],
+          "highlight": [
+            "S"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Chunking and fallback",
+          "points": [
+            "GOP alignment makes each chunk independently retryable and reusable downstream.",
+            "If an old client cannot split, pass the whole file and let the server split it.",
+            "Abandoned parts are reclaimed by the same multipart-cleanup lifecycle rule from step 3."
+          ]
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A mobile upload drops at 80% after several parts succeeded.",
+          "expectedBehavior": "On reconnect the upload continues, re-sending only the unfinished parts.",
+          "mitigation": "The upload session records received parts; the client queries it and resumes the gaps instead of restarting."
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Distant users still see high latency to a single region.",
+          "mitigation": "Route parts through the nearest regional upload endpoint."
+        },
+        {
+          "issue": "Too many tiny parts add per-request overhead.",
+          "mitigation": "Tune chunk size to balance retry granularity against request count."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Chunks by GOP for both resumability and downstream reuse.",
+          "Resumes only failed parts and places upload endpoints near users."
+        ],
+        "weak": [
+          "Uploads the whole file in one stream with no resume.",
+          "Ignores clients that cannot split client-side."
+        ]
+      },
+      "talkingPoints": [
+        "This is internal to step 3: still direct-to-storage, just chunked and resumable.",
+        "GOP chunks do double duty as the transcoding pipeline's parallel work units."
+      ]
+    },
+    {
+      "id": "transcoding-pipeline",
+      "title": "4. Transcode Originals Through an Asynchronous DAG Pipeline",
+      "description": "On the object-created event, a DAG-based pipeline turns the arbitrary original into standardized renditions. A preprocessor splits the video by GOP and generates the task DAG; a scheduler breaks the DAG into stages; a resource manager assigns tasks to workers via priority queues; workers encode, generate thumbnails, extract audio, and package manifests. Message queues decouple every stage for parallelism.",
+      "decisionPrompt": "How do we turn arbitrary uploaded files into standardized playable renditions, with high parallelism and clean retries?",
+      "whyNow": [
+        "Bytes are now durably stored and an event fires on completion, which is exactly the trigger transcoding needs.",
+        "Playback and adaptive quality (next steps) cannot exist until renditions and a manifest are produced here."
+      ],
+      "recap": {
+        "before": "An original blob exists but is unplayable on most devices and networks.",
+        "after": "An asynchronous DAG produces multiple renditions, thumbnails, audio, and a manifest, then marks the video ready.",
+        "newRisk": "Encoding is expensive and failure-prone; partial renditions must never be published as ready."
+      },
+      "concepts": [
+        {
+          "term": "Transcoding",
+          "definition": "Decoding an input video and re-encoding it into target codecs, bitrates, and resolutions.",
+          "whyItMatters": "It makes one upload playable across many devices and network conditions.",
+          "example": "One 1080p original yields 240p, 480p, 720p, and 1080p H.264 + VP9 outputs."
+        },
+        {
+          "term": "DAG pipeline",
+          "definition": "A directed acyclic graph of processing tasks defined per video.",
+          "whyItMatters": "It models inspection, splitting, encoding, thumbnailing, and packaging with parallelism, and supports per-creator variations like watermarks.",
+          "example": "Stage 1 splits into video/audio/metadata; stage 2 fans out encoding + thumbnail tasks."
+        },
+        {
+          "term": "Resource manager",
+          "definition": "A scheduler with task, worker, and running queues that assigns the optimal worker to each task.",
+          "whyItMatters": "It keeps expensive encoding workers busy and lets popular creators be prioritized.",
+          "example": "The task scheduler pulls the highest-priority task and the least-loaded worker, then tracks it in the running queue."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  EventBus[Upload Event Bus\\ntriggers on object created]",
+        "  Pre[Preprocessor\\nsplit by GOP, build DAG]",
+        "  Scheduler[DAG Scheduler\\nsplits DAG into stages]",
+        "  ResourceMgr[Resource Manager\\ntask / worker / running queues]",
+        "  Workers[Task Workers\\nencode, thumbnail, watermark, merge]",
+        "  OriginalStore[(Original Storage\\nread source for workers)]",
+        "  TempStore[(Temp Segment Storage\\nGOPs + intermediates, retryable)]",
+        "  RenditionStore[(Rendition Storage\\nfinished playable outputs)]",
+        "  Metadata[(Metadata DB\\nstatus: processing to ready)]",
+        "  EventBus --> Pre",
+        "  Pre --> Scheduler",
+        "  Pre --> TempStore",
+        "  Scheduler --> ResourceMgr",
+        "  ResourceMgr --> Workers",
+        "  Workers --> OriginalStore",
+        "  Workers --> TempStore",
+        "  Workers --> RenditionStore",
+        "  Workers -->|ready or failed| Metadata"
+      ],
+      "highlight": [
+        "Pre",
+        "Scheduler",
+        "ResourceMgr",
+        "Workers",
+        "TempStore",
+        "RenditionStore"
+      ],
+      "options": [
+        {
+          "name": "DAG pipeline with message queues (default)",
+          "pros": [
+            "Stages are decoupled, so encoding need not wait on download",
+            "Per-video DAGs support watermarks, thumbnails, and chunk-level parallelism",
+            "Retries and priorities are first-class via the queues"
+          ],
+          "cons": [
+            "More components to build and operate (preprocessor, scheduler, resource manager)",
+            "Packaging must reassemble chunk outputs into a coherent manifest"
+          ],
+          "diagram": [
+            "graph TB",
+            "  EventBus[Upload Event Bus]",
+            "  Pre[Preprocessor]",
+            "  Scheduler[DAG Scheduler]",
+            "  ResourceMgr[Resource Manager]",
+            "  Workers[Task Workers]",
+            "  RenditionStore[(Rendition Storage)]",
+            "  Metadata[(Metadata DB)]",
+            "  EventBus --> Pre",
+            "  Pre --> Scheduler",
+            "  Scheduler --> ResourceMgr",
+            "  ResourceMgr --> Workers",
+            "  Workers --> RenditionStore",
+            "  Workers -->|ready or failed| Metadata"
+          ],
+          "highlight": [
+            "Scheduler",
+            "ResourceMgr"
+          ]
+        },
+        {
+          "name": "Single monolithic transcode worker",
+          "pros": [
+            "Trivial to start: one process reads original, writes renditions",
+            "No queue or scheduler machinery"
+          ],
+          "cons": [
+            "No chunk parallelism, so large videos are slow",
+            "One bad video can block the worker; no clean priority or retry model",
+            "Hard to add per-creator processing variations"
+          ],
+          "diagram": [
+            "graph TB",
+            "  EventBus[Upload Event Bus]",
+            "  Worker[Single Transcode Worker]",
+            "  OriginalStore[(Original Storage)]",
+            "  RenditionStore[(Rendition Storage)]",
+            "  Metadata[(Metadata DB)]",
+            "  EventBus --> Worker",
+            "  Worker --> OriginalStore",
+            "  Worker --> RenditionStore",
+            "  Worker --> Metadata"
+          ],
+          "highlight": [
+            "Worker"
+          ]
+        }
+      ],
+      "flows": [
+        {
+          "name": "Transcoding",
+          "note": "The scheduler fans out encoding tasks; the video is marked ready only after required renditions and the manifest exist.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant E as Upload Event Bus",
+            "  participant P as Preprocessor",
+            "  participant S as DAG Scheduler",
+            "  participant W as Task Workers",
+            "  participant R as Rendition Storage",
+            "  participant M as Metadata DB",
+            "  E->>P: upload complete",
+            "  P->>P: split by GOP, build DAG",
+            "  P->>S: submit DAG",
+            "  S->>W: dispatch stage tasks",
+            "  W->>R: write renditions + manifest",
+            "  W->>M: update processing progress",
+            "  S->>M: mark video ready"
+          ],
+          "highlight": [
+            "P",
+            "S"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Parallelism and correctness",
+          "points": [
+            "Chunk-level (GOP) parallelism speeds large videos, but packaging must assemble a coherent manifest.",
+            "Message queues between stages let encoding run without waiting on the download stage.",
+            "Temp storage holds GOPs and intermediates so a failed encode can retry from persisted data, not from scratch."
+          ]
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "Three of five rendition encodes succeed; two fail after retries.",
+          "expectedBehavior": "The video is not marked ready with a broken ladder; it lands in a clear failed/partial state.",
+          "mitigation": "The scheduler marks ready only when all required renditions exist; otherwise route the job to the dead-letter queue and set a failed status."
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Encoding is CPU/GPU expensive and can backlog.",
+          "mitigation": "Autoscale workers, prioritize via the resource manager, and consider on-demand encoding for the long tail."
+        },
+        {
+          "issue": "Retries can publish partial renditions as ready.",
+          "mitigation": "Gate readiness on all required renditions; make rendition writes idempotent."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Describes a DAG with a scheduler and resource manager, not one giant worker.",
+          "Gates readiness on a complete rendition set and uses queues for decoupling."
+        ],
+        "weak": [
+          "Transcodes synchronously in the upload request.",
+          "Marks a video ready before all renditions exist."
+        ]
+      },
+      "talkingPoints": [
+        "Mention container vs codec (mp4/mov vs H.264/VP9/HEVC) if time allows.",
+        "Thumbnails, audio extraction, and manifest packaging are tasks in the same DAG."
+      ]
+    },
+    {
+      "id": "transcode-scheduler-and-resource-manager",
+      "parent": "transcoding-pipeline",
+      "title": "4a. Inside the DAG Scheduler and Resource Manager",
+      "description": "A focused look at one aspect of the previous step. The pipeline architecture is unchanged; this zooms into how the DAG is staged and how tasks are matched to workers. The DAG scheduler splits the per-video graph into stages and emits ready tasks; the resource manager holds a task queue, a worker queue, and a running queue, and its task scheduler binds the highest-priority task to the best available worker.",
+      "decisionPrompt": "Inside the same pipeline, how are DAG tasks ordered into stages and assigned to a finite pool of expensive encoding workers?",
+      "whyNow": [
+        "Step 4 established the pipeline boxes; this is the internal scheduling that makes encoding parallel, prioritized, and retryable.",
+        "Worker assignment is where popular-creator prioritization and worker-failure recovery actually live."
+      ],
+      "recap": {
+        "before": "The pipeline is a black box: events go in, renditions come out.",
+        "after": "The DAG is staged explicitly and tasks are bound to workers through three queues with a clear priority and tracking model.",
+        "newRisk": "The resource manager's queues become coordination state that must itself be replicated and recoverable."
+      },
+      "concepts": [
+        {
+          "term": "DAG stages",
+          "definition": "Tasks grouped so dependencies run in order while independent tasks run in parallel.",
+          "whyItMatters": "It maximizes parallelism without violating ordering (you cannot package before encoding).",
+          "example": "Stage 1 splits into video/audio/metadata; stage 2 fans out encode + thumbnail in parallel; a final stage assembles."
+        },
+        {
+          "term": "Three scheduler queues",
+          "definition": "A task queue (work to do, prioritized), a worker queue (worker utilization), and a running queue (in-flight task/worker bindings).",
+          "whyItMatters": "Separating them lets the scheduler pick the best task and the best worker independently and track progress.",
+          "example": "Task scheduler pops the top task, picks the least-loaded worker, records the binding in the running queue, removes it on completion."
+        },
+        {
+          "term": "Priority and preemption",
+          "definition": "Higher-priority videos (e.g. popular creators) are scheduled ahead of the backlog.",
+          "whyItMatters": "It lets the platform meet processing SLAs for content that matters most.",
+          "example": "A trending creator's upload jumps the task queue ahead of bulk re-encodes."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Pre[Preprocessor\\nemits staged DAG]",
+        "  Scheduler[DAG Scheduler\\nsplits DAG into stages]",
+        "  TaskQ[[Task Queue\\nprioritized work]]",
+        "  WorkerQ[[Worker Queue\\nworker utilization]]",
+        "  RunningQ[[Running Queue\\nin-flight bindings]]",
+        "  TaskSched[Task Scheduler\\nbest task to best worker]",
+        "  Workers[Task Workers\\nencode / thumbnail / merge]",
+        "  Pre --> Scheduler",
+        "  Scheduler --> TaskQ",
+        "  TaskSched --> TaskQ",
+        "  TaskSched --> WorkerQ",
+        "  TaskSched --> RunningQ",
+        "  TaskSched -->|run task| Workers",
+        "  Workers -->|done| RunningQ"
+      ],
+      "highlight": [
+        "TaskQ",
+        "WorkerQ",
+        "RunningQ",
+        "TaskSched"
+      ],
+      "options": [
+        {
+          "name": "Three-queue resource manager (default)",
+          "pros": [
+            "Decouples task selection from worker selection",
+            "Running queue makes in-flight work observable and recoverable",
+            "Priority queue supports SLA-driven scheduling for hot creators"
+          ],
+          "cons": [
+            "More coordination state to operate and replicate",
+            "Scheduler itself must be highly available"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Scheduler[DAG Scheduler]",
+            "  TaskQ[[Task Queue]]",
+            "  WorkerQ[[Worker Queue]]",
+            "  RunningQ[[Running Queue]]",
+            "  TaskSched[Task Scheduler]",
+            "  Workers[Task Workers]",
+            "  Scheduler --> TaskQ",
+            "  TaskSched --> TaskQ",
+            "  TaskSched --> WorkerQ",
+            "  TaskSched --> RunningQ",
+            "  TaskSched -->|run task| Workers"
+          ],
+          "highlight": [
+            "TaskSched"
+          ]
+        },
+        {
+          "name": "Simple FIFO queue, any free worker",
+          "pros": [
+            "Minimal moving parts; one queue",
+            "Easy to reason about for uniform workloads"
+          ],
+          "cons": [
+            "No prioritization, so SLAs for hot creators are impossible",
+            "No utilization awareness, so workers can be unevenly loaded",
+            "Harder to track and recover in-flight tasks on worker failure"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Scheduler[DAG Scheduler]",
+            "  Queue[[FIFO Task Queue]]",
+            "  Workers[Task Workers\\ngrab next task]",
+            "  Scheduler --> Queue",
+            "  Queue --> Workers"
+          ],
+          "highlight": [
+            "Queue"
+          ]
+        }
+      ],
+      "flows": [
+        {
+          "name": "Task scheduling cycle",
+          "note": "The task scheduler matches the top-priority task to the best worker and tracks it until done.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant S as DAG Scheduler",
+            "  participant TQ as Task Queue",
+            "  participant TS as Task Scheduler",
+            "  participant WQ as Worker Queue",
+            "  participant RQ as Running Queue",
+            "  participant W as Task Worker",
+            "  S->>TQ: enqueue stage tasks",
+            "  TS->>TQ: pop highest-priority task",
+            "  TS->>WQ: pick least-loaded worker",
+            "  TS->>RQ: record task-worker binding",
+            "  TS->>W: run task",
+            "  W-->>RQ: task complete",
+            "  RQ->>RQ: remove binding"
+          ],
+          "highlight": [
+            "TS",
+            "RQ"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Why three queues, not one",
+          "points": [
+            "The task queue orders work by priority; the worker queue tracks who can take it; the running queue tracks what is in flight.",
+            "On worker failure, the running-queue binding tells the scheduler exactly which task to reschedule.",
+            "Temp storage from step 4 lets a rescheduled encode resume from persisted GOPs instead of restarting."
+          ]
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A worker dies mid-encode while holding a task.",
+          "expectedBehavior": "The task is detected as orphaned and rescheduled on a healthy worker, not silently lost.",
+          "mitigation": "The running queue holds the binding; a heartbeat timeout returns the task to the task queue for reassignment."
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "A queue or scheduler outage stalls all processing.",
+          "mitigation": "Replicate the resource-manager queues and run the scheduler with failover."
+        },
+        {
+          "issue": "Long encodes hold workers and starve the queue.",
+          "mitigation": "Chunk-level tasks plus priority scheduling keep workers cycling and let hot jobs jump ahead."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Separates task selection from worker selection and explains the running queue's recovery role.",
+          "Connects priority scheduling to processing SLAs for popular creators."
+        ],
+        "weak": [
+          "Assumes a single FIFO queue is enough at scale.",
+          "Has no story for a worker dying mid-task."
+        ]
+      },
+      "talkingPoints": [
+        "This is internal to step 4: the pipeline boxes do not change, only how tasks are scheduled.",
+        "The running queue is what makes worker failure recoverable rather than a lost job."
+      ]
+    },
+    {
+      "id": "streaming-and-cdn",
+      "title": "5. Stream Ready Videos Through a CDN",
+      "description": "Viewers request playback metadata from the API, then stream segmented media from a CDN edge close to them. Origin (rendition storage) is the durable source; edges cache popular segments. App servers authorize and return manifests but never serve video bytes.",
+      "decisionPrompt": "How should viewers retrieve video bytes with low startup latency worldwide, without overloading origin?",
+      "whyNow": [
+        "Renditions and manifests now exist, so the read path can finally serve playable bytes.",
+        "At ~7.5 PB/day egress, only a CDN with high cache hit rates makes serving affordable and fast."
+      ],
+      "recap": {
+        "before": "Renditions sit in origin storage with no global, low-latency delivery.",
+        "after": "CDN edges serve segments close to viewers; origin is hit only on cache miss.",
+        "newRisk": "Long-tail cache misses and viral spikes can hammer regional origin bandwidth."
+      },
+      "concepts": [
+        {
+          "term": "CDN edge",
+          "definition": "A cache location close to users that serves media over HTTP.",
+          "whyItMatters": "It lowers startup latency and offloads origin bandwidth.",
+          "example": "A viewer in Berlin gets segments from a Frankfurt edge, not the US origin."
+        },
+        {
+          "term": "Origin storage",
+          "definition": "The durable rendition source consulted on CDN cache miss.",
+          "whyItMatters": "It keeps long-tail content available without caching everything everywhere.",
+          "example": "A rarely watched video is fetched from origin once, then cached at the edge."
+        },
+        {
+          "term": "Segmented streaming",
+          "definition": "Video split into small HTTP-fetched chunks rather than one file.",
+          "whyItMatters": "It enables fast start, seeking, buffering, and quality switching.",
+          "example": "The player fetches 4-second segments and starts after the first one downloads."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Viewer[Viewer Client\\nlatency-sensitive read]",
+        "  API[API Gateway\\nauth, routing]",
+        "  PlaybackAPI[Playback API\\nauthorizes, returns manifest]",
+        "  Metadata[(Metadata DB\\nverify ready + visibility)]",
+        "  CDN[CDN Edge\\ncaches popular segments]",
+        "  Origin[(Rendition Origin Storage\\ndurable source)]",
+        "  Viewer <-->|API calls| API",
+        "  API --> PlaybackAPI",
+        "  PlaybackAPI --> Metadata",
+        "  PlaybackAPI -->|manifest URL| API",
+        "  Viewer -->|media segments, bypasses API| CDN",
+        "  CDN -->|cache miss| Origin"
+      ],
+      "highlight": [
+        "CDN",
+        "Origin"
+      ],
+      "options": [
+        {
+          "name": "CDN with origin fallback (default)",
+          "pros": [
+            "Most reads served from edge memory, so startup is fast and cheap",
+            "Origin bandwidth scales with the miss rate, not total traffic",
+            "Standard, well-understood operational model"
+          ],
+          "cons": [
+            "Cold long-tail content pays a cache-miss latency penalty",
+            "CDN egress is the dominant cost line (~$150K/day)"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Viewer[Viewer Client]",
+            "  CDN[CDN Edge]",
+            "  Origin[(Rendition Origin Storage)]",
+            "  Viewer --> CDN",
+            "  CDN -->|cache miss| Origin"
+          ],
+          "highlight": [
+            "CDN"
+          ]
+        },
+        {
+          "name": "Serve directly from origin (no CDN)",
+          "pros": [
+            "Simplest possible delivery path",
+            "No cache-consistency or purge concerns"
+          ],
+          "cons": [
+            "Every viewer hits origin: latency and bandwidth explode",
+            "No geographic locality for international users",
+            "Origin becomes the global bottleneck"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Viewer[Viewer Client]",
+            "  Origin[(Rendition Origin Storage)]",
+            "  Viewer -->|every segment| Origin"
+          ],
+          "highlight": [
+            "Origin"
+          ]
+        }
+      ],
+      "flows": [
+        {
+          "name": "Playback start",
+          "note": "The client gets a manifest from the API, then streams media from the CDN.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant V as Viewer",
+            "  participant P as Playback API",
+            "  participant M as Metadata DB",
+            "  participant C as CDN Edge",
+            "  participant O as Origin Storage",
+            "  V->>P: request playback",
+            "  P->>M: verify video ready",
+            "  P-->>V: manifest URL",
+            "  V->>C: request first segment",
+            "  C->>O: fetch on cache miss",
+            "  O-->>C: segment",
+            "  C-->>V: segment"
+          ],
+          "highlight": [
+            "C"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Keep bytes off the API",
+          "points": [
+            "APIs authorize and return manifests; the CDN serves the actual bytes.",
+            "Popular content gets cheaper and faster as the CDN hit rate rises.",
+            "Regional origin bandwidth is the pressure point during viral spikes."
+          ]
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A video goes viral in one region and the local edge cold-misses heavily.",
+          "expectedBehavior": "Viewers still play, and origin is not overwhelmed.",
+          "mitigation": "Edge request coalescing / cache-fill, tiered caching, and regional origin replicas absorb the spike."
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Cache-miss latency for long-tail videos.",
+          "mitigation": "Tiered caching and pre-warming for predictably popular uploads."
+        },
+        {
+          "issue": "Regional origin bandwidth during spikes.",
+          "mitigation": "Coalesce origin fetches and replicate origin per region."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Serves bytes from CDN and keeps the API out of the media path.",
+          "Reasons about hit rate as both a latency and a cost lever."
+        ],
+        "weak": [
+          "Streams video through the API gateway.",
+          "Assumes infinite origin bandwidth."
+        ]
+      },
+      "talkingPoints": [
+        "Popular content becomes cheaper and faster as CDN hit rate improves.",
+        "Manifest first, then segments; the API never proxies bytes."
+      ]
+    },
+    {
+      "id": "adaptive-quality-and-playback-manifest",
+      "title": "6. Support Adaptive Quality With Manifests",
+      "description": "The playback manifest lists the rendition ladder and segment URLs. The server prepares the ladder; the client picks a starting quality and switches in real time based on bandwidth, buffer health, and device capability, all without restarting the video.",
+      "decisionPrompt": "How can the player change quality mid-playback without rebuffering or restarting?",
+      "whyNow": [
+        "Segmented CDN delivery is in place, which is the mechanism adaptive bitrate relies on.",
+        "The manifest is the contract between the renditions produced in step 4 and the player."
+      ],
+      "recap": {
+        "before": "Segments stream from CDN, but the player is stuck at one fixed quality.",
+        "after": "A manifest exposes a rendition ladder the player switches among per segment.",
+        "newRisk": "Too many renditions inflate storage and encode cost; too few hurt quality on varied networks."
+      },
+      "concepts": [
+        {
+          "term": "Playback manifest",
+          "definition": "A file describing available renditions and their segment URLs (e.g. HLS m3u8, DASH mpd).",
+          "whyItMatters": "It is the index the player reads to stream and switch quality.",
+          "example": "master.m3u8 lists 240p/480p/720p/1080p variant playlists."
+        },
+        {
+          "term": "Adaptive bitrate (ABR)",
+          "definition": "Client-side switching among renditions as conditions change.",
+          "whyItMatters": "It keeps playback smooth instead of forcing one fixed quality.",
+          "example": "Bandwidth drops, so the next segment is fetched at 480p instead of 1080p."
+        },
+        {
+          "term": "Buffer health",
+          "definition": "How much playable media is already downloaded ahead of the playhead.",
+          "whyItMatters": "It is the main signal ABR uses to avoid rebuffering.",
+          "example": "A shrinking buffer makes the player step down a rung in the ladder."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Player[Video Player\\nABR logic]",
+        "  Manifest[Playback Manifest\\nrendition ladder]",
+        "  R240[240p Rendition\\nlow bitrate, weak networks]",
+        "  R720[720p Rendition\\nmid bitrate, default]",
+        "  R1080[1080p Rendition\\nhigh bitrate, fast networks]",
+        "  CDN[CDN Edge\\nserves the chosen rung]",
+        "  Player --> Manifest",
+        "  Manifest --> R240",
+        "  Manifest --> R720",
+        "  Manifest --> R1080",
+        "  Player -->|selected segments| CDN",
+        "  CDN --> R240",
+        "  CDN --> R720",
+        "  CDN --> R1080"
+      ],
+      "highlight": [
+        "Manifest",
+        "R240",
+        "R720",
+        "R1080"
+      ],
+      "options": [
+        {
+          "name": "Client-driven ABR over a manifest (default)",
+          "pros": [
+            "Player adapts instantly to local network and buffer state",
+            "Server stays simple: it only prepares the ladder",
+            "Works with standard HLS/DASH players"
+          ],
+          "cons": [
+            "Quality depends on client ABR implementation",
+            "Requires producing and storing a full rendition ladder"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Player[Video Player]",
+            "  Manifest[Playback Manifest]",
+            "  CDN[CDN Edge]",
+            "  Player --> Manifest",
+            "  Player -->|chosen rung| CDN"
+          ],
+          "highlight": [
+            "Manifest"
+          ]
+        },
+        {
+          "name": "Server-selected fixed quality",
+          "pros": [
+            "Simple client; server picks based on device/profile",
+            "Fewer renditions if only a couple are offered"
+          ],
+          "cons": [
+            "Cannot react to mid-stream bandwidth changes",
+            "Rebuffers or over-delivers when the network shifts"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Player[Video Player]",
+            "  Server[Quality Selector]",
+            "  CDN[CDN Edge]",
+            "  Player --> Server",
+            "  Server -->|one rendition| CDN"
+          ],
+          "highlight": [
+            "Server"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Designing the ladder",
+          "points": [
+            "The server prepares the rendition ladder; the client adapts in real time.",
+            "Ladder width is a cost/quality tradeoff tuned to device and network mix.",
+            "HLS and DASH are the common manifest formats; mention them as examples without overcommitting."
+          ]
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A viewer on mobile drops from wifi to a weak cellular signal mid-video.",
+          "expectedBehavior": "Playback continues at lower quality instead of stalling.",
+          "mitigation": "ABR steps down the ladder as buffer health falls, then recovers when bandwidth returns."
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Too many renditions inflate storage and encode cost.",
+          "mitigation": "Tune the ladder; encode rarely watched rungs on demand."
+        },
+        {
+          "issue": "Too few renditions hurt quality across varied networks.",
+          "mitigation": "Keep enough rungs to cover common device/bandwidth tiers."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Puts ABR logic on the client and the ladder on the server.",
+          "Names buffer health and bandwidth as the switching signals."
+        ],
+        "weak": [
+          "Re-requests a new stream from scratch to change quality.",
+          "Offers a single fixed resolution."
+        ]
+      },
+      "talkingPoints": [
+        "Server prepares the ladder; the client adapts per segment.",
+        "HLS or DASH as examples, not a hard commitment."
+      ]
+    },
+    {
+      "id": "security-cost-and-takedown",
+      "title": "7. Add Security, Cost Controls, and Takedown Hooks",
+      "description": "Encryption protects uploads, storage, and playback. Signed playback URLs limit link sharing. Because video is a bandwidth business, cost controls exploit the long-tail access pattern: cache only hot content, encode the long tail on demand, keep regional content regional, and consider ISP-partnered CDN. Takedown hooks purge content across CDN and origin.",
+      "decisionPrompt": "How do we protect media and enforce takedowns while keeping storage and CDN costs manageable?",
+      "whyNow": [
+        "Now that delivery works, the ~$150K/day CDN bill makes cost a first-class design concern, not an afterthought.",
+        "Encryption was a stated requirement and signed URLs depend on the playback path built in step 5."
+      ],
+      "recap": {
+        "before": "Media streams globally but is unprotected and uniformly (expensively) cached.",
+        "after": "Encryption, signed URLs, popularity-based caching, lifecycle policies, and takedown hooks are in place.",
+        "newRisk": "Signed-URL TTLs and purge propagation must be tuned: too strict breaks playback, too loose weakens control."
+      },
+      "concepts": [
+        {
+          "term": "Signed playback URL",
+          "definition": "A short-lived URL that authorizes access to a manifest/segments.",
+          "whyItMatters": "It limits unauthorized sharing of direct media links.",
+          "example": "A 5-minute signed master.m3u8 URL; expired links must be re-issued by the API."
+        },
+        {
+          "term": "Encryption (transit + rest + DRM)",
+          "definition": "TLS for requests, storage-layer encryption for blobs, and optionally DRM/AES for the media itself.",
+          "whyItMatters": "It protects bytes in motion, at rest, and against copying.",
+          "example": "FairPlay/Widevine/PlayReady or AES with an authorization policy decrypts only for authorized viewers."
+        },
+        {
+          "term": "Long-tail cost optimization",
+          "definition": "Most views hit a few videos; many videos get almost none.",
+          "whyItMatters": "It justifies caching only hot content and serving the tail from cheaper origin.",
+          "example": "Serve top videos from CDN; encode and serve cold videos on demand from origin."
+        },
+        {
+          "term": "Lifecycle policy",
+          "definition": "Rules to tier, move, or delete objects over time.",
+          "whyItMatters": "It controls cost for originals, temp files, and unpopular renditions.",
+          "example": "Move originals to cold storage after processing; expire temp GOPs immediately."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Auth[Auth Service\\nverifies viewer]",
+        "  PlaybackAPI[Playback API\\nfast-denies blocked videos]",
+        "  SignedURL[Signed URL Issuer\\nshort-lived tokens]",
+        "  CDN[CDN\\nTLS in transit]",
+        "  Origin[(Encrypted Origin Storage\\nencryption at rest)]",
+        "  Lifecycle[Lifecycle Manager\\ntier / expire objects]",
+        "  Takedown[Takedown Service\\npurge CDN + origin]",
+        "  Auth --> PlaybackAPI",
+        "  PlaybackAPI --> SignedURL",
+        "  SignedURL --> CDN",
+        "  CDN --> Origin",
+        "  Lifecycle --> Origin",
+        "  Takedown --> CDN",
+        "  Takedown --> Origin"
+      ],
+      "highlight": [
+        "SignedURL",
+        "Lifecycle",
+        "Takedown"
+      ],
+      "options": [
+        {
+          "name": "Popularity-based caching + signed URLs (default)",
+          "pros": [
+            "Cuts CDN spend by caching only what is actually watched",
+            "Signed URLs and encryption protect content without blocking valid playback",
+            "Lifecycle policies keep storage cost bounded"
+          ],
+          "cons": [
+            "Long-tail videos pay first-view latency from origin/on-demand encode",
+            "Purge and URL TTLs need careful tuning"
+          ],
+          "diagram": [
+            "graph TB",
+            "  User[Viewer]",
+            "  CDN[CDN\\nhot videos]",
+            "  VideoServers[(Origin / Video Servers\\nlong tail)]",
+            "  User -->|popular| CDN",
+            "  User -->|long tail| VideoServers"
+          ],
+          "highlight": [
+            "CDN",
+            "VideoServers"
+          ]
+        },
+        {
+          "name": "Cache everything at the edge",
+          "pros": [
+            "Uniformly low latency for every video",
+            "Simple policy: everything is hot"
+          ],
+          "cons": [
+            "Caches huge volumes of never-watched content",
+            "CDN storage and fill cost balloon against the long-tail reality"
+          ],
+          "diagram": [
+            "graph TB",
+            "  User[Viewer]",
+            "  CDN[CDN\\nall videos cached]",
+            "  Origin[(Origin Storage)]",
+            "  User --> CDN",
+            "  CDN --> Origin"
+          ],
+          "highlight": [
+            "CDN"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Cost levers from the long tail",
+          "points": [
+            "Serve only popular videos from CDN; serve others from high-capacity origin servers.",
+            "Encode the long tail on demand and skip rarely needed renditions.",
+            "Keep region-specific content regional; large players may build an ISP-partnered CDN."
+          ]
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A video must be taken down for a copyright claim, but edges have it cached.",
+          "expectedBehavior": "The video stops playing everywhere within a bounded window.",
+          "mitigation": "Takedown sets metadata to blocked (fast deny at the API) and issues CDN purge + origin delete; treat purge as eventually consistent."
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Signed-URL TTL tuning: too short breaks playback, too long weakens control.",
+          "mitigation": "Issue per-session URLs with a TTL that covers the watch session and refresh on renewal."
+        },
+        {
+          "issue": "Purge propagation is eventually consistent.",
+          "mitigation": "Deny at the API immediately via metadata state while CDN purge propagates."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Ties cost directly to the long-tail access pattern.",
+          "Makes takedown fast at the metadata layer, not reliant on purge timing."
+        ],
+        "weak": [
+          "Caches all content uniformly and ignores the bandwidth bill.",
+          "Treats encryption or takedown as an afterthought."
+        ]
+      },
+      "talkingPoints": [
+        "Video platforms are bandwidth businesses; cost control is part of the design.",
+        "Cache hot content; serve the long tail from origin and encode on demand."
+      ]
+    },
+    {
+      "id": "failure-handling-and-operations",
+      "title": "8. Close With Failure Handling and Operations",
+      "description": "Uploads need resumability, transcoding needs bounded retries and a dead-letter queue, playback needs graceful degradation, and operators need metrics on every stage. Distinguish recoverable errors (retry) from non-recoverable ones (fail fast with a clear status), and make sure a failed video has a definite state instead of an endlessly spinning upload.",
+      "decisionPrompt": "What failures are expected at each stage, and how does the platform recover without leaving users or operators confused?",
+      "whyNow": [
+        "All happy paths exist, so the design is only credible once each stage's failure behavior is defined.",
+        "Operations and metrics are what turn the architecture into something you can actually run and debug."
+      ],
+      "recap": {
+        "before": "The full pipeline works on the happy path but has no defined failure behavior.",
+        "after": "Each stage has retries, dead-letter handling, graceful degradation, and metrics with alerts.",
+        "newRisk": "Retry storms after an outage can amplify load; alerting and backoff must contain them."
+      },
+      "concepts": [
+        {
+          "term": "Recoverable vs non-recoverable error",
+          "definition": "Transient failures (e.g. a segment encode) are retried; permanent ones (e.g. malformed video) fail fast.",
+          "whyItMatters": "It decides whether to retry or to surface a terminal status.",
+          "example": "A flaky worker is retried; a corrupt container is rejected with a clear error code."
+        },
+        {
+          "term": "Dead-letter queue",
+          "definition": "A queue for jobs that exceed their retry budget.",
+          "whyItMatters": "It stops one bad video from clogging the pipeline and preserves it for inspection.",
+          "example": "After 3 failed encode attempts, the job moves to the DLQ and the video is marked failed."
+        },
+        {
+          "term": "Graceful degradation",
+          "definition": "Serving lower quality or slightly stale metadata when ideal dependencies are unavailable.",
+          "whyItMatters": "It preserves playback when parts of the system are unhealthy.",
+          "example": "A metadata cache node dies; reads fall back to a replica with no user-visible break."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Uploads[Upload Sessions\\nresumable]",
+        "  Jobs[Transcode Jobs\\nrecoverable vs not]",
+        "  Retry[Retry Controller\\nbounded attempts]",
+        "  DLQ[[Dead Letter Queue\\npoison jobs, video failed]]",
+        "  Playback[Playback Path\\ngraceful degradation]",
+        "  Metrics[Metrics + Tracing\\nper-stage health]",
+        "  Alerts[Alerts\\nDLQ depth, rebuffer rate]",
+        "  Uploads --> Metrics",
+        "  Jobs --> Retry",
+        "  Retry -->|exceeded| DLQ",
+        "  Jobs --> Metrics",
+        "  Playback --> Metrics",
+        "  Metrics --> Alerts"
+      ],
+      "highlight": [
+        "Retry",
+        "DLQ",
+        "Metrics"
+      ],
+      "options": [
+        {
+          "name": "Retry with DLQ and clear status (default)",
+          "pros": [
+            "Transient failures self-heal via bounded retries",
+            "Permanent failures are isolated in the DLQ with a terminal video status",
+            "Operators get metrics and alerts per stage"
+          ],
+          "cons": [
+            "Retry logic and DLQ inspection add operational surface",
+            "Backoff tuning is needed to avoid retry storms"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Jobs[Transcode Jobs]",
+            "  Retry[Retry Controller]",
+            "  DLQ[[Dead Letter Queue]]",
+            "  Status[Video Status: failed]",
+            "  Jobs --> Retry",
+            "  Retry -->|exceeded| DLQ",
+            "  DLQ --> Status"
+          ],
+          "highlight": [
+            "DLQ"
+          ]
+        },
+        {
+          "name": "Retry indefinitely, no DLQ",
+          "pros": [
+            "Simplest to implement",
+            "Eventually succeeds for purely transient issues"
+          ],
+          "cons": [
+            "A permanently bad video retries forever and wastes capacity",
+            "Upload appears to spin with no terminal state for the user",
+            "No place to inspect poison jobs"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Jobs[Transcode Jobs]",
+            "  Loop[Infinite Retry]",
+            "  Jobs --> Loop",
+            "  Loop --> Jobs"
+          ],
+          "highlight": [
+            "Loop"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Per-component error playbook",
+          "points": [
+            "Upload/transcode errors retry; malformed media fails fast with an error code.",
+            "Scheduler reschedules tasks; a downed resource-manager queue fails over to a replica; a dead worker's task moves to a new worker.",
+            "Stateless API servers reroute; metadata cache/DB rely on replication with replica promotion."
+          ]
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A worker fleet crashes and thousands of jobs become eligible for retry at once.",
+          "expectedBehavior": "The system recovers without a thundering retry storm overwhelming the pipeline.",
+          "mitigation": "Exponential backoff with jitter, capped retries, and a DLQ; alert on rising DLQ depth."
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Retry storms after a worker outage.",
+          "mitigation": "Backoff with jitter, bounded attempts, and concurrency caps on retries."
+        },
+        {
+          "issue": "CDN or regional origin incidents.",
+          "mitigation": "Multi-region origin and CDN failover; degrade quality before failing playback."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Separates recoverable from non-recoverable errors and gives the video a terminal state.",
+          "Names concrete metrics: upload success, processing time, startup time, rebuffer rate, CDN hit rate."
+        ],
+        "weak": [
+          "Retries forever with no DLQ or failed state.",
+          "Has no observability story."
+        ]
+      },
+      "talkingPoints": [
+        "A failed transcode must produce a clear video status, not an endlessly spinning upload.",
+        "Key metrics: upload success rate, processing time, playback startup time, rebuffer rate, CDN hit rate."
+      ]
+    }
+  ],
+  "satisfies": {
+    "functional": [
+      {
+        "requirement": "Upload videos up to about 1 GB.",
+        "how": "Upload sessions create durable identity early, then clients upload bytes directly to object storage via pre-signed multipart URLs.",
+        "steps": [
+          "video-upload-and-metadata",
+          "direct-object-upload"
+        ]
+      },
+      {
+        "requirement": "Transcode uploads into multiple resolutions and formats.",
+        "how": "An object-created event drives an asynchronous DAG pipeline (preprocessor, scheduler, resource manager, workers) that produces renditions, thumbnails, and manifests.",
+        "steps": [
+          "transcoding-pipeline"
+        ]
+      },
+      {
+        "requirement": "Watch videos globally through CDN.",
+        "how": "Playback APIs authorize ready videos and return manifests; CDN edges serve segmented media from origin on cache miss.",
+        "steps": [
+          "streaming-and-cdn"
+        ]
+      },
+      {
+        "requirement": "Allow quality changes and adaptive streaming.",
+        "how": "A manifest exposes the rendition ladder; the client switches quality per segment based on bandwidth and buffer health.",
+        "steps": [
+          "adaptive-quality-and-playback-manifest"
+        ]
+      },
+      {
+        "requirement": "Store and retrieve video metadata.",
+        "how": "A shared, cached, replicated metadata store holds video identity and lifecycle state for both paths.",
+        "steps": [
+          "scope-and-client-entry-points",
+          "video-upload-and-metadata"
+        ]
+      }
+    ],
+    "nonFunctional": [
+      {
+        "requirement": "Fast and reliable uploads.",
+        "how": "Pre-signed multipart upload plus resumable sessions let clients retry chunks without tying up app servers.",
+        "steps": [
+          "video-upload-and-metadata",
+          "direct-object-upload"
+        ]
+      },
+      {
+        "requirement": "Smooth playback with low startup delay.",
+        "how": "Adaptive-bitrate manifests over segmented CDN delivery keep startup and rebuffering low across devices.",
+        "steps": [
+          "streaming-and-cdn",
+          "adaptive-quality-and-playback-manifest"
+        ]
+      },
+      {
+        "requirement": "Cost-aware storage and CDN strategy.",
+        "how": "Popularity-based caching, on-demand long-tail encoding, and lifecycle policies bound the ~$150K/day CDN and storage spend.",
+        "steps": [
+          "security-cost-and-takedown"
+        ]
+      },
+      {
+        "requirement": "Encryption across upload, storage, and playback.",
+        "how": "TLS in transit, storage encryption at rest, and signed playback URLs (optionally DRM/AES) protect media end to end.",
+        "steps": [
+          "security-cost-and-takedown"
+        ]
+      },
+      {
+        "requirement": "High availability and reliability.",
+        "how": "Resumable uploads, bounded transcode retries with a dead-letter queue, graceful playback degradation, and per-stage metrics make failures recoverable.",
+        "steps": [
+          "failure-handling-and-operations"
+        ]
+      }
+    ]
+  },
+  "finalDesign": {
+    "title": "Final Design",
+    "description": "The final design separates upload, processing, metadata, and playback. Creators upload directly to object storage; an object-created event drives an asynchronous transcoding DAG; workers publish renditions and manifests; metadata tracks readiness; viewers get signed manifests while CDN edges serve segments from encrypted origin storage. Lifecycle and takedown manage cost and compliance; metrics and a dead-letter queue make the pipeline operable.",
+    "decisionPrompt": "Walk a video from upload-session creation to first viewer playback, naming which work is synchronous and which is asynchronous.",
+    "diagram": [
+      "graph TB",
+      "  Creator[Creator Client]",
+      "  Viewer[Viewer Client]",
+      "  API[API Gateway]",
+      "  UploadAPI[Upload API]",
+      "  Metadata[(Metadata DB)]",
+      "  Session[(Upload Session Store)]",
+      "  Original[(Original Video Storage)]",
+      "  UploadEvents[[Upload Event Bus]]",
+      "  Pre[Preprocessor]",
+      "  Scheduler[DAG Scheduler]",
+      "  ResourceMgr[Resource Manager]",
+      "  Workers[Transcode Workers]",
+      "  Temp[(Temp Segment Storage)]",
+      "  Renditions[(Rendition Origin Storage)]",
+      "  Manifest[Manifest Packager]",
+      "  PlaybackAPI[Playback API]",
+      "  Auth[Signed URL Service]",
+      "  CDN[CDN Edge]",
+      "  Lifecycle[Lifecycle Manager]",
+      "  Takedown[Takedown / Purge]",
+      "  DLQ[(Transcode DLQ)]",
+      "  Metrics[Metrics + Alerts]",
+      "  Creator <-->|API calls| API",
+      "  API --> UploadAPI",
+      "  UploadAPI --> Session",
+      "  UploadAPI --> Metadata",
+      "  UploadAPI -->|signed URL| API",
+      "  Creator -->|multipart upload| Original",
+      "  Original --> UploadEvents",
+      "  UploadEvents --> Pre",
+      "  Pre --> Scheduler",
+      "  Pre --> Temp",
+      "  Scheduler --> ResourceMgr",
+      "  ResourceMgr --> Workers",
+      "  Workers --> Original",
+      "  Workers --> Temp",
+      "  Workers --> Renditions",
+      "  Workers --> Manifest",
+      "  Manifest --> Metadata",
+      "  Workers -.->|failed jobs| DLQ",
+      "  Viewer <-->|API calls| API",
+      "  API --> PlaybackAPI",
+      "  PlaybackAPI --> Metadata",
+      "  PlaybackAPI --> Auth",
+      "  Auth -->|manifest URL| API",
+      "  Viewer --> CDN",
+      "  CDN --> Renditions",
+      "  Lifecycle --> Original",
+      "  Lifecycle --> Renditions",
+      "  Takedown --> CDN",
+      "  Takedown --> Metadata",
+      "  UploadAPI --> Metrics",
+      "  Workers --> Metrics",
+      "  PlaybackAPI --> Metrics",
+      "  CDN --> Metrics"
+    ],
+    "highlight": [],
+    "options": [
+      {
+        "name": "Self-managed pipeline (default)",
+        "pros": [
+          "Full control over the transcoding DAG, scheduling, and cost levers",
+          "Clear separation of upload, processing, metadata, and playback",
+          "Operability via DLQ, lifecycle, and per-stage metrics"
+        ],
+        "cons": [
+          "Significant components to build and run",
+          "Cost and reliability now depend on your own operations"
+        ],
+        "diagram": [
+          "graph TB",
+          "  Creator[Creator Client]",
+          "  Viewer[Viewer Client]",
+          "  API[API Gateway]",
+          "  UploadAPI[Upload API]",
+          "  Metadata[(Metadata DB)]",
+          "  Original[(Original Video Storage)]",
+          "  UploadEvents[[Upload Event Bus]]",
+          "  Pre[Preprocessor]",
+          "  Scheduler[DAG Scheduler]",
+          "  ResourceMgr[Resource Manager]",
+          "  Workers[Transcode Workers]",
+          "  Renditions[(Rendition Origin Storage)]",
+          "  PlaybackAPI[Playback API]",
+          "  Auth[Signed URL Service]",
+          "  CDN[CDN Edge]",
+          "  DLQ[(Transcode DLQ)]",
+          "  Metrics[Metrics + Alerts]",
+          "  Creator <-->|API calls| API",
+          "  API --> UploadAPI",
+          "  UploadAPI --> Metadata",
+          "  UploadAPI -->|signed URL| API",
+          "  Creator -->|multipart upload| Original",
+          "  Original --> UploadEvents",
+          "  UploadEvents --> Pre",
+          "  Pre --> Scheduler",
+          "  Scheduler --> ResourceMgr",
+          "  ResourceMgr --> Workers",
+          "  Workers --> Renditions",
+          "  Workers --> Metadata",
+          "  Workers -.->|failed jobs| DLQ",
+          "  Viewer <-->|API calls| API",
+          "  API --> PlaybackAPI",
+          "  PlaybackAPI --> Metadata",
+          "  PlaybackAPI --> Auth",
+          "  Auth -->|manifest URL| API",
+          "  Viewer --> CDN",
+          "  CDN --> Renditions",
+          "  Workers --> Metrics",
+          "  PlaybackAPI --> Metrics",
+          "  CDN --> Metrics"
+        ],
+        "highlight": []
+      },
+      {
+        "name": "Managed cloud media services",
+        "pros": [
+          "Managed upload, transcoding, storage, and CDN cut operational burden",
+          "Faster to ship; provider handles scaling and reliability",
+          "Same architectural boundaries as the self-managed design"
+        ],
+        "cons": [
+          "Less control over cost levers and pipeline behavior",
+          "Provider lock-in and per-feature pricing"
+        ],
+        "diagram": [
+          "graph TB",
+          "  Creator[Creator]",
+          "  ManagedUpload[Managed Upload Service]",
+          "  ObjectStore[(Cloud Object Storage)]",
+          "  ManagedTranscode[Managed Transcoding Service]",
+          "  Metadata[(Metadata DB)]",
+          "  ManagedCDN[Managed CDN]",
+          "  Viewer[Viewer]",
+          "  Creator --> ManagedUpload",
+          "  ManagedUpload --> ObjectStore",
+          "  ObjectStore --> ManagedTranscode",
+          "  ManagedTranscode --> ObjectStore",
+          "  ManagedTranscode --> Metadata",
+          "  Viewer --> ManagedCDN",
+          "  ManagedCDN --> ObjectStore"
+        ],
+        "highlight": [
+          "ManagedUpload",
+          "ManagedTranscode",
+          "ManagedCDN"
+        ]
+      }
+    ],
+    "flows": [
+      {
+        "name": "Upload and transcode",
+        "note": "The user-facing upload completes before the CPU-heavy processing pipeline finishes.",
+        "diagram": [
+          "sequenceDiagram",
+          "  participant C as Creator",
+          "  participant U as Upload API",
+          "  participant O as Original Storage",
+          "  participant E as Upload Event Bus",
+          "  participant S as Scheduler",
+          "  participant W as Transcode Workers",
+          "  participant R as Rendition Storage",
+          "  participant M as Metadata DB",
+          "  C->>U: create upload session",
+          "  U-->>C: upload URL + video id",
+          "  C->>O: multipart upload bytes",
+          "  C->>U: complete upload + checksum",
+          "  U->>M: mark processing",
+          "  O->>E: object created event",
+          "  E->>S: schedule DAG",
+          "  S->>W: encode profiles",
+          "  W->>R: write renditions + manifests",
+          "  W->>M: mark ready"
+        ],
+        "highlight": []
+      },
+      {
+        "name": "Playback start",
+        "note": "The API authorizes playback and returns a manifest; the CDN serves the actual media segments.",
+        "diagram": [
+          "sequenceDiagram",
+          "  participant V as Viewer",
+          "  participant P as Playback API",
+          "  participant M as Metadata DB",
+          "  participant A as Signed URL Service",
+          "  participant C as CDN Edge",
+          "  participant O as Origin Storage",
+          "  V->>P: request playback",
+          "  P->>M: verify video ready",
+          "  P->>A: issue signed manifest URL",
+          "  P-->>V: manifest URL",
+          "  V->>C: request first media segment",
+          "  C->>O: fetch on cache miss",
+          "  O-->>C: segment",
+          "  C-->>V: segment"
+        ],
+        "highlight": []
+      }
+    ],
+    "deepDives": [
+      {
+        "title": "Keep the path boundaries visible",
+        "points": [
+          "Upload, transcode, and playback paths have different latency and reliability goals; keep them visibly separate.",
+          "App servers issue URLs and update metadata; they never proxy video bytes.",
+          "Define exactly what users see when processing fails."
+        ]
+      }
+    ],
+    "bottlenecks": [
+      {
+        "issue": "Encoding cost and queue delay.",
+        "mitigation": "Autoscale workers, prioritize hot creators, encode the long tail on demand."
+      },
+      {
+        "issue": "CDN cache misses for long-tail content.",
+        "mitigation": "Tiered caching and popularity-based placement."
+      },
+      {
+        "issue": "Bad lifecycle policies can explode storage cost.",
+        "mitigation": "Expire temp data, tier originals, prune unwatched renditions."
+      }
+    ],
+    "talkingPoints": [
+      "App servers issue URLs and update metadata; they do not proxy video bytes.",
+      "Manifests plus segmented media enable quality switching.",
+      "Define what users see when processing fails."
+    ]
+  },
+  "followUps": [
+    "How would you support live streaming, and how does its latency requirement change the pipeline?",
+    "How would you prioritize transcode jobs for popular creators?",
+    "How would you propagate a copyright takedown quickly across CDN edges?",
+    "Which metrics would tell you playback quality is degrading before users complain?",
+    "How would you scale the metadata tier (sharding, replication) as the catalog grows?"
+  ]
+}

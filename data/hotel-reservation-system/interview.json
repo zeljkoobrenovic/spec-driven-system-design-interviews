@@ -1,0 +1,3015 @@
+{
+  "title": "Hotel Reservation System - System Design",
+  "description": "A step-by-step walkthrough of designing a hotel-chain reservation system, covering catalog and rate reads, room-type inventory, idempotent booking, concurrency control, payment state, cancellation, overbooking, cache consistency, sharding, and operational controls.",
+  "requirementsDiagram": [
+    "graph TB",
+    "  Guest[Guest / Mobile App]",
+    "  Browse[View hotel and room details]",
+    "  Confirm[Review booking details]",
+    "  Reserve[Reserve room type]",
+    "  Pay[Pay in full]",
+    "  Cancel[Cancel reservation]",
+    "  Admin[Hotel Staff Admin]",
+    "  Manage[Manage hotels rooms rates inventory]",
+    "  Guest -->|browse| Browse",
+    "  Guest -->|confirm| Confirm",
+    "  Guest -->|book| Reserve",
+    "  Reserve -->|charge| Pay",
+    "  Guest -->|cancel| Cancel",
+    "  Admin -->|internal tools| Manage"
+  ],
+  "requirements": {
+    "functional": [
+      "Show hotel detail pages and room-type detail pages for a hotel chain.",
+      "Let guests reserve one or more rooms of a room type for a date range.",
+      "Charge the guest in full during reservation and track payment/reservation state.",
+      "Let guests view reservation history and cancel reservations.",
+      "Let hotel staff add, remove, and update hotels, rooms, rates, and inventory.",
+      "Support controlled overbooking, assumed to be 10% above physical inventory."
+    ],
+    "nonFunctional": [
+      "Protect against double booking and duplicate reservation submissions.",
+      "Support high concurrency for popular hotels during events and peak seasons.",
+      "Accept moderate booking latency; a few seconds is acceptable for confirmed reservations.",
+      "Keep read paths fast for hotel detail, rate, and availability pages.",
+      "Preserve auditability for payments, cancellations, inventory changes, and admin actions.",
+      "Favor correctness in final booking over perfectly fresh cached availability."
+    ]
+  },
+  "capacityDiagram": [
+    "graph TB",
+    "  Hotels[5,000 hotels]",
+    "  Rooms[1M rooms]",
+    "  Occ[70% occupancy]",
+    "  Stay[3 day average stay]",
+    "  Reservations[~240k reservations/day]",
+    "  TPS[~3 reservation TPS average]",
+    "  Detail[~300 detail QPS]",
+    "  Booking[~30 booking-page QPS]",
+    "  InventoryRows[~73M inventory rows for 2 years]",
+    "  Hotels -->|chain size| Rooms",
+    "  Rooms -->|occupied| Occ",
+    "  Occ -->|divided by stay| Reservations",
+    "  Reservations -->|per second| TPS",
+    "  Detail -->|10 percent continue| Booking",
+    "  Booking -->|10 percent book| TPS",
+    "  Hotels -->|20 room types x 730 days| InventoryRows"
+  ],
+  "capacity": [
+    {
+      "label": "Hotels",
+      "value": "5,000",
+      "note": "Hotel-chain scale, not a global travel marketplace."
+    },
+    {
+      "label": "Rooms",
+      "value": "1,000,000",
+      "note": "Rooms are grouped into room types for booking."
+    },
+    {
+      "label": "Daily reservations",
+      "value": "~240,000",
+      "note": "(1M rooms x 70% occupancy) / 3-day average stay."
+    },
+    {
+      "label": "Reservation TPS",
+      "value": "~3 avg",
+      "note": "Average write load is modest, but hotspots matter during events."
+    },
+    {
+      "label": "Detail-page reads",
+      "value": "~300 QPS",
+      "note": "Rough funnel estimate: detail page -> booking page -> reservation."
+    },
+    {
+      "label": "Inventory rows",
+      "value": "~73M",
+      "note": "5,000 hotels x 20 room types x 730 future dates."
+    }
+  ],
+  "api": [
+    {
+      "method": "GET",
+      "path": "/v1/hotels/{hotelId}",
+      "description": "Return hotel details, amenities, policies, and room-type summaries.",
+      "request": "Path: hotelId",
+      "response": "{ \"hotelId\": \"245\", \"name\": \"San Francisco Marriott Marquis\", \"roomTypes\": [...] }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Client",
+        "  participant G as API Gateway",
+        "  participant H as Hotel Service",
+        "  participant K as Hotel Cache",
+        "  participant DB as Hotel Store",
+        "  C->>G: GET /v1/hotels/245",
+        "  G->>H: route hotel detail",
+        "  H->>K: get hotel:245",
+        "  alt cache hit",
+        "    K-->>H: hotel payload",
+        "  else cache miss",
+        "    H->>DB: SELECT hotel and room types",
+        "    DB-->>H: rows",
+        "    H->>K: cache payload",
+        "  end",
+        "  H-->>C: 200 hotel details"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/hotels/{hotelId}/room-types/{roomTypeId}/availability?startDate=&endDate=&rooms=",
+      "description": "Check price and availability for a room type and date range before the guest reaches payment.",
+      "request": "Query: startDate, endDate, rooms",
+      "response": "{ \"available\": true, \"nightlyRates\": [...], \"total\": 892.14 }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Client",
+        "  participant G as API Gateway",
+        "  participant R as Reservation Service",
+        "  participant I as Inventory Cache",
+        "  participant Rate as Rate Service",
+        "  C->>G: GET availability",
+        "  G->>R: route availability query",
+        "  R->>I: MGET hotel_roomType_date keys",
+        "  I-->>R: available counts",
+        "  R->>Rate: get nightly rates",
+        "  Rate-->>R: date -> price",
+        "  R-->>C: availability + total quote"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/reservation-orders",
+      "description": "Create a reviewable reservation order and idempotency key before final payment submission.",
+      "request": "{ \"hotelId\": \"245\", \"roomTypeId\": \"king\", \"startDate\": \"2026-07-01\", \"endDate\": \"2026-07-04\", \"rooms\": 2 }",
+      "response": "{ \"reservationId\": \"resv_13422445\", \"expiresAt\": \"2026-05-23T12:15:00Z\", \"quote\": {...} }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Client",
+        "  participant R as Reservation Service",
+        "  participant ID as ID Generator",
+        "  participant Rate as Rate Service",
+        "  C->>R: POST /reservation-orders",
+        "  R->>ID: allocate reservationId",
+        "  ID-->>R: resv_13422445",
+        "  R->>Rate: price date range",
+        "  Rate-->>R: quote",
+        "  R-->>C: order + reservationId"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/reservations",
+      "description": "Commit the reservation using the reservationId as the idempotency key.",
+      "request": "{ \"reservationId\": \"resv_13422445\", \"hotelId\": \"245\", \"roomTypeId\": \"king\", \"startDate\": \"2026-07-01\", \"endDate\": \"2026-07-04\", \"rooms\": 2, \"paymentToken\": \"tok_...\" }",
+      "response": "{ \"reservationId\": \"resv_13422445\", \"status\": \"paid\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Client",
+        "  participant R as Reservation Service",
+        "  participant DB as Booking Store",
+        "  participant P as Payment Service",
+        "  C->>R: POST /v1/reservations",
+        "  R->>DB: BEGIN tx 1",
+        "  R->>DB: UPDATE inventory rows if available",
+        "  R->>DB: INSERT reservation resv_13422445 status=pending",
+        "  R->>DB: COMMIT tx 1",
+        "  R->>P: charge paymentToken (idempotent)",
+        "  P-->>R: payment accepted",
+        "  R->>DB: tx 2 set status=paid",
+        "  R-->>C: 200 paid"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/reservations?page=&pageSize=",
+      "description": "List the logged-in guest's reservation history, newest first. Served from a read replica so history reads do not contend with booking writes.",
+      "request": "Query: page, pageSize (guest identity from auth)",
+      "response": "{ \"reservations\": [{ \"reservationId\": \"resv_13422445\", \"hotelId\": \"245\", \"status\": \"paid\", \"startDate\": \"2026-07-01\", \"endDate\": \"2026-07-04\" }], \"nextPage\": 2 }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Client",
+        "  participant G as API Gateway",
+        "  participant R as Reservation Service",
+        "  participant Replica as Booking Read Replica",
+        "  C->>G: GET /v1/reservations",
+        "  G->>R: route history query for guest",
+        "  R->>Replica: SELECT reservations WHERE guest_id ORDER BY start_date DESC",
+        "  Replica-->>R: page of reservations",
+        "  R-->>C: 200 reservation history"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/reservations/{reservationId}",
+      "description": "Return details for one reservation, including payment and cancellation status.",
+      "request": "Path: reservationId (must belong to the authenticated guest)",
+      "response": "{ \"reservationId\": \"resv_13422445\", \"hotelId\": \"245\", \"roomTypeId\": \"king\", \"rooms\": 2, \"status\": \"paid\", \"paymentId\": \"pay_98821\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Client",
+        "  participant G as API Gateway",
+        "  participant R as Reservation Service",
+        "  participant Replica as Booking Read Replica",
+        "  C->>G: GET /v1/reservations/resv_13422445",
+        "  G->>R: route reservation lookup",
+        "  R->>Replica: SELECT reservation by reservationId",
+        "  Replica-->>R: reservation row",
+        "  R->>R: authorize guest owns reservation",
+        "  R-->>C: 200 reservation detail"
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/reservations/{reservationId}",
+      "description": "Cancel a reservation, release inventory, and trigger refund when applicable.",
+      "request": "Path: reservationId",
+      "response": "{ \"reservationId\": \"resv_13422445\", \"status\": \"canceled\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Client",
+        "  participant R as Reservation Service",
+        "  participant DB as Booking Store",
+        "  participant P as Payment Service",
+        "  C->>R: DELETE /v1/reservations/resv_13422445",
+        "  R->>DB: load reservation",
+        "  R->>DB: decrement inventory rows",
+        "  R->>DB: mark canceled",
+        "  R->>P: refund if paid",
+        "  P-->>R: refund accepted",
+        "  R-->>C: 200 canceled"
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/internal/v1/hotels/{hotelId}/room-types/{roomTypeId}/inventory",
+      "description": "Internal admin API to adjust room-type inventory, maintenance holds, and overbooking policy.",
+      "request": "{ \"date\": \"2026-07-01\", \"totalInventory\": 100, \"overbookingPercent\": 10 }",
+      "response": "{ \"updated\": true, \"version\": 42 }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant A as Admin Tool",
+        "  participant M as Hotel Management Service",
+        "  participant R as Reservation Service",
+        "  participant DB as Inventory Store",
+        "  participant Bus as Change Bus",
+        "  A->>M: PUT inventory adjustment",
+        "  M->>R: authorized inventory update",
+        "  R->>DB: write totalInventory / policy",
+        "  DB-->>R: ok",
+        "  R-)Bus: inventory-changed",
+        "  M-->>A: updated"
+      ]
+    }
+  ],
+  "dataModel": [
+    {
+      "name": "hotel",
+      "note": "Static hotel metadata owned by Hotel Service.",
+      "fields": [
+        {
+          "name": "hotel_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "name",
+          "type": "varchar"
+        },
+        {
+          "name": "address",
+          "type": "text"
+        },
+        {
+          "name": "location",
+          "type": "geo"
+        },
+        {
+          "name": "status",
+          "type": "varchar"
+        }
+      ]
+    },
+    {
+      "name": "room_type",
+      "note": "Sellable category of interchangeable rooms at a hotel; guests book this, not a physical room number.",
+      "fields": [
+        {
+          "name": "room_type_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "hotel_id",
+          "type": "bigint FK"
+        },
+        {
+          "name": "name",
+          "type": "varchar"
+        },
+        {
+          "name": "description",
+          "type": "text"
+        },
+        {
+          "name": "max_occupancy",
+          "type": "int"
+        },
+        {
+          "name": "status",
+          "type": "varchar"
+        }
+      ]
+    },
+    {
+      "name": "room",
+      "note": "Physical rooms; assigned at check-in, not at booking time.",
+      "fields": [
+        {
+          "name": "room_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "hotel_id",
+          "type": "bigint FK"
+        },
+        {
+          "name": "room_type_id",
+          "type": "bigint FK"
+        },
+        {
+          "name": "floor",
+          "type": "int"
+        },
+        {
+          "name": "number",
+          "type": "varchar"
+        },
+        {
+          "name": "is_available",
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "name": "room_type_rate",
+      "note": "Nightly price per room type and date.",
+      "fields": [
+        {
+          "name": "hotel_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "room_type_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "date",
+          "type": "date PK"
+        },
+        {
+          "name": "rate_cents",
+          "type": "int"
+        },
+        {
+          "name": "currency",
+          "type": "char3"
+        }
+      ]
+    },
+    {
+      "name": "room_type_inventory",
+      "note": "Authoritative inventory counter per hotel, room type, and date.",
+      "fields": [
+        {
+          "name": "hotel_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "room_type_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "date",
+          "type": "date PK"
+        },
+        {
+          "name": "total_inventory",
+          "type": "int"
+        },
+        {
+          "name": "total_reserved",
+          "type": "int"
+        },
+        {
+          "name": "version",
+          "type": "int"
+        }
+      ]
+    },
+    {
+      "name": "reservation_order",
+      "note": "Short-lived checkout quote and idempotency record created before final payment submission.",
+      "fields": [
+        {
+          "name": "reservation_id",
+          "type": "varchar PK"
+        },
+        {
+          "name": "guest_id",
+          "type": "bigint FK"
+        },
+        {
+          "name": "hotel_id",
+          "type": "bigint FK"
+        },
+        {
+          "name": "room_type_id",
+          "type": "bigint FK"
+        },
+        {
+          "name": "start_date",
+          "type": "date"
+        },
+        {
+          "name": "end_date",
+          "type": "date"
+        },
+        {
+          "name": "room_count",
+          "type": "int"
+        },
+        {
+          "name": "quote_cents",
+          "type": "int"
+        },
+        {
+          "name": "status",
+          "type": "varchar"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "reservation",
+      "note": "Guest booking record and idempotency key.",
+      "fields": [
+        {
+          "name": "reservation_id",
+          "type": "varchar PK"
+        },
+        {
+          "name": "guest_id",
+          "type": "bigint FK"
+        },
+        {
+          "name": "hotel_id",
+          "type": "bigint"
+        },
+        {
+          "name": "room_type_id",
+          "type": "bigint"
+        },
+        {
+          "name": "start_date",
+          "type": "date"
+        },
+        {
+          "name": "end_date",
+          "type": "date"
+        },
+        {
+          "name": "room_count",
+          "type": "int"
+        },
+        {
+          "name": "status",
+          "type": "varchar"
+        },
+        {
+          "name": "payment_id",
+          "type": "varchar"
+        }
+      ]
+    },
+    {
+      "name": "payment",
+      "note": "Payment capture/refund state for a reservation; provider callbacks reconcile against this record.",
+      "fields": [
+        {
+          "name": "payment_id",
+          "type": "varchar PK"
+        },
+        {
+          "name": "reservation_id",
+          "type": "varchar FK"
+        },
+        {
+          "name": "amount_cents",
+          "type": "int"
+        },
+        {
+          "name": "currency",
+          "type": "char3"
+        },
+        {
+          "name": "status",
+          "type": "varchar"
+        },
+        {
+          "name": "provider_reference",
+          "type": "varchar"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "guest",
+      "note": "Guest identity and contact details.",
+      "fields": [
+        {
+          "name": "guest_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "first_name",
+          "type": "varchar"
+        },
+        {
+          "name": "last_name",
+          "type": "varchar"
+        },
+        {
+          "name": "email",
+          "type": "varchar"
+        }
+      ]
+    }
+  ],
+  "dataModelDiagram": [
+    "erDiagram",
+    "  HOTEL ||--o{ ROOM_TYPE : offers",
+    "  HOTEL ||--o{ ROOM : contains",
+    "  ROOM_TYPE ||--o{ ROOM : categorizes",
+    "  ROOM_TYPE ||--o{ ROOM_TYPE_RATE : prices",
+    "  ROOM_TYPE ||--o{ ROOM_TYPE_INVENTORY : tracks",
+    "  GUEST ||--o{ RESERVATION_ORDER : creates",
+    "  RESERVATION_ORDER ||--o| RESERVATION : confirms",
+    "  ROOM_TYPE_INVENTORY ||--o{ RESERVATION : reserves",
+    "  GUEST ||--o{ RESERVATION : makes",
+    "  RESERVATION ||--o| PAYMENT : charges",
+    "  HOTEL {",
+    "    bigint hotel_id PK",
+    "    varchar name",
+    "    text address",
+    "    geo location",
+    "    varchar status",
+    "  }",
+    "  ROOM_TYPE {",
+    "    bigint room_type_id PK",
+    "    bigint hotel_id FK",
+    "    varchar name",
+    "    int max_occupancy",
+    "    varchar status",
+    "  }",
+    "  ROOM {",
+    "    bigint room_id PK",
+    "    bigint hotel_id FK",
+    "    bigint room_type_id FK",
+    "    varchar number",
+    "  }",
+    "  ROOM_TYPE_RATE {",
+    "    bigint hotel_id PK",
+    "    bigint room_type_id PK",
+    "    date date PK",
+    "    int rate_cents",
+    "    char3 currency",
+    "  }",
+    "  ROOM_TYPE_INVENTORY {",
+    "    bigint hotel_id PK",
+    "    bigint room_type_id PK",
+    "    date date PK",
+    "    int total_inventory",
+    "    int total_reserved",
+    "    int version",
+    "  }",
+    "  RESERVATION_ORDER {",
+    "    varchar reservation_id PK",
+    "    bigint guest_id FK",
+    "    bigint hotel_id FK",
+    "    bigint room_type_id FK",
+    "    date start_date",
+    "    date end_date",
+    "    int quote_cents",
+    "    timestamp expires_at",
+    "  }",
+    "  RESERVATION {",
+    "    varchar reservation_id PK",
+    "    bigint guest_id FK",
+    "    bigint hotel_id",
+    "    bigint room_type_id",
+    "    date start_date",
+    "    date end_date",
+    "    int room_count",
+    "    varchar status",
+    "    varchar payment_id",
+    "  }",
+    "  PAYMENT {",
+    "    varchar payment_id PK",
+    "    varchar reservation_id FK",
+    "    int amount_cents",
+    "    varchar status",
+    "    varchar provider_reference",
+    "  }",
+    "  GUEST {",
+    "    bigint guest_id PK",
+    "    varchar email",
+    "  }"
+  ],
+  "steps": [
+    {
+      "id": "client-and-api-gateway",
+      "title": "1. Client, CDN, and API Gateway",
+      "description": "Start with the customer and staff entry points. Public web and mobile traffic goes through the CDN and API Gateway, while hotel staff use internal tools protected separately. The gateway routes hotel detail, availability, reservation, payment, and admin requests to service owners.",
+      "decisionPrompt": "Define the entry-point contract: which traffic is public, which traffic is internal, and what guarantees must the gateway provide before service design begins?",
+      "whyNow": [
+        "Every later step routes through here, so the public/internal split has to be settled before any service owns domain logic.",
+        "Drawing the boundary first keeps booking, payment, and admin concerns from leaking into the edge as the design grows."
+      ],
+      "recap": {
+        "before": "Nothing exists yet; guest and staff traffic are undifferentiated.",
+        "after": "Public guest traffic enters through CDN + gateway, staff traffic through a separate internal boundary, each routed to a service owner.",
+        "newRisk": "The gateway is now a shared dependency for all public APIs and a tempting place to accrete domain logic."
+      },
+      "concepts": [
+        {
+          "term": "API Gateway",
+          "definition": "A front-door service that routes requests, authenticates users, and applies cross-cutting policies such as rate limits.",
+          "whyItMatters": "It keeps public request handling consistent while letting internal services own domain logic.",
+          "example": "GET /v1/hotels/245 is authenticated and rate-limited at the gateway, then routed to Hotel Service."
+        },
+        {
+          "term": "Internal API",
+          "definition": "An endpoint available only to authorized staff systems, often behind stronger network and identity controls.",
+          "whyItMatters": "Admin actions can change rates, inventory, and reservations, so they need a stricter boundary than guest browsing."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "An attacker discovers the internal inventory-adjustment endpoint and calls it directly.",
+          "expectedBehavior": "The request is rejected because it never passes staff authentication and is not reachable from the public network.",
+          "mitigation": "Keep internal APIs off the public gateway, require staff identity, and network-isolate the internal path (VPN/private network)."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Separates public guest traffic from staff operations from the first diagram.",
+          "Keeps the gateway thin — routing, auth, rate limiting — not domain decisions."
+        ],
+        "weak": [
+          "Puts inventory or payment logic into the gateway.",
+          "Treats admin actions as just another public endpoint."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  Guest[Guest Web / Mobile]",
+        "  CDN[CDN / Static Assets\\nserves JS/images, offloads reads]",
+        "  Gateway[Public API Gateway\\nauth, rate limit, route by endpoint]",
+        "  HotelSvc[Hotel Service]",
+        "  RateSvc[Rate Service]",
+        "  ResSvc[Reservation Service]",
+        "  PaySvc[Payment Service]",
+        "  Admin[Hotel Staff]",
+        "  Internal[Internal API\\nstaff-only, network isolated]",
+        "  Mgmt[Hotel Management Service]",
+        "  Guest -->|static assets| CDN",
+        "  Guest -->|API calls| Gateway",
+        "  Gateway -->|hotel pages| HotelSvc",
+        "  Gateway -->|rates| RateSvc",
+        "  Gateway -->|book/cancel| ResSvc",
+        "  ResSvc -->|charge/refund| PaySvc",
+        "  Admin -->|staff action| Internal",
+        "  Internal -->|delegate| Mgmt"
+      ],
+      "highlight": [
+        "Guest",
+        "CDN",
+        "Gateway",
+        "Admin",
+        "Internal"
+      ],
+      "options": [
+        {
+          "name": "API Gateway with services (default)",
+          "pros": [
+            "Clear ownership by endpoint and domain",
+            "Easy to add auth, rate limits, and request logging at the edge",
+            "Admin boundary is separated from public guest traffic"
+          ],
+          "cons": [
+            "Requires service routing and operational discipline early",
+            "Gateway can become too smart if domain logic leaks into it"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Guest[Guest Web / Mobile]",
+            "  CDN[CDN / Static Assets]",
+            "  Gateway[Public API Gateway]",
+            "  HotelSvc[Hotel Service]",
+            "  RateSvc[Rate Service]",
+            "  ResSvc[Reservation Service]",
+            "  PaySvc[Payment Service]",
+            "  Admin[Hotel Staff]",
+            "  Internal[Internal API]",
+            "  Mgmt[Hotel Management Service]",
+            "  Guest -->|static assets| CDN",
+            "  Guest -->|API calls| Gateway",
+            "  Gateway -->|hotel pages| HotelSvc",
+            "  Gateway -->|rates| RateSvc",
+            "  Gateway -->|book/cancel| ResSvc",
+            "  ResSvc -->|charge/refund| PaySvc",
+            "  Admin -->|staff action| Internal",
+            "  Internal -->|delegate| Mgmt"
+          ],
+          "highlight": [
+            "Gateway",
+            "Internal"
+          ]
+        },
+        {
+          "name": "Single web application first",
+          "pros": [
+            "Simplest implementation for a small hotel chain",
+            "One deployable unit means fewer distributed failure modes",
+            "Can still keep payment and admin boundaries explicit"
+          ],
+          "cons": [
+            "Harder to scale or evolve service ownership independently",
+            "More risk that booking, catalog, and admin code become tightly coupled"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Guest[Guest Web / Mobile]",
+            "  CDN[CDN / Static Assets]",
+            "  Web[Hotel Booking Web App]",
+            "  DB[(Shared Hotel Store)]",
+            "  PaySvc[Payment Provider]",
+            "  Admin[Hotel Staff]",
+            "  Guest -->|static assets| CDN",
+            "  Guest -->|browse/book| Web",
+            "  Admin -->|staff tools| Web",
+            "  Web -->|read/write| DB",
+            "  Web -->|charge/refund| PaySvc"
+          ],
+          "highlight": [
+            "Web",
+            "DB"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Boundary choices",
+          "points": [
+            "Guest endpoints are public and must handle auth, abuse limits, and idempotency.",
+            "Staff endpoints need separate authorization and audit logs.",
+            "The gateway routes by endpoint; it should not own inventory or payment decisions."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Gateway outage blocks every public API.",
+          "mitigation": "Run gateway redundantly across zones and keep static content on CDN."
+        },
+        {
+          "issue": "Internal APIs can accidentally bypass domain validation.",
+          "mitigation": "Route staff changes through owning services, not direct database writes."
+        }
+      ],
+      "talkingPoints": [
+        "Keep search out of scope unless the interviewer explicitly asks for it.",
+        "Separate public guest traffic from staff operations early."
+      ],
+      "flows": [
+        {
+          "name": "Guest opens hotel page",
+          "note": "Static assets come from CDN; API data comes through the gateway.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant CDN as CDN",
+            "  participant G as API Gateway",
+            "  participant H as Hotel Service",
+            "  C->>CDN: GET /static/app.js",
+            "  CDN-->>C: cached asset",
+            "  C->>G: GET /v1/hotels/245",
+            "  G->>H: route hotel detail",
+            "  H-->>C: hotel payload"
+          ],
+          "highlight": [
+            "CDN",
+            "G",
+            "H"
+          ]
+        },
+        {
+          "name": "Staff updates room information",
+          "note": "Admin actions enter through an internal boundary.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant A as Admin",
+            "  participant I as Internal API",
+            "  participant M as Management Service",
+            "  participant H as Hotel Service",
+            "  A->>I: PUT room details",
+            "  I->>I: authorize staff role",
+            "  I->>M: route change",
+            "  M->>H: update owning service",
+            "  H-->>A: updated"
+          ],
+          "highlight": [
+            "I",
+            "M"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "hotel-catalog-and-rate-read-model",
+      "title": "2. Hotel Catalog and Rate Read Model",
+      "description": "Hotel metadata and room-type details are read-heavy and change relatively rarely. Rates change by date and occupancy expectations, so they deserve a separate Rate Service and a room_type_rate table keyed by hotel, room type, and date.",
+      "decisionPrompt": "Separate static catalog reads from dynamic nightly rates: what should be cached aggressively, and what must stay date-specific and versioned?",
+      "whyNow": [
+        "The capacity funnel showed reads (~300 QPS detail pages) dominate writes (~3 reservation TPS), so the read path is worth designing before booking mechanics.",
+        "Booking needs a price quote, and the quote comes from rates — so the catalog/rate split must exist before the reservation flow can call it."
+      ],
+      "recap": {
+        "before": "Traffic is routed, but there is no model for what guests actually read on a hotel page.",
+        "after": "Cache-friendly catalog metadata and date-specific nightly rates are served by separate concerns and can scale independently.",
+        "newRisk": "Catalog and rate data can drift out of sync, and a cached page can show a price that no longer matches the rate store at checkout."
+      },
+      "concepts": [
+        {
+          "term": "Read model",
+          "definition": "A data shape optimized for serving query traffic rather than enforcing writes.",
+          "whyItMatters": "Hotel detail pages are far more frequent than reservation commits.",
+          "example": "A hotel:245 payload bundles room types, amenities, and policies so one cache hit serves the whole detail page."
+        },
+        {
+          "term": "Dynamic pricing",
+          "definition": "A rate that can vary by date, room type, demand, and expected occupancy.",
+          "whyItMatters": "The final booking quote must use date-specific rates, not one static room price.",
+          "example": "A 3-night stay reads three room_type_rate rows and sums them rather than multiplying one nightly price."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A guest holds a quoted price on the booking page while staff raise the rate for those dates.",
+          "expectedBehavior": "The guest is not silently overcharged, and the final charge matches an explicitly agreed quote.",
+          "mitigation": "Attach an expiration to the quote and revalidate price against the rate store before payment capture."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Recognizes catalog metadata and nightly rates have different update cadences and cache strategies.",
+          "Treats the quote as something to revalidate, not trust indefinitely."
+        ],
+        "weak": [
+          "Models price as a single field on the room or room type.",
+          "Caches rates as aggressively as static catalog data."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  Gateway[API Gateway]",
+        "  HotelSvc[Hotel Service\\nserves catalog read model]",
+        "  HotelCache([Hotel Cache\\nstatic metadata, high hit rate])",
+        "  HotelDB[(Hotel Store)]",
+        "  RateSvc[Rate Service\\nseparate: rates change daily]",
+        "  RateDB[(Rate Store\\nprice keyed by hotel/roomType/date)]",
+        "  Gateway -->|hotel detail| HotelSvc",
+        "  HotelSvc -->|cache lookup| HotelCache",
+        "  HotelCache -->|miss| HotelDB",
+        "  Gateway -->|date rates| RateSvc",
+        "  RateSvc -->|rate by date| RateDB"
+      ],
+      "highlight": [
+        "HotelSvc",
+        "HotelCache",
+        "HotelDB",
+        "RateSvc",
+        "RateDB"
+      ],
+      "options": [
+        {
+          "name": "Separate Hotel and Rate services (default)",
+          "pros": [
+            "Static catalog and dynamic rates can scale independently",
+            "Rate changes do not invalidate all hotel page metadata",
+            "Matches separate ownership and update cadence"
+          ],
+          "cons": [
+            "Booking flow must call more than one service",
+            "Requires quote consistency discipline during checkout"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Gateway[API Gateway]",
+            "  HotelSvc[Hotel Service]",
+            "  HotelCache([Hotel Cache])",
+            "  HotelDB[(Hotel Store)]",
+            "  RateSvc[Rate Service]",
+            "  RateDB[(Rate Store)]",
+            "  Gateway -->|hotel detail| HotelSvc",
+            "  HotelSvc -->|cache lookup| HotelCache",
+            "  HotelCache -->|miss| HotelDB",
+            "  Gateway -->|date rates| RateSvc",
+            "  RateSvc -->|rate by date| RateDB"
+          ],
+          "highlight": [
+            "HotelSvc",
+            "RateSvc"
+          ]
+        },
+        {
+          "name": "Single catalog service with rate rows",
+          "pros": [
+            "Fewer network calls for early-stage design",
+            "Easy to join room type and rate data in one database"
+          ],
+          "cons": [
+            "Static and dynamic data ownership becomes mixed",
+            "High rate-update volume can disturb catalog reads"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Gateway[API Gateway]",
+            "  CatalogSvc[Catalog Service]",
+            "  CatalogCache([Catalog Cache])",
+            "  CatalogDB[(Catalog + Rate Store)]",
+            "  Gateway -->|hotel + rates| CatalogSvc",
+            "  CatalogSvc -->|cache lookup| CatalogCache",
+            "  CatalogCache -->|miss| CatalogDB"
+          ],
+          "highlight": [
+            "CatalogSvc",
+            "CatalogDB"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Rate lookups",
+          "points": [
+            "The booking page needs one rate per night for the date range.",
+            "Rate rows are naturally keyed by hotel_id, room_type_id, and date.",
+            "The final reservation should reprice or validate the quote before payment."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Hotel detail pages can generate repetitive database reads.",
+          "mitigation": "Cache hotel and room-type metadata with explicit invalidation after admin changes."
+        },
+        {
+          "issue": "Rate changes during checkout can surprise users.",
+          "mitigation": "Use quote expiration and revalidate price before payment capture."
+        }
+      ],
+      "talkingPoints": [
+        "Hotel and room metadata are cache-friendly; inventory is not the same thing as catalog metadata.",
+        "Prices can change daily, so the model cannot use one room price field."
+      ],
+      "flows": [
+        {
+          "name": "Hotel detail with rates",
+          "note": "The page combines cache-friendly catalog data with date-specific rates.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant G as API Gateway",
+            "  participant H as Hotel Service",
+            "  participant Rate as Rate Service",
+            "  C->>G: GET hotel detail + dates",
+            "  G->>H: hotel and room types",
+            "  H-->>G: catalog data",
+            "  G->>Rate: nightly rates",
+            "  Rate-->>G: date prices",
+            "  G-->>C: page payload"
+          ],
+          "highlight": [
+            "H",
+            "Rate"
+          ]
+        },
+        {
+          "name": "Admin changes room rate",
+          "note": "Rate changes should not require a full catalog cache flush.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant A as Admin",
+            "  participant M as Management Service",
+            "  participant Rate as Rate Service",
+            "  participant DB as Rate Store",
+            "  A->>M: update date rate",
+            "  M->>Rate: authorized rate change",
+            "  Rate->>DB: UPSERT room_type_rate",
+            "  DB-->>Rate: version updated",
+            "  Rate-->>A: updated"
+          ],
+          "highlight": [
+            "Rate",
+            "DB"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "room-type-inventory-model",
+      "title": "3. Room-Type Inventory Model",
+      "description": "Guests reserve a room type, not a physical room number. Inventory is tracked per hotel, room type, and date, with total inventory and total reserved counters for each future date row.",
+      "decisionPrompt": "Choose the booking unit: why reserve room types instead of physical rooms, and how should inventory be represented across a multi-night date range?",
+      "whyNow": [
+        "Concurrency control, idempotency, and payment all act on inventory, so the inventory unit has to be right before any of them are designed.",
+        "This is the key data-model correction: the naive room_id design works for Airbnb but is wrong for hotels, which assign physical rooms only at check-in."
+      ],
+      "recap": {
+        "before": "The first-pass model booked a specific room_id, copied from listing-style designs.",
+        "after": "Guests reserve a room type, and availability is a per-(hotel, room_type, date) counter of total_inventory vs. total_reserved.",
+        "newRisk": "A multi-night stay now spans several inventory rows that must be checked and updated together, not one."
+      },
+      "concepts": [
+        {
+          "term": "Room type",
+          "definition": "A category such as king room or two-queen room that groups interchangeable physical rooms.",
+          "whyItMatters": "Hotels assign exact room numbers at check-in, so booking must reserve capacity at the type level.",
+          "example": "A guest books \"2 King rooms\" for July 1-4; room numbers 412 and 518 are assigned only when they check in."
+        },
+        {
+          "term": "Inventory row per date",
+          "definition": "One record for each hotel, room type, and date with total_inventory and total_reserved.",
+          "whyItMatters": "A multi-night stay must have available inventory on every night in the range.",
+          "example": "A July 1-4 stay checks the rows for July 1, 2, and 3 (checkout day July 4 consumes no night)."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A 5-night stay has capacity on four nights but is sold out on the third night.",
+          "expectedBehavior": "The whole reservation is refused; the guest is never booked into a partial stay.",
+          "mitigation": "Treat the date range as all-or-nothing — every night's row must pass the capacity check before any row is updated."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Explicitly catches that hotels book room types, not room numbers, and explains why.",
+          "Models availability as a per-date counter so date-range checks are simple and bounded."
+        ],
+        "weak": [
+          "Locks a specific room_id at booking time.",
+          "Stores a single availability number per room type with no date dimension."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  ResSvc[Reservation Service]",
+        "  Inventory[(Inventory Store\\none row per hotel/roomType/date:\\ntotal_inventory + total_reserved)]",
+        "  Reservation[(Reservation Store)]",
+        "  Room[(Room Store\\nphysical rooms, assigned at check-in)]",
+        "  Rate[(Rate Store)]",
+        "  DailyJob[Daily Prepopulate Job\\nseeds rolling 2-year future window]",
+        "  ResSvc -->|check date range| Inventory",
+        "  ResSvc -->|write booking| Reservation",
+        "  Room -->|physical rooms| Inventory",
+        "  Rate -->|nightly price| ResSvc",
+        "  DailyJob -->|future rows| Inventory"
+      ],
+      "highlight": [
+        "Inventory",
+        "Reservation",
+        "Room",
+        "DailyJob"
+      ],
+      "options": [
+        {
+          "name": "Room-type inventory per date (default)",
+          "pros": [
+            "Matches how hotels sell rooms",
+            "Date range checks are simple and bounded",
+            "Supports maintenance holds and overbooking policy per date"
+          ],
+          "cons": [
+            "Requires one row per future date and room type",
+            "Multi-night reservations update several rows atomically"
+          ],
+          "diagram": [
+            "graph TB",
+            "  ResSvc[Reservation Service]",
+            "  Inventory[(Inventory Store)]",
+            "  Reservation[(Reservation Store)]",
+            "  Room[(Room Store)]",
+            "  Rate[(Rate Store)]",
+            "  DailyJob[Daily Prepopulate Job]",
+            "  ResSvc -->|check date range| Inventory",
+            "  ResSvc -->|write booking| Reservation",
+            "  Room -->|physical rooms| Inventory",
+            "  Rate -->|nightly price| ResSvc",
+            "  DailyJob -->|future rows| Inventory"
+          ],
+          "highlight": [
+            "Inventory"
+          ]
+        },
+        {
+          "name": "Specific room reservation",
+          "pros": [
+            "Simple mental model for apartments or Airbnb-style listings",
+            "A reservation points directly to a room_id"
+          ],
+          "cons": [
+            "Wrong model for hotels that assign rooms at check-in",
+            "Causes unnecessary fragmentation when equivalent rooms exist"
+          ],
+          "diagram": [
+            "graph TB",
+            "  ResSvc[Reservation Service]",
+            "  Room[(Physical Room)]",
+            "  Reservation[(Specific Room Reservation Store)]",
+            "  ResSvc -->|select room| Room",
+            "  ResSvc -->|write booking| Reservation",
+            "  Reservation -->|locks exact room| Room"
+          ],
+          "highlight": [
+            "Room",
+            "Reservation"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Availability condition",
+          "points": [
+            "For every date in the stay, total_reserved + rooms_to_book must be within the allowed inventory.",
+            "For 10% overbooking, the limit becomes 1.1 x total_inventory.",
+            "The end date is usually checkout day and should not consume inventory for that night."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Long stays update many inventory rows.",
+          "mitigation": "Keep typical stay ranges small and update rows in a deterministic order."
+        },
+        {
+          "issue": "Inventory row generation can lag for new future dates.",
+          "mitigation": "Run a daily prepopulation job and alert on missing inventory windows."
+        }
+      ],
+      "talkingPoints": [
+        "This is the major data-model correction from a naive room_id design.",
+        "Inventory and reservation should stay transactionally close unless the added microservice complexity is justified."
+      ],
+      "flows": [
+        {
+          "name": "Check availability for date range",
+          "note": "Every date must pass the inventory check.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant R as Reservation Service",
+            "  participant I as Inventory Store",
+            "  C->>R: check hotel, roomType, dates, count",
+            "  R->>I: SELECT inventory rows for date range",
+            "  I-->>R: daily inventory rows",
+            "  R->>R: verify each date has capacity",
+            "  R-->>C: available or sold out"
+          ],
+          "highlight": [
+            "I"
+          ]
+        },
+        {
+          "name": "Prepopulate future inventory",
+          "note": "The room_type_inventory table is prepared for a rolling future window.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant Job as Daily Job",
+            "  participant H as Hotel Store",
+            "  participant I as Inventory Store",
+            "  Job->>H: read rooms and room types",
+            "  H-->>Job: room inventory baseline",
+            "  Job->>I: UPSERT future date rows",
+            "  I-->>Job: rows ready"
+          ],
+          "highlight": [
+            "Job",
+            "I"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "reservation-order-and-idempotency",
+      "title": "4. Reservation Order and Idempotency",
+      "description": "Before final payment, the Reservation Service creates a reservation order and returns a globally unique reservation_id. The final booking request uses that reservation_id as an idempotency key so double clicks and retries do not create duplicate reservations.",
+      "decisionPrompt": "Design the reservation submission contract: how does the system make repeated clicks, network retries, and client resubmits produce one reservation outcome?",
+      "whyNow": [
+        "We can now reserve a room type correctly, but a guest double-clicking Complete Booking would create two of them — duplicate prevention must come before the commit transaction.",
+        "Issuing the reservation_id up front gives both a review/quote step and the idempotency key the commit will rely on."
+      ],
+      "recap": {
+        "before": "Inventory can be checked, but two submissions of the same booking would each try to create a reservation.",
+        "after": "A server-issued reservation_id keys the booking, so retries and double-clicks resolve to one reservation outcome.",
+        "newRisk": "Unsubmitted orders accumulate and must expire, and the client must carry the reservation_id through checkout."
+      },
+      "concepts": [
+        {
+          "term": "Idempotency key",
+          "definition": "A client-supplied or server-issued key that makes repeated requests resolve to the same operation result.",
+          "whyItMatters": "The user may click Complete Booking twice, but the system should not create two bookings.",
+          "example": "Both POST /v1/reservations calls carry reservation_id resv_13422445, so the second returns the first result."
+        },
+        {
+          "term": "Unique constraint",
+          "definition": "A database rule that rejects a second row with the same key.",
+          "whyItMatters": "reservation_id as primary key is the final guard against duplicate inserts."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The commit succeeds but the response is lost, and the client retries the same reservation_id.",
+          "expectedBehavior": "The retry returns the already-created reservation rather than creating a second one or erroring out.",
+          "mitigation": "On duplicate-key insert, look up and return the existing reservation; reject only if the request body conflicts with it."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Names the database primary key as the authoritative duplicate guard, not the disabled button.",
+          "Distinguishes a retry (same key, same body) from a genuine conflict (same key, different body)."
+        ],
+        "weak": [
+          "Relies on client-side button disabling for correctness.",
+          "Lets the client generate the booking with no server-side dedup key."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  Client[Client]",
+        "  ResSvc[Reservation Service]",
+        "  IDGen[ID Generator\\nglobally unique reservationId]",
+        "  Order[(Reservation Order Store\\nshort-lived quote, TTL expiry)]",
+        "  Reservation[(Reservation Store\\nreservationId PK = dedup guard)]",
+        "  Client -->|create order| ResSvc",
+        "  ResSvc -->|allocate reservationId| IDGen",
+        "  ResSvc -->|store pending order| Order",
+        "  Client -->|submit reservationId| ResSvc",
+        "  ResSvc -->|insert once| Reservation"
+      ],
+      "highlight": [
+        "IDGen",
+        "Order",
+        "Reservation"
+      ],
+      "options": [
+        {
+          "name": "Server-issued reservationId (default)",
+          "pros": [
+            "Works even if the client is unreliable",
+            "Easy to enforce with primary key uniqueness",
+            "Allows quote review page before final payment"
+          ],
+          "cons": [
+            "Requires temporary order state and expiration",
+            "Client must preserve reservationId through checkout"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  ResSvc[Reservation Service]",
+            "  IDGen[ID Generator]",
+            "  Order[(Reservation Order Store)]",
+            "  Reservation[(Reservation Store)]",
+            "  Client -->|create order| ResSvc",
+            "  ResSvc -->|allocate reservationId| IDGen",
+            "  ResSvc -->|store pending order| Order",
+            "  Client -->|submit reservationId| ResSvc",
+            "  ResSvc -->|insert once| Reservation"
+          ],
+          "highlight": [
+            "IDGen",
+            "Order"
+          ]
+        },
+        {
+          "name": "Client-generated idempotency key",
+          "pros": [
+            "Useful for mobile retries and offline-friendly clients",
+            "Can avoid creating a separate order before final submit"
+          ],
+          "cons": [
+            "Requires client correctness and key persistence",
+            "Harder to tie to a reviewed quote unless the server stores it"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client generates key]",
+            "  ResSvc[Reservation Service]",
+            "  Idem[(Idempotency Store)]",
+            "  Reservation[(Reservation Store)]",
+            "  Client -->|submit key| ResSvc",
+            "  ResSvc -->|claim key| Idem",
+            "  ResSvc -->|write booking| Reservation",
+            "  Reservation -->|result cached| Idem"
+          ],
+          "highlight": [
+            "Idem"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Duplicate submit behavior",
+          "points": [
+            "The first request creates or completes the reservation.",
+            "A retry with the same reservationId returns the existing result.",
+            "A conflicting body for an existing reservationId should be rejected."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Pending orders can accumulate if users abandon checkout.",
+          "mitigation": "Expire orders after a short TTL and do not decrement inventory until final commit unless holds are explicitly modeled."
+        },
+        {
+          "issue": "Client loses the reservationId on refresh.",
+          "mitigation": "Persist it in checkout session state and allow the client to regenerate a new order if expired."
+        }
+      ],
+      "talkingPoints": [
+        "Client-side button disabling is useful UX but not a correctness mechanism.",
+        "The database primary key is the authoritative duplicate-prevention layer."
+      ],
+      "flows": [
+        {
+          "name": "Double click becomes one reservation",
+          "note": "The second submit hits the same reservationId and does not create a second row.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant R as Reservation Service",
+            "  participant DB as Booking Store",
+            "  C->>R: POST /reservation-orders",
+            "  R-->>C: reservationId=resv_123",
+            "  C->>R: POST /reservations resv_123",
+            "  R->>DB: INSERT reservation resv_123",
+            "  DB-->>R: inserted",
+            "  C->>R: retry POST /reservations resv_123",
+            "  R->>DB: INSERT reservation resv_123",
+            "  DB-->>R: duplicate key",
+            "  R-->>C: existing reservation result"
+          ],
+          "highlight": [
+            "DB"
+          ]
+        },
+        {
+          "name": "Order expiration",
+          "note": "An abandoned order expires without consuming inventory.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant R as Reservation Service",
+            "  participant O as Order Store",
+            "  C->>R: create order",
+            "  R->>O: save pending order with TTL",
+            "  O-->>R: expiresAt",
+            "  R-->>C: review page",
+            "  O->>O: expire abandoned order"
+          ],
+          "highlight": [
+            "O"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "inventory-transaction-and-concurrency",
+      "title": "5. Inventory Transaction and Concurrency Control",
+      "description": "The booking commit must atomically check inventory, update total_reserved for every date, and write the reservation. Optimistic locking or database constraints are usually a pragmatic fit because average reservation TPS is modest, while hotspots still need careful retry behavior.",
+      "decisionPrompt": "Choose the concurrency-control strategy for the last-room problem: how do concurrent users avoid overselling while keeping booking latency acceptable?",
+      "whyNow": [
+        "Idempotency stops one user from booking twice; it does nothing to stop two users from booking the same last room — that is a separate race that the commit must resolve.",
+        "A prior availability read can be stale by commit time, so correctness has to live in the transaction itself, designed here before payment is attached."
+      ],
+      "recap": {
+        "before": "Each reservation is unique, but two concurrent reservations could both read \"1 room left\" and both succeed.",
+        "after": "The commit atomically checks and updates every date's inventory under a chosen concurrency-control strategy, so only one wins the last room.",
+        "newRisk": "Hot hotels during events concentrate contention on the same rows, turning conflicts into retries and visible sold-out responses."
+      },
+      "concepts": [
+        {
+          "term": "Optimistic locking",
+          "definition": "Allow concurrent attempts, but commit only if the row version still matches what was read.",
+          "whyItMatters": "It avoids long database locks when conflicts are usually rare.",
+          "example": "UPDATE ... SET reserved=reserved+n, version=8 WHERE version=7 fails for the loser, who retries or gets sold-out."
+        },
+        {
+          "term": "Pessimistic locking",
+          "definition": "Lock selected rows before updating so other transactions must wait.",
+          "whyItMatters": "It prevents conflicts directly, but can reduce throughput and create deadlock risk under contention."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "Two multi-night bookings overlap on the same dates and lock inventory rows in opposite date order.",
+          "expectedBehavior": "Neither transaction deadlocks; both eventually resolve to a commit or a clean sold-out.",
+          "mitigation": "Always touch inventory rows in deterministic date order, and bound optimistic retries before returning sold-out."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Picks optimistic locking for the modest average TPS and justifies it with the workload, not dogma.",
+          "Insists the final database transaction is the source of truth regardless of any prior availability read."
+        ],
+        "weak": [
+          "Trusts the availability read and updates inventory without a conditional check.",
+          "Reaches for pessimistic locks everywhere, ignoring deadlock and throughput cost."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  ResSvc[Reservation Service]",
+        "  Tx[ACID Booking Transaction\\nall dates updated or none]",
+        "  Inventory[(Inventory Store\\nversioned rows, conditional update)]",
+        "  Reservation[(Reservation Store)]",
+        "  Constraint[Capacity Check 110 percent\\nfinal guard against oversell]",
+        "  ResSvc -->|begin commit| Tx",
+        "  Tx -->|read rows + version| Inventory",
+        "  Tx -->|validate range| Constraint",
+        "  Tx -->|increment reserved| Inventory",
+        "  Tx -->|insert reservation| Reservation"
+      ],
+      "highlight": [
+        "Tx",
+        "Inventory",
+        "Constraint",
+        "Reservation"
+      ],
+      "options": [
+        {
+          "name": "Optimistic locking (default)",
+          "pros": [
+            "Good fit for modest average reservation TPS",
+            "No long-held database locks",
+            "Version checks make stale updates explicit"
+          ],
+          "cons": [
+            "Hot hotels can produce retries and user-visible failures",
+            "Application must handle retry or sold-out responses cleanly"
+          ],
+          "diagram": [
+            "graph TB",
+            "  ResSvc[Reservation Service]",
+            "  Inventory[(Inventory Rows with version)]",
+            "  Reservation[(Reservation Store)]",
+            "  ResSvc -->|read version| Inventory",
+            "  ResSvc -->|conditional update| Inventory",
+            "  ResSvc -->|insert booking| Reservation"
+          ],
+          "highlight": [
+            "Inventory"
+          ]
+        },
+        {
+          "name": "Pessimistic locking with SELECT FOR UPDATE",
+          "pros": [
+            "Serializes updates for a hot room type",
+            "Straightforward correctness story"
+          ],
+          "cons": [
+            "Locks can block other transactions",
+            "Deadlock and timeout handling become important"
+          ],
+          "diagram": [
+            "graph TB",
+            "  ResSvc[Reservation Service]",
+            "  Lock[SELECT FOR UPDATE]",
+            "  Inventory[(Inventory Rows)]",
+            "  Reservation[(Reservation Store)]",
+            "  ResSvc -->|lock date rows| Lock",
+            "  Lock -->|exclusive rows| Inventory",
+            "  ResSvc -->|write booking| Reservation"
+          ],
+          "highlight": [
+            "Lock"
+          ]
+        },
+        {
+          "name": "Database check constraint",
+          "pros": [
+            "Simple final guard against overselling beyond the allowed limit",
+            "Keeps enforcement close to source-of-truth data"
+          ],
+          "cons": [
+            "The constraint must encode the overbooking factor; a plain total_reserved <= total_inventory would forbid the required 10% overbooking",
+            "Does not prevent user-visible failures after stale availability reads",
+            "Constraint portability varies across databases, and it cannot be version-controlled like application code"
+          ],
+          "diagram": [
+            "graph TB",
+            "  ResSvc[Reservation Service]",
+            "  Inventory[(Inventory Rows)]",
+            "  Constraint[CHECK reserved <= 1.1 x inventory]",
+            "  Reservation[(Reservation Store)]",
+            "  ResSvc -->|attempt update| Inventory",
+            "  Inventory -->|enforce| Constraint",
+            "  ResSvc -->|commit if valid| Reservation"
+          ],
+          "highlight": [
+            "Constraint"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "The capacity check",
+          "points": [
+            "For every date in the range, the transaction enforces total_reserved + rooms <= capacity limit.",
+            "The capacity limit is a configurable overbooking policy, covered in sub-step 5a; the default is 110% of total_inventory.",
+            "The final database transaction is still the source of truth even if cache says available."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Popular event hotels can create heavy contention on the same date rows.",
+          "mitigation": "Use optimistic retries with bounded attempts, fast sold-out responses, and optional queueing for extreme hotspots."
+        },
+        {
+          "issue": "Multi-night reservations can deadlock if rows are locked in different orders.",
+          "mitigation": "Always process inventory rows in deterministic date order."
+        }
+      ],
+      "talkingPoints": [
+        "Do not rely on a prior availability read for final correctness.",
+        "The database transaction must update all dates in the stay or none of them."
+      ],
+      "flows": [
+        {
+          "name": "Optimistic booking commit",
+          "note": "Versioned rows prevent stale concurrent updates.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant R as Reservation Service",
+            "  participant I as Inventory Store",
+            "  participant DB as Booking Store",
+            "  R->>I: read date rows and versions",
+            "  I-->>R: available rows v7",
+            "  R->>I: UPDATE rows SET reserved=reserved+n, version=8 WHERE version=7",
+            "  alt all rows updated",
+            "    R->>DB: insert reservation",
+            "    DB-->>R: committed",
+            "  else version conflict",
+            "    R-->>R: retry or sold out",
+            "  end"
+          ],
+          "highlight": [
+            "I"
+          ]
+        },
+        {
+          "name": "Last room race",
+          "note": "Only one transaction wins the final inventory update.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant U1 as User 1",
+            "  participant U2 as User 2",
+            "  participant R as Reservation Service",
+            "  participant I as Inventory Store",
+            "  U1->>R: reserve last room",
+            "  U2->>R: reserve last room",
+            "  R->>I: conditional update for U1",
+            "  I-->>R: success",
+            "  R->>I: conditional update for U2",
+            "  I-->>R: conflict / no capacity",
+            "  R-->>U2: sold out"
+          ],
+          "highlight": [
+            "I"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "overbooking-policy",
+      "parent": "inventory-transaction-and-concurrency",
+      "title": "5a. Overbooking Policy",
+      "description": "A focused look at one aspect of the previous step. The booking transaction and concurrency control stay exactly as designed in step 5 — only the capacity check it evaluates changes. Instead of total_reserved + rooms <= total_inventory, the limit becomes a configurable multiple, total_reserved + rooms <= overbooking_factor x total_inventory, with the business default of 110%.",
+      "decisionPrompt": "Tune the capacity rule, not the architecture: where does the overbooking factor live, what granularity can configure it, and what guardrails keep it from oversell harm?",
+      "whyNow": [
+        "The commit path is already correct; overbooking is a policy knob inside that same transaction, so it belongs as a refinement rather than a new building block.",
+        "Hotels deliberately oversell to offset cancellations, so the capacity check has to model that intent without changing how concurrency is enforced."
+      ],
+      "recap": {
+        "before": "The commit refuses any booking that would push total_reserved past physical total_inventory.",
+        "after": "The same commit refuses only bookings past a configurable overbooking_factor x total_inventory, defaulting to 110%.",
+        "newRisk": "An overbooking factor set too high produces walk situations where confirmed guests cannot be accommodated."
+      },
+      "concepts": [
+        {
+          "term": "Overbooking",
+          "definition": "Selling more reservations than physical inventory, anticipating that some will cancel or no-show.",
+          "whyItMatters": "It raises occupancy and revenue, but the factor must be bounded so the hotel can still honor everyone who arrives.",
+          "example": "A 100-room type with factor 1.1 accepts up to 110 reserved for a date."
+        },
+        {
+          "term": "Configurable policy",
+          "definition": "A rule value stored as data and resolved at evaluation time, not hard-coded in the booking logic.",
+          "whyItMatters": "Different hotels, room types, and dates need different overbooking appetite, so the factor is a column or rule, not a constant."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  ResSvc[Reservation Service]",
+        "  Tx[Booking Transaction\\nsame commit as step 5]",
+        "  Inventory[(Inventory Rows)]",
+        "  Policy[Overbooking Factor\\nconfigurable per hotel/roomType/date, default 1.1]",
+        "  ResSvc -->|begin commit| Tx",
+        "  Tx -->|read rows + version| Inventory",
+        "  Tx -->|resolve factor| Policy",
+        "  Tx -->|reserved + rooms <= factor x inventory| Inventory"
+      ],
+      "highlight": [
+        "Policy"
+      ],
+      "options": [
+        {
+          "name": "Configurable factor, default 110% (default)",
+          "pros": [
+            "Same transaction and concurrency control as step 5 — only the comparison changes",
+            "Can be tuned per hotel, room type, and date to match cancellation behavior",
+            "Default 110% matches the stated business requirement"
+          ],
+          "cons": [
+            "Requires somewhere to store and resolve the factor",
+            "Too high a factor increases the risk of walking confirmed guests"
+          ],
+          "diagram": [
+            "graph TB",
+            "  ResSvc[Reservation Service]",
+            "  Tx[Booking Transaction]",
+            "  Inventory[(Inventory Rows)]",
+            "  Policy[Overbooking Factor per hotel / room type / date]",
+            "  ResSvc -->|begin commit| Tx",
+            "  Tx -->|read rows + version| Inventory",
+            "  Tx -->|resolve factor| Policy",
+            "  Tx -->|reserved + rooms <= factor x inventory| Inventory"
+          ],
+          "highlight": [
+            "Policy"
+          ]
+        },
+        {
+          "name": "Fixed 100%, no overbooking",
+          "pros": [
+            "Simplest possible rule: never sell past physical capacity",
+            "No walk risk from oversell"
+          ],
+          "cons": [
+            "Leaves rooms empty when guests cancel or no-show",
+            "Does not satisfy the stated 10% overbooking requirement"
+          ],
+          "diagram": [
+            "graph TB",
+            "  ResSvc[Reservation Service]",
+            "  Tx[Booking Transaction]",
+            "  Inventory[(Inventory Rows)]",
+            "  Rule[Hard cap reserved <= inventory]",
+            "  ResSvc -->|begin commit| Tx",
+            "  Tx -->|read rows + version| Inventory",
+            "  Tx -->|reserved + rooms <= inventory| Inventory",
+            "  Inventory -.uses.-> Rule"
+          ],
+          "highlight": [
+            "Rule"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Where the factor lives",
+          "points": [
+            "Store the overbooking factor as configuration resolved per hotel, room type, and date, not a constant in code.",
+            "Fall back to a chain of defaults: date-specific, then room-type, then hotel, then a global default of 110%.",
+            "The check is still evaluated inside the same booking transaction the concurrency control protects."
+          ]
+        },
+        {
+          "title": "Guardrails",
+          "points": [
+            "Bound the factor (e.g. cap at a maximum) so a misconfiguration cannot oversell catastrophically.",
+            "Treat the factor as an auditable change, since it directly affects how many guests can be confirmed.",
+            "Walk handling (relocation, compensation) is a downstream business process, not part of the booking commit."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "A wrong overbooking factor oversells a date and forces walking guests.",
+          "mitigation": "Bound and audit the factor, and alert when reserved approaches the overbooking ceiling."
+        },
+        {
+          "issue": "Per-date factor lookups add work to every commit.",
+          "mitigation": "Cache resolved factors and refresh on admin change; default cheaply when none is set."
+        }
+      ],
+      "talkingPoints": [
+        "Overbooking is a capacity-rule knob, not a change to the concurrency-control design.",
+        "The default is 110%, but the real answer is that the factor is configurable and bounded."
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Keeps overbooking as a policy inside the existing transaction rather than a new mechanism.",
+          "Makes the factor configurable per hotel/room-type/date and bounds it against walk risk."
+        ],
+        "weak": [
+          "Hard-codes 1.1 in the booking logic.",
+          "Treats overbooking as a separate service or ignores the walk-risk tradeoff."
+        ]
+      },
+      "flows": [
+        {
+          "name": "Capacity check with overbooking factor",
+          "note": "Same commit as step 5; the comparison uses the resolved factor instead of raw inventory.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant R as Reservation Service",
+            "  participant P as Policy Config",
+            "  participant I as Inventory Store",
+            "  R->>P: resolve overbooking factor for hotel/roomType/date",
+            "  P-->>R: factor = 1.1",
+            "  R->>I: read date rows and versions",
+            "  I-->>R: total_inventory, total_reserved",
+            "  R->>R: check total_reserved + rooms <= factor x total_inventory",
+            "  alt within limit",
+            "    R->>I: conditional update reserved",
+            "  else over limit",
+            "    R-->>R: sold out",
+            "  end"
+          ],
+          "highlight": [
+            "P"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "payment-and-reservation-state",
+      "title": "6. Payment and Reservation State Machine",
+      "description": "A reservation moves through pending, paid, rejected, canceled, and refunded states. Inventory is reserved with a pending reservation in one short transaction; the payment provider is charged outside that transaction; a second short transaction records paid or rejected. Keeping the provider call out of the database transaction matters because payment and the reservation store can fail independently, so state transitions must be explicit and recoverable.",
+      "decisionPrompt": "Define the booking state machine: when is inventory consumed, when is payment captured, and how does the system recover from partial payment or database failures?",
+      "whyNow": [
+        "Inventory now commits correctly, but the requirement is pay-in-full at reservation time, so payment has to join the same outcome — and it can fail independently of the database.",
+        "An explicit state machine is needed before cancellation and refunds, because those are just more transitions on the same states."
+      ],
+      "recap": {
+        "before": "A reservation commits inventory, but there is no defined notion of paid, rejected, or how payment failure unwinds it.",
+        "after": "A reservation moves through pending, paid, rejected, canceled, and refunded, with inventory released on payment failure.",
+        "newRisk": "Payment provider and reservation store can fail independently, creating ambiguous states that need reconciliation."
+      },
+      "concepts": [
+        {
+          "term": "State machine",
+          "definition": "A controlled set of states and transitions for an entity such as a reservation.",
+          "whyItMatters": "It prevents invalid transitions like refunding a reservation that was never paid.",
+          "example": "pending -> paid on capture; pending -> rejected on decline; only paid can move to refunded."
+        },
+        {
+          "term": "Payment capture",
+          "definition": "The step where the payment provider actually charges the guest.",
+          "whyItMatters": "Inventory and payment must converge to one clear reservation outcome."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The provider charges the card, but the response times out before the reservation is marked paid.",
+          "expectedBehavior": "The guest is neither double-charged nor left in limbo; the reservation eventually reflects the true payment outcome.",
+          "mitigation": "Use idempotent payment requests keyed by reservation/payment_id and a reconciliation job that resolves unknown states by looking up the provider."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Treats payment success and store update as independently failable and plans recovery for the gap.",
+          "Defines legal transitions explicitly rather than mutating a free-form status string."
+        ],
+        "weak": [
+          "Assumes capture and the database update always succeed together.",
+          "Has no path for a charge that succeeded but was never recorded."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  Pending[Pending\\ninventory reserved, awaiting payment]",
+        "  Paid[Paid\\ncapture succeeded, booking confirmed]",
+        "  Rejected[Rejected\\npayment failed, inventory released]",
+        "  Canceled[Canceled\\ncanceled before payment]",
+        "  Refunded[Refunded\\npaid then canceled per policy]",
+        "  Pending -->|payment success| Paid",
+        "  Pending -->|payment failed| Rejected",
+        "  Pending -->|user cancels| Canceled",
+        "  Paid -->|cancel policy allows| Refunded"
+      ],
+      "highlight": [
+        "Pending",
+        "Paid",
+        "Rejected",
+        "Canceled",
+        "Refunded"
+      ],
+      "options": [
+        {
+          "name": "Synchronous payment in booking flow (default)",
+          "pros": [
+            "User gets a clear paid or rejected result",
+            "Simple for pay-in-full requirement",
+            "Inventory can be released immediately on payment failure"
+          ],
+          "cons": [
+            "Booking latency depends on payment provider latency",
+            "Requires careful recovery if provider succeeds but store update fails"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  ResSvc[Reservation Service]",
+            "  ResDB[(Reservation Store)]",
+            "  PaySvc[Payment Service]",
+            "  Provider[Payment Provider]",
+            "  Client -->|complete booking| ResSvc",
+            "  ResSvc -->|reserve inventory| ResDB",
+            "  ResSvc -->|charge| PaySvc",
+            "  PaySvc -->|capture| Provider",
+            "  ResSvc -->|mark paid/rejected| ResDB"
+          ],
+          "highlight": [
+            "PaySvc",
+            "Provider"
+          ]
+        },
+        {
+          "name": "Async payment confirmation",
+          "pros": [
+            "Faster initial response under slow provider calls",
+            "Webhook can reconcile provider outcomes"
+          ],
+          "cons": [
+            "User sees pending state longer",
+            "Requires timeout and inventory release policy for unpaid reservations"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  ResSvc[Reservation Service]",
+            "  ResDB[(Reservation Store)]",
+            "  PayQ[[Payment Queue]]",
+            "  PayWorker[Payment Worker]",
+            "  Provider[Payment Provider]",
+            "  Client -->|submit booking| ResSvc",
+            "  ResSvc -->|pending reservation| ResDB",
+            "  ResSvc -->|enqueue charge| PayQ",
+            "  PayQ -->|consume| PayWorker",
+            "  PayWorker -->|capture| Provider",
+            "  PayWorker -->|mark result| ResDB"
+          ],
+          "highlight": [
+            "PayQ",
+            "PayWorker"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Transaction boundaries",
+          "points": [
+            "Reserve inventory and write the pending reservation in one short transaction, then commit before calling the provider.",
+            "Never hold the inventory transaction open across the external payment call; it would pin row versions and locks for the provider's full round-trip.",
+            "Record paid or rejected in a second short transaction once the provider responds."
+          ]
+        },
+        {
+          "title": "Recovery cases",
+          "points": [
+            "If payment fails, release inventory and mark rejected.",
+            "If payment succeeds but the response times out, reconcile by payment_id.",
+            "If cancellation happens after payment, transition to refunded according to policy."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Payment provider latency can slow confirmed booking responses.",
+          "mitigation": "Use timeouts, idempotent payment requests, and a reconciliation job for unknown states."
+        },
+        {
+          "issue": "Payment success with reservation-store failure creates ambiguity.",
+          "mitigation": "Use payment idempotency keys and a recovery workflow that can mark paid or refund."
+        }
+      ],
+      "talkingPoints": [
+        "The source input assumes guests pay in full at reservation time.",
+        "Reservation state should be auditable because it drives customer support and finance workflows."
+      ],
+      "flows": [
+        {
+          "name": "Successful paid reservation",
+          "note": "Payment success moves reservation from pending to paid.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant R as Reservation Service",
+            "  participant DB as Booking Store",
+            "  participant P as Payment Service",
+            "  C->>R: complete booking",
+            "  R->>DB: reserve inventory + pending reservation",
+            "  R->>P: charge payment token",
+            "  P-->>R: paid paymentId",
+            "  R->>DB: status=paid",
+            "  R-->>C: confirmation"
+          ],
+          "highlight": [
+            "P"
+          ]
+        },
+        {
+          "name": "Payment rejected",
+          "note": "Inventory is released when payment cannot be captured.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant R as Reservation Service",
+            "  participant DB as Booking Store",
+            "  participant P as Payment Service",
+            "  R->>DB: reserve inventory + pending",
+            "  R->>P: charge card",
+            "  P-->>R: rejected",
+            "  R->>DB: release inventory + status=rejected"
+          ],
+          "highlight": [
+            "DB",
+            "P"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cancellation-and-inventory-release",
+      "title": "7. Cancellation and Inventory Release",
+      "description": "Cancellations update reservation status, decrement reserved inventory rows for the stay dates, and trigger refunds when the reservation has been paid. The same consistency requirements apply in reverse: release all dates or none of them.",
+      "decisionPrompt": "Design cancellation as a first-class workflow: what must be reversed, what can be asynchronous, and how do policies affect inventory and refunds?",
+      "whyNow": [
+        "Cancellation is a required feature and it is the reverse of everything just built — it releases the same date-range inventory and unwinds the same payment.",
+        "Overbooking depends on cancellations happening, so the release path has to be reliable before scale assumptions hold."
+      ],
+      "recap": {
+        "before": "Reservations can be created and paid, but there is no defined way to undo one and return its capacity.",
+        "after": "Cancellation is a state transition that releases every stay-date inventory row and triggers a refund when the reservation was paid.",
+        "newRisk": "Releases and refunds can be applied twice, or a refund can fail after inventory is already released."
+      },
+      "concepts": [
+        {
+          "term": "Compensating action",
+          "definition": "An operation that reverses or offsets a previously completed operation.",
+          "whyItMatters": "Cancellation releases inventory and may refund payment after a booking was already committed.",
+          "example": "Canceling a paid stay decrements total_reserved for each night and issues a refund against the original payment_id."
+        },
+        {
+          "term": "Refund policy",
+          "definition": "Business rules that decide whether a paid reservation can be refunded and how much.",
+          "whyItMatters": "The technical flow needs hooks for policy decisions, not only a database delete."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A guest double-clicks cancel, or a cancel is retried after a timeout.",
+          "expectedBehavior": "Inventory is released exactly once and the refund is issued exactly once.",
+          "mitigation": "Make cancellation idempotent — transition only from cancelable states, and key the refund by reservation/payment_id."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Models cancellation as an auditable state transition, not a row DELETE.",
+          "Separates fast inventory release from a refund that can settle asynchronously and be retried."
+        ],
+        "weak": [
+          "Decrements inventory without guarding against repeated cancellation.",
+          "Blocks the cancellation on a synchronous refund that the provider can fail."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  Client[Client]",
+        "  ResSvc[Reservation Service]",
+        "  Policy[Cancellation Policy\\ndecides refundable and how much]",
+        "  ResDB[(Reservation Store\\nstate transition, not a DELETE)]",
+        "  Inventory[(Inventory Rows\\nrelease every stay date, once)]",
+        "  PaySvc[Payment Service\\nidempotent refund, can retry async]",
+        "  Client -->|cancel request| ResSvc",
+        "  ResSvc -->|check policy| Policy",
+        "  ResSvc -->|mark canceled| ResDB",
+        "  ResSvc -->|decrement reserved| Inventory",
+        "  ResSvc -->|refund if paid| PaySvc"
+      ],
+      "highlight": [
+        "Policy",
+        "Inventory",
+        "PaySvc"
+      ],
+      "options": [
+        {
+          "name": "Synchronous release with async refund follow-up",
+          "pros": [
+            "Inventory becomes available quickly",
+            "User receives cancellation confirmation even if refund settles later",
+            "Refund retries do not block inventory release"
+          ],
+          "cons": [
+            "Requires clear refund status visibility",
+            "Support must handle pending refund cases"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  ResSvc[Reservation Service]",
+            "  ResDB[(Reservation Store)]",
+            "  Inventory[(Inventory Rows)]",
+            "  RefundQ[[Refund Queue]]",
+            "  PaySvc[Payment Service]",
+            "  Client -->|cancel| ResSvc",
+            "  ResSvc -->|mark canceled| ResDB",
+            "  ResSvc -->|release inventory| Inventory",
+            "  ResSvc -->|enqueue refund| RefundQ",
+            "  RefundQ -->|consume| PaySvc"
+          ],
+          "highlight": [
+            "RefundQ"
+          ]
+        },
+        {
+          "name": "Fully synchronous cancellation and refund",
+          "pros": [
+            "User sees final cancellation and refund outcome together",
+            "Less background reconciliation"
+          ],
+          "cons": [
+            "Cancellation latency depends on payment provider",
+            "Provider outage can block cancellation completion"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  ResSvc[Reservation Service]",
+            "  ResDB[(Reservation Store)]",
+            "  Inventory[(Inventory Rows)]",
+            "  PaySvc[Payment Service]",
+            "  Client -->|cancel| ResSvc",
+            "  ResSvc -->|refund| PaySvc",
+            "  ResSvc -->|release inventory| Inventory",
+            "  ResSvc -->|mark refunded| ResDB"
+          ],
+          "highlight": [
+            "PaySvc"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Cancellation order",
+          "points": [
+            "Load reservation and policy first.",
+            "Use transaction boundaries to avoid releasing inventory twice.",
+            "Refund can be retried idempotently using reservation_id or payment_id."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Double cancellation can decrement inventory twice.",
+          "mitigation": "Make cancellation idempotent and transition only from cancelable states."
+        },
+        {
+          "issue": "Refund provider outage leaves paid canceled reservations unresolved.",
+          "mitigation": "Track refund_pending and retry through a durable queue."
+        }
+      ],
+      "talkingPoints": [
+        "Cancellation is not a DELETE of history; it is a state transition with audit requirements.",
+        "Inventory release must be date-range aware just like reservation commit."
+      ],
+      "flows": [
+        {
+          "name": "Idempotent cancellation",
+          "note": "Repeated cancellation requests return the existing canceled result.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant R as Reservation Service",
+            "  participant DB as Booking Store",
+            "  C->>R: DELETE reservation",
+            "  R->>DB: transition paid -> canceled",
+            "  DB-->>R: updated",
+            "  C->>R: retry DELETE reservation",
+            "  R->>DB: load state=canceled",
+            "  R-->>C: already canceled"
+          ],
+          "highlight": [
+            "DB"
+          ]
+        },
+        {
+          "name": "Refund retry",
+          "note": "Refund is retried without releasing inventory a second time.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant R as Reservation Service",
+            "  participant Q as Refund Queue",
+            "  participant P as Payment Service",
+            "  participant DB as Booking Store",
+            "  R->>Q: enqueue refund paymentId",
+            "  Q->>P: refund request",
+            "  P-->>Q: temporary failure",
+            "  Q->>P: retry with same idempotency key",
+            "  P-->>Q: refunded",
+            "  Q->>DB: mark refunded"
+          ],
+          "highlight": [
+            "Q",
+            "P"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "admin-management-and-cache-invalidation",
+      "title": "8. Admin Management and Cache Invalidation",
+      "description": "Hotel staff update hotel details, room information, rates, maintenance holds, and inventory policy through internal tools. These writes must invalidate or refresh read caches and leave an audit trail.",
+      "decisionPrompt": "Design the staff-management path: how do admin writes reach the owning service, invalidate cached reads, and remain auditable?",
+      "whyNow": [
+        "The admin panel is a stated requirement, and it is the writer behind the read caches and rates introduced earlier — so it has to close the invalidation loop the read model opened.",
+        "Maintenance holds and inventory policy are staff-driven, so the admin path must reach inventory through the same owning service the booking flow uses."
+      ],
+      "recap": {
+        "before": "Guest-facing reads are cached and rates are date-specific, but nothing defines how staff change them safely.",
+        "after": "Staff writes flow through an internal boundary and management service to owning services, invalidate read caches, and append audit records.",
+        "newRisk": "The management service can become a central bottleneck, and a missed invalidation leaves guests on stale pages."
+      },
+      "concepts": [
+        {
+          "term": "Cache invalidation",
+          "definition": "Remove or refresh cached data after the source of truth changes.",
+          "whyItMatters": "Guests should not keep seeing stale room details or rates after staff updates.",
+          "example": "After a room-detail edit commits, Hotel Service evicts the hotel:245 key so the next read repopulates it."
+        },
+        {
+          "term": "Audit log",
+          "definition": "An immutable record of who changed what and when.",
+          "whyItMatters": "Admin actions affect revenue, availability, and customer promises."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "Staff cut a rate for a sale, but cached hotel pages keep serving the old higher price.",
+          "expectedBehavior": "Guests see the new rate within a bounded, predictable window.",
+          "mitigation": "Make invalidation part of the write path or emit a durable rate-changed event consumed by cache refreshers; alert if refresh lags."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Routes staff writes through owning services instead of direct database writes.",
+          "Treats cache invalidation and audit logging as part of the write path, not an afterthought."
+        ],
+        "weak": [
+          "Lets the admin tool write straight to a shared store, bypassing validation and invalidation.",
+          "Has no story for how a cache becomes consistent after an admin change."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  Admin[Hotel Staff]",
+        "  Internal[Internal API]",
+        "  Mgmt[Hotel Management Service\\norchestrator, delegates to owners]",
+        "  HotelSvc[Hotel Service]",
+        "  RateSvc[Rate Service]",
+        "  ResSvc[Reservation Service]",
+        "  Cache([Read Caches\\ninvalidated after each write])",
+        "  Audit[(Audit Log\\nwho changed what, when, immutable)]",
+        "  Admin -->|staff change| Internal",
+        "  Internal -->|authorize| Mgmt",
+        "  Mgmt -->|hotel/room update| HotelSvc",
+        "  Mgmt -->|rate update| RateSvc",
+        "  Mgmt -->|inventory hold| ResSvc",
+        "  Mgmt -->|invalidate| Cache",
+        "  Mgmt -->|append event| Audit"
+      ],
+      "highlight": [
+        "Mgmt",
+        "Cache",
+        "Audit"
+      ],
+      "options": [
+        {
+          "name": "Management service delegates to owners (default)",
+          "pros": [
+            "Preserves service ownership",
+            "Centralizes staff authorization and audit",
+            "Avoids direct admin database writes"
+          ],
+          "cons": [
+            "Admin workflow depends on multiple services",
+            "Partial failures require clear staff feedback"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Admin[Hotel Staff]",
+            "  Internal[Internal API]",
+            "  Mgmt[Hotel Management Service]",
+            "  HotelSvc[Hotel Service]",
+            "  RateSvc[Rate Service]",
+            "  ResSvc[Reservation Service]",
+            "  Cache([Read Caches])",
+            "  Audit[(Audit Log)]",
+            "  Admin -->|staff change| Internal",
+            "  Internal -->|authorize| Mgmt",
+            "  Mgmt -->|hotel/room update| HotelSvc",
+            "  Mgmt -->|rate update| RateSvc",
+            "  Mgmt -->|inventory hold| ResSvc",
+            "  Mgmt -->|invalidate| Cache",
+            "  Mgmt -->|append event| Audit"
+          ],
+          "highlight": [
+            "Mgmt",
+            "Audit"
+          ]
+        },
+        {
+          "name": "Direct admin writes to shared store",
+          "pros": [
+            "Fast to build for a small internal tool",
+            "Fewer service dependencies for staff operations"
+          ],
+          "cons": [
+            "Bypasses domain validation and cache invalidation paths",
+            "Harder to audit ownership and enforce permissions"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Admin[Hotel Staff]",
+            "  Tool[Admin Tool]",
+            "  SharedDB[(Shared Hotel Store)]",
+            "  Cache([Read Caches])",
+            "  Admin -->|staff change| Tool",
+            "  Tool -->|direct write| SharedDB",
+            "  Tool -.->|manual purge| Cache"
+          ],
+          "highlight": [
+            "SharedDB"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Admin safety",
+          "points": [
+            "Staff writes should be authorized by role and hotel scope.",
+            "Every write should include changed_by, reason, old value, and new value where feasible.",
+            "Cache invalidation should be part of the write path or emitted as a durable change event."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Admin changes do not invalidate cached hotel pages.",
+          "mitigation": "Emit hotel-changed and rate-changed events consumed by cache refreshers."
+        },
+        {
+          "issue": "One management service can become a central bottleneck.",
+          "mitigation": "Keep it as an orchestrator and delegate domain writes to owning services."
+        }
+      ],
+      "talkingPoints": [
+        "Admin tools are part of the system design, not an afterthought.",
+        "A cache is only useful if the invalidation story is credible."
+      ],
+      "flows": [
+        {
+          "name": "Room detail update",
+          "note": "Hotel Service owns the write; cache is invalidated after commit.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant A as Admin",
+            "  participant M as Management Service",
+            "  participant H as Hotel Service",
+            "  participant DB as Hotel Store",
+            "  participant K as Hotel Cache",
+            "  A->>M: update room details",
+            "  M->>H: authorized update",
+            "  H->>DB: write room metadata",
+            "  DB-->>H: committed",
+            "  H->>K: invalidate hotel page",
+            "  H-->>A: updated"
+          ],
+          "highlight": [
+            "K"
+          ]
+        },
+        {
+          "name": "Maintenance hold",
+          "note": "Taking rooms out of inventory flows through Reservation Service.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant A as Admin",
+            "  participant M as Management Service",
+            "  participant R as Reservation Service",
+            "  participant I as Inventory Store",
+            "  A->>M: mark rooms unavailable",
+            "  M->>R: maintenance hold",
+            "  R->>I: reduce total_inventory for dates",
+            "  I-->>R: updated",
+            "  R-->>A: hold active"
+          ],
+          "highlight": [
+            "R",
+            "I"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "inventory-cache-and-sharding",
+      "title": "9. Inventory Cache, Sharding, and Scale",
+      "description": "At hotel-chain scale, a relational database can hold the inventory table, but popular travel-site scale requires sharding and cache-assisted reads. The database remains the source of truth; cache answers common availability checks and is refreshed asynchronously.",
+      "decisionPrompt": "Scale the inventory path: when do we add Redis and sharding, what key do we shard by, and why does the database still perform final validation?",
+      "whyNow": [
+        "The core booking flow is correct end to end; scale is the right follow-up because the interviewer's \"what if this were Booking.com?\" pushes QPS ~1000x.",
+        "Caching availability reads only helps once the commit transaction is the proven source of truth, which the earlier steps established."
+      ],
+      "recap": {
+        "before": "A single relational database holds inventory and serves correct but unscaled availability reads.",
+        "after": "Redis fronts availability reads and inventory is sharded by hotel_id, while the database stays the source of truth that validates every final booking.",
+        "newRisk": "Cache staleness and a hot single-hotel shard during a major event become the new failure modes."
+      },
+      "concepts": [
+        {
+          "term": "hotel_id sharding",
+          "definition": "Partition reservation and inventory data by hotel_id or a hash of hotel_id.",
+          "whyItMatters": "Most booking and availability queries start by choosing a hotel.",
+          "example": "hash(hotel_id) % 16 routes a booking to one shard, keeping all of a hotel's inventory co-located."
+        },
+        {
+          "term": "Change data capture",
+          "definition": "A mechanism that reads database changes and applies them to another system such as a cache.",
+          "whyItMatters": "It can keep Redis inventory cache close to the database without adding synchronous cache work to every commit."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "Redis still shows a room available, but the database is already sold out at commit.",
+          "expectedBehavior": "The booking is correctly refused; the cache never overrides the source of truth.",
+          "mitigation": "Always revalidate inventory in the database transaction; treat the cache as a fast filter, and surface a clean \"just sold out\" message."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Defers sharding/cache as scale-driven follow-ups rather than premature step-one complexity.",
+          "Keeps the database authoritative even when Redis says rooms are available."
+        ],
+        "weak": [
+          "Lets the cache make the final booking decision.",
+          "Picks a shard key unrelated to how queries filter (e.g., ignoring hotel_id)."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  ResSvc[Reservation Service]",
+        "  InvCache([Inventory Cache Redis\\nfast availability reads, may be stale])",
+        "  Router[Shard Router hotel_id\\nhash(hotel_id) picks a shard]",
+        "  Shard0[(Shard 0\\nsource of truth, validates final booking)]",
+        "  Shard1[(Shard 1)]",
+        "  ShardN[(Shard N)]",
+        "  CDC[CDC / Cache Updater\\nasync refresh from DB changes]",
+        "  ResSvc -->|availability read| InvCache",
+        "  ResSvc -->|final commit| Router",
+        "  Router -->|hotel hash| Shard0",
+        "  Router -->|hotel hash| Shard1",
+        "  Router -->|hotel hash| ShardN",
+        "  Shard0 -->|changes| CDC",
+        "  CDC -->|refresh keys| InvCache"
+      ],
+      "highlight": [
+        "InvCache",
+        "Router",
+        "Shard0",
+        "Shard1",
+        "ShardN",
+        "CDC"
+      ],
+      "options": [
+        {
+          "name": "Database source of truth with Redis read cache (default)",
+          "pros": [
+            "Availability checks are fast and cheap",
+            "Final commit remains correct at the database",
+            "CDC or async updates keep cache reasonably fresh"
+          ],
+          "cons": [
+            "Cache can be stale and produce disappointing sold-out responses",
+            "More moving parts and reconciliation metrics"
+          ],
+          "diagram": [
+            "graph TB",
+            "  ResSvc[Reservation Service]",
+            "  InvCache([Inventory Cache Redis])",
+            "  Router[Shard Router hotel_id]",
+            "  Shard0[(Shard 0)]",
+            "  Shard1[(Shard 1)]",
+            "  ShardN[(Shard N)]",
+            "  CDC[CDC / Cache Updater\\nasync DB to cache refresh]",
+            "  ResSvc -->|availability read| InvCache",
+            "  ResSvc -->|final commit| Router",
+            "  Router -->|hotel hash| Shard0",
+            "  Router -->|hotel hash| Shard1",
+            "  Router -->|hotel hash| ShardN",
+            "  Shard0 -->|changes| CDC",
+            "  CDC -->|refresh keys| InvCache"
+          ],
+          "highlight": [
+            "InvCache",
+            "Router",
+            "CDC"
+          ]
+        },
+        {
+          "name": "Single replicated booking store",
+          "pros": [
+            "Simpler and enough for the stated hotel-chain scale",
+            "ACID transaction story is straightforward",
+            "Fewer cache consistency issues"
+          ],
+          "cons": [
+            "Less headroom for travel-marketplace traffic",
+            "Hot hotels can still overload one primary"
+          ],
+          "diagram": [
+            "graph TB",
+            "  ResSvc[Reservation Service]",
+            "  Primary[(Primary Booking Store)]",
+            "  Replica[(Read Replica)]",
+            "  ResSvc -->|booking writes| Primary",
+            "  ResSvc -->|history reads| Replica",
+            "  Primary -->|replicate| Replica"
+          ],
+          "highlight": [
+            "Primary",
+            "Replica"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Cache correctness",
+          "points": [
+            "Cache is allowed to be slightly stale because final commit rechecks the database.",
+            "A stale positive availability result leads to a sold-out response at commit time.",
+            "A stale negative result can suppress bookings, so freshness and cache miss policy matter."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "One hotel becomes a hot shard during a major event.",
+          "mitigation": "Use per-hotel admission control, bounded retries, and targeted capacity for hot shards."
+        },
+        {
+          "issue": "Cache updater lags behind database commits.",
+          "mitigation": "Track CDC lag and fall back to database reads when lag exceeds threshold."
+        }
+      ],
+      "talkingPoints": [
+        "For the stated scale, sharding is a follow-up, not necessarily step one.",
+        "The database is still the final authority even when Redis says rooms are available."
+      ],
+      "flows": [
+        {
+          "name": "Availability cache read then source-of-truth commit",
+          "note": "Cache improves read throughput; The source-of-truth store validates final booking.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant R as Reservation Service",
+            "  participant K as Inventory Cache",
+            "  participant DB as Inventory Store",
+            "  C->>R: check availability",
+            "  R->>K: read availability keys",
+            "  K-->>R: available",
+            "  C->>R: book",
+            "  R->>DB: final transactional update",
+            "  DB-->>R: committed or sold out"
+          ],
+          "highlight": [
+            "K",
+            "DB"
+          ]
+        },
+        {
+          "name": "CDC refreshes cache",
+          "note": "Database changes propagate to Redis asynchronously.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant DB as Inventory Store",
+            "  participant CDC as CDC Connector",
+            "  participant K as Inventory Cache",
+            "  DB-)CDC: row change event",
+            "  CDC->>K: update hotel_roomType_date key",
+            "  K-->>CDC: ok"
+          ],
+          "highlight": [
+            "CDC",
+            "K"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "service-consistency-and-observability",
+      "title": "10. Service Consistency and Observability",
+      "description": "Inventory, reservations, and payments form one business transaction. A pragmatic design keeps reservation and inventory in one relational database, while payment and admin events use idempotency, reconciliation, and metrics. A pure microservice design can use sagas, but that adds complexity.",
+      "decisionPrompt": "Choose the consistency boundary: which data must stay in one ACID transaction, where is eventual consistency acceptable, and what metrics prove the booking flow is healthy?",
+      "whyNow": [
+        "Every step relied on inventory and reservation committing together; this step justifies that boundary against the microservice-purist objection and decides where eventual consistency is acceptable.",
+        "With cache, payment, and admin events all in play, the design now needs the observability to prove the whole booking flow is actually healthy."
+      ],
+      "recap": {
+        "before": "The pieces work, but the consistency boundary is implicit and there is no way to prove the live system is correct.",
+        "after": "Reservation and inventory share one ACID boundary by default; cross-service effects use idempotency and reconciliation, backed by metrics and alerts.",
+        "newRisk": "Reservation Service owns more than one capability, and silent payment/state mismatches must be caught by reconciliation rather than users."
+      },
+      "concepts": [
+        {
+          "term": "Saga",
+          "definition": "A sequence of local transactions with compensating actions when later steps fail.",
+          "whyItMatters": "It is one way to coordinate reservation, inventory, and payment across separate service databases.",
+          "example": "If payment fails after inventory is reserved, the saga runs a compensating release of that inventory."
+        },
+        {
+          "term": "Reconciliation",
+          "definition": "A background process that compares systems and repairs or flags mismatched state.",
+          "whyItMatters": "Payment providers, caches, and event buses can disagree with reservation state after partial failures."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "After a partial failure, a batch of reservations is stuck in pending with payments that may or may not have captured.",
+          "expectedBehavior": "These do not sit silently; they are detected, resolved against the provider, and escalated if unresolved.",
+          "mitigation": "Run reconciliation jobs over pending/unknown reservations and alert when stuck counts or payment mismatches exceed a threshold."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Defends keeping reservation and inventory in one ACID boundary as the pragmatic choice, and can articulate the saga alternative.",
+          "Names concrete health metrics (booking success rate, lock-conflict rate, CDC lag, stuck-pending count)."
+        ],
+        "weak": [
+          "Reaches for 2PC or a full saga without being asked to justify distributed-transaction complexity.",
+          "Has no metrics or reconciliation to detect inconsistency after partial failures."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  ResSvc[Reservation Service]",
+        "  ResInvDB[(Booking Store\\nreservation + inventory in one ACID boundary)]",
+        "  PaySvc[Payment Service]",
+        "  PayDB[(Payment Store\\nseparate, eventually consistent)]",
+        "  EventBus[[Event Bus\\ndomain events for audit/analytics]]",
+        "  Recon[Reconciliation Jobs\\nrepair payment/state mismatches]",
+        "  Metrics[Metrics / Alerts\\nbooking success, lock conflicts, CDC lag]",
+        "  ResSvc -->|ACID booking| ResInvDB",
+        "  ResSvc -->|charge/refund| PaySvc",
+        "  PaySvc -->|payment state| PayDB",
+        "  ResSvc -->|domain events| EventBus",
+        "  EventBus -->|audit/analytics| Metrics",
+        "  Recon -->|compare states| ResInvDB",
+        "  Recon -->|compare payments| PayDB",
+        "  Metrics -->|alert| Recon"
+      ],
+      "highlight": [
+        "ResInvDB",
+        "EventBus",
+        "Recon",
+        "Metrics"
+      ],
+      "options": [
+        {
+          "name": "Hybrid ACID boundary (default)",
+          "pros": [
+            "Inventory and reservation commit together",
+            "Simpler concurrency and rollback story",
+            "Avoids saga complexity for the core booking invariant"
+          ],
+          "cons": [
+            "Reservation Service owns more than one conceptual capability",
+            "Purist microservice teams may object to shared persistence boundary"
+          ],
+          "diagram": [
+            "graph TB",
+            "  ResSvc[Reservation Service]",
+            "  ResInvDB[(Booking Store\\nreservation + inventory, one ACID boundary)]",
+            "  PaySvc[Payment Service]",
+            "  PayDB[(Payment Store)]",
+            "  EventBus[[Event Bus]]",
+            "  Recon[Reconciliation Jobs\\ndetect/repair state mismatches]",
+            "  Metrics[Metrics / Alerts]",
+            "  ResSvc -->|ACID booking| ResInvDB",
+            "  ResSvc -->|charge/refund| PaySvc",
+            "  PaySvc -->|payment state| PayDB",
+            "  ResSvc -->|domain events| EventBus",
+            "  EventBus -->|audit/analytics| Metrics",
+            "  Recon -->|compare states| ResInvDB",
+            "  Recon -->|compare payments| PayDB"
+          ],
+          "highlight": [
+            "ResInvDB"
+          ]
+        },
+        {
+          "name": "Pure microservices with Saga",
+          "pros": [
+            "Each service owns its own database",
+            "Independent scaling and deployment boundaries are clean",
+            "Compensation can model complex workflows"
+          ],
+          "cons": [
+            "Eventually consistent booking state is harder to explain and operate",
+            "Many failure cases require compensating actions and reconciliation"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Saga[Reservation Saga Orchestrator]",
+            "  InvSvc[Inventory Service]",
+            "  InvDB[(Inventory Store)]",
+            "  ResSvc[Reservation Service]",
+            "  ResDB[(Reservation Store)]",
+            "  PaySvc[Payment Service]",
+            "  PayDB[(Payment Store)]",
+            "  Saga -->|reserve inventory| InvSvc",
+            "  InvSvc -->|local tx| InvDB",
+            "  Saga -->|create reservation| ResSvc",
+            "  ResSvc -->|local tx| ResDB",
+            "  Saga -->|capture payment| PaySvc",
+            "  PaySvc -->|local tx| PayDB",
+            "  Saga -->|compensate on failure| InvSvc"
+          ],
+          "highlight": [
+            "Saga",
+            "InvSvc",
+            "ResSvc",
+            "PaySvc"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "What to observe",
+          "points": [
+            "Booking success rate, payment rejection rate, payment unknown state count, inventory conflict rate, cache hit rate, CDC lag, and admin change volume.",
+            "Alert on stuck pending reservations and payment/reservation mismatches.",
+            "Track optimistic-lock conflicts by hotel and room type to identify hotspots."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Pure service separation makes one booking span multiple databases.",
+          "mitigation": "Use a saga only if independent ownership is worth the extra failure handling."
+        },
+        {
+          "issue": "Unknown payment states can accumulate silently.",
+          "mitigation": "Run reconciliation jobs and alert on pending or mismatched states above threshold."
+        }
+      ],
+      "talkingPoints": [
+        "The pragmatic interview answer is to keep reservation and inventory together for ACID correctness.",
+        "Do not introduce 2PC unless the interviewer explicitly wants distributed transaction tradeoffs."
+      ],
+      "flows": [
+        {
+          "name": "Reconcile payment mismatch",
+          "note": "Background jobs detect and repair divergent payment and reservation state.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant Job as Reconciliation Job",
+            "  participant RDB as Booking Store",
+            "  participant P as Payment Service",
+            "  participant Alert as Alerts",
+            "  Job->>RDB: find pending/unknown reservations",
+            "  RDB-->>Job: candidates",
+            "  Job->>P: lookup payment_id",
+            "  P-->>Job: paid",
+            "  Job->>RDB: mark reservation paid",
+            "  Job->>Alert: emit repaired mismatch"
+          ],
+          "highlight": [
+            "Job",
+            "Alert"
+          ]
+        },
+        {
+          "name": "Saga compensation example",
+          "note": "Pure microservice design must compensate when payment fails after inventory reservation.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant Saga as Saga Orchestrator",
+            "  participant I as Inventory Service",
+            "  participant R as Reservation Service",
+            "  participant P as Payment Service",
+            "  Saga->>I: reserve inventory",
+            "  I-->>Saga: reserved",
+            "  Saga->>R: create reservation",
+            "  R-->>Saga: pending",
+            "  Saga->>P: capture payment",
+            "  P-->>Saga: failed",
+            "  Saga->>I: compensate release inventory",
+            "  Saga->>R: mark rejected"
+          ],
+          "highlight": [
+            "Saga"
+          ]
+        }
+      ]
+    }
+  ],
+  "finalDesign": {
+    "title": "Final Design",
+    "description": "End-to-end hotel reservation architecture: public and internal entry points, catalog and rates, room-type inventory, idempotent reservation submission, transactional inventory commits, payment state, cancellation, admin updates, cache-assisted reads, sharding, and operational reconciliation.",
+    "diagram": [
+      "graph TB",
+      "  Guest[Guest Web / Mobile]",
+      "  CDN[CDN / Static Assets]",
+      "  Gateway[Public API Gateway]",
+      "  HotelSvc[Hotel Service]",
+      "  HotelCache([Hotel Cache])",
+      "  HotelDB[(Hotel Store)]",
+      "  RateSvc[Rate Service]",
+      "  RateDB[(Rate Store)]",
+      "  ResSvc[Reservation Service]",
+      "  InvCache([Inventory Cache\\nfast reads, DB still validates])",
+      "  Router[Inventory Shard Router\\nshards by hotel_id]",
+      "  ResInvDB[(Booking Store\\nreservation + inventory, one ACID boundary)]",
+      "  PaySvc[Payment Service]",
+      "  PayDB[(Payment Store)]",
+      "  Admin[Hotel Staff]",
+      "  Internal[Internal API]",
+      "  Mgmt[Hotel Management Service]",
+      "  CDC[CDC / Cache Updater\\nasync DB to cache refresh]",
+      "  EventBus[[Domain Event Bus]]",
+      "  Recon[Reconciliation Jobs\\ndetect/repair state mismatches]",
+      "  Metrics[Metrics / Alerts]",
+      "  Guest -->|static assets| CDN",
+      "  Guest -->|API calls| Gateway",
+      "  Gateway -->|hotel detail| HotelSvc",
+      "  HotelSvc -->|cache lookup| HotelCache",
+      "  HotelCache -->|miss| HotelDB",
+      "  Gateway -->|date rates| RateSvc",
+      "  RateSvc -->|rate rows| RateDB",
+      "  Gateway -->|book/cancel| ResSvc",
+      "  ResSvc -->|availability read| InvCache",
+      "  ResSvc -->|final commit| Router",
+      "  Router -->|hotel_id shard| ResInvDB",
+      "  ResSvc -->|charge/refund| PaySvc",
+      "  PaySvc -->|payment state| PayDB",
+      "  Admin -->|staff action| Internal",
+      "  Internal -->|authorize| Mgmt",
+      "  Mgmt -->|hotel/rate/inventory changes| HotelSvc",
+      "  Mgmt -->|inventory holds| ResSvc",
+      "  ResInvDB -->|changes| CDC",
+      "  CDC -->|refresh keys| InvCache",
+      "  ResSvc -->|events| EventBus",
+      "  Recon -->|compare states| ResInvDB",
+      "  Recon -->|compare payments| PayDB",
+      "  EventBus -->|metrics| Metrics"
+    ],
+    "highlight": [],
+    "options": [
+      {
+        "name": "Hybrid ACID reservation boundary with cache/sharding",
+        "pros": [
+          "Reservation and inventory correctness stay inside one transaction",
+          "Catalog, rates, payments, and admin remain separate domains",
+          "Inventory cache scales reads while database validates final booking",
+          "Reconciliation handles payment and event inconsistencies"
+        ],
+        "cons": [
+          "Reservation Service owns both reservation and inventory concerns",
+          "Cache staleness can still create sold-out-at-commit UX",
+          "Sharding and CDC add operational complexity"
+        ],
+        "diagram": [
+          "graph TB",
+          "  Guest[Guest Web / Mobile]",
+          "  CDN[CDN / Static Assets]",
+          "  Gateway[Public API Gateway]",
+          "  HotelSvc[Hotel Service]",
+          "  HotelCache([Hotel Cache])",
+          "  HotelDB[(Hotel Store)]",
+          "  RateSvc[Rate Service]",
+          "  RateDB[(Rate Store)]",
+          "  ResSvc[Reservation Service]",
+          "  InvCache([Inventory Cache\\nfast reads, DB still validates])",
+          "  Router[Inventory Shard Router\\nshards by hotel_id]",
+          "  ResInvDB[(Booking Store\\nreservation + inventory, one ACID boundary)]",
+          "  PaySvc[Payment Service]",
+          "  PayDB[(Payment Store)]",
+          "  Admin[Hotel Staff]",
+          "  Internal[Internal API]",
+          "  Mgmt[Hotel Management Service]",
+          "  CDC[CDC / Cache Updater\\nasync DB to cache refresh]",
+          "  EventBus[[Domain Event Bus]]",
+          "  Recon[Reconciliation Jobs\\ndetect/repair state mismatches]",
+          "  Metrics[Metrics / Alerts]",
+          "  Guest -->|static assets| CDN",
+          "  Guest -->|API calls| Gateway",
+          "  Gateway -->|hotel detail| HotelSvc",
+          "  HotelSvc -->|cache lookup| HotelCache",
+          "  HotelCache -->|miss| HotelDB",
+          "  Gateway -->|date rates| RateSvc",
+          "  RateSvc -->|rate rows| RateDB",
+          "  Gateway -->|book/cancel| ResSvc",
+          "  ResSvc -->|availability read| InvCache",
+          "  ResSvc -->|final commit| Router",
+          "  Router -->|hotel_id shard| ResInvDB",
+          "  ResSvc -->|charge/refund| PaySvc",
+          "  PaySvc -->|payment state| PayDB",
+          "  Admin -->|staff action| Internal",
+          "  Internal -->|authorize| Mgmt",
+          "  Mgmt -->|hotel/rate/inventory changes| HotelSvc",
+          "  Mgmt -->|inventory holds| ResSvc",
+          "  ResInvDB -->|changes| CDC",
+          "  CDC -->|refresh keys| InvCache",
+          "  ResSvc -->|events| EventBus",
+          "  Recon -->|compare states| ResInvDB",
+          "  Recon -->|compare payments| PayDB",
+          "  EventBus -->|metrics| Metrics"
+        ],
+        "highlight": []
+      },
+      {
+        "name": "Pure microservice Saga design",
+        "pros": [
+          "Every service owns its database independently",
+          "Clean service boundaries for large organizations",
+          "Compensation can model complex multi-step failures"
+        ],
+        "cons": [
+          "Core booking becomes eventually consistent",
+          "Many partial failure paths require compensation and reconciliation",
+          "Harder to explain and operate in an interview unless required"
+        ],
+        "diagram": [
+          "graph TB",
+          "  Guest[Guest]",
+          "  Gateway[API Gateway]",
+          "  Saga[Booking Saga Orchestrator]",
+          "  HotelSvc[Hotel Service]",
+          "  RateSvc[Rate Service]",
+          "  InvSvc[Inventory Service]",
+          "  InvDB[(Inventory Store)]",
+          "  ResSvc[Reservation Service]",
+          "  ResDB[(Reservation Store)]",
+          "  PaySvc[Payment Service]",
+          "  PayDB[(Payment Store)]",
+          "  EventBus[[Event Bus]]",
+          "  Guest -->|book| Gateway",
+          "  Gateway -->|start booking| Saga",
+          "  Saga -->|hotel data| HotelSvc",
+          "  Saga -->|price quote| RateSvc",
+          "  Saga -->|reserve inventory| InvSvc",
+          "  InvSvc -->|local tx| InvDB",
+          "  Saga -->|create reservation| ResSvc",
+          "  ResSvc -->|local tx| ResDB",
+          "  Saga -->|capture payment| PaySvc",
+          "  PaySvc -->|local tx| PayDB",
+          "  Saga -->|publish outcome| EventBus",
+          "  Saga -->|compensate failure| InvSvc"
+        ],
+        "highlight": []
+      }
+    ]
+  },
+  "satisfies": {
+    "functional": [
+      {
+        "requirement": "Show hotel and room details.",
+        "how": "Hotel Service serves cache-friendly catalog data while Rate Service provides date-specific rates.",
+        "steps": [
+          "client-and-api-gateway",
+          "hotel-catalog-and-rate-read-model"
+        ]
+      },
+      {
+        "requirement": "Reserve a room.",
+        "how": "Reservation Service creates an idempotent order, validates room-type inventory across the date range, captures payment, and commits reservation state.",
+        "steps": [
+          "room-type-inventory-model",
+          "reservation-order-and-idempotency",
+          "inventory-transaction-and-concurrency",
+          "payment-and-reservation-state"
+        ]
+      },
+      {
+        "requirement": "View reservation history.",
+        "how": "GET /v1/reservations and GET /v1/reservations/{id} return the authenticated guest's bookings from a read replica, so history reads do not contend with booking writes.",
+        "steps": [
+          "client-and-api-gateway",
+          "inventory-cache-and-sharding"
+        ]
+      },
+      {
+        "requirement": "Cancel a reservation.",
+        "how": "Cancellation is modeled as a state transition that releases inventory and triggers refunds when applicable.",
+        "steps": [
+          "cancellation-and-inventory-release",
+          "payment-and-reservation-state"
+        ]
+      },
+      {
+        "requirement": "Admin panel to manage hotels, rooms, rates, and inventory.",
+        "how": "Internal API and Hotel Management Service authorize staff actions, delegate writes to owning services, invalidate caches, and write audit records.",
+        "steps": [
+          "admin-management-and-cache-invalidation"
+        ]
+      },
+      {
+        "requirement": "Support 10% overbooking.",
+        "how": "Inventory validation uses a configurable capacity policy, such as total_reserved + rooms <= 1.1 x total_inventory, applied inside the same booking transaction.",
+        "steps": [
+          "room-type-inventory-model",
+          "inventory-transaction-and-concurrency",
+          "overbooking-policy"
+        ]
+      }
+    ],
+    "nonFunctional": [
+      {
+        "requirement": "Support high concurrency for popular hotels.",
+        "how": "Final booking uses database-backed concurrency control; optimistic locking, constraints, or locks protect hot inventory rows.",
+        "steps": [
+          "inventory-transaction-and-concurrency"
+        ]
+      },
+      {
+        "requirement": "Moderate reservation latency is acceptable.",
+        "how": "The design keeps final booking synchronous enough to return a clear outcome, while slow refunds and cache refreshes can be asynchronous.",
+        "steps": [
+          "payment-and-reservation-state",
+          "cancellation-and-inventory-release",
+          "inventory-cache-and-sharding"
+        ]
+      },
+      {
+        "requirement": "Read paths should be fast.",
+        "how": "Catalog data and availability reads use caches, while final booking revalidates against the source-of-truth database.",
+        "steps": [
+          "hotel-catalog-and-rate-read-model",
+          "inventory-cache-and-sharding"
+        ]
+      },
+      {
+        "requirement": "Avoid data inconsistency in core booking.",
+        "how": "Reservation and inventory remain inside one ACID boundary by default; cross-service effects use idempotency and reconciliation.",
+        "steps": [
+          "inventory-transaction-and-concurrency",
+          "service-consistency-and-observability"
+        ]
+      },
+      {
+        "requirement": "Scale to a larger travel-site scenario.",
+        "how": "Inventory can be sharded by hotel_id and fronted by Redis, with CDC-driven refresh and lag monitoring.",
+        "steps": [
+          "inventory-cache-and-sharding",
+          "service-consistency-and-observability"
+        ]
+      }
+    ]
+  },
+  "followUps": [
+    "How would the design change if rooms could be held for 10 minutes before payment?",
+    "How would you handle third-party booking channels such as Expedia or phone reservations?",
+    "How would you expose search by city, amenities, price, and availability without overloading the reservation database?",
+    "What should happen if payment succeeds but the reservation transaction times out?",
+    "How would you tune overbooking by hotel, date, room type, and cancellation history?",
+    "How would you make this design multi-region while preserving booking correctness for a hot hotel?"
+  ]
+}

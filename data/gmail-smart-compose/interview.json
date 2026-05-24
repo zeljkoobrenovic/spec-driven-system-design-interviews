@@ -1,0 +1,2015 @@
+{
+  "title": "Gmail Smart Compose - System Design",
+  "description": "A step-by-step ML system design walkthrough for real-time assisted email writing, grouped into the online suggestion path, offline ML pipeline, evaluation loop, and production rollout. It covers product triggering, privacy-safe data preparation, subword tokenization, decoder-only Transformers, two-stage training, low-latency beam-search serving, safety filtering, metrics, and model operations.",
+  "requirementsDiagram": [
+    "graph TB",
+    "  User((Gmail User))",
+    "  Composer[Email Composer]",
+    "  Trigger[Triggering Service]",
+    "  Suggest[Suggestion Service]",
+    "  Filter[Safety and Confidence Filter]",
+    "  UI[Inline Suggestion UI]",
+    "  Feedback[Accept / Dismiss Feedback]",
+    "  User -->|types email body| Composer",
+    "  Composer -->|eligible context| Trigger",
+    "  Trigger -->|suggest request| Suggest",
+    "  Suggest -->|candidate completions| Filter",
+    "  Filter -->|only safe confident text| UI",
+    "  User -->|tab accepts or keeps typing| Feedback"
+  ],
+  "requirements": {
+    "functional": [
+      "Suggest the next few words while a user types an email body.",
+      "Start with a global English model and no per-user personalization.",
+      "Use the partial email body as the initial input, with room to add subject, recipient, and previous-message context later.",
+      "Show a suggestion only when the system is confident enough.",
+      "Filter suggestions that could expose sensitive information or make biased assumptions.",
+      "Collect acceptance and dismissal feedback for evaluation and future improvements."
+    ],
+    "nonFunctional": [
+      "Return suggestions fast enough for typing, targeting roughly 100 ms end-to-end latency.",
+      "Scale to Gmail-like traffic: many users typing at once, with client-side triggering to avoid a request on every keystroke.",
+      "Train from roughly one billion email messages after privacy, language, and quality filtering.",
+      "Keep training data privacy-safe by removing PII, confidential content, duplicates, and non-English messages for the initial model.",
+      "Prefer predictable deterministic completions over creative variation.",
+      "Support safe rollout, rollback, and evaluation before exposing a new model broadly."
+    ]
+  },
+  "capacityDiagram": [
+    "graph TB",
+    "  Users[1.8B Gmail users]",
+    "  Active[Active composers]",
+    "  Emails[Up to 500 emails per heavy user per day]",
+    "  Triggers[Client trigger events]",
+    "  QPS[Hundreds of thousands to millions of global peak QPS]",
+    "  Latency[p99 target around 100 ms]",
+    "  Corpus[1B sanitized email messages]",
+    "  Model[GB-scale model artifacts]",
+    "  Users -->|subset typing now| Active",
+    "  Active -->|compose sessions| Emails",
+    "  Emails -->|not every keystroke| Triggers",
+    "  Triggers -->|global serving load| QPS",
+    "  QPS -->|must stay interactive| Latency",
+    "  Corpus -->|fine-tuning data| Model",
+    "  Model -->|replicated to serving regions| QPS"
+  ],
+  "capacity": [
+    {
+      "label": "Registered users",
+      "value": "~1.8B",
+      "note": "Requirement-scale anchor; only a subset are composing at any moment."
+    },
+    {
+      "label": "Heavy-user upper bound",
+      "value": "500 emails/day/user",
+      "note": "Useful for abuse and professional-user extremes, not the average user assumption."
+    },
+    {
+      "label": "Suggestion latency",
+      "value": "~100 ms",
+      "note": "The system must respond before the user naturally types the same words."
+    },
+    {
+      "label": "Fine-tuning corpus",
+      "value": "~1B messages",
+      "note": "After language detection, deduplication, redaction, and quality filtering."
+    },
+    {
+      "label": "Serving load",
+      "value": "100k-1M+ peak QPS",
+      "note": "Client-side triggering, debouncing, and eligibility checks prevent a request per keystroke."
+    },
+    {
+      "label": "Request size",
+      "value": "KB-scale",
+      "note": "Context includes partial body and optional structured metadata, not full mailboxes."
+    },
+    {
+      "label": "Response size",
+      "value": "sub-KB",
+      "note": "Usually one short completion plus score, model version, and display metadata."
+    },
+    {
+      "label": "Model release cadence",
+      "value": "days to weeks",
+      "note": "Offline eval, safety review, canary, and A/B testing matter more than continuous retraining."
+    }
+  ],
+  "api": [
+    {
+      "method": "POST",
+      "path": "/v1/smart-compose/suggestions",
+      "description": "Return at most one inline completion for the current composing context.",
+      "request": "{ \"draftId\": \"d_123\", \"locale\": \"en-US\", \"bodyPrefix\": \"Hi Petra, it was\", \"subject\": \"Thanks\", \"recipientHints\": [\"Petra\"], \"clientTrigger\": \"pause_after_word\" }",
+      "response": "{ \"suggestion\": \" nice seeing you\", \"confidence\": 0.82, \"modelVersion\": \"sc_2026_05_20\", \"expiresInMs\": 3000 }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Gmail Client",
+        "  participant T as Triggering Service",
+        "  participant S as Suggestion Service",
+        "  participant I as Inference Service",
+        "  participant F as Safety Filter",
+        "  C->>T: typing context after local trigger",
+        "  T->>S: POST /suggestions",
+        "  S->>I: build prompt and decode",
+        "  I-->>S: candidates with scores",
+        "  S->>F: confidence length and safety checks",
+        "  F-->>S: approved suggestion or empty",
+        "  S-->>C: suggestion response"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/smart-compose/feedback",
+      "description": "Record whether a shown suggestion was accepted, ignored, or explicitly dismissed.",
+      "request": "{ \"suggestionId\": \"sg_456\", \"draftId\": \"d_123\", \"event\": \"accepted\", \"latencyMs\": 74, \"modelVersion\": \"sc_2026_05_20\" }",
+      "response": "{ \"recorded\": true }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Gmail Client",
+        "  participant G as API Gateway",
+        "  participant F as Feedback Service",
+        "  participant Q as Event Stream",
+        "  participant A as Analytics Store",
+        "  C->>G: POST /feedback",
+        "  G->>F: validate event",
+        "  F-)Q: suggestion_feedback",
+        "  Q->>A: aggregate metrics",
+        "  F-->>C: recorded"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/smart-compose/config",
+      "description": "Return client-side trigger thresholds, locale support, and rollout assignment.",
+      "request": "?locale=en-US",
+      "response": "{ \"enabled\": true, \"minChars\": 8, \"debounceMs\": 80, \"maxWords\": 6, \"modelVersion\": \"sc_2026_05_20\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Gmail Client",
+        "  participant Config as Config Service",
+        "  participant R as Rollout DB",
+        "  C->>Config: GET /config",
+        "  Config->>R: lookup user cohort and locale",
+        "  R-->>Config: assignment",
+        "  Config-->>C: trigger and rollout config"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/internal/v1/model-versions",
+      "description": "Register a trained model artifact after offline evaluation and safety review.",
+      "request": "{ \"modelVersion\": \"sc_2026_05_20\", \"tokenizerVersion\": \"spm_18\", \"artifactUri\": \"gs://models/sc_2026_05_20\", \"metrics\": { \"perplexity\": 18.7, \"exactMatchAt3\": 0.41 } }",
+      "response": "{ \"registered\": true, \"state\": \"ready_for_canary\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant T as Training Pipeline",
+        "  participant E as Evaluation Service",
+        "  participant R as Model Registry",
+        "  participant S as Safety Review",
+        "  T->>E: submit candidate metrics",
+        "  E->>S: safety report",
+        "  S-->>E: approved",
+        "  E->>R: register model and tokenizer",
+        "  R-->>T: ready_for_canary"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/internal/v1/model-versions/{modelVersion}/rollout",
+      "description": "Move a model through canary, A/B test, general availability, or rollback states.",
+      "request": "{ \"targetState\": \"canary\", \"trafficPercent\": 1, \"locales\": [\"en-US\"] }",
+      "response": "{ \"modelVersion\": \"sc_2026_05_20\", \"rolloutState\": \"canary\", \"trafficPercent\": 1 }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant O as Operator",
+        "  participant R as Rollout Service",
+        "  participant M as Model Registry",
+        "  participant S as Serving Fleet",
+        "  O->>R: start canary",
+        "  R->>M: verify approved artifact",
+        "  M-->>R: artifact and tokenizer",
+        "  R->>S: update routing config",
+        "  S-->>R: version loaded",
+        "  R-->>O: rollout state"
+      ]
+    }
+  ],
+  "dataModel": [
+    {
+      "name": "sanitized_email_message",
+      "note": "Privacy-filtered email text used for fine-tuning, not raw user mail.",
+      "fields": [
+        {
+          "name": "message_id",
+          "type": "varchar PK"
+        },
+        {
+          "name": "language",
+          "type": "varchar"
+        },
+        {
+          "name": "subject_text",
+          "type": "text"
+        },
+        {
+          "name": "body_text",
+          "type": "text"
+        },
+        {
+          "name": "redaction_version",
+          "type": "varchar"
+        },
+        {
+          "name": "quality_score",
+          "type": "float"
+        }
+      ]
+    },
+    {
+      "name": "tokenizer_version",
+      "note": "Subword vocabulary and normalization rules used by both training and serving.",
+      "fields": [
+        {
+          "name": "tokenizer_version",
+          "type": "varchar PK"
+        },
+        {
+          "name": "algorithm",
+          "type": "varchar"
+        },
+        {
+          "name": "vocab_size",
+          "type": "int"
+        },
+        {
+          "name": "artifact_uri",
+          "type": "text"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "training_example",
+      "note": "Context and target tokens for next-token prediction.",
+      "fields": [
+        {
+          "name": "example_id",
+          "type": "varchar PK"
+        },
+        {
+          "name": "message_id",
+          "type": "varchar FK"
+        },
+        {
+          "name": "tokenizer_version",
+          "type": "varchar FK"
+        },
+        {
+          "name": "context_tokens",
+          "type": "json"
+        },
+        {
+          "name": "target_tokens",
+          "type": "json"
+        }
+      ]
+    },
+    {
+      "name": "model_version",
+      "note": "A trained model artifact tied to a tokenizer and evaluation report.",
+      "fields": [
+        {
+          "name": "model_version",
+          "type": "varchar PK"
+        },
+        {
+          "name": "tokenizer_version",
+          "type": "varchar FK"
+        },
+        {
+          "name": "artifact_uri",
+          "type": "text"
+        },
+        {
+          "name": "state",
+          "type": "varchar"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "suggestion_log",
+      "note": "Privacy-minimized production log for latency, versioning, and quality metrics.",
+      "fields": [
+        {
+          "name": "suggestion_id",
+          "type": "varchar PK"
+        },
+        {
+          "name": "model_version",
+          "type": "varchar FK"
+        },
+        {
+          "name": "locale",
+          "type": "varchar"
+        },
+        {
+          "name": "confidence",
+          "type": "float"
+        },
+        {
+          "name": "latency_ms",
+          "type": "int"
+        },
+        {
+          "name": "shown",
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "name": "feedback_event",
+      "note": "User interaction with a shown suggestion.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "varchar PK"
+        },
+        {
+          "name": "suggestion_id",
+          "type": "varchar FK"
+        },
+        {
+          "name": "event_type",
+          "type": "varchar"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "evaluation_run",
+      "note": "Offline and online metrics for candidate and released models.",
+      "fields": [
+        {
+          "name": "evaluation_id",
+          "type": "varchar PK"
+        },
+        {
+          "name": "model_version",
+          "type": "varchar FK"
+        },
+        {
+          "name": "perplexity",
+          "type": "float"
+        },
+        {
+          "name": "exact_match_at_3",
+          "type": "float"
+        },
+        {
+          "name": "acceptance_rate",
+          "type": "float"
+        },
+        {
+          "name": "p99_latency_ms",
+          "type": "int"
+        }
+      ]
+    }
+  ],
+  "dataModelDiagram": [
+    "erDiagram",
+    "  sanitized_email_message ||--o{ training_example : produces",
+    "  tokenizer_version ||--o{ training_example : tokenizes",
+    "  tokenizer_version ||--o{ model_version : pairs_with",
+    "  model_version ||--o{ suggestion_log : serves",
+    "  suggestion_log ||--o{ feedback_event : receives",
+    "  model_version ||--o{ evaluation_run : evaluated_by",
+    "  sanitized_email_message {",
+    "    varchar message_id PK",
+    "    varchar language",
+    "    text subject_text",
+    "    text body_text",
+    "    varchar redaction_version",
+    "    float quality_score",
+    "  }",
+    "  tokenizer_version {",
+    "    varchar tokenizer_version PK",
+    "    varchar algorithm",
+    "    int vocab_size",
+    "    text artifact_uri",
+    "    timestamp created_at",
+    "  }",
+    "  training_example {",
+    "    varchar example_id PK",
+    "    varchar message_id FK",
+    "    varchar tokenizer_version FK",
+    "    json context_tokens",
+    "    json target_tokens",
+    "  }",
+    "  model_version {",
+    "    varchar model_version PK",
+    "    varchar tokenizer_version FK",
+    "    text artifact_uri",
+    "    varchar state",
+    "    timestamp created_at",
+    "  }",
+    "  suggestion_log {",
+    "    varchar suggestion_id PK",
+    "    varchar model_version FK",
+    "    varchar locale",
+    "    float confidence",
+    "    int latency_ms",
+    "    boolean shown",
+    "  }",
+    "  feedback_event {",
+    "    varchar event_id PK",
+    "    varchar suggestion_id FK",
+    "    varchar event_type",
+    "    timestamp created_at",
+    "  }",
+    "  evaluation_run {",
+    "    varchar evaluation_id PK",
+    "    varchar model_version FK",
+    "    float perplexity",
+    "    float exact_match_at_3",
+    "    float acceptance_rate",
+    "    int p99_latency_ms",
+    "  }"
+  ],
+  "steps": [
+    {
+      "id": "product-boundary-and-triggering",
+      "title": "1. Online Path: Product Boundary and Triggering",
+      "description": "The online path starts by narrowing the product: Smart Compose is an inline assistant that suggests a short continuation while the user is already typing. The client should not call the backend on every keystroke; a lightweight triggering service decides when enough context exists to make a useful request.",
+      "decisionPrompt": "Where should the system decide whether to ask for a suggestion: in the Gmail client, in the backend, or both?",
+      "concepts": [
+        {
+          "term": "Triggering service",
+          "definition": "A component that decides whether the current typing state is eligible for a suggestion.",
+          "whyItMatters": "It cuts traffic and avoids distracting users with low-value completions."
+        },
+        {
+          "term": "Interactive latency budget",
+          "definition": "A response-time target tied to human typing speed rather than batch throughput.",
+          "whyItMatters": "A good suggestion is useless if it arrives after the user has typed the same words."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Gmail Web / Mobile Client]",
+        "  Config[Config Service]",
+        "  Trigger[Triggering Service]",
+        "  Gateway[API Gateway]",
+        "  Suggest[Suggestion Service]",
+        "  Client -->|fetch thresholds| Config",
+        "  Client -->|typing events| Trigger",
+        "  Trigger -->|eligible context only| Gateway",
+        "  Gateway -->|suggestion request| Suggest",
+        "  Suggest -->|short completion or empty| Client"
+      ],
+      "highlight": [
+        "Client",
+        "Config",
+        "Trigger",
+        "Gateway",
+        "Suggest"
+      ],
+      "options": [
+        {
+          "name": "Client-assisted triggering (default)",
+          "pros": [
+            "Avoids backend calls when the prefix is too short or the user is typing continuously",
+            "Lets rollout config tune thresholds without shipping a new client",
+            "Keeps the backend focused on high-value suggestion requests"
+          ],
+          "cons": [
+            "Requires careful client implementation across web and mobile",
+            "Eligibility rules must remain simple enough to run locally"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Gmail Web / Mobile Client]",
+            "  Config[Config Service]",
+            "  Trigger[Triggering Service]",
+            "  Gateway[API Gateway]",
+            "  Suggest[Suggestion Service]",
+            "  Client -->|fetch thresholds| Config",
+            "  Client -->|typing events| Trigger",
+            "  Trigger -->|eligible context only| Gateway",
+            "  Gateway -->|suggestion request| Suggest",
+            "  Suggest -->|short completion or empty| Client"
+          ],
+          "highlight": [
+            "Trigger",
+            "Config"
+          ]
+        },
+        {
+          "name": "Backend-only triggering",
+          "pros": [
+            "Centralizes trigger behavior",
+            "Simplifies older clients"
+          ],
+          "cons": [
+            "Creates far more network traffic",
+            "Backend receives many obviously unusable prefixes",
+            "Harder to meet global latency and cost targets"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Gmail Client]",
+            "  Gateway[API Gateway]",
+            "  Trigger[Backend Trigger Service]",
+            "  Suggest[Suggestion Service]",
+            "  Client -->|frequent typing updates| Gateway",
+            "  Gateway -->|all prefixes| Trigger",
+            "  Trigger -->|eligible only| Suggest",
+            "  Suggest -->|completion or empty| Client"
+          ],
+          "highlight": [
+            "Trigger"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Trigger examples",
+          "points": [
+            "Do not trigger after one character or while the cursor is in the middle of a word.",
+            "Trigger after a pause, a whitespace boundary, or a phrase with enough context.",
+            "Suppress requests when locale is unsupported or the user disabled assisted writing."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "A request per keystroke makes the design too expensive.",
+          "mitigation": "Use client-side debouncing, minimum context length, and server-side rate limits."
+        },
+        {
+          "issue": "A slow backend creates UI flicker or stale suggestions.",
+          "mitigation": "Attach request sequence numbers and let the client discard responses for older prefixes."
+        }
+      ],
+      "talkingPoints": [
+        "The API is allowed to return an empty suggestion; silence is part of the product.",
+        "The first design boundary is user experience and latency, not the model architecture."
+      ],
+      "flows": [
+        {
+          "name": "Eligible prefix request",
+          "note": "The client waits for enough context before crossing the network.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Gmail Client",
+            "  participant Config as Config Service",
+            "  participant T as Triggering Service",
+            "  participant S as Suggestion Service",
+            "  C->>Config: load minChars debounce locale",
+            "  Config-->>C: trigger policy",
+            "  C->>T: user typed at word boundary",
+            "  T->>T: local eligibility check",
+            "  T->>S: request suggestion",
+            "  S-->>C: short suggestion or empty"
+          ],
+          "highlight": [
+            "T",
+            "Config"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "low-latency-inference-and-beam-search",
+      "title": "1a. Online Path: Real-Time Inference and Beam Search",
+      "parent": "product-boundary-and-triggering",
+      "description": "After triggering, the online path turns the current email context into a prompt, tokenizes it, runs the model, and generates a short completion. This is the inference-engine step: Smart Compose should use deterministic decoding, with beam search tracking several likely continuations and returning the highest-scoring short phrase.",
+      "decisionPrompt": "How should the serving path generate a completion while staying deterministic and under the latency budget?",
+      "concepts": [
+        {
+          "term": "Beam search",
+          "definition": "A deterministic decoding algorithm that keeps the top-k partial sequences at each generation step.",
+          "whyItMatters": "It avoids the narrowness of greedy decoding while still producing predictable completions."
+        },
+        {
+          "term": "Context window",
+          "definition": "The maximum number of recent tokens the model can use for one request.",
+          "whyItMatters": "Serving must include enough recent email context without making inference too slow."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Gateway[API Gateway]",
+        "  Context[Context Builder Service]",
+        "  Tokenizer[Tokenizer Service]",
+        "  PromptCache([Prompt Cache])",
+        "  Inference[Inference Service]",
+        "  Model[(Model Artifact Store)]",
+        "  Beam[Beam Search Decoder]",
+        "  Candidates[Candidate Completions]",
+        "  Gateway -->|suggest request| Context",
+        "  Context -->|prompt template| Tokenizer",
+        "  Tokenizer -->|token IDs| PromptCache",
+        "  PromptCache -->|miss or cached prefix| Inference",
+        "  Model -->|loaded weights| Inference",
+        "  Inference -->|probabilities| Beam",
+        "  Beam -->|top completions| Candidates"
+      ],
+      "highlight": [
+        "Context",
+        "Tokenizer",
+        "PromptCache",
+        "Inference",
+        "Model",
+        "Beam",
+        "Candidates"
+      ],
+      "options": [
+        {
+          "name": "Beam search with short max length (default)",
+          "pros": [
+            "Deterministic and predictable for the same input",
+            "Considers multiple likely phrases instead of only the top token",
+            "Works well because suggestions are short"
+          ],
+          "cons": [
+            "More expensive than greedy search",
+            "Beam width must be tuned to avoid latency spikes"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Prefix[Prompt Tokens]",
+            "  Inference[Inference Service]",
+            "  Beam[Beam Search Decoder]",
+            "  Candidates[Top-k Completions]",
+            "  Prefix -->|context tokens| Inference",
+            "  Inference -->|next-token probabilities| Beam",
+            "  Beam -->|rank by cumulative score| Candidates"
+          ],
+          "highlight": [
+            "Beam",
+            "Candidates"
+          ]
+        },
+        {
+          "name": "Stochastic sampling",
+          "pros": [
+            "More diverse output for creative writing products",
+            "Can explore lower-probability continuations"
+          ],
+          "cons": [
+            "Inconsistent results for the same prefix",
+            "Higher risk of surprising or inappropriate suggestions",
+            "Not a good fit for conservative email completion"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Prefix[Prompt Tokens]",
+            "  Inference[Inference Service]",
+            "  Sampler[Random Sampling Decoder]",
+            "  Completion[Variable Completion]",
+            "  Prefix --> Inference",
+            "  Inference -->|probability distribution| Sampler",
+            "  Sampler -->|random draw| Completion"
+          ],
+          "highlight": [
+            "Sampler"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Prompt template",
+          "points": [
+            "Start with body prefix only to match the initial requirement.",
+            "Add tagged optional fields later, such as subject, recipients, and previous thread snippets.",
+            "Train with missing optional fields so serving can use the same template flexibly."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Inference compute dominates cost at high QPS.",
+          "mitigation": "Use regional model replicas, accelerator-backed serving, small beam width, max token limits, and batching where latency permits."
+        },
+        {
+          "issue": "A stale response can apply to a newer prefix.",
+          "mitigation": "Include prefix hash or request sequence in the response and validate it in the client."
+        }
+      ],
+      "talkingPoints": [
+        "Greedy decoding is faster but can produce worse phrases because it commits to the top token too early.",
+        "Beam search is acceptable because Smart Compose wants short, conventional, deterministic completions."
+      ],
+      "flows": [
+        {
+          "name": "Beam-search suggestion",
+          "note": "The serving path generates candidates before product filters decide whether to show one.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Gmail Client",
+            "  participant B as Context Builder Service",
+            "  participant T as Tokenizer Service",
+            "  participant I as Inference Service",
+            "  participant D as Beam Decoder",
+            "  C->>B: body prefix and optional context",
+            "  B->>T: prompt text",
+            "  T-->>B: token IDs",
+            "  B->>I: context tokens",
+            "  I->>D: next-token probabilities",
+            "  D->>I: expand and prune beams",
+            "  I-->>C: candidate completions"
+          ],
+          "highlight": [
+            "I",
+            "D"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "confidence-safety-and-post-processing",
+      "title": "1b. Online Path: Confidence, Safety, and Post-Processing",
+      "parent": "product-boundary-and-triggering",
+      "description": "The online path ends with a conservative product gate. Candidate completions are filtered by length, confidence, policy, and bias checks before the UI sees them, and returning no suggestion is a normal successful outcome.",
+      "decisionPrompt": "What checks must happen after generation but before showing text to the user?",
+      "concepts": [
+        {
+          "term": "Confidence threshold",
+          "definition": "A minimum score below which the system suppresses a suggestion.",
+          "whyItMatters": "Low-confidence text feels distracting and can damage trust."
+        },
+        {
+          "term": "Post-processing",
+          "definition": "Rule-based or model-based filtering and rewriting after generation.",
+          "whyItMatters": "The generated text must satisfy product safety and inclusivity requirements, not only language-model likelihood."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Candidates[Candidate Completions]",
+        "  Length[Length Filter]",
+        "  Confidence[Confidence Filter]",
+        "  Safety[Safety Policy Service]",
+        "  Bias[Bias and Sensitive Terms Filter]",
+        "  Formatter[Suggestion Formatter]",
+        "  Empty[Return Empty Suggestion]",
+        "  UI[Inline Suggestion UI]",
+        "  Candidates -->|top-k phrases| Length",
+        "  Length -->|short enough| Confidence",
+        "  Confidence -->|score above threshold| Safety",
+        "  Safety -->|policy allowed| Bias",
+        "  Bias -->|approved text| Formatter",
+        "  Formatter -->|display text| UI",
+        "  Length -->|too long| Empty",
+        "  Confidence -->|low score| Empty",
+        "  Safety -->|blocked| Empty",
+        "  Bias -->|unsafe assumption| Empty"
+      ],
+      "highlight": [
+        "Length",
+        "Confidence",
+        "Safety",
+        "Bias",
+        "Formatter",
+        "Empty",
+        "UI"
+      ],
+      "options": [
+        {
+          "name": "Conservative show-or-empty gate (default)",
+          "pros": [
+            "Protects user trust by showing fewer weak suggestions",
+            "Keeps unsafe or biased output away from the UI",
+            "Easy to reason about in an interview"
+          ],
+          "cons": [
+            "May suppress useful suggestions",
+            "Threshold tuning requires online metrics and experiments"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Candidates[Candidate Completions]",
+            "  Gate[Length Confidence Safety Gate]",
+            "  UI[Inline Suggestion UI]",
+            "  Empty[No Suggestion]",
+            "  Candidates -->|candidate list| Gate",
+            "  Gate -->|approved top phrase| UI",
+            "  Gate -->|anything questionable| Empty"
+          ],
+          "highlight": [
+            "Gate",
+            "Empty"
+          ]
+        },
+        {
+          "name": "Always show best candidate",
+          "pros": [
+            "Maximizes visible feature usage",
+            "Simple ranking logic"
+          ],
+          "cons": [
+            "Shows many low-quality completions",
+            "Raises safety and bias risk",
+            "Contradicts the requirement to show only confident suggestions"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Candidates[Candidate Completions]",
+            "  Ranker[Ranker]",
+            "  UI[Inline Suggestion UI]",
+            "  Candidates -->|top score| Ranker",
+            "  Ranker -->|always show| UI"
+          ],
+          "highlight": [
+            "Ranker"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Bias handling examples",
+          "points": [
+            "Avoid assuming gender from a name unless explicit context supports it.",
+            "Prefer neutral wording when a completion would introduce sensitive attributes.",
+            "Suppress content that includes PII-like patterns or NSFW terms."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Over-filtering can make the feature feel absent.",
+          "mitigation": "Track show rate, acceptance rate, and suppression reasons by model version and locale."
+        },
+        {
+          "issue": "Rule-only filters can miss nuanced unsafe output.",
+          "mitigation": "Use layered checks: rules for obvious cases, classifiers for nuance, and human evaluation for samples."
+        }
+      ],
+      "talkingPoints": [
+        "Post-processing is not a replacement for safer training data; both are needed.",
+        "A blocked suggestion should not be treated as an error in the client."
+      ],
+      "flows": [
+        {
+          "name": "Suppress low-confidence suggestion",
+          "note": "Returning no suggestion is a normal successful outcome.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant I as Inference Service",
+            "  participant G as Confidence Gate",
+            "  participant P as Safety Policy Service",
+            "  participant U as Gmail Client",
+            "  I-->>G: top candidates and scores",
+            "  G->>G: compare score threshold",
+            "  alt score too low",
+            "    G-->>U: empty suggestion",
+            "  else score accepted",
+            "    G->>P: policy check",
+            "    P-->>U: approved suggestion",
+            "  end"
+          ],
+          "highlight": [
+            "G",
+            "P"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "privacy-safe-data-preparation",
+      "title": "2. Offline ML: Privacy-Safe Data Preparation",
+      "description": "The offline ML pipeline begins before model work: the training corpus must be made safe and useful. The pipeline combines general text for language understanding with email text for task adaptation, then filters for language, quality, deduplication, PII, confidential content, and policy-sensitive terms.",
+      "decisionPrompt": "What data is allowed to reach model training, and what must be removed before tokenization?",
+      "concepts": [
+        {
+          "term": "Data minimization",
+          "definition": "Collect and retain only the data needed for the stated training purpose.",
+          "whyItMatters": "Email content is sensitive, so raw mailbox data should not become a long-lived training artifact."
+        },
+        {
+          "term": "Language identification",
+          "definition": "A classifier or heuristic that tags the language of text before downstream processing.",
+          "whyItMatters": "The initial product is English-only, so non-English data should not train or evaluate the first model."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  General[(General Text Corpus)]",
+        "  Email[(Raw Email Corpus)]",
+        "  Cleaner[Cleaning Service]",
+        "  Lang[Language Classifier]",
+        "  Redactor[PII Redaction Service]",
+        "  Dedupe[Deduplication Job]",
+        "  SafeStore[(Sanitized Training Store)]",
+        "  Audit[Privacy Audit Logs]",
+        "  General -->|normalize text| Cleaner",
+        "  Email -->|candidate messages| Cleaner",
+        "  Cleaner -->|clean text| Lang",
+        "  Lang -->|English only| Redactor",
+        "  Redactor -->|redacted text| Dedupe",
+        "  Dedupe -->|unique examples| SafeStore",
+        "  Redactor -->|redaction events| Audit"
+      ],
+      "highlight": [
+        "General",
+        "Email",
+        "Cleaner",
+        "Lang",
+        "Redactor",
+        "Dedupe",
+        "SafeStore",
+        "Audit"
+      ],
+      "options": [
+        {
+          "name": "Sanitized offline corpus (default)",
+          "pros": [
+            "Creates a repeatable training set for offline experiments",
+            "Keeps raw email out of model training jobs",
+            "Supports privacy audits and redaction versioning"
+          ],
+          "cons": [
+            "Requires a strong data governance process",
+            "Training data may lag current email language trends"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Email[(Raw Email Corpus)]",
+            "  Redactor[PII Redaction Service]",
+            "  SafeStore[(Sanitized Training Store)]",
+            "  Trainer[Training Pipeline]",
+            "  Email -->|restricted batch read| Redactor",
+            "  Redactor -->|redacted examples| SafeStore",
+            "  SafeStore -->|approved corpus| Trainer"
+          ],
+          "highlight": [
+            "Redactor",
+            "SafeStore"
+          ]
+        },
+        {
+          "name": "Train directly from production mail",
+          "pros": [
+            "Simpler data movement in a prototype",
+            "Freshest possible data"
+          ],
+          "cons": [
+            "Unacceptable privacy and audit risk for email",
+            "Hard to reproduce experiments",
+            "Harder to remove confidential or duplicated content reliably"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Email[(Production Mail Store)]",
+            "  Trainer[Training Pipeline]",
+            "  Email -->|direct training read| Trainer"
+          ],
+          "highlight": [
+            "Email",
+            "Trainer"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Cleaning stages",
+          "points": [
+            "Normalize whitespace, casing policy, signatures, quoted replies, and irrelevant symbols.",
+            "Remove duplicate boilerplate and repeated forwarded content so the model does not overfit.",
+            "Version redaction rules because evaluation needs to know exactly what preprocessing created the corpus."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "PII redaction can miss edge cases.",
+          "mitigation": "Combine deterministic detectors, ML classifiers, sampling audits, and conservative exclusion rules."
+        },
+        {
+          "issue": "Deduplication at billion-message scale is expensive.",
+          "mitigation": "Use content hashes, near-duplicate fingerprints, and partitioned batch processing."
+        }
+      ],
+      "talkingPoints": [
+        "The training pipeline should make unsafe examples disappear before tokenization.",
+        "Privacy review is an architectural component here, not a legal afterthought."
+      ],
+      "flows": [
+        {
+          "name": "Email corpus sanitization",
+          "note": "Raw email is transformed into a restricted, reproducible training corpus.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant E as Raw Email Store",
+            "  participant C as Cleaning Service",
+            "  participant L as Language Classifier",
+            "  participant R as PII Redaction Service",
+            "  participant D as Deduplication Job",
+            "  participant S as Sanitized Training Store",
+            "  E->>C: batch candidate messages",
+            "  C->>L: normalized text",
+            "  L-->>C: English confidence",
+            "  C->>R: English messages",
+            "  R->>D: redacted text",
+            "  D->>S: unique safe examples"
+          ],
+          "highlight": [
+            "R",
+            "S"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "tokenization-and-training-examples",
+      "title": "2a. Offline ML: Tokenization and Training Examples",
+      "parent": "privacy-safe-data-preparation",
+      "description": "The offline ML pipeline next converts safe text into model-ready examples. A tokenizer converts text into token IDs, and training examples pair a context prefix with the next-token targets. Subword tokenization is the right default because it handles rare words better than word tokens and uses shorter sequences than character tokens.",
+      "decisionPrompt": "Which tokenization strategy should Smart Compose use, and how do we turn emails into next-token training examples?",
+      "concepts": [
+        {
+          "term": "Subword tokenization",
+          "definition": "A method such as BPE, WordPiece, or SentencePiece that splits text into common word pieces.",
+          "whyItMatters": "It can represent rare names and words without exploding the vocabulary."
+        },
+        {
+          "term": "Next-token prediction",
+          "definition": "Training the model to predict each next token from the previous tokens.",
+          "whyItMatters": "It matches the way Smart Compose generates completions one token at a time."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  SafeStore[(Sanitized Training Store)]",
+        "  TokenizerJob[Tokenizer Training Job]",
+        "  Vocab[(Tokenizer Registry)]",
+        "  ExampleBuilder[Training Example Builder]",
+        "  ExampleStore[(Training Example Store)]",
+        "  SafeStore -->|sample text| TokenizerJob",
+        "  TokenizerJob -->|subword vocab| Vocab",
+        "  SafeStore -->|messages| ExampleBuilder",
+        "  Vocab -->|token IDs| ExampleBuilder",
+        "  ExampleBuilder -->|context target pairs| ExampleStore"
+      ],
+      "highlight": [
+        "TokenizerJob",
+        "Vocab",
+        "ExampleBuilder",
+        "ExampleStore"
+      ],
+      "options": [
+        {
+          "name": "Subword tokenizer (default)",
+          "pros": [
+            "Handles rare words and names without unknown-token failures",
+            "Keeps sequence length manageable",
+            "Works well with modern Transformer language models"
+          ],
+          "cons": [
+            "Requires versioned tokenizer artifacts",
+            "Pieces are less intuitive than full words during debugging"
+          ],
+          "diagram": [
+            "graph TB",
+            "  SafeStore[(Sanitized Training Store)]",
+            "  TokenizerJob[SentencePiece / BPE Job]",
+            "  Vocab[(Tokenizer Registry)]",
+            "  ExampleBuilder[Training Example Builder]",
+            "  ExampleStore[(Training Example Store)]",
+            "  SafeStore -->|train vocabulary| TokenizerJob",
+            "  TokenizerJob -->|vocab artifact| Vocab",
+            "  Vocab -->|stable version| ExampleBuilder",
+            "  ExampleBuilder -->|subword IDs| ExampleStore"
+          ],
+          "highlight": [
+            "TokenizerJob",
+            "Vocab"
+          ]
+        },
+        {
+          "name": "Word-level tokenizer",
+          "pros": [
+            "Easy to explain and inspect",
+            "Short common phrases map cleanly to tokens"
+          ],
+          "cons": [
+            "Very large vocabulary at Gmail scale",
+            "Poor handling of misspellings, names, and rare terms",
+            "More unknown-token problems"
+          ],
+          "diagram": [
+            "graph TB",
+            "  SafeStore[(Sanitized Training Store)]",
+            "  WordVocab[(Word Vocabulary)]",
+            "  ExampleBuilder[Training Example Builder]",
+            "  SafeStore -->|split by whitespace| WordVocab",
+            "  WordVocab -->|word IDs| ExampleBuilder"
+          ],
+          "highlight": [
+            "WordVocab"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Context and target construction",
+          "points": [
+            "Add a BOS token at the beginning and an EOS token at the end of each sequence.",
+            "For a sequence such as BOS Hi Petra EOS, the model learns BOS -> Hi, Hi -> Petra, and Petra -> EOS.",
+            "The same tokenizer version must be used in training and serving."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Changing tokenizer versions can invalidate model artifacts.",
+          "mitigation": "Store tokenizer_version on model_version and reject incompatible serving deployments."
+        },
+        {
+          "issue": "Long emails can exceed the context window.",
+          "mitigation": "Use a recent-context window and optional prompt tags for subject or reply context."
+        }
+      ],
+      "talkingPoints": [
+        "Tokenizer choice is a system contract because clients, training, and serving must agree on IDs.",
+        "Subword tokenization is a pragmatic middle ground between character and word tokenization."
+      ],
+      "flows": [
+        {
+          "name": "Build next-token examples",
+          "note": "One email sequence yields many supervised training positions.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant S as Sanitized Training Store",
+            "  participant V as Tokenizer Registry",
+            "  participant B as Example Builder",
+            "  participant E as Training Example Store",
+            "  S->>B: sanitized email body",
+            "  B->>V: load tokenizer version",
+            "  V-->>B: vocabulary and rules",
+            "  B->>B: tokenize plus BOS EOS",
+            "  B->>E: context tokens and target tokens"
+          ],
+          "highlight": [
+            "V",
+            "B",
+            "E"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "decoder-only-transformer-architecture",
+      "title": "2b. Offline ML: Decoder-Only Transformer Architecture",
+      "parent": "privacy-safe-data-preparation",
+      "description": "With data represented as tokens, choose the model shape. Smart Compose is a text generation task, so a decoder-only Transformer predicts continuations from left to right: embeddings map token IDs into vectors, positional encodings preserve order, self-attention models context, and a prediction head returns probabilities over the vocabulary.",
+      "decisionPrompt": "Why is a decoder-only Transformer a better fit than an RNN, encoder-only model, or encoder-decoder model for short email completion?",
+      "concepts": [
+        {
+          "term": "Self-attention",
+          "definition": "A mechanism that lets each token representation use information from earlier tokens in the sequence.",
+          "whyItMatters": "It captures phrase-level context more effectively and parallelizes better than classic RNN recurrence."
+        },
+        {
+          "term": "Prediction head",
+          "definition": "The final layer that converts Transformer outputs into probabilities for every token in the vocabulary.",
+          "whyItMatters": "Smart Compose chooses continuations from these probabilities."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Tokens[Token IDs]",
+        "  Embed[Text Embedding Layer]",
+        "  Position[Fixed Positional Encoding]",
+        "  Transformer[Decoder-only Transformer]",
+        "  Head[Prediction Head]",
+        "  Prob[Next-token Probabilities]",
+        "  Tokens -->|lookup vectors| Embed",
+        "  Embed -->|add sequence order| Position",
+        "  Position -->|causal self-attention| Transformer",
+        "  Transformer -->|hidden states| Head",
+        "  Head -->|softmax over vocabulary| Prob"
+      ],
+      "highlight": [
+        "Embed",
+        "Position",
+        "Transformer",
+        "Head",
+        "Prob"
+      ],
+      "options": [
+        {
+          "name": "Decoder-only Transformer (default)",
+          "pros": [
+            "Naturally generates left-to-right continuations",
+            "Parallelizes training across sequence positions",
+            "Handles longer context better than basic RNNs"
+          ],
+          "cons": [
+            "More expensive to serve than a small recurrent model",
+            "Needs careful latency optimization for interactive use"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Tokens[Token IDs]",
+            "  Embed[Text Embedding Layer]",
+            "  Position[Fixed Positional Encoding]",
+            "  Transformer[Decoder-only Transformer]",
+            "  Head[Prediction Head]",
+            "  Prob[Next-token Probabilities]",
+            "  Tokens -->|lookup vectors| Embed",
+            "  Embed -->|add positions| Position",
+            "  Position -->|causal attention| Transformer",
+            "  Transformer -->|hidden states| Head",
+            "  Head -->|token probabilities| Prob"
+          ],
+          "highlight": [
+            "Transformer",
+            "Head"
+          ]
+        },
+        {
+          "name": "RNN or LSTM baseline",
+          "pros": [
+            "Simpler and potentially smaller for very constrained devices",
+            "Can generate text autoregressively"
+          ],
+          "cons": [
+            "Harder to parallelize during training",
+            "Weaker at long-context dependencies",
+            "Not the modern default for large-scale language generation"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Tokens[Token IDs]",
+            "  RNN[RNN / LSTM Model]",
+            "  Head[Prediction Head]",
+            "  Tokens -->|sequential recurrence| RNN",
+            "  RNN -->|hidden state| Head"
+          ],
+          "highlight": [
+            "RNN"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Fixed positional encoding",
+          "points": [
+            "A Transformer does not inherently know token order, so order is added to embeddings.",
+            "Fixed sine-cosine encodings add no trainable parameters and can generalize to positions beyond the common training lengths.",
+            "Learned encodings may fit the training distribution well but can generalize poorly to unseen sequence lengths."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Large models can exceed the 100 ms budget.",
+          "mitigation": "Use a smaller distilled model, optimized serving runtime, batching, and accelerator-backed inference."
+        },
+        {
+          "issue": "A full vocabulary softmax can be expensive.",
+          "mitigation": "Optimize model size and serving kernels; keep generated suggestions short."
+        }
+      ],
+      "talkingPoints": [
+        "Encoder-only models such as BERT are better at understanding or classification than direct left-to-right generation.",
+        "Encoder-decoder models are useful for translation or summarization, but Smart Compose only needs continuation from a prefix."
+      ],
+      "flows": [
+        {
+          "name": "One next-token prediction",
+          "note": "The prediction head ranks candidate tokens from the current prefix.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant B as Token IDs",
+            "  participant E as Embedding Layer",
+            "  participant P as Positional Encoding",
+            "  participant T as Transformer Model",
+            "  participant H as Prediction Head",
+            "  B->>E: token IDs",
+            "  E->>P: dense vectors",
+            "  P->>T: ordered embeddings",
+            "  T->>H: hidden states",
+            "  H-->>B: next-token probabilities"
+          ],
+          "highlight": [
+            "T",
+            "H"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "two-stage-training-pipeline",
+      "title": "2c. Offline ML: Two-Stage Training Pipeline",
+      "parent": "privacy-safe-data-preparation",
+      "description": "The offline ML pipeline then trains and promotes candidates. Training from scratch on email alone is expensive and risks overfitting, so a two-stage pipeline pretrains a base language model on broad text, then fine-tunes it on sanitized email examples using the same next-token objective and cross-entropy loss.",
+      "decisionPrompt": "Should the team train only on email data, or pretrain generally and fine-tune on email?",
+      "concepts": [
+        {
+          "term": "Transfer learning",
+          "definition": "Reusing knowledge learned from a broad task and adapting it to a narrower task.",
+          "whyItMatters": "The model learns general language once, then adapts to email tone and phrases."
+        },
+        {
+          "term": "Cross-entropy loss",
+          "definition": "A loss function that penalizes the model when it assigns low probability to the correct next token.",
+          "whyItMatters": "It directly trains the probability distribution used at serving time."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  General[(General Text Store)]",
+        "  EmailExamples[(Email Training Examples)]",
+        "  Pretrain[Pretraining Pipeline]",
+        "  Base[(Base Model Registry)]",
+        "  Finetune[Fine-tuning Pipeline]",
+        "  Eval[Offline Evaluation Service]",
+        "  Registry[(Model Registry)]",
+        "  General -->|next-token objective| Pretrain",
+        "  Pretrain -->|base weights| Base",
+        "  Base -->|initialize| Finetune",
+        "  EmailExamples -->|email examples| Finetune",
+        "  Finetune -->|candidate model| Eval",
+        "  Eval -->|approved metrics| Registry"
+      ],
+      "highlight": [
+        "Pretrain",
+        "Base",
+        "Finetune",
+        "Eval",
+        "Registry"
+      ],
+      "options": [
+        {
+          "name": "Pretrain then fine-tune (default)",
+          "pros": [
+            "Improves generalization and reduces overfitting on email-only data",
+            "Expensive pretraining can be reused across related language tasks",
+            "Fine-tuning adapts the model to email style and phrases"
+          ],
+          "cons": [
+            "Requires managing multiple training stages and artifacts",
+            "General pretraining data must also pass quality and safety review"
+          ],
+          "diagram": [
+            "graph TB",
+            "  General[(General Text Store)]",
+            "  EmailExamples[(Email Training Examples)]",
+            "  Pretrain[Pretraining Pipeline]",
+            "  Base[(Base Model Registry)]",
+            "  Finetune[Fine-tuning Pipeline]",
+            "  Registry[(Model Registry)]",
+            "  General -->|language learning| Pretrain",
+            "  Pretrain -->|base model| Base",
+            "  Base -->|initial weights| Finetune",
+            "  EmailExamples -->|task data| Finetune",
+            "  Finetune -->|email model| Registry"
+          ],
+          "highlight": [
+            "Pretrain",
+            "Finetune",
+            "Registry"
+          ]
+        },
+        {
+          "name": "Train from scratch on email",
+          "pros": [
+            "Simpler conceptual pipeline",
+            "Model specializes only in email data"
+          ],
+          "cons": [
+            "High compute cost and slower iteration",
+            "Greater risk of memorizing email-specific training examples",
+            "Weaker general language understanding"
+          ],
+          "diagram": [
+            "graph TB",
+            "  EmailExamples[(Email Training Examples)]",
+            "  Train[Training Pipeline]",
+            "  Registry[(Model Registry)]",
+            "  EmailExamples -->|from scratch| Train",
+            "  Train -->|model artifact| Registry"
+          ],
+          "highlight": [
+            "Train"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Training objective",
+          "points": [
+            "The model predicts every next token in the sequence, not only the final word.",
+            "Training computes losses for many token positions in parallel.",
+            "Fine-tuning keeps the same objective but changes the data distribution to email."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Training jobs can be costly and slow.",
+          "mitigation": "Reuse base models, checkpoint frequently, and run smaller candidate models before full training."
+        },
+        {
+          "issue": "A candidate can look good offline while failing product safety.",
+          "mitigation": "Gate registry promotion on safety suites, bias tests, and human review samples."
+        }
+      ],
+      "talkingPoints": [
+        "Perplexity and ExactMatch@N belong before production rollout, not after.",
+        "The tokenizer, model weights, data recipe, and metrics must be versioned together."
+      ],
+      "flows": [
+        {
+          "name": "Candidate model training",
+          "note": "The model only enters serving after objective metrics and safety checks pass.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant G as General Text Store",
+            "  participant P as Pretraining Pipeline",
+            "  participant E as Email Example Store",
+            "  participant F as Fine-tuning Pipeline",
+            "  participant V as Evaluation Service",
+            "  participant R as Model Registry",
+            "  G->>P: broad text examples",
+            "  P-->>F: base checkpoint",
+            "  E->>F: email examples",
+            "  F->>V: candidate model",
+            "  V->>R: register approved artifact"
+          ],
+          "highlight": [
+            "F",
+            "V",
+            "R"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "feedback-evaluation-and-experimentation",
+      "title": "2d. Evaluation Loop: Feedback and Experimentation",
+      "parent": "privacy-safe-data-preparation",
+      "description": "Evaluation connects offline model quality to production usefulness. Offline metrics such as perplexity and ExactMatch@N catch candidate quality before release; online metrics such as acceptance rate, usage rate, completion time, latency, and feedback rate measure real user impact.",
+      "decisionPrompt": "How do we prove a new Smart Compose model is better before and after production rollout?",
+      "concepts": [
+        {
+          "term": "Perplexity",
+          "definition": "An offline metric based on how much probability the model assigns to the actual next tokens.",
+          "whyItMatters": "Lower perplexity usually means the model predicts held-out text better."
+        },
+        {
+          "term": "A/B experiment",
+          "definition": "A controlled production comparison between model or product variants.",
+          "whyItMatters": "Offline gains do not always translate to accepted suggestions or faster email composition."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Registry[(Model Registry)]",
+        "  Offline[Offline Evaluation Service]",
+        "  Safety[Safety Review Service]",
+        "  Rollout[Experiment Service]",
+        "  Feedback[Feedback Service]",
+        "  Metrics[(Analytics Store)]",
+        "  Dashboard[Quality Dashboard]",
+        "  Registry -->|candidate model| Offline",
+        "  Offline -->|perplexity exact match| Safety",
+        "  Safety -->|approved candidate| Rollout",
+        "  Rollout -->|A/B assignment| Feedback",
+        "  Feedback -->|accept dismiss latency| Metrics",
+        "  Metrics -->|online metrics| Dashboard",
+        "  Dashboard -->|promote or rollback signal| Rollout"
+      ],
+      "highlight": [
+        "Offline",
+        "Safety",
+        "Rollout",
+        "Feedback",
+        "Metrics",
+        "Dashboard"
+      ],
+      "options": [
+        {
+          "name": "Offline gates plus online A/B tests (default)",
+          "pros": [
+            "Catches bad candidates before users see them",
+            "Measures real user behavior under production latency",
+            "Supports rollback based on guardrail metrics"
+          ],
+          "cons": [
+            "Slower than pushing every candidate directly",
+            "Requires experimentation infrastructure and metric discipline"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Candidate[(Candidate Model)]",
+            "  Offline[Offline Evaluation Service]",
+            "  AB[Experiment Service]",
+            "  Metrics[(Analytics Store)]",
+            "  Candidate -->|held-out set| Offline",
+            "  Offline -->|passes gates| AB",
+            "  AB -->|production cohorts| Metrics"
+          ],
+          "highlight": [
+            "Offline",
+            "AB"
+          ]
+        },
+        {
+          "name": "Offline-only release",
+          "pros": [
+            "Simpler pipeline",
+            "Faster initial launch for a prototype"
+          ],
+          "cons": [
+            "Cannot detect product regressions such as lower acceptance rate",
+            "Misses latency and interaction effects",
+            "Riskier for a high-traffic product"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Candidate[(Candidate Model)]",
+            "  Offline[Offline Evaluation Service]",
+            "  Serving[Serving Fleet]",
+            "  Candidate --> Offline",
+            "  Offline -->|passes| Serving"
+          ],
+          "highlight": [
+            "Offline"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Metric families",
+          "points": [
+            "Offline: perplexity and ExactMatch@N on held-out sanitized email data.",
+            "Engagement: acceptance rate and usage rate.",
+            "Effectiveness: average completion time with and without suggestions.",
+            "Guardrails: p99 latency, feedback complaints, and safety suppression rates."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Feedback logs can accidentally capture sensitive text.",
+          "mitigation": "Log suggestion IDs, metadata, scores, and interaction events instead of raw draft content."
+        },
+        {
+          "issue": "Acceptance rate alone can reward bland suggestions.",
+          "mitigation": "Combine acceptance with user time saved, human evaluation, safety metrics, and suppression reasons."
+        }
+      ],
+      "talkingPoints": [
+        "ExactMatch@N is helpful because Smart Compose suggestions are short phrase completions.",
+        "Online evaluation should include latency because delayed suggestions are effectively wrong suggestions."
+      ],
+      "flows": [
+        {
+          "name": "Feedback to metrics",
+          "note": "Production interactions feed dashboards without storing raw draft text.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Gmail Client",
+            "  participant F as Feedback Service",
+            "  participant Q as Event Stream",
+            "  participant A as Analytics Store",
+            "  participant D as Quality Dashboard",
+            "  C->>F: accepted or dismissed suggestionId",
+            "  F-)Q: privacy-minimized event",
+            "  Q->>A: aggregate by model version",
+            "  A->>D: acceptance latency safety metrics"
+          ],
+          "highlight": [
+            "F",
+            "A",
+            "D"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "model-rollout-and-global-scale",
+      "title": "3. Operations: Model Rollout and Global Scale",
+      "description": "Operations make the design production-safe. A model version is released only when its tokenizer, model artifact, safety status, and rollout config are compatible. Serving fleets are regional, autoscaled, monitored, and able to fall back to returning no suggestion when overloaded.",
+      "decisionPrompt": "How should Gmail deploy model versions globally without breaking latency, safety, or tokenizer compatibility?",
+      "concepts": [
+        {
+          "term": "Canary rollout",
+          "definition": "Sending a small slice of traffic to a new version before broad release.",
+          "whyItMatters": "A bad model or serving regression can be stopped before it affects most users."
+        },
+        {
+          "term": "Graceful degradation",
+          "definition": "The system intentionally serves a simpler response when dependencies are slow or unhealthy.",
+          "whyItMatters": "For Smart Compose, the safe degraded response is no suggestion."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Gmail Client]",
+        "  Geo[Geo Routing / Edge]",
+        "  Gateway[Regional API Gateway]",
+        "  Rollout[Rollout Service]",
+        "  Registry[(Model Registry)]",
+        "  Fleet[Regional Inference Fleet]",
+        "  Autoscale[Autoscaler]",
+        "  Metrics[Metrics and Alerts]",
+        "  Empty[No Suggestion Fallback]",
+        "  Client -->|nearest healthy region| Geo",
+        "  Geo -->|route request| Gateway",
+        "  Gateway -->|cohort lookup| Rollout",
+        "  Rollout -->|model version| Fleet",
+        "  Registry -->|artifact tokenizer| Fleet",
+        "  Fleet -->|health and load| Autoscale",
+        "  Fleet -->|latency quality safety| Metrics",
+        "  Metrics -->|rollback signal| Rollout",
+        "  Fleet -->|timeout overload| Empty"
+      ],
+      "highlight": [
+        "Geo",
+        "Rollout",
+        "Registry",
+        "Fleet",
+        "Autoscale",
+        "Metrics",
+        "Empty"
+      ],
+      "options": [
+        {
+          "name": "Regional serving with canary rollout (default)",
+          "pros": [
+            "Keeps inference close to users",
+            "Lets the team roll out and roll back by version, cohort, and locale",
+            "Contains failures to a small traffic slice first"
+          ],
+          "cons": [
+            "Model artifacts must be replicated and warmed in every serving region",
+            "Requires strong observability by model version and region"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Gmail Client]",
+            "  Geo[Geo Routing / Edge]",
+            "  Gateway[Regional API Gateway]",
+            "  Rollout[Rollout Service]",
+            "  Fleet[Regional Inference Fleet]",
+            "  Metrics[Metrics and Alerts]",
+            "  Client --> Geo",
+            "  Geo --> Gateway",
+            "  Gateway --> Rollout",
+            "  Rollout -->|version assignment| Fleet",
+            "  Fleet -->|metrics by version| Metrics",
+            "  Metrics -->|rollback alert| Rollout"
+          ],
+          "highlight": [
+            "Geo",
+            "Rollout",
+            "Fleet"
+          ]
+        },
+        {
+          "name": "Single global serving region",
+          "pros": [
+            "Simpler artifact deployment",
+            "Easier to debug one fleet"
+          ],
+          "cons": [
+            "High latency for many users",
+            "One regional incident can disable the feature globally",
+            "Harder to meet interactive p99 targets"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Gmail Client]",
+            "  GlobalGateway[Global API Gateway]",
+            "  Fleet[Single Inference Fleet]",
+            "  Client -->|long-haul request| GlobalGateway",
+            "  GlobalGateway --> Fleet"
+          ],
+          "highlight": [
+            "Fleet"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Rollout controls",
+          "points": [
+            "Pin each request to a model_version and tokenizer_version.",
+            "Canary by percentage, locale, client platform, and geography.",
+            "Rollback should update routing config faster than replacing model binaries."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Cold model loads can spike latency.",
+          "mitigation": "Warm model replicas before shifting traffic and keep old versions loaded during canary."
+        },
+        {
+          "issue": "Traffic bursts can overload accelerator capacity.",
+          "mitigation": "Autoscale serving pools, shed low-priority requests, and return empty suggestions on timeout."
+        }
+      ],
+      "talkingPoints": [
+        "No suggestion is the right fallback because sending stale or unsafe text is worse than silence.",
+        "Tokenizer compatibility should be enforced automatically at model load time."
+      ],
+      "flows": [
+        {
+          "name": "Canary rollout and rollback",
+          "note": "The operator changes routing, not client behavior.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant O as Operator",
+            "  participant R as Rollout Service",
+            "  participant M as Model Registry",
+            "  participant F as Regional Inference Fleet",
+            "  participant A as Metrics and Alerts",
+            "  O->>R: canary model to 1 percent",
+            "  R->>M: verify approved model tokenizer",
+            "  M-->>R: artifact metadata",
+            "  R->>F: route canary traffic",
+            "  F->>A: latency acceptance safety metrics",
+            "  alt regression detected",
+            "    A->>R: rollback alert",
+            "    R->>F: route traffic to previous model",
+            "  end"
+          ],
+          "highlight": [
+            "R",
+            "F",
+            "A"
+          ]
+        }
+      ]
+    }
+  ],
+  "finalDesign": {
+    "title": "Final Design",
+    "description": "End-to-end Gmail Smart Compose architecture grouped by responsibility: the online suggestion path handles triggering, prompt construction, inference, decoding, filtering, display, and feedback; the offline ML pipeline sanitizes data, tokenizes examples, trains, evaluates, and registers models; the operations layer rolls out compatible model and tokenizer versions to regional serving fleets.",
+    "diagram": [
+      "graph TB",
+      "  Client[Gmail Web / Mobile Client]",
+      "  Config[Config Service]",
+      "  Trigger[Triggering Service]",
+      "  Gateway[API Gateway]",
+      "  Context[Context Builder Service]",
+      "  Tokenizer[Tokenizer Service]",
+      "  PromptCache([Prompt Cache])",
+      "  Inference[Regional Inference Fleet]",
+      "  Beam[Beam Search Decoder]",
+      "  Filter[Confidence and Safety Filter]",
+      "  Feedback[Feedback Service]",
+      "  Stream[[Event Stream]]",
+      "  Analytics[(Analytics Store)]",
+      "  Raw[(Raw Email Corpus)]",
+      "  Redactor[Privacy Redaction Pipeline]",
+      "  SafeStore[(Sanitized Training Store)]",
+      "  Examples[(Training Example Store)]",
+      "  Train[Pretraining and Fine-tuning Pipeline]",
+      "  Eval[Offline Evaluation Service]",
+      "  Registry[(Model Registry)]",
+      "  Rollout[Rollout Service]",
+      "  Metrics[Metrics and Alerts]",
+      "  Client -->|fetch trigger config| Config",
+      "  Client -->|typing events| Trigger",
+      "  Trigger -->|eligible context| Gateway",
+      "  Gateway -->|suggest request| Context",
+      "  Context -->|prompt text| Tokenizer",
+      "  Tokenizer -->|token IDs| PromptCache",
+      "  PromptCache -->|cached prefix or miss| Inference",
+      "  Registry -->|model and tokenizer artifact| Inference",
+      "  Inference -->|token probabilities| Beam",
+      "  Beam -->|candidate completions| Filter",
+      "  Filter -->|approved suggestion or empty| Client",
+      "  Client -->|accept dismiss events| Feedback",
+      "  Feedback -->|privacy-minimized events| Stream",
+      "  Stream -->|aggregate| Analytics",
+      "  Analytics -->|online metrics| Metrics",
+      "  Raw -->|restricted batch read| Redactor",
+      "  Redactor -->|safe English deduped text| SafeStore",
+      "  SafeStore -->|tokenized examples| Examples",
+      "  Examples -->|fine-tuning data| Train",
+      "  Train -->|candidate model| Eval",
+      "  Eval -->|approved artifact| Registry",
+      "  Rollout -->|version routing| Gateway",
+      "  Metrics -->|promote or rollback| Rollout"
+    ],
+    "highlight": [],
+    "options": [
+      {
+        "name": "Global model with privacy-safe training and regional serving",
+        "pros": [
+          "Matches the no-personalization starting requirement",
+          "Keeps serving latency low with regional inference fleets",
+          "Separates model quality gates from production rollout",
+          "Suppresses low-confidence or unsafe suggestions before display"
+        ],
+        "cons": [
+          "Inference remains expensive at Gmail scale",
+          "A global model cannot capture every user's personal writing style",
+          "Privacy and safety pipelines add release friction"
+        ],
+        "diagram": [
+          "graph TB",
+          "  Client[Gmail Client]",
+          "  Trigger[Triggering Service]",
+          "  Suggest[Suggestion Service]",
+          "  Inference[Regional Inference Fleet]",
+          "  Filter[Safety and Confidence Filter]",
+          "  Feedback[Feedback Service]",
+          "  Training[Offline Training Pipeline]",
+          "  Registry[(Model Registry)]",
+          "  Rollout[Rollout Service]",
+          "  Client -->|eligible prefix| Trigger",
+          "  Trigger -->|request| Suggest",
+          "  Suggest -->|tokens| Inference",
+          "  Inference -->|candidates| Filter",
+          "  Filter -->|suggestion or empty| Client",
+          "  Client -->|accept dismiss| Feedback",
+          "  Training -->|approved model| Registry",
+          "  Registry -->|artifact| Inference",
+          "  Rollout -->|version routing| Suggest"
+        ],
+        "highlight": []
+      },
+      {
+        "name": "Future personalized contextual model",
+        "pros": [
+          "Can use recipient, subject, thread, and user-specific style to improve relevance",
+          "May increase acceptance rate for frequent senders and repetitive workflows",
+          "Supports multilingual and domain-specific extensions"
+        ],
+        "cons": [
+          "Raises privacy, consent, isolation, and fairness complexity",
+          "Needs stronger context retrieval and prompt construction",
+          "Harder to debug and evaluate because outputs vary by user context"
+        ],
+        "diagram": [
+          "graph TB",
+          "  Client[Gmail Client]",
+          "  Trigger[Triggering Service]",
+          "  Context[Context Retrieval Service]",
+          "  Profile[(User Preference Store)]",
+          "  Thread[(Thread Context Store)]",
+          "  Inference[Personalized Inference Service]",
+          "  Filter[Safety and Confidence Filter]",
+          "  Client --> Trigger",
+          "  Trigger --> Context",
+          "  Context -->|user opt-in style| Profile",
+          "  Context -->|recent thread| Thread",
+          "  Context -->|rich prompt| Inference",
+          "  Inference -->|candidate| Filter",
+          "  Filter -->|suggestion or empty| Client"
+        ],
+        "highlight": []
+      }
+    ],
+    "deepDives": [
+      {
+        "title": "Why this is the final design",
+        "points": [
+          "The online path is short: trigger, tokenize, infer, decode, filter, display.",
+          "The offline path is controlled: sanitize, tokenize, train, evaluate, register, roll out.",
+          "Every production response can safely be empty, which gives the system a clean fallback under low confidence, safety risk, timeout, or overload."
+        ]
+      }
+    ],
+    "flows": [
+      {
+        "name": "End-to-end suggestion",
+        "note": "This is the normal user-facing path after model deployment.",
+        "diagram": [
+          "sequenceDiagram",
+          "  participant C as Gmail Client",
+          "  participant T as Triggering Service",
+          "  participant S as Suggestion Service",
+          "  participant I as Regional Inference Fleet",
+          "  participant F as Safety Filter",
+          "  participant FB as Feedback Service",
+          "  C->>T: typed eligible prefix",
+          "  T->>S: suggestion request",
+          "  S->>I: tokenized context",
+          "  I-->>S: beam candidates",
+          "  S->>F: confidence and safety gate",
+          "  F-->>C: approved suggestion or empty",
+          "  C->>FB: accept or dismiss event"
+        ],
+        "highlight": []
+      }
+    ]
+  },
+  "satisfies": {
+    "functional": [
+      {
+        "requirement": "Suggest the next few words while the user types.",
+        "how": "The client-assisted triggering path sends eligible prefixes to a regional suggestion service that generates short completions.",
+        "steps": [
+          "product-boundary-and-triggering",
+          "low-latency-inference-and-beam-search"
+        ]
+      },
+      {
+        "requirement": "Start with no personalization and English-only support.",
+        "how": "The initial corpus filters for English, and the online context starts with body-prefix prompts instead of user-specific style models.",
+        "steps": [
+          "privacy-safe-data-preparation",
+          "low-latency-inference-and-beam-search"
+        ]
+      },
+      {
+        "requirement": "Show suggestions only when confident.",
+        "how": "Candidate completions pass length and confidence gates before they reach the UI.",
+        "steps": [
+          "confidence-safety-and-post-processing"
+        ]
+      },
+      {
+        "requirement": "Avoid biased assumptions and unsafe suggestions.",
+        "how": "The design combines safe data preparation, policy filters, bias-sensitive post-processing, and human or automated safety evaluation.",
+        "steps": [
+          "privacy-safe-data-preparation",
+          "confidence-safety-and-post-processing",
+          "feedback-evaluation-and-experimentation"
+        ]
+      },
+      {
+        "requirement": "Collect feedback for future improvement.",
+        "how": "The feedback service records accept, dismiss, latency, and model-version metadata without storing raw draft text.",
+        "steps": [
+          "feedback-evaluation-and-experimentation"
+        ]
+      }
+    ],
+    "nonFunctional": [
+      {
+        "requirement": "Meet the roughly 100 ms interactive latency target.",
+        "how": "Client-side triggering reduces load, regional inference keeps requests close, and beam width plus max token length are bounded.",
+        "steps": [
+          "product-boundary-and-triggering",
+          "low-latency-inference-and-beam-search",
+          "model-rollout-and-global-scale"
+        ]
+      },
+      {
+        "requirement": "Scale to Gmail-like traffic.",
+        "how": "The design avoids a backend call per keystroke, uses regional inference fleets, autoscaling, and an empty-suggestion fallback under overload.",
+        "steps": [
+          "product-boundary-and-triggering",
+          "model-rollout-and-global-scale"
+        ]
+      },
+      {
+        "requirement": "Train from around one billion email messages safely.",
+        "how": "Raw email goes through language filtering, redaction, deduplication, and sanitized storage before tokenization and fine-tuning.",
+        "steps": [
+          "privacy-safe-data-preparation",
+          "tokenization-and-training-examples",
+          "two-stage-training-pipeline"
+        ]
+      },
+      {
+        "requirement": "Prefer deterministic predictable completions.",
+        "how": "The inference path chooses beam search rather than stochastic sampling.",
+        "steps": [
+          "decoder-only-transformer-architecture",
+          "low-latency-inference-and-beam-search"
+        ]
+      },
+      {
+        "requirement": "Support safe rollout and rollback.",
+        "how": "The model registry, offline evaluation, canary rollout, version routing, and metrics alerts let operators promote or revert a model safely.",
+        "steps": [
+          "feedback-evaluation-and-experimentation",
+          "model-rollout-and-global-scale"
+        ]
+      }
+    ]
+  },
+  "followUps": [
+    "How would the design change if Smart Compose had to support multiple languages from day one?",
+    "How would you add personalization while preserving user privacy and avoiding data leakage?",
+    "What extra context would you add first: subject, recipient, previous thread, or calendar context?",
+    "How would you tune beam width, confidence threshold, and maximum suggestion length against latency?",
+    "How would you detect memorization of rare training phrases or sensitive text?",
+    "What should happen if the safety filter and model confidence disagree?",
+    "How would you make a smaller on-device model work for offline compose?",
+    "How would you evaluate whether Smart Compose saves time rather than merely increasing acceptance rate?"
+  ]
+}

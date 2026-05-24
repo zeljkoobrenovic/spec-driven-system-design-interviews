@@ -88,22 +88,62 @@ relative to its own page, i.e. `docs/<group>/data/index.json`.)
 ```
 
 The overview shows each dataset's icon from `data/<id>/icon.png` (derived from
-`path`), falling back to `icons/system-design.png` if that file is missing. A
-legacy flat `{ "datasets": [...] }` manifest is still accepted by both
-`normalizeManifest` (explorer) and `normalizeGroups` (overview); it renders as
-one unnamed category.
+`path`), falling back to `icons/system-design.png` if that file is missing.
 
 ## Dataset shape
 
-All fields below are optional except `steps`.
+All fields below are optional except `highLevelArchitecture` and either
+`steps` or `patternCatalog`. `highLevelArchitecture` always contains `nodes`,
+`links`, and `types` arrays; catalog datasets may keep them empty.
 
 ```jsonc
 {
   "title": "URL Shortener — System Design",
   "description": "Short blurb shown under the title.",
 
+  // Explicit high-level architecture metadata used for generated views,
+  // node captions, sequence participant annotations, and styling.
+  "highLevelArchitecture": {
+    // Each node is keyed at render time by exact (id + label); if an id appears
+    // with multiple labels, the exact label disambiguates sequence participants
+    // like C/P/I/R that are reused inside one dataset.
+    "nodes": [
+      {
+        "id": "Cache",                         // Mermaid node/participant id
+        "label": "Redis Cache",                // exact rendered label in the diagram
+        "type": "cache",                       // canonical type from _templates/node-types.json
+        "category": "state",                   // boundary | traffic | compute | async | state | ops
+        "traits": ["stateful", "derived"],      // optional badges/semantics
+        "description": "Fast derived state layer used to reduce DB load."
+      }
+    ],
+
+    // Canonical architecture links used by structured step views. `from` and `to`
+    // reference node ids from highLevelArchitecture.nodes. `render` is optional
+    // and should stay an escape hatch for Mermaid-specific arrows/classes.
+    "links": [
+      {
+        "id": "client-cache",
+        "from": "Client",
+        "to": "Cache",
+        "label": "read hot URL",
+        "kind": "sync",
+        "description": "Client request reaches the hot redirect cache.",
+        "render": { "arrow": "-->" }
+      }
+    ],
+
+    // Optional subgraph grouping for generated architecture diagrams. Named
+    // types rather than groups to avoid collision with manifest categories.
+    "types": [
+      { "id": "read-path", "label": "Read Path", "nodes": ["Client", "Cache", "DB"] }
+    ]
+  },
+
   // ---- Overview ----
-  // Mermaid fields are arrays of source lines. The renderer joins with "\n".
+  // Raw Mermaid overview fields are arrays of source lines. The renderer joins
+  // with "\n". Requirements/capacity render without node-type HTML annotation;
+  // keep them simple, metric-oriented sketches.
   "requirementsDiagram": ["graph LR", "  ..."],   // optional; above Requirements (direction forced to LR)
   "capacityDiagram":     ["graph LR", "  ..."],   // optional; above Capacity (direction forced to LR)
   "dataModelDiagram":    ["erDiagram", "  ..."],  // optional explicit ER; otherwise auto-derived
@@ -124,7 +164,18 @@ All fields below are optional except `steps`.
       "description": "...",
       "request":     "{ \"longUrl\": \"...\" }",
       "response":    "{ \"shortUrl\": \"...\" }",
-      "diagram":     ["sequenceDiagram", "  ..."]   // optional; appears in Wrap-up > API Flows only
+      "sequence": {                                  // optional; appears in Wrap-up > API Flows only
+        "participants": [
+          { "id": "Client" },
+          { "id": "App", "label": "App Server" },
+          { "id": "DB", "label": "URL Store" }
+        ],
+        "messages": [
+          { "from": "Client", "to": "App", "label": "POST /api/v1/shorten" },
+          { "from": "App", "to": "DB", "label": "persist mapping" },
+          { "from": "App", "to": "Client", "arrow": "-->>", "label": "201 shortUrl" }
+        ]
+      }
     }
   ],
 
@@ -157,27 +208,33 @@ All fields below are optional except `steps`.
   // ---- Architecture steps ---- (optional when patternCatalog is present)
   "steps": [
     {
-  "steps": [
-    {
       "id":          "cache",
       "title":       "4. Add a Cache for Hot URLs",
       "description": "...",                       // string OR array; strings are auto-bulleted
       "parent":      "load-balancer",             // optional; mark as sub-step of another step (indented in sidebar)
 
-      // EITHER a step-level diagram + highlight ...
-      "diagram":   ["graph TB", "  ..."],
-      "highlight": ["Cache"],                     // explicit nodeIds to highlight as "new"
+      // Architecture steps use structured graph views. The renderer generates
+      // Mermaid from the node/link catalog and type settings.
+      "view": {
+        "nodes": [
+          { "id": "Client", "label": "Client / Browser" },
+          { "id": "Cache", "label": "Redis Cache" },
+          { "id": "DB", "label": "Mapping Store" }
+        ],
+        "links": ["client-cache", "cache-db"],
+        "groups": ["read-path"],                 // optional highLevelArchitecture.types ids
+        "highlight": ["Cache"]
+      },
 
-      // ... OR options with their own diagram/highlight/pros/cons (tabs above the diagram)
+      // Options may define their own view/pros/cons (tabs above the diagram).
       "options": [
         {
           "name":      "Redis (default)",
           "pros":      ["..."],
           "cons":      ["..."],
-          "diagram":   ["graph TB", "  ..."],
-          "highlight": ["Cache"]
+          "view":      { "nodes": ["App", "Redis", "DB"], "links": ["app-redis", "redis-db"], "highlight": ["Redis"] }
         },
-        { "name": "Memcached", "pros": ["..."], "cons": ["..."], "diagram": ["..."], "highlight": ["..."] }
+        { "name": "Memcached", "pros": ["..."], "cons": ["..."], "view": { "nodes": ["App", "Memcached", "DB"], "links": ["app-memcached", "memcached-db"] } }
       ],
 
       // Per-step education and extras (each optional)
@@ -211,15 +268,35 @@ All fields below are optional except `steps`.
         {
           "name":      "Redirect — cache-aside read",
           "note":      "...",
-          "diagram":   ["sequenceDiagram", "  ..."],
-          "highlight": ["K"]   // optional; explicit participant IDs to mark as new
+          "sequence": {
+            "participants": [
+              { "id": "Client" },
+              { "id": "Cache", "label": "Redis Cache" },
+              { "id": "DB", "label": "Mapping Store" }
+            ],
+            "messages": [
+              { "from": "Client", "to": "Cache", "label": "GET short code" },
+              {
+                "type": "alt",
+                "label": "cache miss",
+                "messages": [
+                  { "from": "Cache", "to": "DB", "label": "load mapping" },
+                  { "from": "DB", "to": "Cache", "arrow": "-->>", "label": "long URL" }
+                ],
+                "else": {
+                  "label": "cache hit",
+                  "messages": [
+                    { "from": "Cache", "to": "Client", "arrow": "-->>", "label": "redirect target" }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": ["Cache"]   // optional; explicit participant/node IDs to mark as new
         }
       ],
       "deepDives":     [{ "title": "Caching policy", "points": ["...", "..."],
-                          "diagram": ["graph TB", "  ..."] }],  // optional escape hatch:
-                        // a structural diagram for the rare deep dive the main/option/flow
-                        // diagrams don't cover. Prefer a sub-step or flow when the depth is
-                        // a sub-decision or a sequence; reserve dd.diagram for pure structure.
+                          "view": { "nodes": ["App", "Cache", "DB"], "links": ["app-cache", "cache-db"] } }],
       "bottlenecks":   [{ "issue": "...", "mitigation": "..." }],
       "talkingPoints": ["...", "..."],
       "interviewerSignals": {
@@ -234,15 +311,13 @@ All fields below are optional except `steps`.
   "finalDesign": {                              // optional; if omitted, no Final Design wrap-up entry is shown
     "title":       "Final Design",
     "description": "End-to-end architecture summary.",
-    "diagram":     ["graph TB", "  ..."],
-    "highlight":   [],                         // usually empty: final design is a review, not a diff
+    "view":        { "nodes": ["Client", "App", "Cache", "DB"], "links": ["client-app", "app-cache", "cache-db"] },
     "options": [                               // optional; same shape/renderer as step.options
       {
         "name":      "Recommended design",
         "pros":      ["..."],
         "cons":      ["..."],
-        "diagram":   ["graph TB", "  ..."],
-        "highlight": []
+        "view":      { "nodes": ["Client", "App", "Cache", "DB"], "links": ["client-app", "app-cache", "cache-db"] }
       }
     ]
   },
@@ -268,46 +343,77 @@ All fields below are optional except `steps`.
 }
 ```
 
-The four fields above (`patterns`, `step.patterns`, `step.traps`,
+The fields above (`patterns`, `step.patterns`, `step.traps`,
 `interviewScript`, `levelVariants`) are the **book differentiators** — all
 optional, so the 17 example datasets render unchanged. `patterns` and
 `step.traps` are exercised in the canonical `url-shortener` example;
 `data/book/payment-system` uses all of them.
 
+`highLevelArchitecture` is required for every dataset and always contains
+`nodes`, `links`, and `types` arrays; catalog datasets may keep all three empty.
+The renderer uses explicit `highLevelArchitecture.nodes` metadata for type
+styling and does not infer node types from labels. Architecture steps should
+use `view`, not hand-authored Mermaid flowcharts; `step.diagram`,
+`step.options[].diagram`, `step.deepDives[].diagram`, `finalDesign.diagram`,
+and `finalDesign.options[].diagram` are rejected. Temporal flows use structured
+`sequence` objects, not raw Mermaid `diagram` fields, so participants reuse the
+same node ids, labels, type styling, and highlights as architecture diagrams.
+Canonical `type` values are documented in
+`_templates/node-types.json`: `actor`, `client`, `edge`, `gateway`, `service`,
+`orchestrator`, `worker`, `queue`, `stream`, `cache`, `database`,
+`object-storage`, `index`, `model`, `observability`, and `external`.
+Use `actor` for human or organization roles and `client` for browsers, mobile
+apps, SDKs, portals, dashboards, devices, and other caller software outside the
+backend boundary.
+Statefulness is represented as a trait (`stateful` / `stateless`), not as a
+separate primary type.
+Node rendering is also configured there: `rendering.types[type]` defines the
+default Mermaid shape, fill, stroke, text color, and class name for that type.
+Renderer code should not infer shape or color from type names; it only reads
+the config, with `view.nodes[].render.shape` reserved as a local escape hatch.
+
 ### Highlighting "new" elements
 
-Mermaid source fields (`requirementsDiagram`, `capacityDiagram`,
-`dataModelDiagram`, and every `diagram`) are stored as string arrays with one
-array element per Mermaid source line. `interview.js` joins those arrays with `\n`
-before rendering. The renderer still accepts legacy string values, but new
-datasets should use arrays.
+Raw Mermaid source fields (`requirementsDiagram`, `capacityDiagram`, and
+optional `dataModelDiagram`) are stored as string arrays with one array element
+per Mermaid source line. `interview.js` joins those arrays with `\n` before
+rendering. Architecture and flow diagrams are structured data now: use `view`
+for graph diagrams and `sequence` for temporal flows.
 
 Flowchart **layout direction is forced at render time** via
-`forceFlowchartDirection()`, so the authored header direction is ignored for
-these four slots: `requirementsDiagram` and `capacityDiagram` render `LR`;
-architecture `steps[].diagram` and `finalDesign.diagram` render `TB`. (Other
-diagrams — API flows, deep dives, data model — keep their authored direction.)
+`forceFlowchartDirection()`: `requirementsDiagram` and `capacityDiagram` render
+`LR`; generated architecture step/final/deep-dive views render `TB`. Data model
+ER diagrams keep their authored direction.
+
+Requirements/capacity overview diagrams render with `annotateNodeTypes: false`
+so their metric labels are not wrapped in inline HTML. Generated architecture
+views still get type captions and configured shapes/colors from
+`_templates/node-types.json`.
 
 The main step diagram (a flowchart) marks nodes that are new or changed
 relative to the previous step:
 
-- If `step.highlight` (or `step.options[i].highlight`) is present, those IDs
-  are highlighted.
-- Otherwise the app auto-diffs node IDs against the previous step's
-  default-option diagram and highlights the additions.
+- If `step.view.highlight` (or `step.options[i].view.highlight`) is present,
+  those IDs are highlighted.
+- Otherwise the app auto-diffs node IDs against the previous step's generated
+  default-option view and highlights the additions.
 - Applied by appending Mermaid `classDef newNode ...; class A,B,C newNode;`
   to the source. CSS in `styles.css` targets the rendered SVG.
 
-Per-step flow diagrams (sequence diagrams) get the same treatment for
+Per-step flow diagrams (`sequence` objects) get the same treatment for
 **participants**, but via a different mechanism (the sequence-diagram parser
 rejects `classDef`/`class`):
 
 - If `flow.highlight` is present, those participant IDs are highlighted.
+- If a flow uses `sequence`, participants should reference canonical
+  `highLevelArchitecture.nodes` ids. Optional `alias` keeps compact Mermaid
+  participant names while styling and highlighting still resolve to the
+  canonical node id.
 - Otherwise the union of:
   - Participants new to this step (not present in any earlier step's flows), and
-  - Participants whose ID matches a node in `step.highlight` (inheritance —
-    so "we introduced X" stays consistent between the architecture diagram
-    and the flow).
+  - Participants whose ID matches a node in `step.view.highlight`
+    (inheritance — so "we introduced X" stays consistent between the
+    architecture diagram and the flow).
 - Applied by patching the rendered SVG after Mermaid renders (adding the
   `newNode` class to the matching participant `<rect>` and `<text>`).
 
@@ -316,10 +422,10 @@ rejects `classDef`/`class`):
 - **Per-step flows** (`step.flows`) appear under each architecture step as a
   **tab strip** — one tab per flow, one flow visible at a time. Tab state
   resets to the first flow on step/dataset change.
-- **Per-endpoint flows** (`api[i].diagram`) appear in the **Wrap-up → API
+- **Per-endpoint flows** (`api[i].sequence`) appear in the **Wrap-up → API
   Flows** section, not in the Overview → API Design section. Flows belong
-  after the architecture is established. Endpoints without a `diagram` still
-  render in the API Flows section but show an inline placeholder.
+  after the architecture is established. Endpoints without a flow still render
+  in the API Flows section but show an inline placeholder.
 
 ## File map
 
@@ -331,6 +437,8 @@ Sources (edit these):
 - `_templates/interview.js`   — Explorer behavior: dataset loading, sidebar
                                 grouping, all rendering, Mermaid orchestration,
                                 hash routing, keyboard nav, error capture.
+- `_templates/node-types.json` — Canonical node types plus Mermaid shape/color
+                                 rendering settings.
 - `_templates/styles.css`     — All styling for both pages, including the
                                 `.newNode` highlight rules applied to
                                 Mermaid-rendered SVG nodes.
@@ -344,7 +452,7 @@ Sources (edit these):
 Build output (generated, committed for GitHub Pages — do not hand-edit):
 
 - `docs/<group>/{index.html,overview.js,interview.html,interview.js,styles.css}`
-  plus `icons/` — copies of the templates.
+  plus `node-types.json` and `icons/` — copies of the templates.
 - `docs/<group>/data/...`                        — copy of the group's data.
 
 Existing dataset: `data/examples/url-shortener/interview.json` — a fully
@@ -357,9 +465,12 @@ populated URL shortener walkthrough used as the worked example.
 - Each Mermaid render gets a unique element id (`mermaid-…-<seq>`); render
   errors are caught per-diagram and shown inline so one bad source doesn't
   break the page.
-- The dataset validator only requires a non-empty `steps[]` and that each
-  step has either a step-level `diagram` or non-empty `options[].diagram`.
-  Every other field is optional and renders only if present.
+- The dataset validator requires `highLevelArchitecture.nodes`,
+  `highLevelArchitecture.links`, and `highLevelArchitecture.types` arrays, plus
+  either non-empty `steps[]` or non-empty `patternCatalog[]`. Each step and
+  final design must have a `view` or options with views. Step/final/deep-dive
+  graph diagrams must use structured `view` objects; flow diagrams must use
+  structured `sequence` objects.
 - Sentence-splitting of `description` strings tolerates common abbreviations
   (`e.g.`, `i.e.`, `etc.`, etc.) so they don't break into separate bullets.
 

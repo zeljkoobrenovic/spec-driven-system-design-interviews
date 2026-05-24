@@ -33,6 +33,7 @@ Two pages, sharing `styles.css`:
 | `_templates/overview.js`            | Overview-page behavior (one IIFE)                        |
 | `_templates/interview.html`         | Explorer DOM shell + Mermaid CDN tag (shared)            |
 | `_templates/interview.js`           | Explorer behavior (one IIFE, no modules)                 |
+| `_templates/node-types.json`        | Canonical node types + external rendering config         |
 | `_templates/styles.css`             | All styling, both pages (shared)                         |
 | `_templates/icons/system-design.png`| Fallback interview icon (shared)                         |
 | `data/<group>/index.json`           | One site's manifest (`groups[]` of categories)           |
@@ -51,7 +52,7 @@ publishable once it has an `index.json` manifest.
 
 | Path                                | Role                                                     |
 |-------------------------------------|----------------------------------------------------------|
-| `docs/<group>/`                     | Copy of the whole `_templates/` tree (both pages, css, `icons/`) |
+| `docs/<group>/`                     | Copy of the whole `_templates/` tree (pages, js, css, `node-types.json`, `icons/`) |
 | `docs/<group>/data/index.json`      | Copy of `data/<group>/index.json`                        |
 | `docs/<group>/data/<id>/...`        | Copy of each dataset subdir (incl. any `icon.png`)       |
 
@@ -104,11 +105,13 @@ python3 build.py                                                # copy step itse
 Edit the sources in `_templates/` (`interview.js`, `overview.js`, …), not the
 `docs/<group>/` copies — those are overwritten on the next build.
 
-For dataset edits, cross-check that `highlight` node IDs actually appear in
-their diagrams, and that `satisfies[*].steps[*]` slugs resolve to real step
-IDs. Both checks were done inline during initial population — repeat them
-when you touch those fields. Mermaid source itself can only be visually
-validated; if you change diagrams, say so explicitly to the user.
+For dataset edits, cross-check that `view.highlight` IDs appear in that view's
+`nodes`, `view.links` references resolve to `highLevelArchitecture.links`, and
+sequence participants reference canonical node IDs or aliases. Also verify that
+`satisfies[*].steps[*]` slugs resolve to real step IDs. Raw Mermaid source only
+remains for requirements/capacity overview sketches and ER data-model diagrams;
+if you change those, say explicitly that Mermaid rendering still needs visual
+validation.
 
 HTTP-serve check (`python3 build.py`, start `python3 -m http.server -d docs` in
 the background, curl each asset under `/examples/` for 200, stop server) is fast
@@ -125,7 +128,7 @@ The explorer (`interview.js`). One IIFE. Top to bottom:
 3. **`state`** — current dataset, entries list, indices.
 4. **`INTRO_SLUGS` / `WRAPUP_ORDER` / `WRAPUP_SLUGS`** — sidebar wiring. New
    intro sections must be registered here.
-5. **Utilities** — `fetchJson`, `extractNodeIds`, `computeAutoDiff`,
+5. **Utilities** — `fetchJson`, structured graph/sequence helpers,
    `resolveHighlights`, `augmentDiagramWithHighlights`, sentence splitter.
 6. **`buildEntries(data)`** — turns a dataset into a flat list of `{ kind,
    id, title, payload }` items in sidebar order (intros, then steps, then
@@ -147,16 +150,32 @@ The explorer (`interview.js`). One IIFE. Top to bottom:
     `#diagram-block` vs `#intro-block` based on `entry.kind`.
 11. **Navigation** — `selectEntry`, `selectOption`, `updateHash`, `parseHash`.
 12. **Dataset loading** — `validateDataset`, `normalizeManifest`,
-    `loadDataset`, `init`. `normalizeManifest` accepts both the grouped
-    manifest (`groups[]`) and the legacy flat one (`datasets[]`), returning a
-    flat `datasets` list (each tagged with `groupId`/`groupName`) plus the
-    `groups` for the dropdown's `<optgroup>`s.
+    `loadDataset`, `init`. `normalizeManifest` accepts the grouped manifest
+    (`groups[]`), returning a flat `datasets` list (each tagged with
+    `groupId`/`groupName`) plus the `groups` for the dropdown's `<optgroup>`s.
 13. **Event wiring** — buttons, dataset dropdown, arrow keys, `hashchange`.
 
 The overview page (`overview.js`) is a separate, much smaller IIFE: fetch
-`data/index.json`, `normalizeGroups()` (same dual-shape logic), render one
+`data/index.json`, `normalizeGroups()` (same grouped-manifest logic), render one
 `.group-section` per category with a grid of `.interview-card`s. It shares no
 code with `interview.js` — keep the two manifest normalizers in sync by hand.
+
+## Node Types
+
+Canonical architecture node types live in `_templates/node-types.json`, not in
+renderer name heuristics. `interview.js` loads that file and uses
+`rendering.types[type]` for Mermaid shape, fill, stroke, text color, and class
+name. Keep shapes/colors there; only use `view.nodes[].render.shape` as a local
+escape hatch.
+
+Current canonical types are: `actor`, `client`, `edge`, `gateway`, `service`,
+`orchestrator`, `worker`, `queue`, `stream`, `cache`, `database`,
+`object-storage`, `index`, `model`, `observability`, and `external`.
+
+Use `actor` only for human or organization roles: user, buyer, driver,
+merchant, operator, admin, creator, viewer. Use `client` for software outside
+the backend boundary: browser, mobile app, SDK, admin portal, dashboard,
+producer app, consumer app, device app, or upstream caller software.
 
 ## Highlight pipeline (the subtle part)
 
@@ -164,52 +183,59 @@ There are **two paths** depending on diagram type, because Mermaid's
 sequence-diagram parser rejects the `classDef`/`class` syntax used for
 flowcharts. Don't try to unify them.
 
-### Flowcharts (step main diagram, intro overview diagrams)
+### Flowcharts (generated architecture views)
 
-1. `effectiveDiagramFor(step)` resolves which Mermaid source + highlight
-   list to use, accounting for `options` if present (selected option's
-   diagram + highlight override the step's).
-2. For auto-diff, the *previous* step's "default option" diagram is used
-   (not its raw `diagram` field) so options don't break the diff.
-3. `resolveHighlights()` returns explicit `highlight` if present, else the
-   diff of node IDs.
+Architecture steps, options, deep dives, and final designs are authored as
+structured `view` objects. Do not add raw Mermaid `diagram` fields there; the
+validator rejects them. The renderer generates Mermaid from
+`highLevelArchitecture.nodes`, `highLevelArchitecture.links`, and
+`highLevelArchitecture.types`.
+
+1. `effectiveDiagramFor(step)` generates Mermaid from `view.nodes` /
+   `view.links`, accounting for `options` if present.
+2. For auto-diff, the previous step's default-option view is generated and
+   compared to the current generated view.
+3. `resolveHighlights()` returns explicit `view.highlight` if present, else
+   the diff of node IDs.
 4. `augmentDiagramWithHighlights()` appends `classDef newNode ...` and
    `class A,B,C newNode` to the Mermaid source before render.
 5. CSS in `styles.css` (`.node.newNode > rect|polygon|…`) targets the
    rendered SVG. Mermaid's class assignment ends up on the `.node` group.
 
 **Layout direction is forced at render time, not authored.**
-`forceFlowchartDirection(src, dir)` rewrites the `graph`/`flowchart` header so
-the authored `LR`/`TB` doesn't matter: requirements + capacity diagrams →
-`LR`, architecture steps + final design → `TB`. Applied in
+`forceFlowchartDirection(src, dir)` rewrites the `graph`/`flowchart` header:
+requirements + capacity diagrams → `LR`, generated architecture views → `TB`.
+Applied in
 `renderIntroRequirements`/`renderIntroCapacity` (LR) and `renderDiagram` (TB,
 which serves both steps and the `final-design` intro entry). It only touches
-flowcharts — sequence/ER sources pass through. So don't fuss over the header
-direction when authoring a dataset diagram in one of those four slots; it gets
-normalized. (API-flow, deep-dive, and data-model diagrams are *not* forced.)
+flowcharts — sequence/ER sources pass through.
+
+Requirements and capacity diagrams are raw overview Mermaid arrays rendered as
+authored, with `annotateNodeTypes: false`. Do not inject HTML type captions into
+them: metric labels such as `~1k creates/sec` and multiline capacity labels can
+break Mermaid parsing when wrapped in inline HTML.
 
 ### Sequence diagrams (per-step `flows[]`)
 
-1. `extractSequenceParticipants()` parses participant IDs from `participant
-   X (as Label)?` declarations and from message-arrow endpoints. Identifier
-   class deliberately excludes `-` so arrow tokens (`-->>`, `-x`, `-)`)
-   aren't swallowed into the operand.
+1. `flowParticipantIds()` reads participant IDs from the structured
+   `sequence.participants` and `sequence.messages` data, including aliases.
 2. `resolveFlowHighlights(flow, currentStep, allStepsBefore)`:
    - Explicit `flow.highlight` wins (filtered to participants that actually
      appear in this flow).
    - Otherwise union of: participants new to this step (not present in any
-     earlier step's flows) + IDs from `currentStep.highlight` that match a
+     earlier step's flows) + IDs from `currentStep.view.highlight` that match a
      participant in this flow (inheritance from the main diagram).
 3. **Do NOT** mutate the Mermaid source — the sequence parser rejects
    `classDef`. Instead pass the highlight list to `makeMermaidEl()` via
-   `opts = { highlightParticipants, sourceForLabels }`.
+   `opts = { highlightParticipants, sourceForLabels, annotateParticipants }`.
 4. After Mermaid resolves, `applySequenceHighlights()` walks the rendered
    SVG, finds `<text>` elements whose textContent matches a participant
    label (resolved via `parseSequenceParticipantLabels`), and adds the
    `newNode` class to that `<text>` plus the matching participant `<rect>`.
 5. CSS selectors that target this path: `rect.newNode`, `text.newNode`,
-   plus the `.actor.newNode` family. Keep these alongside the flowchart
-   selectors.
+   plus the `.actor.newNode` family emitted by Mermaid sequence SVGs. This
+   `.actor` class is Mermaid's participant class, not the canonical `actor`
+   node type. Keep these selectors alongside the flowchart selectors.
 
 ### Debugging
 
@@ -219,9 +245,8 @@ If a step diagram highlight breaks visually:
 3. Did Mermaid emit the class on the SVG `<g class="node …">`?
 
 If a flow diagram highlight breaks:
-1. Did `extractSequenceParticipants` find the participant? (Check via the
-   inline simulator pattern in the conversation history — node script that
-   runs the regex against the diagram source.)
+1. Does `sequence.participants` include the canonical node id or alias used by
+   the highlight?
 2. Does the visible label match what `parseSequenceParticipantLabels`
    resolved? Mermaid renders the `as <label>` value, not the bare ID.
 3. Did `applySequenceHighlights` find a matching `<text>` element in the
@@ -230,12 +255,19 @@ If a flow diagram highlight breaks:
 
 ## Mermaid render helper
 
-`makeMermaidEl(diagramSrc, className)` returns a container div and kicks
+`makeMermaidEl(diagramSrc, className, opts)` returns a container div and kicks
 off `mermaid.render()` asynchronously with a unique id. On render failure
 it shows an inline error block under that one diagram instead of crashing
-the page. Use it for any *new* Mermaid diagram outside the main step
-diagram. The step diagram uses `renderDiagram()` because it needs the
-highlight pipeline above.
+the page. Use it for any *new* Mermaid diagram outside the main step diagram.
+The step diagram uses `renderDiagram()` because it needs the highlight pipeline
+above.
+
+For flowcharts, `makeMermaidEl()` annotates node labels/types by default. Pass
+`{ annotateNodeTypes: false }` for raw overview diagrams such as
+`requirementsDiagram` and `capacityDiagram`; those should remain simple Mermaid
+source with no injected HTML labels. For sequence diagrams, pass
+`highlightParticipants`, `sourceForLabels`, and `annotateParticipants` so the
+rendered SVG can be patched after Mermaid finishes.
 
 Mermaid render IDs must be unique per page render. We use a monotonically
 incrementing `mermaidIdSeq` plus `Date.now()`. Don't reuse IDs.
@@ -329,6 +361,17 @@ per family. Foundational/social families are intentionally left to `examples`.
 - **Mermaid node IDs**: must be `[A-Za-z_][A-Za-z0-9_-]*`. The highlight
   regex filter drops anything that doesn't match. If you use a node id with
   a space, slash, or dot, it won't highlight.
+- **Architecture diagrams are structured now**: do not add `diagram` to
+  `steps[]`, `step.options[]`, `step.deepDives[]`, `finalDesign`, or
+  `finalDesign.options[]`. Use `view.nodes`, `view.links`, optional
+  `view.groups`, and optional `view.highlight`.
+- **Flow diagrams are structured now**: do not add raw Mermaid sequence
+  `diagram` fields. Use `sequence.participants` and `sequence.messages` for
+  `step.flows[]`, `finalDesign.flows[]`, and `api[].sequence`.
+- **Node type styling is external**: add or adjust canonical types and
+  shapes/colors in `_templates/node-types.json`, not by inferring names in
+  `interview.js`. Keep `actor` for people/organizations and `client` for
+  software caller surfaces.
 - **erDiagram type tokens**: must be a bare identifier (no spaces, no
   punctuation). `autoErDiagramFromDataModel()` sanitizes this — if you write
   an explicit `dataModelDiagram`, do the sanitization yourself.
@@ -346,9 +389,8 @@ per family. Foundational/social families are intentionally left to `examples`.
   for the overview card (else it falls back to `icons/system-design.png`). Then
   re-run `python3 build.py` and commit `docs/`.
 - **Manifest is grouped**: `index.json` is `{ groups: [{ id, name, datasets:
-  [...] }] }`. Both `interview.js` (`normalizeManifest`) and `overview.js`
-  (`normalizeGroups`) still accept a legacy flat `{ datasets: [...] }`, so don't
-  assume one shape when editing either parser.
+  [...] }] }`. Keep `interview.js` (`normalizeManifest`) and `overview.js`
+  (`normalizeGroups`) aligned on that shape.
 - **Editing the wrong copy**: edit sources (`_templates/`, `data/<group>/`),
   never the generated `docs/<group>/` copies — the next build overwrites them.
 - **Forgetting to rebuild**: changes to `_templates/` or `data/` are invisible

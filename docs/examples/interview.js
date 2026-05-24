@@ -2,7 +2,7 @@
 // Vanilla JS, no build step. Loads a manifest of datasets, then a per-dataset
 // JSON file containing both dataset-level interview sections (requirements,
 // capacity, API, data model, follow-ups) and a sequence of architecture
-// steps with Mermaid diagrams.
+// steps with structured graph views.
 
 (function () {
     "use strict";
@@ -43,6 +43,10 @@
         groups: [],             // [{ id, name, datasets }, ...]
         currentDatasetId: null,
         data: null,
+        nodeTypeConfig: null,
+        nodeIndex: null,
+        linkIndex: null,
+        architectureTypeIndex: null,
         entries: [],            // [{ kind, id, title, payload? }, ...]
         currentEntryIndex: 0,
         currentOptionIndex: 0,  // per-step (reset on entry change)
@@ -99,6 +103,11 @@
         }
     }
 
+    async function loadNodeTypeConfig() {
+        const cfg = await fetchJson("node-types.json");
+        return cfg && typeof cfg === "object" ? cfg : {};
+    }
+
     function diagramSource(value) {
         if (Array.isArray(value)) return value.join("\n");
         return typeof value === "string" ? value : "";
@@ -108,18 +117,25 @@
         return diagramSource(value).trim() !== "";
     }
 
-    function pickDiagram() {
-        for (const value of arguments) {
-            if (hasDiagram(value)) return diagramSource(value);
-        }
-        return "";
+    function hasGraphView(value) {
+        return !!(value && typeof value === "object" && (
+            Array.isArray(value.nodes) ||
+            Array.isArray(value.links) ||
+            Array.isArray(value.groups)
+        ));
+    }
+
+    function hasSequence(value) {
+        return !!(value && typeof value === "object" &&
+            Array.isArray(value.participants) &&
+            Array.isArray(value.messages));
     }
 
     function hasStepLikeDiagram(item) {
         if (!item || typeof item !== "object") return false;
-        const hasOwn = hasDiagram(item.diagram);
+        const hasOwn = hasGraphView(item.view);
         const hasOpt = Array.isArray(item.options) && item.options.length > 0 &&
-            item.options.every((o) => o && hasDiagram(o.diagram));
+            item.options.every((o) => o && hasGraphView(o.view));
         return hasOwn || hasOpt;
     }
 
@@ -188,55 +204,176 @@
             .toLowerCase();
     }
 
-    function inferNodeType(id, label, shape) {
-        const text = `${compactTypeText(id)} ${compactTypeText(label)}`;
-        const has = (re) => re.test(text);
-
-        if (has(/\b(web servers?)\b/)) return "webserver";
-        if (has(/\b(cdn|edge)\b/)) return "edge";
-        if (has(/\b(geo ?dns|dns)\b/)) return "dns";
-        if (has(/\b(load balancer|balancer|\blb\b)\b/)) return "load balancer";
-        if (has(/\bapi gateway\b/) || has(/\bapi\b/) || has(/\b(endpoint|graphql)\b/)) return "api";
-        if (has(/\b(router|gateway)\b/)) return "router";
-        if (has(/\b(queue|stream|event bus|message bus|topic|log)\b/) || shape === "subroutine" && has(/\bq\b/)) return "queue";
-        if (has(/\b(cache|redis|memcached)\b/)) return "cache";
-        if (has(/\b(object storage|media store|archive|origin|bucket|storage engine|commit logs?|memtables?|sstables?|hash table|blob store|file store)\b/)) return "storage";
-        if (has(/\b(index|search index|owner index|analytics store)\b/)) return "index";
-        if (has(/\b(db|database|datastore|data store|store|shard|replica|primary|master|slave|sql|nosql|kv)\b/) || shape === "database") return "database";
-        if (has(/\b(worker|processor|scheduler|parser|normalizer|filter|classifier|fingerprinter|compactor|controller|merge|jobs)\b/)) return "worker";
-        if (has(/\b(generator|allocator|id gen|idgen)\b/)) return "generator";
-        if (has(/\b(auth|rate limit|limiter|policy|rules?)\b/)) return "policy";
-        if (has(/\b(metrics?|alerts?|dashboard|logs?|analytics|tools|observability)\b/)) return "observability";
-        if (has(/\b(service|server|app|web tier|post svc|feed svc|user svc)\b/)) return "service";
-        if (has(/\b(workers?)\b/)) return "worker";
-        if (has(/\b(client|user|viewer|author|browser|mobile|operator|admin)\b/)) return "client";
-        if (has(/\b(graph|social graph)\b/)) return "graph";
-        return "";
-    }
-
-    const NODE_TYPE_STYLES = {
-        webserver: {className: "nodeTypeWebserver", fill: "#fff7ed", stroke: "#ea580c"},
-        edge: {className: "nodeTypeEdge", fill: "#eff6ff", stroke: "#2563eb"},
-        dns: {className: "nodeTypeDns", fill: "#eff6ff", stroke: "#2563eb"},
-        "load balancer": {className: "nodeTypeLoadBalancer", fill: "#fff7ed", stroke: "#ea580c"},
-        queue: {className: "nodeTypeQueue", fill: "#f5f3ff", stroke: "#7c3aed"},
-        cache: {className: "nodeTypeCache", fill: "#ecfdf5", stroke: "#059669"},
-        storage: {className: "nodeTypeStorage", fill: "#eef2ff", stroke: "#4f46e5"},
-        index: {className: "nodeTypeIndex", fill: "#eef2ff", stroke: "#4f46e5"},
-        database: {className: "nodeTypeDatabase", fill: "#eef2ff", stroke: "#4f46e5"},
-        worker: {className: "nodeTypeWorker", fill: "#fff7ed", stroke: "#ea580c"},
-        router: {className: "nodeTypeRouter", fill: "#fff7ed", stroke: "#ea580c"},
-        generator: {className: "nodeTypeGenerator", fill: "#fffbeb", stroke: "#d97706"},
-        policy: {className: "nodeTypePolicy", fill: "#fef2f2", stroke: "#dc2626"},
-        observability: {className: "nodeTypeObservability", fill: "#f0fdfa", stroke: "#0f766e"},
-        api: {className: "nodeTypeApi", fill: "#eff6ff", stroke: "#2563eb"},
-        service: {className: "nodeTypeService", fill: "#fff7ed", stroke: "#ea580c"},
-        client: {className: "nodeTypeClient", fill: "#f8fafc", stroke: "#64748b"},
-        graph: {className: "nodeTypeGraph", fill: "#fdf4ff", stroke: "#c026d3"},
+    const NODE_TYPE_CATEGORIES = {
+        actor: "boundary",
+        client: "boundary",
+        edge: "boundary",
+        gateway: "traffic",
+        service: "compute",
+        orchestrator: "compute",
+        worker: "compute",
+        queue: "async",
+        stream: "async",
+        cache: "state",
+        database: "state",
+        "object-storage": "state",
+        index: "state",
+        model: "compute",
+        observability: "ops",
+        external: "boundary",
     };
 
+    function canonicalNodeType(type) {
+        const t = String(type || "").trim().toLowerCase();
+        return NODE_TYPE_CATEGORIES[t] ? t : "";
+    }
+
+    function nodeTypeCategory(type) {
+        return NODE_TYPE_CATEGORIES[canonicalNodeType(type)] || "";
+    }
+
+    function normalizeNodeLookupLabel(label) {
+        return String(label || "")
+            .replace(/\\n/g, "\n")
+            .replace(/<br\s*\/?>/gi, "\n")
+            .replace(/\s+/g, " ")
+            .trim();
+    }
+
+    function nodeLookupKey(id, label) {
+        return `${String(id || "")}\u0000${normalizeNodeLookupLabel(label)}`;
+    }
+
+    function normalizeNodeMeta(item) {
+        if (!item || typeof item !== "object") return null;
+        const id = String(item.id || "").trim();
+        const type = canonicalNodeType(item.type);
+        if (!id || !type) return null;
+        const label = normalizeNodeLookupLabel(item.label || id);
+        return {
+            id,
+            label,
+            type,
+            category: String(item.category || nodeTypeCategory(type) || "").trim(),
+            traits: Array.isArray(item.traits)
+                ? item.traits.map((t) => String(t || "").trim()).filter(Boolean)
+                : [],
+            description: String(item.description || "").trim(),
+        };
+    }
+
+    function buildNodeIndex(data) {
+        const exact = new Map();
+        const byId = new Map();
+        const arch = data && data.highLevelArchitecture;
+        const items = arch && Array.isArray(arch.nodes) ? arch.nodes : [];
+
+        items.forEach((item) => {
+            const meta = normalizeNodeMeta(item);
+            if (!meta) return;
+            exact.set(nodeLookupKey(meta.id, meta.label), meta);
+            if (!byId.has(meta.id)) byId.set(meta.id, []);
+            byId.get(meta.id).push(meta);
+        });
+
+        return {exact, byId};
+    }
+
+    function nodeMetadataFor(id, label) {
+        if (!state.nodeIndex || !id) return null;
+        const exact = state.nodeIndex.exact.get(nodeLookupKey(id, label));
+        if (exact) return exact;
+
+        const matches = state.nodeIndex.byId.get(String(id || "").trim()) || [];
+        if (matches.length === 1) return matches[0];
+
+        const normalizedLabel = normalizeNodeLookupLabel(label);
+        const sameLabel = matches.filter((m) => m.label === normalizedLabel);
+        return sameLabel.length === 1 ? sameLabel[0] : null;
+    }
+
+    function normalizeNodeRef(ref) {
+        if (typeof ref === "string") return {id: ref};
+        if (ref && typeof ref === "object") {
+            return {
+                id: String(ref.id || "").trim(),
+                label: ref.label !== undefined ? normalizeNodeLookupLabel(ref.label) : undefined,
+                render: ref.render && typeof ref.render === "object" ? ref.render : null,
+            };
+        }
+        return {id: ""};
+    }
+
+    function nodeMetadataForRef(ref) {
+        const r = normalizeNodeRef(ref);
+        if (!r.id) return null;
+        return nodeMetadataFor(r.id, r.label || "") || {
+            id: r.id,
+            label: r.label || r.id,
+            type: "",
+            category: "",
+            traits: [],
+            description: "",
+        };
+    }
+
+    function buildLinkIndex(data) {
+        const out = new Map();
+        const arch = data && data.highLevelArchitecture;
+        const items = arch && Array.isArray(arch.links) ? arch.links : [];
+        items.forEach((link) => {
+            if (!link || typeof link !== "object") return;
+            const id = String(link.id || "").trim();
+            if (!id) return;
+            out.set(id, Object.assign({}, link, {id}));
+        });
+        return out;
+    }
+
+    function buildArchitectureTypeIndex(data) {
+        const out = new Map();
+        const arch = data && data.highLevelArchitecture;
+        const items = arch && Array.isArray(arch.types) ? arch.types : [];
+        items.forEach((group) => {
+            if (!group || typeof group !== "object") return;
+            const id = String(group.id || "").trim();
+            if (!id) return;
+            out.set(id, Object.assign({}, group, {id}));
+        });
+        return out;
+    }
+
+    function nodeRenderingConfig() {
+        return state.nodeTypeConfig && state.nodeTypeConfig.rendering && typeof state.nodeTypeConfig.rendering === "object"
+            ? state.nodeTypeConfig.rendering
+            : {};
+    }
+
+    function safeMermaidClassName(value, fallback) {
+        const raw = String(value || fallback || "").trim();
+        const safe = raw.replace(/[^A-Za-z0-9_-]/g, "_");
+        if (/^[A-Za-z_]/.test(safe)) return safe || "nodeType";
+        return `nodeType_${safe}`;
+    }
+
     function nodeTypeStyle(type) {
-        return NODE_TYPE_STYLES[type] || null;
+        const canonical = canonicalNodeType(type);
+        if (!canonical) return null;
+        const config = nodeRenderingConfig();
+        const defaults = config.defaults && typeof config.defaults === "object" ? config.defaults : {};
+        const types = config.types && typeof config.types === "object" ? config.types : {};
+        const spec = types[canonical] && typeof types[canonical] === "object" ? types[canonical] : {};
+        const className = safeMermaidClassName(spec.className, canonical);
+        return {
+            type: canonical,
+            className,
+            shape: String(spec.shape || defaults.shape || "rect"),
+            fill: String(spec.fill || defaults.fill || "#ffffff"),
+            stroke: String(spec.stroke || defaults.stroke || "#d1d5db"),
+            strokeWidth: String(spec.strokeWidth || defaults.strokeWidth || "1.4px"),
+            color: String(spec.color || defaults.color || "#1f2329"),
+            captionColor: String(spec.captionColor || spec.stroke || defaults.captionColor || "#6a7280"),
+        };
     }
 
     function typeAnnotatedLabel(type, label) {
@@ -250,11 +387,15 @@
         const note = noteText
             ? `<span class='node-annotation' style='display:block;margin-top:2px;color:#8a929e;font-size:9px;line-height:1.1;font-weight:400;'>(${escapeHtmlLabel(noteText).replace(/\n/g, "<br/>")})</span>`
             : "";
-        const topSpacer = (type === "database" || type === "storage" || type === "index")
+        const canonicalType = canonicalNodeType(type);
+        const style = nodeTypeStyle(type);
+        const renderShape = style ? style.shape : "";
+        const captionColor = style ? style.captionColor : "#6a7280";
+        const topSpacer = renderShape === "database"
             ? "<span class='node-label-top-spacer' style='display:block;height:1em;line-height:1em;'>&nbsp;</span>"
             : "";
-        const caption = type
-            ? `<span class='node-type-caption' style='display:block;margin:0 0 1px;color:#6a7280;font-size:10px;line-height:1;font-weight:600;letter-spacing:0.04em;text-transform:uppercase;'>${escapeHtmlLabel(type)}</span>`
+        const caption = canonicalType
+            ? `<span class='node-type-caption' style='display:block;margin:0 0 1px;color:${escapeHtmlLabel(captionColor)};font-size:10px;line-height:1;font-weight:600;letter-spacing:0.04em;text-transform:uppercase;'>${escapeHtmlLabel(canonicalType)}</span>`
             : "";
         return `<span class='node-label-stack' style='display:inline-block;line-height:1.12;text-align:center;white-space:nowrap;'>${topSpacer}${caption}<span class='node-main-label' style='display:block;line-height:1.15;'>${body}</span>${note}</span>`;
     }
@@ -285,7 +426,8 @@
         }
 
         function rebuild(shape, id, label) {
-            const type = inferNodeType(id, label, shape);
+            const meta = nodeMetadataFor(id, label);
+            const type = meta ? meta.type : "";
             if (/node-type-caption/.test(label)) return null;
             // Rebuild when the node has a known type OR carries an inline annotation
             // (a `\n` in the label), so annotation styling reaches typeless nodes too.
@@ -293,26 +435,25 @@
             if (!type && !hasAnnotation) return null;
             if (type) rememberTypeClass(id, type);
             const annotated = typeAnnotatedLabel(type, label);
-            // Caches are visually distinct from authoritative databases/stores:
-            // render them as stadium/pill nodes even if the source uses DB syntax.
-            const renderedShape = type === "cache" ? "stadium" : shape;
+            const typeStyle = nodeTypeStyle(type);
+            const renderedShape = typeStyle && typeStyle.shape ? typeStyle.shape : shape;
             switch (renderedShape) {
                 case "subroutine":
-                    return `${id}[["${annotated}"]]`;
+                    return `${id}[[${annotated}]]`;
                 case "database":
-                    return `${id}[("${annotated}")]`;
+                    return `${id}[(${annotated})]`;
                 case "stadium":
-                    return `${id}(["${annotated}"])`;
+                    return `${id}([${annotated}])`;
                 case "circle":
-                    return `${id}(("${annotated}"))`;
+                    return `${id}((${annotated}))`;
                 case "diamond":
-                    return `${id}{"${annotated}"}`;
+                    return `${id}{${annotated}}`;
                 case "parallelogram":
-                    return `${id}[/"${annotated}"/]`;
+                    return `${id}[/${annotated}/]`;
                 case "asymmetric":
-                    return `${id}>"${annotated}"]`;
+                    return `${id}>${annotated}]`;
                 default:
-                    return `${id}["${annotated}"]`;
+                    return `${id}[${annotated}]`;
             }
         }
 
@@ -332,44 +473,11 @@
         const classLines = [];
         typeClasses.forEach(({style, ids}, className) => {
             const uniqueIds = [...new Set(ids)];
-            classLines.push(`classDef ${className} fill:${style.fill},stroke:#d1d5db,stroke-width:1.4px,color:#1f2329;`);
+            classLines.push(`classDef ${className} fill:${style.fill},stroke:${style.stroke},stroke-width:${style.strokeWidth},color:${style.color};`);
             classLines.push(`class ${uniqueIds.join(",")} ${className};`);
         });
 
         return annotatedLines.concat(classLines).join("\n");
-    }
-
-    // Extract participant IDs from a Mermaid sequenceDiagram source. Recognizes:
-    //   participant X
-    //   participant X as Label
-    //   actor X (as ...)
-    //   bare message lines: X->>Y: msg  /  X-)Y: msg  /  X-->>Y: msg  /  X-xY  etc.
-    // Returns a Set of bare identifiers.
-    function extractSequenceParticipants(diagram) {
-        diagram = diagramSource(diagram);
-        if (!diagram) return new Set();
-        const ids = new Set();
-        // Participant IDs in sequence diagrams are alphanumeric + underscore. Avoid
-        // hyphens in the character class so we don't accidentally swallow a `-` from
-        // the arrow (`-->>`, `-x`, `-)`).
-        const reDecl = /^\s*(?:participant|actor)\s+([A-Za-z_][A-Za-z0-9_]*)/gm;
-        let m;
-        while ((m = reDecl.exec(diagram)) !== null) ids.add(m[1]);
-        // Sequence message arrows. Mermaid supports ->, -->, ->>, -->>, -x, --x,
-        // -), --), and dotted variants. We just need the two endpoint identifiers.
-        const reMsg = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:--?>>?|--?x|--?\))\s*([A-Za-z_][A-Za-z0-9_]*)\s*:/gm;
-        while ((m = reMsg.exec(diagram)) !== null) {
-            ids.add(m[1]);
-            ids.add(m[2]);
-        }
-        const reserved = new Set([
-            "sequenceDiagram", "participant", "actor", "Note", "note", "loop",
-            "alt", "else", "opt", "par", "and", "rect", "activate", "deactivate",
-            "end", "autonumber", "title", "over", "left", "right", "of",
-            "classDef", "class",
-        ]);
-        for (const r of reserved) ids.delete(r);
-        return ids;
     }
 
     // Resolve which participants in `flow` should be highlighted at `currentStep`.
@@ -377,14 +485,27 @@
     //   - If flow.highlight is an explicit array, use it (filtered to known IDs).
     //   - Otherwise union:
     //       a) participants new to this step (not present in any earlier step's flows), and
-    //       b) participants whose ID matches a node in currentStep.highlight (inheritance).
-    function resolveFlowHighlights(flow, currentStep, allStepsBefore) {
-        const flowParticipants = extractSequenceParticipants(flow.diagram);
+    //       b) participants whose ID matches a node highlighted in the step view.
+    function flowParticipantIds(flow) {
+        const ids = new Set();
+        if (!flow || !hasSequence(flow.sequence)) return ids;
+        sequenceParticipantSpecs(flow.sequence).specs.forEach((spec) => {
+            ids.add(spec.id);
+            ids.add(spec.alias);
+        });
+        return ids;
+    }
 
-        if (Array.isArray(flow.highlight) && flow.highlight.length > 0) {
+    function resolveFlowHighlights(flow, currentStep, allStepsBefore) {
+        const flowParticipants = flowParticipantIds(flow);
+        const explicitHighlight = Array.isArray(flow.highlight) && flow.highlight.length > 0
+            ? flow.highlight
+            : (flow.sequence && Array.isArray(flow.sequence.highlight) ? flow.sequence.highlight : []);
+
+        if (explicitHighlight.length > 0) {
             // Only keep IDs that actually appear in the flow, so a typo or stale
             // reference doesn't inject orphan `class` lines.
-            return flow.highlight.filter((id) => flowParticipants.has(id));
+            return explicitHighlight.filter((id) => flowParticipants.has(id));
         }
 
         const out = new Set();
@@ -394,16 +515,18 @@
         for (const prev of allStepsBefore) {
             const flows = Array.isArray(prev.flows) ? prev.flows : [];
             for (const f of flows) {
-                if (!f || !hasDiagram(f.diagram)) continue;
-                for (const id of extractSequenceParticipants(f.diagram)) seenBefore.add(id);
+                if (!hasFlowDiagram(f)) continue;
+                for (const id of flowParticipantIds(f)) seenBefore.add(id);
             }
         }
         for (const id of flowParticipants) {
             if (!seenBefore.has(id)) out.add(id);
         }
 
-        // (b) Inherit step.highlight matches that appear as participants here.
-        const stepHighlight = Array.isArray(currentStep.highlight) ? currentStep.highlight : [];
+        // (b) Inherit step view highlights that appear as participants here.
+        const stepHighlight = currentStep.view && Array.isArray(currentStep.view.highlight)
+            ? currentStep.view.highlight
+            : [];
         for (const id of stepHighlight) {
             if (flowParticipants.has(id)) out.add(id);
         }
@@ -640,23 +763,355 @@
 
     // ---------- Rendering: architecture step diagram + options ----------
 
+    function mermaidSafeId(id, prefix) {
+        const raw = String(id || "").trim();
+        const safe = raw.replace(/[^A-Za-z0-9_-]/g, "_");
+        if (/^[A-Za-z_]/.test(safe)) return safe || `${prefix || "N"}_`;
+        return `${prefix || "N"}_${safe}`;
+    }
+
+    function mermaidSequenceSafeId(id, used) {
+        const raw = String(id || "").trim();
+        let safe = raw.replace(/[^A-Za-z0-9_]/g, "_");
+        if (!safe) safe = "P";
+        if (!/^[A-Za-z_]/.test(safe)) safe = `P_${safe}`;
+        const base = safe;
+        let i = 2;
+        while (used.has(safe)) {
+            safe = `${base}_${i}`;
+            i += 1;
+        }
+        used.add(safe);
+        return safe;
+    }
+
+    function mermaidNodeLabel(label) {
+        return String(label || "").replace(/"/g, "&quot;");
+    }
+
+    function mermaidSequenceText(text) {
+        return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function graphShapeLine(id, label, shape) {
+        if (shape === "database") {
+            return `  ${id}[(${label})]`;
+        }
+        if (shape === "queue" || shape === "subroutine") {
+            return `  ${id}[[${label}]]`;
+        }
+        if (shape === "cache" || shape === "stadium") {
+            return `  ${id}([${label}])`;
+        }
+        if (shape === "external" || shape === "actor" || shape === "parallelogram") {
+            return `  ${id}[/${label}/]`;
+        }
+        if (shape === "diamond") return `  ${id}{${label}}`;
+        if (shape === "circle") return `  ${id}((${label}))`;
+        if (shape === "asymmetric") return `  ${id}>${label}]`;
+        return `  ${id}[${label}]`;
+    }
+
+    function graphNodeLine(node, render) {
+        const id = mermaidSafeId(node.id, "N");
+        const label = mermaidNodeLabel((render && render.label) || node.label || node.id);
+        const style = nodeTypeStyle(node.type);
+        const shape = render && render.shape ? String(render.shape) : (style && style.shape ? style.shape : "rect");
+        return graphShapeLine(id, label, shape);
+    }
+
+    function graphLinkLine(link) {
+        if (!link || !link.from || !link.to) return "";
+        const from = mermaidSafeId(link.from, "N");
+        const to = mermaidSafeId(link.to, "N");
+        const render = link.render && typeof link.render === "object" ? link.render : {};
+        const arrow = String(render.arrow || (render.style === "dashed" ? "-.->" : "-->"));
+        const label = String(link.label || "").trim();
+        const escaped = label.replace(/\|/g, "/");
+        return label ? `  ${from} ${arrow}|${escaped}| ${to}` : `  ${from} ${arrow} ${to}`;
+    }
+
+    function graphViewRefs(view, key) {
+        if (!view || typeof view !== "object") return [];
+        const value = view[key];
+        return Array.isArray(value) ? value : [];
+    }
+
+    function linkFromRef(ref) {
+        if (typeof ref === "string") return state.linkIndex && state.linkIndex.get(ref);
+        if (ref && typeof ref === "object") return ref;
+        return null;
+    }
+
+    function graphViewToMermaid(view) {
+        if (!hasGraphView(view)) return "";
+        const nodeRefs = graphViewRefs(view, "nodes");
+        const nodeMetas = [];
+        const nodeIds = new Set();
+
+        nodeRefs.forEach((ref) => {
+            const meta = nodeMetadataForRef(ref);
+            if (!meta || !meta.id) return;
+            const render = normalizeNodeRef(ref).render || (meta.render && typeof meta.render === "object" ? meta.render : null);
+            nodeMetas.push({meta, render});
+            nodeIds.add(meta.id);
+        });
+
+        const links = graphViewRefs(view, "links")
+            .map(linkFromRef)
+            .filter((link) => link && link.from && link.to)
+            .filter((link) => nodeIds.has(link.from) && nodeIds.has(link.to));
+
+        links.forEach((link) => {
+            [link.from, link.to].forEach((id) => {
+                if (nodeIds.has(id)) return;
+                const meta = nodeMetadataForRef(id);
+                if (meta && meta.id) {
+                    nodeMetas.push({meta, render: null});
+                    nodeIds.add(meta.id);
+                }
+            });
+        });
+
+        const lines = ["graph TB"];
+        const emitted = new Set();
+        const groupRefs = graphViewRefs(view, "groups");
+        groupRefs.forEach((groupRef) => {
+            const groupId = typeof groupRef === "string" ? groupRef : groupRef && groupRef.id;
+            const group = groupId && state.architectureTypeIndex ? state.architectureTypeIndex.get(groupId) : null;
+            if (!group || !Array.isArray(group.nodes)) return;
+            const grouped = nodeMetas.filter((item) => group.nodes.includes(item.meta.id));
+            if (grouped.length === 0) return;
+            lines.push(`  subgraph ${mermaidSafeId(group.id, "G")}["${mermaidNodeLabel(group.label || group.id)}"]`);
+            grouped.forEach((item) => {
+                lines.push(graphNodeLine(item.meta, item.render));
+                emitted.add(item.meta.id);
+            });
+            lines.push("  end");
+        });
+
+        nodeMetas.forEach((item) => {
+            if (emitted.has(item.meta.id)) return;
+            lines.push(graphNodeLine(item.meta, item.render));
+            emitted.add(item.meta.id);
+        });
+        links.forEach((link) => {
+            const line = graphLinkLine(link);
+            if (line) lines.push(line);
+        });
+        return lines.join("\n");
+    }
+
+    function normalizeSequenceParticipant(ref) {
+        if (typeof ref === "string") return {id: String(ref).trim(), label: ""};
+        if (!ref || typeof ref !== "object") return {id: "", label: ""};
+        const id = String(ref.id || ref.node || ref.ref || ref.alias || ref.label || "").trim();
+        return {
+            id,
+            alias: String(ref.alias || "").trim(),
+            label: ref.label !== undefined ? normalizeNodeLookupLabel(ref.label) : "",
+            kind: String(ref.kind || "").trim().toLowerCase(),
+            actor: ref.actor === true,
+        };
+    }
+
+    function collectSequenceMessageRefs(messages, out) {
+        if (!Array.isArray(messages)) return;
+        messages.forEach((msg) => {
+            if (!msg || typeof msg !== "object") return;
+            if (msg.from) out.add(String(msg.from).trim());
+            if (msg.to) out.add(String(msg.to).trim());
+            if (Array.isArray(msg.over)) msg.over.forEach((id) => out.add(String(id).trim()));
+            if (msg.of) out.add(String(msg.of).trim());
+            collectSequenceMessageRefs(msg.messages, out);
+            if (msg.else && typeof msg.else === "object") collectSequenceMessageRefs(msg.else.messages, out);
+            if (Array.isArray(msg.branches)) {
+                msg.branches.forEach((branch) => collectSequenceMessageRefs(branch && branch.messages, out));
+            }
+        });
+    }
+
+    function sequenceParticipantSpecs(sequence) {
+        const participants = sequence && Array.isArray(sequence.participants)
+            ? sequence.participants
+            : [];
+        const specs = [];
+        const byId = new Map();
+        const usedAliases = new Set();
+
+        function addParticipant(ref) {
+            const raw = normalizeSequenceParticipant(ref);
+            if (!raw.id) return null;
+            if (byId.has(raw.id)) return byId.get(raw.id);
+            const meta = nodeMetadataFor(raw.id, raw.label || "");
+            const label = raw.label || (meta && meta.label) || raw.id;
+            let alias;
+            if (raw.alias && /^[A-Za-z_][A-Za-z0-9_]*$/.test(raw.alias) && !usedAliases.has(raw.alias)) {
+                alias = raw.alias;
+                usedAliases.add(alias);
+            } else {
+                alias = mermaidSequenceSafeId(raw.id, usedAliases);
+            }
+            const spec = {
+                id: raw.id,
+                alias,
+                label,
+                actor: raw.actor || raw.kind === "actor" || (meta && meta.type === "actor"),
+            };
+            specs.push(spec);
+            byId.set(raw.id, spec);
+            if (raw.alias) byId.set(raw.alias, spec);
+            return spec;
+        }
+
+        participants.forEach(addParticipant);
+
+        const referenced = new Set();
+        collectSequenceMessageRefs(sequence && sequence.messages, referenced);
+        referenced.forEach((id) => {
+            if (!id || byId.has(id)) return;
+            addParticipant({id});
+        });
+
+        const aliasByRef = new Map();
+        const nodeByAlias = new Map();
+        specs.forEach((spec) => {
+            aliasByRef.set(spec.id, spec.alias);
+            aliasByRef.set(spec.alias, spec.alias);
+            nodeByAlias.set(spec.alias, spec.id);
+        });
+
+        return {specs, aliasByRef, nodeByAlias};
+    }
+
+    function appendSequenceMessages(lines, messages, aliasByRef, indent) {
+        if (!Array.isArray(messages)) return;
+        const pad = "  ".repeat(indent || 1);
+
+        function refAlias(ref) {
+            const id = String(ref || "").trim();
+            return aliasByRef.get(id) || mermaidSequenceSafeId(id || "P", new Set());
+        }
+
+        messages.forEach((msg) => {
+            if (!msg || typeof msg !== "object") return;
+            const type = String(msg.type || "").trim().toLowerCase();
+
+            if (msg.from && msg.to) {
+                const arrow = String(msg.arrow || "->>").trim() || "->>";
+                lines.push(`${pad}${refAlias(msg.from)}${arrow}${refAlias(msg.to)}: ${mermaidSequenceText(msg.label || msg.message || "")}`);
+                return;
+            }
+
+            if (type === "note") {
+                const over = Array.isArray(msg.over)
+                    ? msg.over.map(refAlias).join(",")
+                    : refAlias(msg.of || msg.to || msg.from);
+                const position = String(msg.position || "over").trim() || "over";
+                lines.push(`${pad}Note ${position} ${over}: ${mermaidSequenceText(msg.label || msg.text || msg.message || "")}`);
+                return;
+            }
+
+            if (type === "activate" || type === "deactivate") {
+                lines.push(`${pad}${type} ${refAlias(msg.participant || msg.id || msg.of)}`);
+                return;
+            }
+
+            if (type === "alt") {
+                lines.push(`${pad}alt ${mermaidSequenceText(msg.label || msg.condition || "")}`);
+                appendSequenceMessages(lines, msg.messages, aliasByRef, (indent || 1) + 1);
+                if (msg.else && typeof msg.else === "object") {
+                    lines.push(`${pad}else ${mermaidSequenceText(msg.else.label || msg.else.condition || "")}`);
+                    appendSequenceMessages(lines, msg.else.messages, aliasByRef, (indent || 1) + 1);
+                }
+                lines.push(`${pad}end`);
+                return;
+            }
+
+            if (type === "loop" || type === "opt" || type === "critical" || type === "break") {
+                lines.push(`${pad}${type} ${mermaidSequenceText(msg.label || msg.condition || "")}`);
+                appendSequenceMessages(lines, msg.messages, aliasByRef, (indent || 1) + 1);
+                lines.push(`${pad}end`);
+                return;
+            }
+
+            if (type === "par") {
+                lines.push(`${pad}par ${mermaidSequenceText(msg.label || "")}`);
+                appendSequenceMessages(lines, msg.messages, aliasByRef, (indent || 1) + 1);
+                (msg.branches || []).forEach((branch) => {
+                    lines.push(`${pad}and ${mermaidSequenceText(branch && branch.label || "")}`);
+                    appendSequenceMessages(lines, branch && branch.messages, aliasByRef, (indent || 1) + 1);
+                });
+                lines.push(`${pad}end`);
+                return;
+            }
+
+            if (type === "raw" && msg.line) {
+                lines.push(`${pad}${String(msg.line).trim()}`);
+            }
+        });
+    }
+
+    function sequenceToMermaid(sequence) {
+        if (!hasSequence(sequence)) return "";
+        const {specs, aliasByRef} = sequenceParticipantSpecs(sequence);
+        if (specs.length === 0) return "";
+        const lines = ["sequenceDiagram"];
+        if (sequence.autonumber) lines.push("  autonumber");
+        if (sequence.title) lines.push(`  title ${mermaidSequenceText(sequence.title)}`);
+        specs.forEach((spec) => {
+            const keyword = spec.actor ? "actor" : "participant";
+            const label = mermaidSequenceText(spec.label || spec.id);
+            lines.push(label && label !== spec.alias
+                ? `  ${keyword} ${spec.alias} as ${label}`
+                : `  ${keyword} ${spec.alias}`);
+        });
+        appendSequenceMessages(lines, sequence.messages, aliasByRef, 1);
+        return lines.join("\n");
+    }
+
+    function flowDiagramSource(flow) {
+        if (!flow || typeof flow !== "object") return "";
+        return sequenceToMermaid(flow.sequence);
+    }
+
+    function sequenceParticipantNodeMap(sequence) {
+        if (!hasSequence(sequence)) return null;
+        return sequenceParticipantSpecs(sequence).nodeByAlias;
+    }
+
+    function flowParticipantNodeMap(flow) {
+        return flow && hasSequence(flow.sequence) ? sequenceParticipantNodeMap(flow.sequence) : null;
+    }
+
+    function hasFlowDiagram(flow) {
+        return !!(flow && hasSequence(flow.sequence));
+    }
+
     function effectiveDiagramFor(step) {
         if (Array.isArray(step.options) && step.options.length > 0) {
             const opt = step.options[state.currentOptionIndex] || step.options[0];
+            const viewDiagram = graphViewToMermaid(opt.view || step.view);
             return {
-                diagram: pickDiagram(opt.diagram, step.diagram),
-                highlight: Array.isArray(opt.highlight) ? opt.highlight : step.highlight,
+                diagram: viewDiagram,
+                highlight: opt.view && Array.isArray(opt.view.highlight)
+                        ? opt.view.highlight
+                        : (step.view && Array.isArray(step.view.highlight) ? step.view.highlight : []),
             };
         }
-        return {diagram: pickDiagram(step.diagram), highlight: step.highlight};
+        const viewDiagram = graphViewToMermaid(step.view);
+        return {
+            diagram: viewDiagram,
+            highlight: step.view && Array.isArray(step.view.highlight) ? step.view.highlight : [],
+        };
     }
 
     function defaultDiagramFor(step) {
         if (!step) return "";
         if (Array.isArray(step.options) && step.options.length > 0) {
-            return pickDiagram(step.options[0].diagram, step.diagram);
+            return graphViewToMermaid(step.options[0].view || step.view);
         }
-        return pickDiagram(step.diagram);
+        return graphViewToMermaid(step.view);
     }
 
     function defaultEffectiveFor(step) {
@@ -1121,7 +1576,7 @@
         if (Array.isArray(step.flows) && step.flows.length > 0) {
             // Only render valid flows (must have a non-empty diagram source).
             const validFlows = step.flows.filter(
-                (f) => f && hasDiagram(f.diagram)
+                (f) => hasFlowDiagram(f)
             );
             if (validFlows.length > 0) {
                 if (state.currentFlowIndex >= validFlows.length) state.currentFlowIndex = 0;
@@ -1162,11 +1617,12 @@
                     body.appendChild(n);
                 }
                 const flowHighlights = resolveFlowHighlights(flow, step, allStepsBefore);
-                const flowSrc = diagramSource(flow.diagram);
+                const flowSrc = flowDiagramSource(flow);
                 body.appendChild(makeMermaidEl(flowSrc, "flow-diagram", {
                     highlightParticipants: flowHighlights,
                     sourceForLabels: flowSrc,
                     annotateParticipants: true,
+                    participantNodeIds: flowParticipantNodeMap(flow),
                 }));
                 wrap.appendChild(body);
 
@@ -1189,14 +1645,8 @@
                 h.textContent = dd.title || "Deep dive";
                 card.appendChild(h);
                 card.appendChild(makeBulletList(bulletsFrom(dd.points || [])));
-                // Optional escape hatch: a deep dive may carry its own diagram for the
-                // rare structural detail the main/option/flow diagrams don't cover.
-                if (hasDiagram(dd.diagram)) {
-                    const ddSrc = diagramSource(dd.diagram);
-                    card.appendChild(makeMermaidEl(ddSrc, "deepdive-diagram", {
-                        annotateParticipants: true,
-                        sourceForLabels: ddSrc,
-                    }));
+                if (hasGraphView(dd.view)) {
+                    card.appendChild(makeMermaidEl(graphViewToMermaid(dd.view), "deepdive-diagram"));
                 }
                 wrap.appendChild(card);
             }
@@ -1258,12 +1708,19 @@
     // boxes by their visible label and tag them with the `newNode` class so the
     // CSS in styles.css picks them up. We need this because Mermaid's sequence
     // parser rejects the `classDef` / `class` syntax we use for flowcharts.
-    function applySequenceHighlights(targetEl, idToLabel, highlightIds) {
+    function applySequenceHighlights(targetEl, idToLabel, highlightIds, idToNodeId) {
         if (!highlightIds || highlightIds.length === 0) return;
         const labels = new Set();
         for (const id of highlightIds) {
             if (idToLabel.has(id)) labels.add(idToLabel.get(id));
             labels.add(id); // also match the bare id, in case it's used as label
+            if (idToNodeId && idToNodeId.size > 0) {
+                idToNodeId.forEach((nodeId, participantId) => {
+                    if (nodeId !== id) return;
+                    labels.add(participantId);
+                    if (idToLabel.has(participantId)) labels.add(idToLabel.get(participantId));
+                });
+            }
         }
         const svg = targetEl.querySelector("svg");
         if (!svg) return;
@@ -1318,15 +1775,36 @@
         return rects;
     }
 
-    function applySequenceParticipantTypes(targetEl, idToLabel) {
+    function setSvgStyle(el, prop, value) {
+        if (!el || !value || !el.style || !el.style.setProperty) return;
+        el.style.setProperty(prop, value, "important");
+    }
+
+    function applyConfiguredNodeTypeStyle(textEl, rects, style) {
+        if (!style) return;
+        if (style.className) {
+            textEl.classList.add(style.className);
+            rects.forEach((r) => r.classList.add(style.className));
+        }
+        rects.forEach((r) => {
+            setSvgStyle(r, "fill", style.fill);
+            setSvgStyle(r, "stroke", style.stroke);
+            setSvgStyle(r, "stroke-width", style.strokeWidth);
+        });
+        setSvgStyle(textEl, "fill", style.color);
+    }
+
+    function applySequenceParticipantTypes(targetEl, idToLabel, idToNodeId) {
         if (!idToLabel || idToLabel.size === 0) return;
         const svg = targetEl.querySelector("svg");
         if (!svg) return;
 
         const byLabel = new Map();
         idToLabel.forEach((label, id) => {
-            byLabel.set(label, {id, label});
-            byLabel.set(id, {id, label});
+            const nodeId = idToNodeId && idToNodeId.has(id) ? idToNodeId.get(id) : id;
+            byLabel.set(label, {id, nodeId, label});
+            byLabel.set(id, {id, nodeId, label});
+            if (nodeId !== id) byLabel.set(nodeId, {id, nodeId, label});
         });
 
         const ns = svg.namespaceURI || "http://www.w3.org/2000/svg";
@@ -1338,22 +1816,21 @@
             if (!participant) return;
             if (actorRectsForText(t).length === 0) return;
 
-            const type = inferNodeType(participant.id, participant.label, "participant");
+            const meta = nodeMetadataFor(participant.nodeId, participant.label);
+            const type = meta ? meta.type : "";
             if (!type) return;
             const style = nodeTypeStyle(type);
             const rects = actorRectsForText(t);
-            if (style) {
-                t.classList.add(style.className);
-                rects.forEach((r) => r.classList.add(style.className));
-            }
+            applyConfiguredNodeTypeStyle(t, rects, style);
 
             const x = t.getAttribute("x");
             t.textContent = "";
             if (t.dataset) t.dataset.participantTypeAnnotated = "true";
 
             const typeLine = document.createElementNS(ns, "tspan");
-            typeLine.textContent = type.toUpperCase();
+            typeLine.textContent = canonicalNodeType(type).toUpperCase();
             typeLine.setAttribute("class", "sequence-node-type-caption");
+            if (style) setSvgStyle(typeLine, "fill", style.captionColor);
             if (x !== null) typeLine.setAttribute("x", x);
             // Mermaid centers the original participant label vertically. Pull the
             // first tspan up so the smaller type caption does not float too low.
@@ -1362,6 +1839,7 @@
             const labelLine = document.createElementNS(ns, "tspan");
             labelLine.textContent = participant.label;
             labelLine.setAttribute("class", "sequence-node-main-label");
+            if (style) setSvgStyle(labelLine, "fill", style.color);
             if (x !== null) labelLine.setAttribute("x", x);
             labelLine.setAttribute("dy", "1.15em");
 
@@ -1374,13 +1852,14 @@
     // it errors we replace the container's contents with an inline error block.
     //
     // The optional `opts` argument supports `{ highlightParticipants,
-    // sourceForLabels, annotateParticipants }`
+    // sourceForLabels, annotateParticipants, annotateNodeTypes }`
     // for sequence diagrams. We can't use Mermaid's `classDef`/`class` syntax
     // there (the sequence parser rejects it), so instead we patch the rendered
     // SVG to tag participant boxes whose label matches a highlighted id.
     function makeMermaidEl(diagramSrc, className, opts) {
         diagramSrc = diagramSource(diagramSrc);
-        const renderSrc = annotateFlowchartNodeTypes(diagramSrc);
+        const annotateNodeTypes = !opts || opts.annotateNodeTypes !== false;
+        const renderSrc = annotateNodeTypes ? annotateFlowchartNodeTypes(diagramSrc) : diagramSrc;
         const wrap = document.createElement("div");
         wrap.className = `overview-diagram${className ? " " + className : ""}`;
         const target = document.createElement("div");
@@ -1394,11 +1873,12 @@
                 if (bindFunctions) bindFunctions(target);
                 if (opts && (opts.annotateParticipants || (Array.isArray(opts.highlightParticipants) && opts.highlightParticipants.length > 0))) {
                     const labelMap = parseSequenceParticipantLabels(opts.sourceForLabels || diagramSrc);
+                    const participantNodeIds = opts.participantNodeIds || null;
                     if (Array.isArray(opts.highlightParticipants) && opts.highlightParticipants.length > 0) {
-                        applySequenceHighlights(target, labelMap, opts.highlightParticipants);
+                        applySequenceHighlights(target, labelMap, opts.highlightParticipants, participantNodeIds);
                     }
                     if (opts.annotateParticipants) {
-                        applySequenceParticipantTypes(target, labelMap);
+                        applySequenceParticipantTypes(target, labelMap, participantNodeIds);
                     }
                 }
             },
@@ -1450,7 +1930,9 @@
         const outer = document.createElement("div");
         if (state.data && hasDiagram(state.data.requirementsDiagram)) {
             // Requirements diagrams lay out left-to-right.
-            outer.appendChild(makeMermaidEl(forceFlowchartDirection(state.data.requirementsDiagram, "LR")));
+            outer.appendChild(makeMermaidEl(forceFlowchartDirection(state.data.requirementsDiagram, "LR"), "", {
+                annotateNodeTypes: false,
+            }));
         }
         const wrap = document.createElement("div");
         wrap.className = "req-columns";
@@ -1484,7 +1966,9 @@
         const outer = document.createElement("div");
         if (state.data && hasDiagram(state.data.capacityDiagram)) {
             // Capacity-estimation diagrams lay out left-to-right.
-            outer.appendChild(makeMermaidEl(forceFlowchartDirection(state.data.capacityDiagram, "LR")));
+            outer.appendChild(makeMermaidEl(forceFlowchartDirection(state.data.capacityDiagram, "LR"), "", {
+                annotateNodeTypes: false,
+            }));
         }
         const table = document.createElement("table");
         table.className = "capacity-table";
@@ -1591,8 +2075,13 @@
                 card.appendChild(desc);
             }
 
-            if (hasDiagram(r.diagram)) {
-                card.appendChild(makeMermaidEl(r.diagram, "api-diagram"));
+            if (hasFlowDiagram(r)) {
+                const flowSrc = flowDiagramSource(r);
+                card.appendChild(makeMermaidEl(flowSrc, "api-diagram", {
+                    annotateParticipants: true,
+                    sourceForLabels: flowSrc,
+                    participantNodeIds: flowParticipantNodeMap(r),
+                }));
             } else {
                 const placeholder = document.createElement("p");
                 placeholder.className = "muted api-flow-placeholder";
@@ -2028,7 +2517,7 @@
         if (!entry || (entry.kind !== "step" && entry.id !== INTRO_SLUGS.finalDesign)) return;
         const flows = Array.isArray(entry.payload.flows) ? entry.payload.flows : [];
         const validCount = flows.filter(
-            (f) => f && hasDiagram(f.diagram)
+            (f) => hasFlowDiagram(f)
         ).length;
         if (validCount === 0) return;
         const clamped = Math.max(0, Math.min(index, validCount - 1));
@@ -2073,14 +2562,37 @@
         if (!hasSteps && !hasCatalog) {
             throw new Error(`Dataset ${path}: needs a non-empty "steps" array (or a "patternCatalog" for a catalog dataset)`);
         }
+        function validateDiagramArray(value, label) {
+            if (value !== undefined && !Array.isArray(value)) {
+                throw new Error(`${label}: Mermaid diagram fields must be arrays of source lines`);
+            }
+        }
+        validateDiagramArray(d.requirementsDiagram, `Dataset ${path} requirementsDiagram`);
+        validateDiagramArray(d.capacityDiagram, `Dataset ${path} capacityDiagram`);
+        validateDiagramArray(d.dataModelDiagram, `Dataset ${path} dataModelDiagram`);
         (d.steps || []).forEach((step, i) => {
             if (!step || typeof step !== "object") throw new Error(`Step ${i} is not an object`);
+            if (step.diagram !== undefined) throw new Error(`Step ${i} ("${step.title || step.id || ""}") must use "view", not "diagram"`);
+            (step.options || []).forEach((opt, j) => {
+                if (opt.diagram !== undefined) throw new Error(`Step ${i} option ${j} ("${opt.name || ""}") must use "view", not "diagram"`);
+            });
+            (step.deepDives || []).forEach((dd, j) => {
+                if (dd && typeof dd === "object") {
+                    if (dd.diagram !== undefined) throw new Error(`Step ${i} deepDive ${j} ("${dd.title || ""}") must use "view", not "diagram"`);
+                }
+            });
             if (!hasStepLikeDiagram(step)) {
-                throw new Error(`Step ${i} ("${step.title || step.id || ""}") must define a "diagram" or non-empty "options[].diagram"`);
+                throw new Error(`Step ${i} ("${step.title || step.id || ""}") must define a "view" or non-empty "options[]" with views`);
             }
         });
+        if (d.finalDesign) {
+            if (d.finalDesign.diagram !== undefined) throw new Error(`Dataset ${path}: finalDesign must use "view", not "diagram"`);
+            (d.finalDesign.options || []).forEach((opt, j) => {
+                if (opt.diagram !== undefined) throw new Error(`Dataset ${path}: finalDesign option ${j} must use "view", not "diagram"`);
+            });
+        }
         if (d.finalDesign && !hasStepLikeDiagram(d.finalDesign)) {
-            throw new Error(`Dataset ${path}: "finalDesign" must define a "diagram" or non-empty "options[].diagram"`);
+            throw new Error(`Dataset ${path}: "finalDesign" must define a "view" or non-empty "options[]" with views`);
         }
         // Book-feature fields are optional, but if present must be arrays so the
         // renderers can iterate them. Contents stay free-form (rendered only if
@@ -2089,6 +2601,105 @@
             if (d[key] !== undefined && !Array.isArray(d[key])) {
                 throw new Error(`Dataset ${path}: "${key}" must be an array if present`);
             }
+        }
+        const architecture = d.highLevelArchitecture;
+        if (!architecture || typeof architecture !== "object") {
+            throw new Error(`Dataset ${path}: "highLevelArchitecture" must be an object`);
+        }
+        if (!Array.isArray(architecture.nodes)) {
+            throw new Error(`Dataset ${path}: highLevelArchitecture.nodes must be an array`);
+        }
+        if (!Array.isArray(architecture.links)) {
+            throw new Error(`Dataset ${path}: highLevelArchitecture.links must be an array`);
+        }
+        if (!Array.isArray(architecture.types)) {
+            throw new Error(`Dataset ${path}: highLevelArchitecture.types must be an array`);
+        }
+        architecture.nodes.forEach((node, i) => {
+            if (!node || typeof node !== "object") {
+                throw new Error(`Dataset ${path}: highLevelArchitecture.nodes[${i}] is not an object`);
+            }
+            if (!node.id || !node.type || !node.category || !Array.isArray(node.traits)) {
+                throw new Error(`Dataset ${path}: highLevelArchitecture.nodes[${i}] needs id, type, category, and traits[]`);
+            }
+        });
+        (architecture.links || []).forEach((link, i) => {
+            if (!link || typeof link !== "object" || !link.id || !link.from || !link.to) {
+                throw new Error(`Dataset ${path}: highLevelArchitecture.links[${i}] needs id, from, and to`);
+            }
+        });
+        (architecture.types || []).forEach((type, i) => {
+            if (!type || typeof type !== "object" || !type.id || !Array.isArray(type.nodes)) {
+                throw new Error(`Dataset ${path}: highLevelArchitecture.types[${i}] needs id and nodes[]`);
+            }
+        });
+        const linkIds = new Set((architecture.links || []).map((l) => l.id));
+        const groupIds = new Set((architecture.types || []).map((g) => g.id));
+        function validateView(view, label) {
+            if (!view) return;
+            if (!hasGraphView(view)) throw new Error(`${label}: "view" must define nodes[], links[], groups[], or mode`);
+            if (view.nodes !== undefined && !Array.isArray(view.nodes)) throw new Error(`${label}: view.nodes must be an array`);
+            if (view.links !== undefined && !Array.isArray(view.links)) throw new Error(`${label}: view.links must be an array`);
+            if (view.groups !== undefined && !Array.isArray(view.groups)) throw new Error(`${label}: view.groups must be an array`);
+            (view.links || []).forEach((ref) => {
+                if (typeof ref === "string" && !linkIds.has(ref)) throw new Error(`${label}: view.links references unknown link "${ref}"`);
+            });
+            (view.groups || []).forEach((ref) => {
+                const id = typeof ref === "string" ? ref : ref && ref.id;
+                if (id && !groupIds.has(id)) throw new Error(`${label}: view.groups references unknown high-level architecture type "${id}"`);
+            });
+        }
+        function validateSequence(sequence, label) {
+            if (!sequence) return;
+            if (!hasSequence(sequence)) throw new Error(`${label}: "sequence" must define participants[] and messages[]`);
+            sequence.participants.forEach((participant, j) => {
+                const normalized = normalizeSequenceParticipant(participant);
+                if (!normalized.id) throw new Error(`${label}: sequence.participants[${j}] needs an id`);
+            });
+            function validateMessages(messages, pathLabel) {
+                messages.forEach((message, j) => {
+                    if (!message || typeof message !== "object") throw new Error(`${pathLabel}[${j}] is not an object`);
+                    const type = String(message.type || "").trim().toLowerCase();
+                    if (message.from !== undefined || message.to !== undefined) {
+                        if (!message.from || !message.to) throw new Error(`${pathLabel}[${j}] needs from and to`);
+                    }
+                    if (Array.isArray(message.messages)) validateMessages(message.messages, `${pathLabel}[${j}].messages`);
+                    if (message.else && typeof message.else === "object" && Array.isArray(message.else.messages)) {
+                        validateMessages(message.else.messages, `${pathLabel}[${j}].else.messages`);
+                    }
+                    if (type === "par" && Array.isArray(message.branches)) {
+                        message.branches.forEach((branch, k) => {
+                            if (branch && Array.isArray(branch.messages)) validateMessages(branch.messages, `${pathLabel}[${j}].branches[${k}].messages`);
+                        });
+                    }
+                });
+            }
+            validateMessages(sequence.messages, `${label}: sequence.messages`);
+        }
+        function validateFlow(flow, label) {
+            if (!flow || typeof flow !== "object") throw new Error(`${label}: flow is not an object`);
+            if (flow.diagram !== undefined) throw new Error(`${label}: use "sequence"; Mermaid "diagram" is not supported for flows`);
+            if (!hasSequence(flow.sequence)) throw new Error(`${label}: flow must define a structured "sequence"`);
+            validateSequence(flow.sequence, label);
+        }
+        (d.steps || []).forEach((step, i) => {
+            validateView(step.view, `Step ${i} ("${step.title || step.id || ""}")`);
+            (step.options || []).forEach((opt, j) => validateView(opt.view, `Step ${i} option ${j} ("${opt.name || ""}")`));
+            (step.deepDives || []).forEach((dd, j) => {
+                if (dd && typeof dd === "object") validateView(dd.view, `Step ${i} deepDive ${j} ("${dd.title || ""}")`);
+            });
+            if (step.flows !== undefined && !Array.isArray(step.flows)) throw new Error(`Step ${i} ("${step.title || step.id || ""}"): "flows" must be an array if present`);
+            (step.flows || []).forEach((flow, j) => validateFlow(flow, `Step ${i} flow ${j} ("${flow && flow.name || ""}")`));
+        });
+        (Array.isArray(d.api) ? d.api : []).forEach((row, i) => {
+            if (row && row.diagram !== undefined) throw new Error(`API row ${i} ("${row.method || ""} ${row.path || ""}"): use "sequence"; Mermaid "diagram" is not supported for flows`);
+            validateSequence(row && row.sequence, `API row ${i} ("${row && row.method || ""} ${row && row.path || ""}")`);
+        });
+        if (d.finalDesign) {
+            validateView(d.finalDesign.view, `Dataset ${path} finalDesign`);
+            (d.finalDesign.options || []).forEach((opt, j) => validateView(opt.view, `Dataset ${path} finalDesign option ${j}`));
+            if (d.finalDesign.flows !== undefined && !Array.isArray(d.finalDesign.flows)) throw new Error(`Dataset ${path} finalDesign: "flows" must be an array if present`);
+            (d.finalDesign.flows || []).forEach((flow, j) => validateFlow(flow, `Dataset ${path} finalDesign flow ${j} ("${flow && flow.name || ""}")`));
         }
         (d.steps || []).forEach((step, i) => {
             for (const key of ["patterns", "traps"]) {
@@ -2110,6 +2721,9 @@
             validateDataset(data, meta.path);
             state.currentDatasetId = datasetId;
             state.data = data;
+            state.nodeIndex = buildNodeIndex(data);
+            state.linkIndex = buildLinkIndex(data);
+            state.architectureTypeIndex = buildArchitectureTypeIndex(data);
             state.entries = buildEntries(data);
 
             els.datasetTitle.textContent = data.title || meta.name || "System Design Explorer";
@@ -2132,32 +2746,25 @@
         }
     }
 
-    // Accepts both the grouped manifest ({ groups: [{ id, name, datasets }] })
-    // and the legacy flat manifest ({ datasets: [...] }). Returns
-    // { groups, datasets } where `datasets` is the flat list and each dataset
-    // carries its resolved `group` / `groupName`.
+    // Returns { groups, datasets } where `datasets` is the flat list and each
+    // dataset carries its resolved `groupId` / `groupName`.
     function normalizeManifest(manifest) {
-        if (manifest && Array.isArray(manifest.groups)) {
-            const groups = manifest.groups
+        const groups = manifest && Array.isArray(manifest.groups)
+            ? manifest.groups
                 .filter((g) => g && Array.isArray(g.datasets))
                 .map((g) => ({
                     id: g.id || g.name || "group",
                     name: g.name || g.id || "Group",
                     datasets: g.datasets,
-                }));
-            const datasets = [];
-            groups.forEach((g) => {
-                g.datasets.forEach((d) => {
-                    datasets.push(Object.assign({groupId: g.id, groupName: g.name}, d));
-                });
+                }))
+            : [];
+        const datasets = [];
+        groups.forEach((g) => {
+            g.datasets.forEach((d) => {
+                datasets.push(Object.assign({groupId: g.id, groupName: g.name}, d));
             });
-            return {groups, datasets};
-        }
-        if (manifest && Array.isArray(manifest.datasets)) {
-            const datasets = manifest.datasets.slice();
-            return {groups: [{id: "all", name: "Interviews", datasets}], datasets};
-        }
-        return {groups: [], datasets: []};
+        });
+        return {groups, datasets};
     }
 
     function populateDatasetSelect() {
@@ -2183,10 +2790,11 @@
             const manifest = await fetchJson("data/index.json");
             const {groups, datasets} = normalizeManifest(manifest);
             if (datasets.length === 0) {
-                throw new Error('data/index.json must contain a non-empty "groups" or "datasets" array');
+                throw new Error('data/index.json must contain a non-empty "groups" array');
             }
             state.groups = groups;
             state.datasets = datasets;
+            state.nodeTypeConfig = await loadNodeTypeConfig();
             populateDatasetSelect();
 
             const hash = parseHash();

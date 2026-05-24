@@ -24,22 +24,15 @@
         return res.json();
     }
 
-    // Accepts the grouped manifest ({ groups: [...] }) and the legacy flat
-    // manifest ({ datasets: [...] }). Returns a list of { id, name, datasets }.
     function normalizeGroups(manifest) {
-        if (manifest && Array.isArray(manifest.groups)) {
-            return manifest.groups
-                .filter((g) => g && Array.isArray(g.datasets))
-                .map((g) => ({
-                    id: g.id || g.name || "group",
-                    name: g.name || g.id || "Group",
-                    datasets: g.datasets,
-                }));
-        }
-        if (manifest && Array.isArray(manifest.datasets)) {
-            return [{id: "all", name: "Interviews", datasets: manifest.datasets}];
-        }
-        return [];
+        const groups = manifest && Array.isArray(manifest.groups) ? manifest.groups : [];
+        return groups
+            .filter((g) => g && Array.isArray(g.datasets))
+            .map((g) => ({
+                id: g.id || g.name || "group",
+                name: g.name || g.id || "Group",
+                datasets: g.datasets,
+            }));
     }
 
     // data/<id>/interview.json -> data/<id>/icon.png
@@ -103,7 +96,7 @@
             const groups = normalizeGroups(manifest);
             const total = groups.reduce((n, g) => n + g.datasets.length, 0);
             if (total === 0) {
-                throw new Error('data/index.json must contain a non-empty "groups" or "datasets" array');
+                throw new Error('data/index.json must contain a non-empty "groups" array');
             }
             render(groups);
         } catch (err) {

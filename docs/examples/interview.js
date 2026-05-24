@@ -196,6 +196,7 @@
         if (has(/\b(cdn|edge)\b/)) return "edge";
         if (has(/\b(geo ?dns|dns)\b/)) return "dns";
         if (has(/\b(load balancer|balancer|\blb\b)\b/)) return "load balancer";
+        if (has(/\bapi gateway\b/) || has(/\bapi\b/) || has(/\b(endpoint|graphql)\b/)) return "api";
         if (has(/\b(router|gateway)\b/)) return "router";
         if (has(/\b(queue|stream|event bus|message bus|topic|log)\b/) || shape === "subroutine" && has(/\bq\b/)) return "queue";
         if (has(/\b(cache|redis|memcached)\b/)) return "cache";
@@ -206,7 +207,7 @@
         if (has(/\b(generator|allocator|id gen|idgen)\b/)) return "generator";
         if (has(/\b(auth|rate limit|limiter|policy|rules?)\b/)) return "policy";
         if (has(/\b(metrics?|alerts?|dashboard|logs?|analytics|tools|observability)\b/)) return "observability";
-        if (has(/\b(api|service|server|app|web tier|post svc|feed svc|user svc)\b/)) return "service";
+        if (has(/\b(service|server|app|web tier|post svc|feed svc|user svc)\b/)) return "service";
         if (has(/\b(workers?)\b/)) return "worker";
         if (has(/\b(client|user|viewer|author|browser|mobile|operator|admin)\b/)) return "client";
         if (has(/\b(graph|social graph)\b/)) return "graph";
@@ -228,6 +229,7 @@
         generator: {className: "nodeTypeGenerator", fill: "#fffbeb", stroke: "#d97706"},
         policy: {className: "nodeTypePolicy", fill: "#fef2f2", stroke: "#dc2626"},
         observability: {className: "nodeTypeObservability", fill: "#f0fdfa", stroke: "#0f766e"},
+        api: {className: "nodeTypeApi", fill: "#eff6ff", stroke: "#2563eb"},
         service: {className: "nodeTypeService", fill: "#fff7ed", stroke: "#ea580c"},
         client: {className: "nodeTypeClient", fill: "#f8fafc", stroke: "#64748b"},
         graph: {className: "nodeTypeGraph", fill: "#fdf4ff", stroke: "#c026d3"},

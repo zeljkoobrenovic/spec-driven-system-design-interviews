@@ -1,0 +1,1353 @@
+{
+  "title": "Ticketmaster \u2014 System Design",
+  "description": "Designing a ticketing system for high-demand events, where a fixed inventory of seats meets a flash crowd of buyers the instant tickets drop. The hard problem is correctness under massive concurrency: never sell the same seat twice, never oversell, and keep it fair \u2014 while most of the crowd will leave empty-handed. We build from a naive 'buy' call toward seat locking, a waiting room, expiring holds, and sharded hot-event isolation.",
+  "requirementsDiagram": [
+    "graph LR",
+    "  Client[Client / Browser]",
+    "  API[Booking API]",
+    "  Reserve[Reservation Service]",
+    "  Inventory[(Inventory DB)]",
+    "  Checkout[Checkout Service]",
+    "  Payment[/Payment System/]",
+    "  Client -->|browse / reserve / buy| API",
+    "  API --> Reserve",
+    "  Reserve --> Inventory",
+    "  API --> Checkout",
+    "  Checkout --> Payment"
+  ],
+  "capacityDiagram": [
+    "graph LR",
+    "  Client[Client / Browser]",
+    "  WaitRoom[[Waiting Room Queue]]",
+    "  Gate[Admission Gate]",
+    "  Reserve[Reservation Service]",
+    "  Inventory[(Inventory DB)]",
+    "  Client -->|1M+ at on-sale| Queue",
+    "  Queue -->|admit N/s| Gate",
+    "  Gate --> Reserve",
+    "  Reserve -->|seat lock| Inventory"
+  ],
+  "requirements": {
+    "functional": [
+      "Browse events and view a live seat map with availability.",
+      "Reserve specific seats, holding them briefly while the user checks out.",
+      "Complete purchase, converting a hold into a confirmed order with payment.",
+      "Release seats automatically if the hold expires before checkout.",
+      "Support general-admission (quantity) and reserved-seating (specific seats)."
+    ],
+    "nonFunctional": [
+      "Never sell the same seat twice; never oversell inventory.",
+      "Fairness: order of access should be roughly first-come under a flash crowd.",
+      "Handle extreme, spiky concurrency at on-sale (1M+ users for thousands of seats).",
+      "Low latency for browse/reserve so the experience stays usable under load.",
+      "Resist bots and scalpers grabbing inventory unfairly.",
+      "Graceful degradation: shed or queue load rather than collapse or oversell."
+    ]
+  },
+  "capacity": [
+    {
+      "label": "Concurrent buyers at on-sale",
+      "value": "~1,000,000+",
+      "note": "A popular tour drop draws orders of magnitude more buyers than seats."
+    },
+    {
+      "label": "Inventory per event",
+      "value": "~10k\u2013100k seats",
+      "note": "Fixed and scarce \u2014 the contention is buyers-per-seat, not raw volume."
+    },
+    {
+      "label": "Reserve attempts/sec",
+      "value": "~50,000/s peak",
+      "note": "Bursts in the first seconds; most attempts must fail fast and fairly."
+    },
+    {
+      "label": "Hold duration",
+      "value": "~2\u201310 minutes",
+      "note": "Long enough to check out, short enough to recirculate unsold seats."
+    },
+    {
+      "label": "Read:write",
+      "value": "very read-heavy",
+      "note": "Browsing and seat-map polling vastly outnumber successful reservations."
+    },
+    {
+      "label": "Correctness target",
+      "value": "zero double-sell / oversell",
+      "note": "Correctness dominates; we'd rather reject than oversell."
+    }
+  ],
+  "api": [
+    {
+      "method": "GET",
+      "path": "/v1/events/{id}/seatmap",
+      "description": "Return the seat map with availability. Served from a read model / cache, eventually consistent.",
+      "request": "GET /v1/events/evt_1/seatmap",
+      "response": "200 OK\n{ \"sections\": [ { \"id\": \"A\", \"seats\": [ { \"id\": \"A12\", \"status\": \"available\" } ] } ] }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/events/{id}/reservations",
+      "description": "Atomically reserve specific seats, creating a short-lived hold. Idempotency-Key dedupes retries.",
+      "request": "Idempotency-Key: rsv_9f\n{ \"seats\": [\"A12\", \"A13\"], \"user_id\": \"usr_1\" }",
+      "response": "201 Created\n{ \"hold_id\": \"hold_77\", \"expires_at\": \"...\", \"seats\": [\"A12\",\"A13\"] }\n\u2014 or 409 Conflict if any seat was just taken",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Client",
+        "  participant R as Reservation Service",
+        "  participant L as Seat Lock Store",
+        "  participant I as Inventory DB",
+        "  C->>R: POST reservations (seats, key)",
+        "  R->>L: acquire locks for seats (atomic)",
+        "  alt all seats free",
+        "    L-->>R: locked",
+        "    R->>I: mark held + create hold (TTL)",
+        "    R-->>C: 201 hold",
+        "  else any seat taken",
+        "    L-->>R: conflict",
+        "    R-->>C: 409 Conflict",
+        "  end"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/reservations/{hold}/checkout",
+      "description": "Convert a valid hold into a confirmed order via payment. Idempotent.",
+      "request": "Idempotency-Key: chk_4a\n{ \"payment_source\": \"tok_visa\" }",
+      "response": "201 Created\n{ \"order_id\": \"ord_5\", \"status\": \"confirmed\", \"seats\": [\"A12\",\"A13\"] }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Client",
+        "  participant K as Checkout",
+        "  participant I as Inventory DB",
+        "  participant P as Payment System",
+        "  C->>K: checkout(hold_id, key)",
+        "  K->>I: verify hold still valid",
+        "  alt hold valid",
+        "    K->>P: charge (idempotent)",
+        "    P-->>K: captured",
+        "    K->>I: convert hold -> sold",
+        "    K-->>C: 201 confirmed",
+        "  else hold expired",
+        "    K-->>C: 410 Gone (seats released)",
+        "  end"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/queue/{event}/token",
+      "description": "Join the waiting room for a high-demand on-sale; returns a position/token used to gate admission.",
+      "request": "GET /v1/queue/evt_1/token",
+      "response": "200 OK\n{ \"token\": \"q_abc\", \"position\": 48213, \"status\": \"waiting\" }"
+    }
+  ],
+  "dataModel": [
+    {
+      "name": "events",
+      "note": "Event metadata and on-sale configuration.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "venue_id",
+          "type": "uuid"
+        },
+        {
+          "name": "on_sale_at",
+          "type": "timestamptz"
+        },
+        {
+          "name": "status",
+          "type": "enum(scheduled, on_sale, sold_out)"
+        }
+      ]
+    },
+    {
+      "name": "seats",
+      "note": "One row per physical seat; the unit of contention. Status transitions are the heart of correctness.",
+      "fields": [
+        {
+          "name": "seat_id",
+          "type": "varchar (event-scoped) PK"
+        },
+        {
+          "name": "event_id",
+          "type": "uuid"
+        },
+        {
+          "name": "section",
+          "type": "varchar"
+        },
+        {
+          "name": "status",
+          "type": "enum(available, held, sold)"
+        },
+        {
+          "name": "version",
+          "type": "int (optimistic lock)"
+        }
+      ]
+    },
+    {
+      "name": "holds",
+      "note": "A short-lived reservation over one or more seats, with an expiry. The expiry worker reclaims stale holds.",
+      "fields": [
+        {
+          "name": "hold_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "event_id",
+          "type": "uuid"
+        },
+        {
+          "name": "user_id",
+          "type": "uuid"
+        },
+        {
+          "name": "seat_ids",
+          "type": "varchar[]"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamptz"
+        },
+        {
+          "name": "status",
+          "type": "enum(active, converted, expired)"
+        }
+      ]
+    },
+    {
+      "name": "orders",
+      "note": "A confirmed purchase produced by checkout; references the payment.",
+      "fields": [
+        {
+          "name": "order_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "hold_id",
+          "type": "uuid"
+        },
+        {
+          "name": "user_id",
+          "type": "uuid"
+        },
+        {
+          "name": "seat_ids",
+          "type": "varchar[]"
+        },
+        {
+          "name": "payment_ref",
+          "type": "varchar"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "queue_tokens",
+      "note": "Waiting-room admission tokens for fairness during on-sale spikes.",
+      "fields": [
+        {
+          "name": "token",
+          "type": "varchar PK"
+        },
+        {
+          "name": "event_id",
+          "type": "uuid"
+        },
+        {
+          "name": "position",
+          "type": "bigint"
+        },
+        {
+          "name": "admitted_at",
+          "type": "timestamptz null"
+        }
+      ]
+    }
+  ],
+  "patterns": [
+    {
+      "name": "Distributed lock / seat locking",
+      "what": "Acquire an exclusive, short-lived lock on each contended resource (seat) before mutating it.",
+      "whenToUse": "Multiple clients race to claim the same scarce item.",
+      "steps": [
+        "reserve-lock"
+      ]
+    },
+    {
+      "name": "Optimistic concurrency control",
+      "what": "Read a version, write only if it's unchanged (compare-and-set), retry on conflict.",
+      "whenToUse": "High contention where holding pessimistic locks would serialize everything.",
+      "steps": [
+        "overbooking"
+      ]
+    },
+    {
+      "name": "Virtual waiting room",
+      "what": "Admit users from a queue at a controlled rate so the core system sees bounded load.",
+      "whenToUse": "Flash crowds far exceeding capacity, where fairness and overload protection matter.",
+      "steps": [
+        "waiting-room"
+      ]
+    },
+    {
+      "name": "TTL / lease expiry",
+      "what": "Give holds a time-to-live and reclaim them automatically when it lapses.",
+      "whenToUse": "Reserved-but-not-bought resources that must recirculate if abandoned.",
+      "steps": [
+        "hold-expiry"
+      ]
+    },
+    {
+      "name": "Idempotency key",
+      "what": "Dedupe retried reserve/checkout calls so a user doesn't double-hold or double-buy.",
+      "whenToUse": "State-changing calls over an unreliable network under load.",
+      "steps": [
+        "reserve-lock",
+        "checkout"
+      ]
+    },
+    {
+      "name": "Read model / cache",
+      "what": "Serve seat maps and availability from a fast, eventually-consistent projection, not the inventory primary.",
+      "whenToUse": "Very read-heavy browse traffic over a write-contended store.",
+      "steps": [
+        "browse"
+      ]
+    },
+    {
+      "name": "Load shedding / admission control",
+      "what": "Reject or queue excess load early so the protected core stays correct.",
+      "whenToUse": "Demand can exceed capacity by orders of magnitude.",
+      "steps": [
+        "waiting-room"
+      ]
+    },
+    {
+      "name": "Sharding by key",
+      "what": "Partition inventory by event so one hot event's contention is isolated from others.",
+      "whenToUse": "A few hot events would otherwise overwhelm shared infrastructure.",
+      "steps": [
+        "scale"
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "naive-buy",
+      "title": "1. Naive 'Buy a Seat' (the baseline)",
+      "description": "Start with the simplest path: the client posts a purchase for a seat, the API checks availability and writes 'sold'. With one buyer this works; the whole design exists because thousands hit the same seat in the same millisecond.",
+      "patterns": [
+        "Synchronous request/response"
+      ],
+      "decisionPrompt": "Two requests read seat A12 as available at the same instant. What happens?",
+      "concepts": [
+        {
+          "term": "Race condition",
+          "definition": "Two operations interleave so both see 'available' and both write 'sold'.",
+          "whyItMatters": "It's the central hazard \u2014 a check-then-act without atomicity double-sells the seat."
+        },
+        {
+          "term": "Contention",
+          "definition": "Many actors competing for the same resource at once.",
+          "whyItMatters": "Ticketing is buyers-per-seat contention, not raw throughput; that shapes every choice."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client / Browser]",
+        "  API[Booking API]",
+        "  Inventory[(Inventory DB)]",
+        "  Client -->|buy A12| API",
+        "  API -->|check + mark sold| Inventory"
+      ],
+      "highlight": [
+        "Client",
+        "API",
+        "Inventory"
+      ],
+      "talkingPoints": [
+        "State that correctness (no double-sell/oversell) dominates latency or availability here.",
+        "Name the check-then-act race immediately \u2014 it motivates locking."
+      ],
+      "traps": [
+        {
+          "trap": "Check availability, then write sold as two separate steps",
+          "why": "Concurrent buyers both pass the check and both write sold \u2014 the seat is sold twice.",
+          "instead": "Make claim atomic (a conditional update / lock), not check-then-act."
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Unbounded concurrent writes to the same seat row.",
+          "mitigation": "Atomic seat locking (next step)."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Spots the double-sell race without prompting.",
+          "Frames the problem as contention/correctness, not throughput."
+        ],
+        "weak": [
+          "Assumes the DB write 'just handles' concurrency.",
+          "Optimizes for speed before correctness."
+        ]
+      },
+      "whyNow": [
+        "A concrete baseline makes the locking and queueing that follow obvious responses to a real failure."
+      ]
+    },
+    {
+      "id": "browse",
+      "title": "2. Browse: Seat Map Read Model",
+      "description": "Browsing and seat-map polling dwarf purchases. Serve availability from a read model / cache (and static seat maps from a CDN), accepting slight staleness \u2014 the authoritative check happens at reserve time anyway.",
+      "patterns": [
+        "Read model / cache"
+      ],
+      "decisionPrompt": "Can the seat map a user sees be slightly stale? What must NOT be stale?",
+      "concepts": [
+        {
+          "term": "Eventually consistent read model",
+          "definition": "A projection of inventory that lags the source of truth slightly.",
+          "whyItMatters": "Browse traffic is enormous; serving it from the contended primary would melt it."
+        },
+        {
+          "term": "Authoritative check at write",
+          "definition": "Availability shown is a hint; the real check is the atomic reserve.",
+          "whyItMatters": "Lets reads be cheap and stale while keeping the purchase correct."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client / Browser]",
+        "  CDN[/CDN \u2014 static seat maps/]",
+        "  API[Booking API]",
+        "  Search[Event / Seat Read Model]",
+        "  Cache[(Availability Cache)]",
+        "  Inventory[(Inventory DB)]",
+        "  Client -->|seat map| CDN",
+        "  Client -->|availability| API",
+        "  API --> Search",
+        "  Search --> Cache",
+        "  Inventory -->|project updates| Cache"
+      ],
+      "highlight": [
+        "CDN",
+        "Search",
+        "Cache"
+      ],
+      "deepDives": [
+        {
+          "title": "Keeping the seat map fresh enough",
+          "points": [
+            "Static seat geometry (the map image/layout) is immutable \u2014 cache it hard on a CDN.",
+            "Availability overlays change fast \u2014 push updates to the cache; tolerate seconds of lag.",
+            "Show 'available' optimistically; the reserve call is the source of truth and may 409."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Serving the live seat map straight from the inventory primary",
+          "why": "Millions of pollers on the write-contended store crush it exactly when it's most loaded.",
+          "instead": "Serve from a read model/cache; reserve against the primary."
+        },
+        {
+          "trap": "Promising the displayed availability is exact",
+          "why": "Under a flash crowd it's stale by the time the user clicks.",
+          "instead": "Treat it as a hint and confirm atomically at reserve."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Separates immutable seat geometry from fast-changing availability.",
+          "Accepts stale reads but keeps the write authoritative."
+        ],
+        "weak": [
+          "Reads availability from the primary.",
+          "Tries to make the seat map strongly consistent."
+        ]
+      },
+      "recap": {
+        "before": "Every view hit the inventory primary.",
+        "after": "Browse is cheap and cached; the primary is reserved for claims.",
+        "newRisk": "Displayed availability is stale \u2014 reserve must be the real check."
+      },
+      "whyNow": [
+        "Offloading reads protects the primary before we pour on-sale write load onto it."
+      ]
+    },
+    {
+      "id": "reserve-lock",
+      "title": "3. Atomic Reservation with Seat Locking",
+      "description": "Replace check-then-act with an atomic claim: acquire a short-lived exclusive lock on each requested seat before marking it held. If any seat is already locked or sold, the whole reservation fails fast with 409. Idempotency keys make retries safe.",
+      "patterns": [
+        "Distributed lock / seat locking",
+        "Idempotency key"
+      ],
+      "decisionPrompt": "How do you atomically grab 3 specific adjacent seats, all-or-nothing, under contention?",
+      "concepts": [
+        {
+          "term": "Distributed lock",
+          "definition": "An exclusive, expiring claim on a resource across processes (e.g. a row lock or a Redis lock with TTL).",
+          "whyItMatters": "Serializes the claim on each seat so only one buyer wins."
+        },
+        {
+          "term": "All-or-nothing multi-seat hold",
+          "definition": "A request for several seats succeeds only if all are obtainable.",
+          "whyItMatters": "Partial holds strand seats and frustrate users; acquire in a fixed order to avoid deadlock."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client / Browser]",
+        "  API[Booking API]",
+        "  Reserve[Reservation Service]",
+        "  Lock[(Seat Lock Store)]",
+        "  Inventory[(Inventory DB)]",
+        "  Hold[(Holds \u2014 TTL)]",
+        "  Client -->|reserve seats| API",
+        "  API --> Reserve",
+        "  Reserve -->|acquire locks| Lock",
+        "  Reserve -->|mark held| Inventory",
+        "  Reserve -->|create hold| Hold"
+      ],
+      "highlight": [
+        "Reserve",
+        "Lock",
+        "Hold"
+      ],
+      "options": [
+        {
+          "name": "Lock store with TTL (e.g. Redis) (default)",
+          "pros": [
+            "Very fast claims; locks auto-expire so a crashed client can't strand seats forever.",
+            "Keeps lock contention off the inventory primary."
+          ],
+          "cons": [
+            "Lock store and inventory can diverge on failure \u2014 needs reconciliation/fencing.",
+            "Another stateful system to run."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Reserve[Reservation Service]",
+            "  Lock[(Seat Lock Store)]",
+            "  Inventory[(Inventory DB)]",
+            "  Reserve -->|SETNX seat TTL| Lock",
+            "  Reserve -->|mark held| Inventory"
+          ],
+          "highlight": [
+            "Lock"
+          ]
+        },
+        {
+          "name": "Conditional UPDATE in the DB (SELECT ... FOR UPDATE / CAS)",
+          "pros": [
+            "Single source of truth; no lock/inventory divergence.",
+            "Strong correctness with no extra system."
+          ],
+          "cons": [
+            "Row locks under extreme contention serialize and can thrash the primary.",
+            "Hot rows become a bottleneck on the biggest drops."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Reserve[Reservation Service]",
+            "  Inventory[(Inventory DB)]",
+            "  Reserve -->|UPDATE seat SET held WHERE available| Inventory"
+          ],
+          "highlight": [
+            "Inventory"
+          ]
+        }
+      ],
+      "flows": [
+        {
+          "name": "Two buyers race for A12",
+          "note": "Atomic lock means exactly one wins; the other gets 409.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant B1 as Buyer 1",
+            "  participant B2 as Buyer 2",
+            "  participant R as Reservation Service",
+            "  participant L as Lock Store",
+            "  B1->>R: reserve A12",
+            "  B2->>R: reserve A12",
+            "  R->>L: lock A12 (B1)",
+            "  L-->>R: ok",
+            "  R->>L: lock A12 (B2)",
+            "  L-->>R: already locked",
+            "  R-->>B2: 409 Conflict"
+          ],
+          "highlight": [
+            "L"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Locking seats one by one without a consistent order",
+          "why": "Two multi-seat requests can each hold one of the other's seats \u2014 deadlock.",
+          "instead": "Acquire locks in a fixed global order (e.g. sorted seat id) so cycles can't form."
+        },
+        {
+          "trap": "Locks with no expiry",
+          "why": "A client that crashes mid-reservation strands those seats forever.",
+          "instead": "Give every lock a TTL; pair with the hold expiry worker to reclaim."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "Reservation service crashes after locking seats but before writing the hold.",
+          "expectedBehavior": "Seats become available again shortly, not stranded.",
+          "mitigation": "Lock TTL expires; idempotent retry re-acquires or the expiry worker reclaims."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Makes the claim atomic and all-or-nothing with ordered acquisition.",
+          "Gives locks a TTL and explains the lock-store vs DB-CAS tradeoff."
+        ],
+        "weak": [
+          "Keeps check-then-act.",
+          "Ignores deadlock and crash-while-locked."
+        ]
+      },
+      "recap": {
+        "before": "Concurrent buyers could double-sell a seat.",
+        "after": "Each seat is claimed atomically; exactly one buyer wins, others 409.",
+        "newRisk": "Held-but-unbought seats can be stranded \u2014 they need expiry."
+      },
+      "whyNow": [
+        "Atomic claiming is the core correctness guarantee everything else builds on."
+      ]
+    },
+    {
+      "id": "hold-expiry",
+      "title": "4. Holds & TTL Expiry",
+      "description": "A reservation creates a hold with a short TTL so a user can check out. If they abandon it, an expiry mechanism releases the seats and the locks so inventory recirculates. Without this, scarce seats leak out of the market.",
+      "patterns": [
+        "TTL / lease expiry"
+      ],
+      "decisionPrompt": "A user reserves 2 seats and walks away. How and when do those seats come back?",
+      "concepts": [
+        {
+          "term": "Hold TTL",
+          "definition": "The window during which reserved seats are off the market for one buyer.",
+          "whyItMatters": "Long enough to check out, short enough to recirculate abandoned seats during a hot drop."
+        },
+        {
+          "term": "Reaping / expiry",
+          "definition": "Reclaiming holds whose TTL lapsed, by a sweeper and/or lazy check.",
+          "whyItMatters": "Determines how fast scarce seats return to availability."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Reserve[Reservation Service]",
+        "  Hold[(Holds \u2014 TTL)]",
+        "  Lock[(Seat Lock Store)]",
+        "  Inventory[(Inventory DB)]",
+        "  Expiry[Hold Expiry Worker]",
+        "  Cache[(Availability Cache)]",
+        "  Reserve --> Hold",
+        "  Expiry -->|scan expired| Hold",
+        "  Expiry -->|release| Lock",
+        "  Expiry -->|mark available| Inventory",
+        "  Inventory -->|update| Cache"
+      ],
+      "highlight": [
+        "Expiry"
+      ],
+      "options": [
+        {
+          "name": "Sweeper worker + lazy check (default)",
+          "pros": [
+            "Background worker reaps expired holds promptly; lazy check at access catches stragglers.",
+            "Bounded staleness even if the worker lags."
+          ],
+          "cons": [
+            "Two mechanisms to reason about; clock skew must be handled."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Expiry[Hold Expiry Worker]",
+            "  Hold[(Holds \u2014 TTL)]",
+            "  Inventory[(Inventory DB)]",
+            "  Expiry -->|periodic scan| Hold",
+            "  Expiry -->|release| Inventory"
+          ],
+          "highlight": [
+            "Expiry"
+          ]
+        },
+        {
+          "name": "Rely on lock-store TTL only",
+          "pros": [
+            "Simplest \u2014 locks just expire."
+          ],
+          "cons": [
+            "Inventory 'held' state and the hold row aren't cleaned, drifting from reality.",
+            "No clean event to refresh the availability cache."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Lock[(Seat Lock Store)]",
+            "  Inventory[(Inventory DB)]",
+            "  Lock -->|TTL expires| Inventory"
+          ],
+          "highlight": [
+            "Lock"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Releasing the lock but not the hold/inventory state",
+          "why": "Seat shows 'held' forever in the DB even though the lock is gone \u2014 it's lost inventory.",
+          "instead": "Expiry must release lock, hold row, and inventory status together, then refresh the cache."
+        },
+        {
+          "trap": "Trusting wall-clock expiry across services with skew",
+          "why": "A seat may be released early or late if clocks disagree.",
+          "instead": "Anchor TTL to a single authoritative clock/store and reap from there."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The expiry worker is down for several minutes during a hot drop.",
+          "expectedBehavior": "Abandoned seats still recirculate, just a bit slower; nothing is double-sold.",
+          "mitigation": "Lazy check at reserve time treats an expired hold as available; the worker catches up on restart."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Releases lock + hold + inventory atomically and refreshes the cache.",
+          "Combines a sweeper with a lazy check for robustness."
+        ],
+        "weak": [
+          "Lets inventory drift from locks.",
+          "Assumes the expiry worker never lags."
+        ]
+      },
+      "recap": {
+        "before": "Reserved seats could be stranded by abandonment.",
+        "after": "Abandoned holds expire and seats recirculate automatically.",
+        "newRisk": "Expiry timing trades user grace period against recirculation speed."
+      },
+      "whyNow": [
+        "With locking in place, leaked inventory is the next way scarce seats are lost."
+      ]
+    },
+    {
+      "id": "waiting-room",
+      "title": "5. Virtual Waiting Room (fairness + overload protection)",
+      "description": "At on-sale, 1M+ users hit a few thousand seats. A virtual waiting room admits users to the booking core at a controlled rate, giving rough first-come fairness and protecting the reserve path from a thundering herd.",
+      "patterns": [
+        "Virtual waiting room",
+        "Load shedding / admission control"
+      ],
+      "decisionPrompt": "A million users arrive in the first second. How do you stay fair and keep the core alive?",
+      "concepts": [
+        {
+          "term": "Virtual waiting room",
+          "definition": "A queue that issues positions and admits users to the real system at a metered rate.",
+          "whyItMatters": "Bounds the load the contended core ever sees, and makes ordering visible/fair."
+        },
+        {
+          "term": "Admission control",
+          "definition": "Letting in only as many users as the core can safely serve.",
+          "whyItMatters": "Prevents collapse; converts an overload into an orderly wait."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client / Browser]",
+        "  WaitRoom[[Waiting Room Queue]]",
+        "  Gate[Admission Gate]",
+        "  API[Booking API]",
+        "  Reserve[Reservation Service]",
+        "  Client -->|join| Queue",
+        "  Queue -->|token + position| Client",
+        "  Queue -->|admit at rate| Gate",
+        "  Gate -->|admitted only| API",
+        "  API --> Reserve"
+      ],
+      "highlight": [
+        "Queue",
+        "Gate"
+      ],
+      "deepDives": [
+        {
+          "title": "Fairness vs. gaming",
+          "points": [
+            "Assign a position at join time; admit in position order at a rate the core sustains.",
+            "Tie tokens to identity/device to blunt users multiplying their queue entries.",
+            "Show estimated wait so users don't hammer refresh (which would re-create the herd)."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "No waiting room \u2014 let everyone hit reserve directly",
+          "why": "The lock store and primary are swamped; latency explodes and fairness is whoever has the fastest connection/bot.",
+          "instead": "Meter admission through a queue so the core sees bounded, ordered load."
+        },
+        {
+          "trap": "Admitting far more users than there are seats with no expectation-setting",
+          "why": "Most admitted users still fail to get seats and retry-storm.",
+          "instead": "Admit at a rate matched to seat availability and communicate position/odds."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The waiting room itself gets the flash crowd.",
+          "expectedBehavior": "It absorbs load without admitting a herd downstream.",
+          "mitigation": "The queue is a lightweight, horizontally scalable buffer (e.g. token issuance + a sorted store); only admission rate touches the core."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Introduces admission control to bound core load and provide fairness.",
+          "Ties queue position to identity and sets expectations."
+        ],
+        "weak": [
+          "Sends the whole crowd at the reserve path.",
+          "Treats the waiting room as cosmetic."
+        ]
+      },
+      "recap": {
+        "before": "The reserve path faced the full flash crowd.",
+        "after": "Admission is metered and roughly fair; the core sees bounded load.",
+        "newRisk": "The queue must itself scale and resist gaming."
+      },
+      "whyNow": [
+        "Correct locking still collapses under 1M concurrent claims \u2014 the herd must be shaped before it arrives."
+      ]
+    },
+    {
+      "id": "checkout",
+      "title": "6. Checkout & Payment Integration",
+      "description": "A valid hold is converted to a confirmed order by charging via the payment system (itself idempotent). Checkout re-verifies the hold is still valid, charges, then flips seats from held to sold atomically. Expired holds fail cleanly.",
+      "patterns": [
+        "Idempotency key",
+        "Saga / state machine"
+      ],
+      "decisionPrompt": "The user pays, but their hold expired one second earlier. What happens to their money and the seat?",
+      "concepts": [
+        {
+          "term": "Hold-to-order conversion",
+          "definition": "Atomically turning a held seat into a sold one once payment succeeds.",
+          "whyItMatters": "The seat must not be resold between charge and confirmation."
+        },
+        {
+          "term": "Compensation",
+          "definition": "Refunding/reversing if a step fails after money moved.",
+          "whyItMatters": "Payment and inventory are separate systems; a saga handles partial failure."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client / Browser]",
+        "  Checkout[Checkout Service]",
+        "  Hold[(Holds \u2014 TTL)]",
+        "  Inventory[(Inventory DB)]",
+        "  Payment[/Payment System/]",
+        "  Order[(Orders DB)]",
+        "  Client -->|checkout hold| Checkout",
+        "  Checkout -->|verify valid| Hold",
+        "  Checkout -->|charge| Payment",
+        "  Checkout -->|held -> sold| Inventory",
+        "  Checkout -->|create order| Order"
+      ],
+      "highlight": [
+        "Checkout",
+        "Payment",
+        "Order"
+      ],
+      "flows": [
+        {
+          "name": "Pay-then-expire race",
+          "note": "Re-verify the hold inside the conversion; if expired after charge, compensate.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant K as Checkout",
+            "  participant H as Holds",
+            "  participant P as Payment",
+            "  participant I as Inventory",
+            "  K->>H: verify hold valid",
+            "  H-->>K: valid",
+            "  K->>P: charge (idempotent)",
+            "  P-->>K: captured",
+            "  K->>I: convert held->sold (CAS on hold still active)",
+            "  alt seat still held by this hold",
+            "    I-->>K: sold",
+            "  else hold expired/lost",
+            "    K->>P: refund (compensate)",
+            "  end"
+          ],
+          "highlight": [
+            "P",
+            "I"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Charging before confirming the hold is still valid",
+          "why": "The hold may have expired and the seat resold \u2014 you took money for nothing.",
+          "instead": "Re-verify inside the atomic conversion; if it lost the seat after charging, refund (compensate)."
+        },
+        {
+          "trap": "Non-idempotent checkout",
+          "why": "A retry double-charges or double-confirms.",
+          "instead": "Idempotency key on checkout; the payment call is itself idempotent."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "Payment succeeds but the seat conversion fails (hold expired in the gap).",
+          "expectedBehavior": "User isn't charged for a seat they didn't get.",
+          "mitigation": "Saga compensation refunds; ideally extend/renew the hold for the payment window to shrink the race."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Re-verifies the hold atomically with conversion and compensates on loss.",
+          "Makes checkout idempotent end to end."
+        ],
+        "weak": [
+          "Charges first, checks later.",
+          "Ignores the pay-then-expire race."
+        ]
+      },
+      "recap": {
+        "before": "Holds didn't become real, paid orders.",
+        "after": "Holds convert to confirmed orders with idempotent, compensatable payment.",
+        "newRisk": "The charge\u2194conversion gap is a race \u2014 shrink it and compensate."
+      },
+      "whyNow": [
+        "A hold is worthless until it safely becomes a paid order without losing money or the seat."
+      ]
+    },
+    {
+      "id": "overbooking",
+      "title": "7. Overbooking Prevention & Consistency",
+      "description": "Make 'never oversell' a hard invariant even across the lock store, inventory, and general-admission counters. Use the seat status as the single source of truth with optimistic concurrency; for GA, use an atomic counter that can never go negative.",
+      "patterns": [
+        "Optimistic concurrency control",
+        "Distributed lock / seat locking"
+      ],
+      "decisionPrompt": "Your Redis lock store and your inventory DB disagree about seat A12. Which wins, and how do you prevent overselling?",
+      "concepts": [
+        {
+          "term": "Single source of truth",
+          "definition": "Inventory status (in the DB) is authoritative; the lock store is an accelerator.",
+          "whyItMatters": "If two systems can disagree, one must be canonical or you oversell."
+        },
+        {
+          "term": "Atomic counter (GA)",
+          "definition": "A decrement-if-positive on a remaining-count for general admission.",
+          "whyItMatters": "Bounds GA sales without per-seat rows; must be atomic to avoid going negative."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Reserve[Reservation Service]",
+        "  Lock[(Seat Lock Store)]",
+        "  Inventory[(Inventory DB)]",
+        "  Metrics[(Metrics / Audit)]",
+        "  Reserve -->|fast path| Lock",
+        "  Reserve -->|authoritative CAS| Inventory",
+        "  Lock -.->|accelerator only| Inventory",
+        "  Inventory -->|invariant checks| Metrics"
+      ],
+      "highlight": [
+        "Inventory",
+        "Metrics"
+      ],
+      "deepDives": [
+        {
+          "title": "Making oversell impossible",
+          "points": [
+            "Inventory status with a version is the source of truth; the conversion is a compare-and-set on (available/held -> sold).",
+            "The lock store only gates who attempts the CAS \u2014 if it and the DB disagree, the DB wins.",
+            "For GA, decrement-if-positive an atomic counter; reject at zero. Reconcile counter vs. orders periodically."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Treating the lock store as the source of truth for sold/available",
+          "why": "A lock-store failure or eviction then lets the same seat sell twice.",
+          "instead": "The lock only gates the attempt; the authoritative sold/available transition is a CAS on inventory."
+        },
+        {
+          "trap": "Non-atomic GA decrement (read count, then write count-1)",
+          "why": "Concurrent buyers both read N and both write N-1 \u2014 oversell.",
+          "instead": "Atomic decrement-if-positive; reject when it hits zero."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The lock store is wiped (eviction/restart) mid-sale.",
+          "expectedBehavior": "No seat is sold twice.",
+          "mitigation": "Locks are advisory; the inventory CAS is the real guard, so a lost lock at worst causes extra 409s, never an oversell."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Names inventory CAS as authoritative and the lock as an accelerator.",
+          "Uses an atomic, non-negative counter for GA and reconciles it."
+        ],
+        "weak": [
+          "Relies on the lock store for correctness.",
+          "Does read-modify-write on a GA count."
+        ]
+      },
+      "recap": {
+        "before": "Correctness leaned on the lock store staying perfect.",
+        "after": "Oversell is impossible by construction \u2014 the DB CAS / atomic counter is the guard.",
+        "newRisk": "More 409s under contention, which the waiting room and retries absorb."
+      },
+      "whyNow": [
+        "Before scaling out, the no-oversell invariant must hold even when components fail."
+      ]
+    },
+    {
+      "id": "scale",
+      "title": "8. Scaling Hot Events & Anti-Abuse",
+      "description": "A handful of mega-events drive nearly all contention. Shard inventory by event so one hot drop is isolated, scale its waiting room and reserve path independently, and add bot/scalper defenses so fairness survives adversaries.",
+      "patterns": [
+        "Sharding by key",
+        "Load shedding / admission control"
+      ],
+      "decisionPrompt": "One stadium tour is generating 95% of your load. How do you keep it from taking down every other event?",
+      "concepts": [
+        {
+          "term": "Event-level sharding",
+          "definition": "Partitioning inventory, locks, and queues by event_id.",
+          "whyItMatters": "Isolates a hot event's contention so it can't starve the rest of the platform."
+        },
+        {
+          "term": "Anti-abuse",
+          "definition": "Bot detection, rate limits, and identity checks at the queue and reserve edges.",
+          "whyItMatters": "Scalpers automate to beat fairness; defenses are part of correctness here."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Gate[Admission Gate]",
+        "  AntiBot[Anti-Abuse / Bot Filter]",
+        "  Router[Event Router]",
+        "  ShardA[(Event Shard A)]",
+        "  ShardB[(Event Shard B)]",
+        "  Reserve[Reservation Service]",
+        "  Gate --> AntiBot",
+        "  AntiBot --> Router",
+        "  Router -->|by event| ShardA",
+        "  Router -->|by event| ShardB",
+        "  ShardA --> Reserve",
+        "  ShardB --> Reserve"
+      ],
+      "highlight": [
+        "AntiBot",
+        "Router",
+        "ShardA",
+        "ShardB"
+      ],
+      "options": [
+        {
+          "name": "Dedicated shard + autoscaled lane per hot event (default)",
+          "pros": [
+            "A mega-event's contention is isolated; other events are unaffected.",
+            "Its waiting room and reserve capacity scale independently."
+          ],
+          "cons": [
+            "Routing and per-event capacity planning add operational work.",
+            "Hot-event detection/promotion needs tooling."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Router[Event Router]",
+            "  ShardA[(Event Shard A)]",
+            "  ShardB[(Event Shard B)]",
+            "  Router -->|hot event| ShardA",
+            "  Router -->|everything else| ShardB"
+          ],
+          "highlight": [
+            "ShardA"
+          ]
+        },
+        {
+          "name": "One shared pool for all events",
+          "pros": [
+            "Simplest; no routing."
+          ],
+          "cons": [
+            "One mega-drop's contention degrades every other event.",
+            "No blast-radius isolation."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Router[Event Router]",
+            "  ShardB[(Event Shard B)]",
+            "  Router --> ShardB"
+          ],
+          "highlight": []
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Bot and scalper defense",
+          "points": [
+            "Rate-limit and fingerprint at the waiting-room edge before tokens are issued.",
+            "Require verified identity / payment pre-auth for the hottest events; cap tickets per identity.",
+            "Feed abuse signals into admission so suspected bots get lower priority, not the front of the line."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "One shared inventory/lock tier for all events",
+          "why": "A single mega-event's lock contention and queue load degrade unrelated events.",
+          "instead": "Shard by event so blast radius is contained; give hot events their own lane."
+        },
+        {
+          "trap": "Treating bots as a post-hoc cleanup",
+          "why": "By the time you cancel scalper orders, real fans are gone and trust is damaged.",
+          "instead": "Defend at the edge (queue/reserve) so fairness holds during the sale, not after."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Isolates hot events by sharding and dedicated lanes.",
+          "Builds anti-abuse into admission, not as cleanup."
+        ],
+        "weak": [
+          "Shares one tier across all events.",
+          "Ignores bots/scalpers entirely."
+        ]
+      },
+      "recap": {
+        "before": "All events shared one contended tier; bots gamed fairness.",
+        "after": "Hot events are isolated and scaled independently with edge anti-abuse.",
+        "newRisk": "Routing, hot-event promotion, and abuse tuning are ongoing operational work."
+      },
+      "whyNow": [
+        "At platform scale, a few mega-events dominate load and adversaries actively attack fairness."
+      ]
+    }
+  ],
+  "finalDesign": {
+    "title": "Final Design",
+    "description": "End-to-end: CDN + read model for browse, a virtual waiting room with anti-abuse metering admission, atomic seat locking with TTL holds, an expiry worker recirculating abandoned seats, idempotent checkout integrated with the payment system via a compensating saga, inventory CAS as the authoritative no-oversell guard, and per-event sharding isolating hot drops.",
+    "diagram": [
+      "graph TB",
+      "  Client[Client / Browser]",
+      "  CDN[/CDN \u2014 static seat maps/]",
+      "  WaitRoom[[Waiting Room Queue]]",
+      "  Gate[Admission Gate]",
+      "  AntiBot[Anti-Abuse / Bot Filter]",
+      "  API[Booking API]",
+      "  Search[Event / Seat Read Model]",
+      "  Cache[(Availability Cache)]",
+      "  Router[Event Router]",
+      "  Reserve[Reservation Service]",
+      "  Lock[(Seat Lock Store)]",
+      "  ShardA[(Event Shard A)]",
+      "  ShardB[(Event Shard B)]",
+      "  Hold[(Holds \u2014 TTL)]",
+      "  Expiry[Hold Expiry Worker]",
+      "  Checkout[Checkout Service]",
+      "  Payment[/Payment System/]",
+      "  Order[(Orders DB)]",
+      "  Client -->|seat map| CDN",
+      "  Client -->|availability| Search",
+      "  Search --> Cache",
+      "  Client -->|on-sale| Queue",
+      "  Queue --> Gate",
+      "  Gate --> AntiBot",
+      "  AntiBot --> API",
+      "  API --> Router",
+      "  Router --> ShardA",
+      "  Router --> ShardB",
+      "  ShardA --> Reserve",
+      "  ShardB --> Reserve",
+      "  Reserve --> Lock",
+      "  Reserve --> Hold",
+      "  Reserve -->|CAS| ShardA",
+      "  Expiry --> Hold",
+      "  Expiry --> Lock",
+      "  API --> Checkout",
+      "  Checkout --> Hold",
+      "  Checkout --> Payment",
+      "  Checkout --> Order",
+      "  ShardA --> Cache",
+      "  ShardB --> Cache"
+    ],
+    "highlight": []
+  },
+  "satisfies": {
+    "functional": [
+      {
+        "requirement": "Browse events with a live seat map",
+        "how": "Static map on CDN, availability from a read model/cache.",
+        "steps": [
+          "browse"
+        ]
+      },
+      {
+        "requirement": "Reserve specific seats with a hold",
+        "how": "Atomic multi-seat locking creates a short-lived hold.",
+        "steps": [
+          "reserve-lock"
+        ]
+      },
+      {
+        "requirement": "Complete purchase",
+        "how": "Idempotent checkout charges payment and converts held->sold atomically.",
+        "steps": [
+          "checkout"
+        ]
+      },
+      {
+        "requirement": "Auto-release abandoned holds",
+        "how": "TTL holds reaped by an expiry worker plus lazy checks.",
+        "steps": [
+          "hold-expiry"
+        ]
+      },
+      {
+        "requirement": "Support GA and reserved seating",
+        "how": "Per-seat status for reserved; atomic non-negative counter for GA.",
+        "steps": [
+          "overbooking"
+        ]
+      }
+    ],
+    "nonFunctional": [
+      {
+        "requirement": "Never double-sell or oversell",
+        "how": "Atomic seat locking plus an authoritative inventory CAS / GA counter.",
+        "steps": [
+          "reserve-lock",
+          "overbooking"
+        ]
+      },
+      {
+        "requirement": "Fairness under a flash crowd",
+        "how": "Virtual waiting room admits in position order at a metered rate.",
+        "steps": [
+          "waiting-room"
+        ]
+      },
+      {
+        "requirement": "Survive extreme concurrency",
+        "how": "Admission control bounds core load; per-event sharding isolates hot drops.",
+        "steps": [
+          "waiting-room",
+          "scale"
+        ]
+      },
+      {
+        "requirement": "Low-latency browse under load",
+        "how": "Reads served from CDN and cache, off the contended primary.",
+        "steps": [
+          "browse"
+        ]
+      },
+      {
+        "requirement": "Resist bots and scalpers",
+        "how": "Edge anti-abuse and per-identity caps feeding admission.",
+        "steps": [
+          "scale"
+        ]
+      },
+      {
+        "requirement": "Graceful degradation",
+        "how": "Shed/queue load rather than oversell; locks and holds expire safely.",
+        "steps": [
+          "waiting-room",
+          "hold-expiry"
+        ]
+      }
+    ]
+  },
+  "interviewScript": [
+    {
+      "phase": "Scope & the real problem",
+      "time": "first 5 min",
+      "say": [
+        "Restate it: fixed scarce inventory meets a flash crowd; correctness and fairness dominate.",
+        "List functional (browse, reserve, checkout, expiry) and non-functional (no oversell, fairness, extreme concurrency).",
+        "Say the headline: this is a contention problem, not a throughput problem."
+      ]
+    },
+    {
+      "phase": "Estimate & API",
+      "time": "5\u201315 min",
+      "say": [
+        "Size buyers-per-seat at on-sale, reserve attempts/s, and hold duration.",
+        "Sketch GET seatmap (cached), POST reservations (atomic), checkout, and the queue token."
+      ]
+    },
+    {
+      "phase": "Build up the design",
+      "time": "15\u201340 min",
+      "say": [
+        "Start naive to expose the double-sell race, then add atomic seat locking and TTL holds.",
+        "Add the waiting room for fairness/overload, then checkout+payment, then the no-oversell invariant.",
+        "Go deep where pushed: locking vs DB-CAS, hold expiry, or waiting-room fairness."
+      ]
+    },
+    {
+      "phase": "Scale & wrap",
+      "time": "final 5 min",
+      "say": [
+        "Shard by event to isolate hot drops; add edge anti-abuse for scalpers.",
+        "Summarize how each requirement is met and name the dominant risk (contention on a hot seat)."
+      ]
+    }
+  ],
+  "levelVariants": [
+    {
+      "level": "Junior",
+      "expectations": [
+        "Recognizes the double-sell race and reaches for a lock or atomic update.",
+        "Knows holds need a timeout so abandoned seats come back."
+      ]
+    },
+    {
+      "level": "Senior",
+      "expectations": [
+        "Designs atomic multi-seat holds with ordered locking and TTLs.",
+        "Adds a waiting room for fairness and overload protection.",
+        "Handles the pay-then-expire race in checkout with compensation."
+      ]
+    },
+    {
+      "level": "Staff+",
+      "expectations": [
+        "Makes no-oversell a hard invariant with an authoritative CAS, treating the lock store as an accelerator.",
+        "Isolates hot events via sharding and dedicated lanes; reasons about blast radius.",
+        "Builds anti-abuse into admission and quantifies fairness vs. throughput tradeoffs."
+      ]
+    }
+  ],
+  "followUps": [
+    "How do you handle seat selection for groups who want adjacent seats under contention?",
+    "How would you implement dynamic pricing or auctions without breaking the no-oversell guarantee?",
+    "How do you support resale/transfer of tickets while preventing fraud and double-use at the gate?",
+    "How would you roll out presales and access codes that gate a subset of inventory?",
+    "What's your strategy when a hot event's dedicated shard still saturates?",
+    "How do you reconcile the lock store, inventory, and orders after a partial outage during a sale?"
+  ]
+}

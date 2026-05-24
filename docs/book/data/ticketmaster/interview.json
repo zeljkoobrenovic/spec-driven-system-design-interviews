@@ -74,6 +74,21 @@
       "label": "Correctness target",
       "value": "zero double-sell / oversell",
       "note": "Correctness dominates; we'd rather reject than oversell."
+    },
+    {
+      "label": "Admission rate",
+      "value": "~hundreds/s into the core",
+      "note": "With ~50k seats and a ~5-min hold, admitting ~200/s drains the inventory in roughly the hold window — sized to seats, not to the 1M crowd."
+    },
+    {
+      "label": "Checkout time budget",
+      "value": "~30–60s per buyer",
+      "note": "From admission to paid order; the hold TTL must cover this with margin, or be renewable across the payment window."
+    },
+    {
+      "label": "Payment provider throughput",
+      "value": "PSP-limited (~1–2k tps)",
+      "note": "The external PSP, not our services, often caps confirmed checkouts/sec — a downstream bottleneck to plan retries/queueing around."
     }
   ],
   "api": [
@@ -203,7 +218,7 @@
     },
     {
       "name": "holds",
-      "note": "A short-lived reservation over one or more seats, with an expiry. The expiry worker reclaims stale holds.",
+      "note": "A short-lived reservation over one or more seats, with an expiry. The expiry worker reclaims stale holds. Seats are linked via the hold_seats join table (not an array) so a seat belongs to at most one active hold.",
       "fields": [
         {
           "name": "hold_id",
@@ -218,16 +233,26 @@
           "type": "uuid"
         },
         {
-          "name": "seat_ids",
-          "type": "varchar[]"
-        },
-        {
           "name": "expires_at",
           "type": "timestamptz"
         },
         {
           "name": "status",
           "type": "enum(active, converted, expired)"
+        }
+      ]
+    },
+    {
+      "name": "hold_seats",
+      "note": "Join table linking a hold to its seats. A unique constraint on (event_id, seat_id) among active holds enforces that a seat can't be held twice — a DB-level oversell guard.",
+      "fields": [
+        {
+          "name": "(hold_id, event_id, seat_id)",
+          "type": "composite PK"
+        },
+        {
+          "name": "event_id, seat_id",
+          "type": "FK -> seats; unique among active holds"
         }
       ]
     },
@@ -593,6 +618,11 @@
           "term": "All-or-nothing multi-seat hold",
           "definition": "A request for several seats succeeds only if all are obtainable.",
           "whyItMatters": "Partial holds strand seats and frustrate users; acquire in a fixed order to avoid deadlock."
+        },
+        {
+          "term": "Lock as accelerator, not source of truth",
+          "definition": "The lock store gates who may attempt a claim; the authoritative available->held/sold transition is a conditional write on the inventory record itself.",
+          "whyItMatters": "If the lock store is lost or wrong, the worst case is extra 409s — never a double-sell. (Made rigorous in Step 7.)"
         }
       ],
       "diagram": [
@@ -718,6 +748,88 @@
       "whyNow": [
         "Atomic claiming is the core correctness guarantee everything else builds on."
       ]
+    },
+    {
+      "id": "multi-seat-locking",
+      "parent": "reserve-lock",
+      "title": "3a. Multi-Seat Locking Details",
+      "description": "Going deeper on the atomic reservation: how to grab several specific seats all-or-nothing under contention without deadlock, and how to make the locks safe across crashes. The mechanics here are what make the no-double-sell guarantee real.",
+      "patterns": [
+        "Distributed lock / seat locking",
+        "Idempotency key"
+      ],
+      "decisionPrompt": "Two requests each want seats {A12, A13} and {A13, A12}. How do you avoid a deadlock where each holds one?",
+      "concepts": [
+        {
+          "term": "Ordered lock acquisition",
+          "definition": "Always acquire locks for a multi-seat request in a fixed global order (e.g. sorted seat id).",
+          "whyItMatters": "Cyclic wait is impossible if everyone locks in the same order \u2014 no deadlock."
+        },
+        {
+          "term": "Fencing token / lease id",
+          "definition": "A monotonically increasing token issued with each lock so a stale holder is rejected.",
+          "whyItMatters": "A paused/GC'd client whose lease expired can't later mutate the seat it no longer owns."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Reserve[Reservation Service]",
+        "  Lock[(Seat Lock Store)]",
+        "  Idem[(Idempotency Store)]",
+        "  Inventory[(Inventory DB)]",
+        "  Reserve -->|sorted order, fencing token| Lock",
+        "  Reserve -->|store key + result| Idem",
+        "  Reserve -->|all locked: mark held| Inventory",
+        "  Reserve -->|any fail: release acquired| Lock"
+      ],
+      "highlight": [
+        "Idem"
+      ],
+      "deepDives": [
+        {
+          "title": "All-or-nothing under contention",
+          "points": [
+            "Sort the requested seat ids and acquire locks in that order so two overlapping requests can't deadlock.",
+            "If any lock fails, release the ones already acquired and return 409 \u2014 never leave a partial hold.",
+            "Carry a fencing token with each lock; the inventory write checks it so a holder whose lease expired is fenced out.",
+            "Persist the idempotency key with its result so a retried reserve replays the same hold instead of re-locking."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Acquiring multi-seat locks in request order",
+          "why": "Two requests with overlapping seats in different orders deadlock \u2014 each holds one the other needs.",
+          "instead": "Acquire in a fixed global order (sorted seat id) so cycles can't form."
+        },
+        {
+          "trap": "A lock with a TTL but no fencing token",
+          "why": "A client that pauses past its TTL can wake up and mutate a seat someone else now holds.",
+          "instead": "Issue a fencing token with the lease; reject writes carrying a stale token."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A client acquires 2 of 3 seat locks, then its process pauses for a full GC longer than the TTL.",
+          "expectedBehavior": "It must not complete the reservation when it wakes.",
+          "mitigation": "Lease expiry frees the seats; the fencing token makes the late write fail; the partial locks were already released or expire."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Acquires locks in a deterministic order and releases on partial failure.",
+          "Adds fencing tokens for lease safety; persists the idempotency result."
+        ],
+        "weak": [
+          "Locks in arbitrary order (deadlock).",
+          "Relies on TTL alone with no fencing."
+        ]
+      },
+      "recap": {
+        "before": "Atomic reservation was stated but its mechanics were hand-waved.",
+        "after": "Ordered acquisition + fencing + idempotent retry make multi-seat holds correct under contention and crashes.",
+        "newRisk": "More moving parts (token issuance, ordered acquisition) to implement carefully."
+      }
     },
     {
       "id": "hold-expiry",
@@ -923,6 +1035,89 @@
       ]
     },
     {
+      "id": "admission-tokens",
+      "parent": "waiting-room",
+      "title": "5a. Admission-Token Enforcement",
+      "description": "Going deeper on the waiting room: how a queue position becomes a signed admission token that the reservation endpoint actually checks, so the queue genuinely gates load and fairness instead of being cosmetic. Without enforcement, the waiting room is theater.",
+      "patterns": [
+        "Virtual waiting room",
+        "Load shedding / admission control"
+      ],
+      "decisionPrompt": "A user gets a queue position but the reserve API doesn't check it. What is the waiting room actually doing?",
+      "concepts": [
+        {
+          "term": "Signed admission token",
+          "definition": "A cryptographically signed token issued on admission, carrying user, event, and an admission window.",
+          "whyItMatters": "The reserve endpoint can verify it offline (no central lookup) and reject anyone not admitted."
+        },
+        {
+          "term": "Admission window",
+          "definition": "A bounded time during which an admitted token may reserve before it expires.",
+          "whyItMatters": "Stops admitted users from sitting on access forever and bounds in-flight load."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client]",
+        "  WaitRoom[[Waiting Room Queue]]",
+        "  Gate[Admission Gate]",
+        "  Reserve[Reservation Service]",
+        "  Client -->|join| WaitRoom",
+        "  WaitRoom -->|position| Client",
+        "  Gate -->|admit at rate: signed token| Client",
+        "  Client -->|reserve + token| Reserve",
+        "  Reserve -->|verify signature, window, identity| Reserve"
+      ],
+      "highlight": [
+        "Gate"
+      ],
+      "deepDives": [
+        {
+          "title": "Making admission real",
+          "points": [
+            "Assign a monotonic position at join; admit in position order at a rate the core sustains.",
+            "Sign the admission token (user + event + window) so reserve verifies it without a central call.",
+            "Bind the token to identity so it can't be shared/sold; reject reuse beyond the seat cap.",
+            "On token expiry or denied reserve, re-queue with backoff rather than letting clients hammer reserve."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Issuing queue positions but not verifying a token at reserve",
+          "why": "Anyone can skip the line by calling reserve directly \u2014 the waiting room enforces nothing.",
+          "instead": "Require and verify a signed, time-boxed admission token at the reserve endpoint."
+        },
+        {
+          "trap": "Unbound tokens that aren't tied to identity",
+          "why": "Tokens get shared or resold, defeating fairness and enabling scalpers.",
+          "instead": "Bind the token to the authenticated user and cap seats per identity."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A bot floods the reserve endpoint directly, skipping the queue.",
+          "expectedBehavior": "Those requests are rejected.",
+          "mitigation": "Reserve requires a valid signed admission token; tokenless or invalid requests get 401 and never reach seat locking."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Enforces a signed, identity-bound, time-boxed token at reserve.",
+          "Handles expiry with re-queue + backoff."
+        ],
+        "weak": [
+          "Treats the queue as cosmetic with no reserve-side check.",
+          "Tokens aren't bound or time-boxed."
+        ]
+      },
+      "recap": {
+        "before": "The waiting room assigned positions but nothing enforced them.",
+        "after": "Signed, identity-bound admission tokens are verified at reserve, so the queue truly gates load and fairness.",
+        "newRisk": "Token signing/rotation and clock skew on the window must be managed."
+      }
+    },
+    {
       "id": "checkout",
       "title": "6. Checkout & Payment Integration",
       "description": "Checkout drives an order state machine (pending_payment -> confirmed, with cancelled/refund_pending branches), not just a charge plus an order row. It re-verifies (and briefly renews) the hold, records a payment attempt, charges the idempotent payment system, then flips seats from held to sold via inventory CAS. Expired holds fail cleanly; a charge that can't be converted is refunded.",
@@ -1028,6 +1223,90 @@
       ]
     },
     {
+      "id": "checkout-state-machine",
+      "parent": "checkout",
+      "title": "6a. Checkout State Machine & Reconciliation",
+      "description": "Going deeper on checkout: model the order as an explicit state machine and handle the awkward window where payment is in flight. Hold renewal, durable payment attempts, and reconciliation are what keep money and seats consistent when steps fail or race.",
+      "patterns": [
+        "Saga / state machine",
+        "Idempotency key"
+      ],
+      "decisionPrompt": "Payment takes 8 seconds but the hold TTL is 5. How do you avoid the seat being resold mid-charge?",
+      "concepts": [
+        {
+          "term": "Order states",
+          "definition": "pending_payment -> confirmed, with cancelled and refund_pending branches.",
+          "whyItMatters": "Explicit states make the in-flight and failure cases handleable and auditable."
+        },
+        {
+          "term": "Hold renewal/freezing during payment",
+          "definition": "Extending or freezing the seat hold while a charge is in flight.",
+          "whyItMatters": "Prevents the seat expiring out from under a payment that's about to succeed."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Checkout[Checkout Service]",
+        "  Hold[(Holds \u2014 TTL)]",
+        "  Payment[/Payment System/]",
+        "  Order[(Orders DB)]",
+        "  Recon[Reconciliation Worker]",
+        "  Checkout -->|renew/freeze during charge| Hold",
+        "  Checkout -->|pending_payment| Order",
+        "  Checkout -->|charge idempotent| Payment",
+        "  Checkout -->|captured: confirmed| Order",
+        "  Recon -->|payment vs order drift| Order"
+      ],
+      "highlight": [
+        "Recon"
+      ],
+      "deepDives": [
+        {
+          "title": "The payment window and reconciliation",
+          "points": [
+            "Move the order to pending_payment and renew/freeze the hold for the payment window before charging.",
+            "Record a durable payment_attempt with the idempotency key before calling the PSP, so a crash mid-charge is recoverable.",
+            "On capture, transition pending_payment -> confirmed and convert held -> sold; on failure, cancel and release.",
+            "A reconciliation worker compares PSP records to orders and repairs drift (charged-but-not-confirmed -> confirm or refund)."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Letting the hold expire while payment is in flight",
+          "why": "The seat gets resold mid-charge, and you've taken money for a seat someone else now owns.",
+          "instead": "Renew/freeze the hold for the payment window; if it still lapses, compensate (refund)."
+        },
+        {
+          "trap": "No durable payment-attempt record or reconciliation",
+          "why": "A crash between charge and confirm leaves money moved with no order and no way to detect it.",
+          "instead": "Persist the attempt before charging; reconcile PSP vs orders to catch and repair drift."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The PSP captures the charge but checkout crashes before writing 'confirmed'.",
+          "expectedBehavior": "The discrepancy is detected and resolved \u2014 confirm the order or refund.",
+          "mitigation": "The durable payment_attempt + reconciliation worker find charged-but-unconfirmed orders and repair them."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Models explicit order states and renews the hold across the payment window.",
+          "Adds durable payment attempts + reconciliation."
+        ],
+        "weak": [
+          "Treats checkout as charge-then-insert with no in-flight handling.",
+          "No way to detect charged-but-unconfirmed."
+        ]
+      },
+      "recap": {
+        "before": "Checkout was a single charge-and-create with a pay-then-expire race noted but unresolved.",
+        "after": "An explicit state machine with hold renewal, durable attempts, and reconciliation closes the money/seat gaps.",
+        "newRisk": "Reconciliation and renewal add components that must themselves be reliable."
+      }
+    },
+    {
       "id": "overbooking",
       "title": "7. Overbooking Prevention & Consistency",
       "description": "Make 'never oversell' a hard invariant even across the lock store, inventory, and general-admission counters. Use the seat status as the single source of truth with optimistic concurrency; for GA, use an atomic counter that can never go negative.",
@@ -1071,6 +1350,27 @@
             "The lock store only gates who attempts the CAS \u2014 if it and the DB disagree, the DB wins.",
             "For GA, decrement-if-positive an atomic counter; reject at zero. Reconcile counter vs. orders periodically."
           ]
+        },
+        {
+          "title": "Inventory event stream & audit (staff-level)",
+          "points": [
+            "Emit every authoritative seat transition (available->held->sold, releases) to an outbox in the same transaction as the CAS, so events can't diverge from state.",
+            "A relay publishes the outbox to a stream that updates the availability cache/read model \u2014 that's how browse stays fresh without reading the contended primary.",
+            "Append each transition to an immutable audit log; reconciliation and dispute resolution replay it to explain how any seat reached its current state.",
+            "Consumers are idempotent (keyed by transition id) because the stream is at-least-once."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Inventory[(Inventory DB)]",
+            "  Outbox[(Inventory Outbox)]",
+            "  Stream[[Inventory Event Stream]]",
+            "  Cache[(Availability Cache)]",
+            "  Audit[(Audit Log)]",
+            "  Inventory --- Outbox",
+            "  Outbox -->|relay| Stream",
+            "  Stream -->|update read model| Cache",
+            "  Stream -->|append immutable| Audit"
+          ]
         }
       ],
       "traps": [
@@ -1112,6 +1412,87 @@
       ]
     },
     {
+      "id": "ga-counters",
+      "parent": "overbooking",
+      "title": "7a. General-Admission Counters",
+      "description": "Going deeper on the GA case: general admission has no seats, just a pool with a remaining count. The correctness tool is an atomic decrement-if-positive rather than per-seat locks, with its own reconciliation \u2014 and it's worth being explicit about how GA differs from reserved seating.",
+      "patterns": [
+        "Optimistic concurrency control"
+      ],
+      "decisionPrompt": "A GA pool has 100 spots and 5,000 simultaneous buyers. How do you sell exactly 100, no more?",
+      "concepts": [
+        {
+          "term": "Decrement-if-positive",
+          "definition": "An atomic operation that reduces a counter only while it stays >= 0, rejecting at zero.",
+          "whyItMatters": "Concurrent buyers can't drive the pool negative \u2014 no oversell without per-seat rows."
+        },
+        {
+          "term": "Counter/order reconciliation",
+          "definition": "Periodically checking that remaining + reserved + sold equals the original pool size.",
+          "whyItMatters": "Catches drift from failed/abandoned reservations that didn't release correctly."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Reserve[Reservation Service]",
+        "  GA[(GA Pool Counter)]",
+        "  Hold[(Holds \u2014 TTL)]",
+        "  Recon[GA Reconciliation Worker]",
+        "  Reserve -->|decrement-if-positive| GA",
+        "  Reserve -->|reserved: create hold| Hold",
+        "  Recon -->|remaining+reserved+sold == pool?| GA"
+      ],
+      "highlight": [
+        "GA",
+        "Recon"
+      ],
+      "deepDives": [
+        {
+          "title": "GA vs reserved seating",
+          "points": [
+            "Reserved: lock a specific seat row (identity matters). GA: decrement a shared count (only quantity matters).",
+            "Decrement-if-positive (atomic CAS / Lua / conditional update) reserves; release increments it back on expiry/failure.",
+            "Reconcile periodically: remaining + reserved + sold must equal the pool; repair drift from lost releases.",
+            "Hot GA counters can still be a contention point \u2014 shard the pool into sub-counters if one row is too hot."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Read the GA count, then write count-1",
+          "why": "Two buyers both read N and both write N-1 \u2014 classic lost update, oversell.",
+          "instead": "Atomic decrement-if-positive; reject when it would go below zero."
+        },
+        {
+          "trap": "Never reconciling the counter against actual holds/orders",
+          "why": "Failed reservations that don't release correctly silently shrink the pool over time.",
+          "instead": "Reconcile remaining + reserved + sold against the pool size and repair drift."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "Many GA reservations are abandoned and their releases are lost.",
+          "expectedBehavior": "The pool doesn't permanently leak capacity.",
+          "mitigation": "TTL releases increment the counter back; reconciliation detects and repairs any residual drift."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Uses atomic decrement-if-positive and reconciles the counter; distinguishes GA from reserved.",
+          "Shards a hot pool counter."
+        ],
+        "weak": [
+          "Read-modify-write on the count.",
+          "Treats GA exactly like reserved seating."
+        ]
+      },
+      "recap": {
+        "before": "GA was mentioned but its mechanism was thin.",
+        "after": "An atomic, reconciled pool counter sells GA correctly without per-seat rows.",
+        "newRisk": "A hot GA counter is itself a contention point \u2014 shard it if needed."
+      }
+    },
+    {
       "id": "scale",
       "title": "8. Scaling Hot Events & Anti-Abuse",
       "description": "A handful of mega-events drive nearly all contention. Shard inventory by event so one hot drop is isolated, scale its waiting room and reserve path independently, and add bot/scalper defenses so fairness survives adversaries.",
@@ -1137,16 +1518,20 @@
         "  Gate[Admission Gate]",
         "  AntiBot[Anti-Abuse / Bot Filter]",
         "  Router[Event Router]",
-        "  ReserveA[Reservation Svc — Event A]",
-        "  ReserveB[Reservation Svc — Event B]",
+        "  ReserveA[Reservation Svc \u2014 Event A]",
+        "  ReserveB[Reservation Svc \u2014 Event B]",
         "  ShardA[(Inventory Shard A)]",
         "  ShardB[(Inventory Shard B)]",
+        "  LockA[(Seat Lock Store A)]",
+        "  LockB[(Seat Lock Store B)]",
         "  Gate --> AntiBot",
         "  AntiBot --> Router",
         "  Router -->|hot event A| ReserveA",
         "  Router -->|other events| ReserveB",
         "  ReserveA -->|reads/writes| ShardA",
-        "  ReserveB -->|reads/writes| ShardB"
+        "  ReserveB -->|reads/writes| ShardB",
+        "  ReserveA -->|locks| LockA",
+        "  ReserveB -->|locks| LockB"
       ],
       "highlight": [
         "AntiBot",
@@ -1168,8 +1553,8 @@
           "diagram": [
             "graph TB",
             "  Router[Event Router]",
-            "  ReserveA[Reservation Svc — Event A]",
-            "  ReserveB[Reservation Svc — other events]",
+            "  ReserveA[Reservation Svc \u2014 Event A]",
+            "  ReserveB[Reservation Svc \u2014 other events]",
             "  ShardA[(Inventory Shard A)]",
             "  ShardB[(Inventory Shard B)]",
             "  Router -->|hot event| ReserveA",
@@ -1194,7 +1579,7 @@
           "diagram": [
             "graph TB",
             "  Router[Event Router]",
-            "  Reserve[Reservation Service — shared]",
+            "  Reserve[Reservation Service \u2014 shared]",
             "  Shared[(Inventory DB)]",
             "  Router --> Reserve",
             "  Reserve --> Shared"
@@ -1453,6 +1838,8 @@
     "How do you support resale/transfer of tickets while preventing fraud and double-use at the gate?",
     "How would you roll out presales and access codes that gate a subset of inventory?",
     "What's your strategy when a hot event's dedicated shard still saturates?",
-    "How do you reconcile the lock store, inventory, and orders after a partial outage during a sale?"
+    "How do you reconcile the lock store, inventory, and orders after a partial outage during a sale?",
+    "How do you version a venue's seat map (renumbering, holds-for-production) without invalidating in-flight holds?",
+    "How would you deliver tickets and prevent gate fraud — rotating barcodes/QR, offline validation, and double-scan detection?"
   ]
 }

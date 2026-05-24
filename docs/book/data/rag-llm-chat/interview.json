@@ -1,0 +1,1362 @@
+{
+  "title": "RAG / LLM Chat \u2014 System Design",
+  "description": "Designing a chat assistant grounded in your own documents: a conversational LLM app that retrieves relevant context from a knowledge base and answers with citations. The interesting problems are AI-era \u2014 managing a bounded context window across a long conversation, streaming tokens with low latency, the ingestion-to-retrieval pipeline (chunking, embeddings, a vector index), grounding answers to reduce hallucination, and controlling the cost and safety of an expensive, non-deterministic dependency. We build from a thin LLM proxy toward a grounded, streamed, cost-controlled RAG system.",
+  "requirementsDiagram": [
+    "graph LR",
+    "  Client[Client / Chat UI]",
+    "  API[Chat API Gateway]",
+    "  Orchestrator[Chat Orchestrator]",
+    "  Retriever[Retrieval Service]",
+    "  LLM[/LLM Inference/]",
+    "  Client -->|message| API",
+    "  API --> Orchestrator",
+    "  Orchestrator -->|retrieve context| Retriever",
+    "  Orchestrator -->|prompt + context| LLM",
+    "  LLM -->|streamed answer| Client"
+  ],
+  "capacityDiagram": [
+    "graph LR",
+    "  Client[Client / Chat UI]",
+    "  Orchestrator[Chat Orchestrator]",
+    "  Retriever[Retrieval Service]",
+    "  VectorDB[(Vector Index)]",
+    "  LLM[/LLM Inference/]",
+    "  Client -->|~5k msgs/s peak| Orchestrator",
+    "  Orchestrator -->|top-k query| Retriever",
+    "  Retriever --> VectorDB",
+    "  Orchestrator -->|tokens, $$, seconds| LLM"
+  ],
+  "requirements": {
+    "functional": [
+      "Hold a multi-turn conversation with an assistant.",
+      "Ground answers in a corpus of ingested documents (RAG), with citations.",
+      "Stream the response token by token as it is generated.",
+      "Ingest and re-index documents so new knowledge becomes retrievable.",
+      "Maintain conversation history and continue prior conversations."
+    ],
+    "nonFunctional": [
+      "Low time-to-first-token; the user should see output within ~1s.",
+      "Stay within the model's context window across long conversations.",
+      "Reduce hallucination by grounding in retrieved sources.",
+      "Control cost \u2014 LLM tokens are expensive and usage is unbounded without limits.",
+      "Safety: filter unsafe inputs/outputs and prevent prompt injection from documents.",
+      "Graceful degradation when the LLM or vector store is slow, rate-limited, or down."
+    ]
+  },
+  "capacity": [
+    {
+      "label": "Chat messages",
+      "value": "~5,000/s peak",
+      "note": "Each may trigger retrieval and an LLM call."
+    },
+    {
+      "label": "LLM cost",
+      "value": "$ per 1k tokens",
+      "note": "Dominant cost; context size and call count drive the bill."
+    },
+    {
+      "label": "Time-to-first-token",
+      "value": "target < ~1s",
+      "note": "Streaming hides total latency; first token must be fast."
+    },
+    {
+      "label": "Corpus size",
+      "value": "millions of chunks",
+      "note": "Documents split into embedded chunks in a vector index."
+    },
+    {
+      "label": "Context window",
+      "value": "fixed token budget",
+      "note": "History + retrieved context + answer must fit; long chats need summarization."
+    },
+    {
+      "label": "Retrieval latency",
+      "value": "tens of ms (top-k)",
+      "note": "Approximate nearest-neighbor search over embeddings."
+    }
+  ],
+  "api": [
+    {
+      "method": "POST",
+      "path": "/v1/conversations/{id}/messages",
+      "description": "Send a message and stream the grounded answer. Returns a token stream (SSE/WebSocket).",
+      "request": "{ \"content\": \"How do refunds work?\", \"stream\": true }",
+      "response": "200 OK (text/event-stream)\ndata: {\"delta\":\"Refunds \"}\ndata: {\"delta\":\"are issued \"}\n... data: {\"citations\":[\"doc_12#p3\"], \"done\":true}",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Client",
+        "  participant O as Orchestrator",
+        "  participant R as Retriever",
+        "  participant L as LLM",
+        "  C->>O: POST message (stream=true)",
+        "  O->>R: retrieve top-k context",
+        "  R-->>O: chunks + citations",
+        "  O->>L: prompt(history + context + question)",
+        "  loop streaming",
+        "    L-->>O: token",
+        "    O-->>C: SSE delta",
+        "  end",
+        "  O-->>C: citations + done"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/documents",
+      "description": "Ingest a document; it is chunked, embedded, and indexed asynchronously.",
+      "request": "{ \"source_id\": \"handbook\", \"content\": \"...\", \"metadata\": {...} }",
+      "response": "202 Accepted { \"document_id\": \"doc_12\", \"status\": \"indexing\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant U as Uploader",
+        "  participant I as Ingestion",
+        "  participant E as Embedding Model",
+        "  participant V as Vector Index",
+        "  U->>I: POST /documents",
+        "  I->>I: split into chunks",
+        "  I->>E: embed chunks",
+        "  E-->>I: vectors",
+        "  I->>V: upsert vectors + metadata",
+        "  I-->>U: 202 indexing"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/conversations/{id}",
+      "description": "Fetch a conversation's message history.",
+      "request": "GET /v1/conversations/conv_3",
+      "response": "200 OK { \"messages\": [ { \"role\": \"user\", \"content\": \"...\" }, ... ] }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/feedback",
+      "description": "Record thumbs up/down and the trace id for evaluation.",
+      "request": "{ \"message_id\": \"msg_9\", \"rating\": \"down\", \"reason\": \"wrong\" }",
+      "response": "200 OK"
+    }
+  ],
+  "dataModel": [
+    {
+      "name": "conversations",
+      "note": "One row per conversation thread.",
+      "fields": [
+        {
+          "name": "conversation_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "user_id",
+          "type": "uuid"
+        },
+        {
+          "name": "summary",
+          "type": "text (rolling summary of old turns)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "messages",
+      "note": "Ordered turns within a conversation; the raw history.",
+      "fields": [
+        {
+          "name": "message_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "conversation_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "role",
+          "type": "enum(user, assistant, system)"
+        },
+        {
+          "name": "content",
+          "type": "text"
+        },
+        {
+          "name": "tokens",
+          "type": "int"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "documents",
+      "note": "Source documents; chunks reference back to these for citations.",
+      "fields": [
+        {
+          "name": "document_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "source_id",
+          "type": "varchar"
+        },
+        {
+          "name": "metadata",
+          "type": "jsonb"
+        },
+        {
+          "name": "version",
+          "type": "int"
+        }
+      ]
+    },
+    {
+      "name": "chunks",
+      "note": "A document split into embeddable passages; the unit of retrieval and citation.",
+      "fields": [
+        {
+          "name": "chunk_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "document_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "text",
+          "type": "text"
+        },
+        {
+          "name": "embedding",
+          "type": "vector(d) \u2014 in the vector index"
+        },
+        {
+          "name": "position",
+          "type": "int"
+        }
+      ]
+    },
+    {
+      "name": "traces",
+      "note": "Per-request record of retrieved chunks, prompt, model, tokens, and cost for eval and debugging.",
+      "fields": [
+        {
+          "name": "trace_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "message_id",
+          "type": "uuid"
+        },
+        {
+          "name": "retrieved_chunks",
+          "type": "uuid[]"
+        },
+        {
+          "name": "model",
+          "type": "varchar"
+        },
+        {
+          "name": "tokens_in_out",
+          "type": "int[]"
+        },
+        {
+          "name": "cost",
+          "type": "numeric"
+        }
+      ]
+    }
+  ],
+  "patterns": [
+    {
+      "name": "Stateless LLM proxy",
+      "what": "Treat the model as a stateless function; the app supplies all context each call.",
+      "whenToUse": "Any LLM integration \u2014 the model remembers nothing between calls.",
+      "steps": [
+        "chat-proxy"
+      ]
+    },
+    {
+      "name": "Context window management",
+      "what": "Fit history + retrieved context + answer into a fixed token budget, summarizing or truncating old turns.",
+      "whenToUse": "Multi-turn chat that outgrows the model's window.",
+      "steps": [
+        "conversation"
+      ]
+    },
+    {
+      "name": "Streaming (SSE / WebSocket)",
+      "what": "Stream tokens to the client as generated to minimize perceived latency.",
+      "whenToUse": "Any interactive generation where total latency is high but first-token can be fast.",
+      "steps": [
+        "streaming"
+      ]
+    },
+    {
+      "name": "Embedding + vector index (ANN)",
+      "what": "Represent text as vectors and search by approximate nearest neighbor for semantic retrieval.",
+      "whenToUse": "Finding relevant passages by meaning rather than keywords.",
+      "steps": [
+        "ingestion",
+        "retrieval"
+      ]
+    },
+    {
+      "name": "Retrieval-augmented generation (RAG)",
+      "what": "Retrieve relevant context and ground the model's answer in it, with citations.",
+      "whenToUse": "When answers must reflect a private/changing corpus and avoid hallucination.",
+      "steps": [
+        "retrieval",
+        "rag-assembly"
+      ]
+    },
+    {
+      "name": "Async ingestion pipeline",
+      "what": "Chunk, embed, and index documents off the request path.",
+      "whenToUse": "Indexing is slow and bursty; queries must not wait on it.",
+      "steps": [
+        "ingestion"
+      ]
+    },
+    {
+      "name": "Semantic / prompt caching",
+      "what": "Reuse answers or embeddings for semantically equivalent requests to cut cost and latency.",
+      "whenToUse": "Repeated or near-duplicate questions over a stable corpus.",
+      "steps": [
+        "cost-control"
+      ]
+    },
+    {
+      "name": "Guardrails / safety filter",
+      "what": "Screen inputs and outputs for unsafe content and prompt injection, especially from retrieved docs.",
+      "whenToUse": "Any user-facing LLM, more so with untrusted document content.",
+      "steps": [
+        "scale-safety"
+      ]
+    },
+    {
+      "name": "Model routing / cascading",
+      "what": "Route easy requests to a small fast model and hard ones to a large model.",
+      "whenToUse": "Cost/latency optimization across heterogeneous request difficulty.",
+      "steps": [
+        "scale-safety"
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "chat-proxy",
+      "title": "1. Thin LLM Proxy (the baseline)",
+      "description": "Start minimal: the client sends a message, the API forwards it to the LLM and returns the completion. This exposes the foundational truth \u2014 the model is a stateless, slow, expensive, non-deterministic dependency \u2014 before we add memory, retrieval, or streaming.",
+      "patterns": [
+        "Stateless LLM proxy"
+      ],
+      "decisionPrompt": "The model 'forgets' everything between calls and a call takes seconds. What does that force on the rest of the design?",
+      "concepts": [
+        {
+          "term": "Stateless inference",
+          "definition": "The LLM holds no memory across calls; every request must carry all needed context.",
+          "whyItMatters": "The app \u2014 not the model \u2014 owns conversation memory and retrieved knowledge."
+        },
+        {
+          "term": "Non-determinism & latency",
+          "definition": "Outputs vary and generation is slow and token-priced.",
+          "whyItMatters": "Caching, streaming, and cost control all stem from this."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client / Chat UI]",
+        "  API[Chat API Gateway]",
+        "  Orchestrator[Chat Orchestrator]",
+        "  LLM[/LLM Inference/]",
+        "  Client -->|message| API",
+        "  API --> Orchestrator",
+        "  Orchestrator -->|prompt| LLM",
+        "  LLM -->|completion| Orchestrator"
+      ],
+      "highlight": [
+        "Client",
+        "API",
+        "Orchestrator",
+        "LLM"
+      ],
+      "talkingPoints": [
+        "State that the model is stateless, slow, expensive, and non-deterministic \u2014 every later choice follows from that.",
+        "Note that grounding (RAG) and memory live in the app, not the model."
+      ],
+      "traps": [
+        {
+          "trap": "Assuming the model remembers the conversation",
+          "why": "It doesn't \u2014 without resending context each call, every turn starts blank.",
+          "instead": "The app assembles and sends the full needed context on every call."
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Whole-response latency makes the UI feel frozen for seconds.",
+          "mitigation": "Streaming (a later step)."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Treats the LLM as a stateless function and puts memory/knowledge in the app.",
+          "Anticipates cost, latency, and non-determinism."
+        ],
+        "weak": [
+          "Expects the model to maintain state.",
+          "Ignores token cost and latency."
+        ]
+      },
+      "whyNow": [
+        "The baseline names the constraints (stateless, slow, costly) that justify every later component."
+      ]
+    },
+    {
+      "id": "conversation",
+      "title": "2. Conversation Store & Context Window",
+      "description": "Persist the conversation and assemble each prompt from history. Because the context window is a fixed token budget, long chats need a strategy: keep recent turns verbatim and replace older ones with a rolling summary.",
+      "patterns": [
+        "Context window management"
+      ],
+      "decisionPrompt": "A conversation has 200 turns but the model's window holds ~20. What do you send?",
+      "concepts": [
+        {
+          "term": "Context window",
+          "definition": "The maximum tokens a model can attend to in one call.",
+          "whyItMatters": "History + retrieved context + the answer must all fit; it's a hard budget."
+        },
+        {
+          "term": "Rolling summary",
+          "definition": "Periodically compress old turns into a short summary kept in the prompt.",
+          "whyItMatters": "Preserves long-range context without resending (and re-paying for) the whole history."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Orchestrator[Chat Orchestrator]",
+        "  ConvStore[(Conversation Store)]",
+        "  Summarizer[Context / Summary Builder]",
+        "  LLM[/LLM Inference/]",
+        "  Orchestrator -->|load history| ConvStore",
+        "  Orchestrator --> Summarizer",
+        "  Summarizer -->|recent + summary| Orchestrator",
+        "  Orchestrator -->|bounded prompt| LLM",
+        "  Orchestrator -->|append turn| ConvStore"
+      ],
+      "highlight": [
+        "ConvStore",
+        "Summarizer"
+      ],
+      "options": [
+        {
+          "name": "Recent turns verbatim + rolling summary (default)",
+          "pros": [
+            "Keeps the budget bounded regardless of length.",
+            "Retains long-range context cheaply via the summary."
+          ],
+          "cons": [
+            "Summary loss is irreversible; summarization is itself an LLM call.",
+            "Tuning what to keep vs summarize is fiddly."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Summarizer[Context / Summary Builder]",
+            "  LLM[/LLM Inference/]",
+            "  Summarizer -->|summary + last N turns| LLM"
+          ],
+          "highlight": [
+            "Summarizer"
+          ]
+        },
+        {
+          "name": "Truncate to the last N turns",
+          "pros": [
+            "Trivial; no extra LLM call."
+          ],
+          "cons": [
+            "Silently forgets anything older than N turns \u2014 the assistant 'loses the plot'."
+          ],
+          "diagram": [
+            "graph TB",
+            "  ConvStore[(Conversation Store)]",
+            "  LLM[/LLM Inference/]",
+            "  ConvStore -->|last N turns only| LLM"
+          ],
+          "highlight": [
+            "ConvStore"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Resending the entire history every turn",
+          "why": "Token cost and latency grow with conversation length and you eventually overflow the window anyway.",
+          "instead": "Cap the budget: recent turns verbatim, older turns as a rolling summary."
+        },
+        {
+          "trap": "Forgetting that retrieved context also competes for the window",
+          "why": "History can crowd out the very documents you retrieved, defeating RAG.",
+          "instead": "Budget the window across system prompt, summary, recent turns, AND retrieved chunks."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A user references something from 150 turns ago.",
+          "expectedBehavior": "The assistant still has the gist.",
+          "mitigation": "The rolling summary retains key facts; optionally retrieve old turns semantically if needed."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Budgets the window across all prompt parts including retrieval.",
+          "Uses summarization rather than blind truncation."
+        ],
+        "weak": [
+          "Resends full history.",
+          "Truncates with no summary and loses context."
+        ]
+      },
+      "recap": {
+        "before": "Each call was a blank slate.",
+        "after": "Conversations persist and fit the window via recent-turns + summary.",
+        "newRisk": "Summarization loses detail and costs a call; the budget is shared with retrieval."
+      },
+      "whyNow": [
+        "Memory must exist before we add retrieved context that competes for the same token budget."
+      ]
+    },
+    {
+      "id": "streaming",
+      "title": "3. Streaming Responses",
+      "description": "Generation takes seconds; waiting for the whole answer feels broken. Stream tokens to the client as they're produced (SSE or WebSocket) so time-to-first-token is ~1s even when total time is much longer.",
+      "patterns": [
+        "Streaming (SSE / WebSocket)"
+      ],
+      "decisionPrompt": "Total generation takes 8 seconds. How do you make the experience feel fast?",
+      "concepts": [
+        {
+          "term": "Time-to-first-token",
+          "definition": "Latency until the user sees the first piece of output.",
+          "whyItMatters": "It dominates perceived speed; streaming makes it tiny even for long answers."
+        },
+        {
+          "term": "Server-sent events / WebSocket",
+          "definition": "Transports that push incremental tokens to the client.",
+          "whyItMatters": "Let the orchestrator relay model tokens as they arrive."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client / Chat UI]",
+        "  API[Chat API Gateway]",
+        "  Stream[Streaming Gateway \u2014 SSE/WS]",
+        "  Orchestrator[Chat Orchestrator]",
+        "  LLM[/LLM Inference/]",
+        "  Client -->|message| API",
+        "  API --> Orchestrator",
+        "  Orchestrator -->|prompt| LLM",
+        "  LLM -->|tokens| Orchestrator",
+        "  Orchestrator --> Stream",
+        "  Stream -->|deltas| Client"
+      ],
+      "highlight": [
+        "Stream"
+      ],
+      "deepDives": [
+        {
+          "title": "Streaming pitfalls",
+          "points": [
+            "Relay tokens as they arrive; don't buffer the whole answer before sending.",
+            "Run safety checks incrementally or on a sliding window so streaming isn't blocked by a final filter.",
+            "Send citations/usage as a terminal event after the token stream completes.",
+            "Handle client disconnect: stop generation to avoid paying for tokens nobody reads."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Buffering the full completion, then sending it",
+          "why": "Throws away streaming's entire benefit \u2014 the user stares at a spinner for 8s.",
+          "instead": "Forward each token delta to the client as it arrives."
+        },
+        {
+          "trap": "Not stopping generation on client disconnect",
+          "why": "You keep paying for tokens that will never be displayed.",
+          "instead": "Cancel the upstream LLM call when the client stream closes."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The connection drops mid-stream.",
+          "expectedBehavior": "No wasted spend; the partial answer is recoverable or clearly incomplete.",
+          "mitigation": "Cancel upstream generation on disconnect; persist partial output keyed by message id for resume."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Streams deltas and cancels on disconnect.",
+          "Handles safety and citations without blocking the stream."
+        ],
+        "weak": [
+          "Buffers then sends.",
+          "Keeps generating after the client leaves."
+        ]
+      },
+      "recap": {
+        "before": "Users waited for the whole answer.",
+        "after": "Tokens stream out with ~1s time-to-first-token.",
+        "newRisk": "Streaming complicates safety filtering and disconnect handling."
+      },
+      "whyNow": [
+        "Streaming is table stakes for chat UX and must be in place before retrieval lengthens the pipeline."
+      ]
+    },
+    {
+      "id": "ingestion",
+      "title": "4. Document Ingestion: Chunking & Embeddings",
+      "description": "To ground answers, ingest documents: split them into passages (chunks), embed each chunk into a vector, and upsert into a vector index plus a chunk store. This runs asynchronously off the query path and re-runs when documents change.",
+      "patterns": [
+        "Async ingestion pipeline",
+        "Embedding + vector index (ANN)"
+      ],
+      "decisionPrompt": "How big should a chunk be, and what breaks if it's too large or too small?",
+      "concepts": [
+        {
+          "term": "Chunking",
+          "definition": "Splitting a document into passages sized for embedding and retrieval.",
+          "whyItMatters": "Chunk size trades retrieval precision (small) against context completeness (large)."
+        },
+        {
+          "term": "Embedding",
+          "definition": "A vector representation of text capturing semantic meaning.",
+          "whyItMatters": "Enables semantic 'find similar passages' rather than keyword match."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Ingest[Doc Ingestion Pipeline]",
+        "  Chunker[Chunk + Embed Worker]",
+        "  Embed[/Embedding Model/]",
+        "  VectorDB[(Vector Index)]",
+        "  DocStore[(Document / Chunk Store)]",
+        "  Ingest --> Chunker",
+        "  Chunker -->|embed| Embed",
+        "  Embed -->|vectors| Chunker",
+        "  Chunker -->|upsert vectors| VectorDB",
+        "  Chunker -->|store text + metadata| DocStore"
+      ],
+      "highlight": [
+        "Ingest",
+        "Chunker",
+        "Embed",
+        "VectorDB",
+        "DocStore"
+      ],
+      "deepDives": [
+        {
+          "title": "Chunking and re-indexing",
+          "points": [
+            "Chunk on semantic boundaries (paragraphs/sections) with slight overlap so context isn't cut mid-thought.",
+            "Store source + position with each chunk so answers can cite the exact passage.",
+            "On document update, re-embed only changed chunks; version documents so stale chunks are retired."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "One giant chunk per document",
+          "why": "Retrieval returns huge, mostly-irrelevant context that wastes the window and dilutes grounding.",
+          "instead": "Chunk to passage size with overlap; retrieve the few most relevant."
+        },
+        {
+          "trap": "Embedding synchronously during a query",
+          "why": "Re-embedding the corpus per query is impossibly slow and costly.",
+          "instead": "Embed at ingestion time, asynchronously; queries only embed the question."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A 500-page handbook is uploaded during peak query load.",
+          "expectedBehavior": "Queries stay fast; the doc becomes searchable shortly after.",
+          "mitigation": "Ingestion is async and rate-limited off the query path; indexing lag is acceptable."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Chunks on semantic boundaries with overlap and stores citation metadata.",
+          "Keeps embedding async and re-embeds only changed chunks."
+        ],
+        "weak": [
+          "Uses arbitrary fixed-size or whole-doc chunks.",
+          "Embeds at query time."
+        ]
+      },
+      "recap": {
+        "before": "The corpus wasn't searchable by meaning.",
+        "after": "Documents are chunked, embedded, and indexed for semantic retrieval, with citations.",
+        "newRisk": "Chunking strategy and re-indexing freshness become tuning knobs."
+      },
+      "whyNow": [
+        "Retrieval needs an index; the index needs an ingestion pipeline first."
+      ]
+    },
+    {
+      "id": "retrieval",
+      "title": "5. Retrieval & Reranking",
+      "description": "At query time, embed the question, find the top-k most similar chunks via approximate nearest-neighbor search, and rerank them for relevance. Optionally combine vector search with keyword/BM25 (hybrid) for terms that embeddings miss.",
+      "patterns": [
+        "Embedding + vector index (ANN)",
+        "Retrieval-augmented generation (RAG)"
+      ],
+      "decisionPrompt": "Vector search returns 50 plausible chunks. How do you pick the few that actually go in the prompt?",
+      "concepts": [
+        {
+          "term": "Approximate nearest neighbor (ANN)",
+          "definition": "Sub-linear similarity search trading a little recall for big speed (HNSW, IVF).",
+          "whyItMatters": "Exact search over millions of vectors per query is too slow."
+        },
+        {
+          "term": "Reranking",
+          "definition": "A second, more precise model scores the candidate chunks for relevance.",
+          "whyItMatters": "ANN recall is coarse; reranking sharpens which few chunks ground the answer."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Orchestrator[Chat Orchestrator]",
+        "  Embed[/Embedding Model/]",
+        "  Retriever[Retrieval Service]",
+        "  VectorDB[(Vector Index)]",
+        "  Reranker[Reranker]",
+        "  DocStore[(Document / Chunk Store)]",
+        "  Orchestrator -->|embed question| Embed",
+        "  Embed --> Retriever",
+        "  Retriever -->|ANN top-k| VectorDB",
+        "  Retriever --> Reranker",
+        "  Reranker -->|fetch text| DocStore",
+        "  Reranker -->|top chunks| Orchestrator"
+      ],
+      "highlight": [
+        "Retriever",
+        "Reranker"
+      ],
+      "options": [
+        {
+          "name": "Vector ANN + reranker (default)",
+          "pros": [
+            "Fast candidate generation; precise final selection.",
+            "Reranker catches relevance the embedding alone misses."
+          ],
+          "cons": [
+            "Reranking adds latency and another model.",
+            "Two stages to tune."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Retriever[Retrieval Service]",
+            "  VectorDB[(Vector Index)]",
+            "  Reranker[Reranker]",
+            "  Retriever -->|top-50| VectorDB",
+            "  Retriever --> Reranker"
+          ],
+          "highlight": [
+            "Reranker"
+          ]
+        },
+        {
+          "name": "Hybrid (vector + keyword/BM25)",
+          "pros": [
+            "Catches exact terms, codes, and names embeddings blur.",
+            "More robust recall."
+          ],
+          "cons": [
+            "Must fuse two ranked lists; more moving parts."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Retriever[Retrieval Service]",
+            "  VectorDB[(Vector Index)]",
+            "  DocStore[(Document / Chunk Store)]",
+            "  Retriever -->|vector| VectorDB",
+            "  Retriever -->|keyword| DocStore"
+          ],
+          "highlight": [
+            "Retriever"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Stuffing all top-k chunks into the prompt",
+          "why": "Irrelevant chunks waste the window, raise cost, and can mislead the model.",
+          "instead": "Rerank and include only the few most relevant; leave window for history and the answer."
+        },
+        {
+          "trap": "Pure vector search for exact identifiers",
+          "why": "Embeddings blur exact codes/SKUs/names, so a precise lookup can miss.",
+          "instead": "Add keyword/BM25 in a hybrid retriever for exact-match needs."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "Retrieval returns nothing relevant for a question.",
+          "expectedBehavior": "The assistant says it doesn't know rather than hallucinating.",
+          "mitigation": "Threshold on relevance score; if below it, answer 'not found in sources' instead of grounding on noise."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Uses ANN for candidates and a reranker for precision; knows when to go hybrid.",
+          "Thresholds relevance to avoid grounding on noise."
+        ],
+        "weak": [
+          "Dumps all candidates into the prompt.",
+          "Relies on vectors alone for exact-match queries."
+        ]
+      },
+      "recap": {
+        "before": "The corpus was indexed but not yet queried.",
+        "after": "Each question retrieves and reranks the few most relevant grounded chunks.",
+        "newRisk": "Retrieval quality bounds answer quality; thresholds prevent grounding on irrelevant chunks."
+      },
+      "whyNow": [
+        "Retrieval is the 'R' in RAG \u2014 the bridge from index to grounded answer."
+      ]
+    },
+    {
+      "id": "rag-assembly",
+      "title": "6. RAG Assembly, Grounding & Citations",
+      "description": "Assemble the final prompt \u2014 system instructions, conversation summary, recent turns, and retrieved chunks \u2014 instruct the model to answer only from the provided context and cite sources, then map the answer back to chunk citations.",
+      "patterns": [
+        "Retrieval-augmented generation (RAG)",
+        "Context window management"
+      ],
+      "decisionPrompt": "How do you make the model answer from the documents and admit when they don't contain the answer?",
+      "concepts": [
+        {
+          "term": "Grounding",
+          "definition": "Constraining the model to answer from supplied context, not its parametric memory.",
+          "whyItMatters": "Reduces hallucination and keeps answers current with the corpus."
+        },
+        {
+          "term": "Citation mapping",
+          "definition": "Linking spans of the answer back to the chunks that support them.",
+          "whyItMatters": "Lets users verify and trust answers; turns RAG from a black box into a sourced one."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Orchestrator[Chat Orchestrator]",
+        "  Retriever[Retrieval Service]",
+        "  Summarizer[Context / Summary Builder]",
+        "  LLM[/LLM Inference/]",
+        "  Stream[Streaming Gateway \u2014 SSE/WS]",
+        "  Retriever -->|chunks + citations| Orchestrator",
+        "  Summarizer -->|history| Orchestrator",
+        "  Orchestrator -->|grounded prompt| LLM",
+        "  LLM -->|answer + cited chunks| Orchestrator",
+        "  Orchestrator --> Stream"
+      ],
+      "highlight": [
+        "Orchestrator"
+      ],
+      "deepDives": [
+        {
+          "title": "Reducing hallucination",
+          "points": [
+            "Instruct: 'answer only from the context; if it's not there, say you don't know.'",
+            "Pass chunk ids alongside text so the model can cite, and validate citations against retrieved ids.",
+            "If retrieval scored low, prefer 'I couldn't find that' over a confident guess."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Putting context in the prompt but not instructing grounding",
+          "why": "The model blends parametric knowledge with context and still hallucinates.",
+          "instead": "Explicitly instruct it to answer only from context and to cite; validate citations."
+        },
+        {
+          "trap": "Trusting citations the model emits without checking",
+          "why": "Models can fabricate plausible-looking citations.",
+          "instead": "Validate emitted citations against the actually-retrieved chunk ids; drop unverifiable ones."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The model answers confidently but cites a chunk that wasn't retrieved.",
+          "expectedBehavior": "The bogus citation is caught.",
+          "mitigation": "Validate every citation against the retrieved set; surface only verified ones, flag the rest."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Instructs grounding + 'say you don't know', and validates citations.",
+          "Budgets the window across all prompt parts."
+        ],
+        "weak": [
+          "Adds context without grounding instructions.",
+          "Trusts model-emitted citations blindly."
+        ]
+      },
+      "recap": {
+        "before": "Retrieved chunks weren't yet shaped into a grounded, cited answer.",
+        "after": "The model answers from context with verified citations, or declines.",
+        "newRisk": "Grounding quality depends on retrieval; citation validation is mandatory."
+      },
+      "whyNow": [
+        "This is the heart of RAG \u2014 turning retrieved context into a trustworthy, sourced answer."
+      ]
+    },
+    {
+      "id": "cost-control",
+      "title": "7. Caching & Cost / Rate Control",
+      "description": "LLM tokens are the dominant cost and usage is unbounded by default. Add a semantic/prompt cache for repeated questions, cache embeddings, and enforce per-user/per-tenant rate and cost limits with graceful degradation.",
+      "patterns": [
+        "Semantic / prompt caching",
+        "Rate limiting / throttling"
+      ],
+      "decisionPrompt": "Your LLM bill is growing super-linearly with users. Where do you cut cost without gutting quality?",
+      "concepts": [
+        {
+          "term": "Semantic cache",
+          "definition": "Return a stored answer when a new question is semantically equivalent to a past one.",
+          "whyItMatters": "Repeated FAQs over a stable corpus can skip the LLM entirely."
+        },
+        {
+          "term": "Cost budget / quota",
+          "definition": "Per-user/tenant token or dollar limits.",
+          "whyItMatters": "Without it, one user or a loop can run up an unbounded bill."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Orchestrator[Chat Orchestrator]",
+        "  Cache[(Semantic / Prompt Cache)]",
+        "  Limiter[Rate / Cost Limiter]",
+        "  Retriever[Retrieval Service]",
+        "  LLM[/LLM Inference/]",
+        "  Orchestrator -->|lookup| Cache",
+        "  Orchestrator -->|check budget| Limiter",
+        "  Orchestrator -->|miss| Retriever",
+        "  Orchestrator -->|miss| LLM",
+        "  LLM -->|store answer| Cache"
+      ],
+      "highlight": [
+        "Cache",
+        "Limiter"
+      ],
+      "options": [
+        {
+          "name": "Semantic cache + per-tenant budgets (default)",
+          "pros": [
+            "Skips retrieval+LLM for repeat questions; caps spend per tenant.",
+            "Embedding cache avoids re-embedding identical text."
+          ],
+          "cons": [
+            "Semantic cache can return a stale or slightly-off answer; needs a similarity threshold and TTL.",
+            "Cache invalidation on corpus change."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Orchestrator[Chat Orchestrator]",
+            "  Cache[(Semantic / Prompt Cache)]",
+            "  Orchestrator -->|similar question| Cache"
+          ],
+          "highlight": [
+            "Cache"
+          ]
+        },
+        {
+          "name": "Exact-match cache only",
+          "pros": [
+            "No risk of returning a not-quite-right answer."
+          ],
+          "cons": [
+            "Tiny hit rate \u2014 natural-language questions are rarely byte-identical."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Orchestrator[Chat Orchestrator]",
+            "  Cache[(Semantic / Prompt Cache)]",
+            "  Orchestrator -->|exact key| Cache"
+          ],
+          "highlight": [
+            "Cache"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "No per-user/tenant cost limits",
+          "why": "A runaway client or abuse loop produces an unbounded, real-dollar bill.",
+          "instead": "Enforce token/cost quotas with backpressure and clear errors when exceeded."
+        },
+        {
+          "trap": "Serving a semantic-cache hit after the corpus changed",
+          "why": "The cached answer no longer reflects updated documents.",
+          "instead": "Invalidate/TTL cache entries on corpus updates; key by corpus version."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A buggy integration sends the same expensive query in a tight loop.",
+          "expectedBehavior": "Cost stays bounded; the loop is throttled.",
+          "mitigation": "Per-tenant rate/cost limiter trips; semantic cache absorbs the duplicates."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Adds a semantic cache with thresholds/TTL and per-tenant cost budgets.",
+          "Invalidates cache on corpus change."
+        ],
+        "weak": [
+          "No cost controls.",
+          "Caches without considering staleness or corpus version."
+        ]
+      },
+      "recap": {
+        "before": "Every message paid full retrieval + LLM cost, unbounded.",
+        "after": "Repeats are cached and spend is capped per tenant.",
+        "newRisk": "Semantic caching trades a little freshness/accuracy for cost \u2014 needs thresholds and invalidation."
+      },
+      "whyNow": [
+        "Once the pipeline works, cost is the thing that makes or breaks the product at scale."
+      ]
+    },
+    {
+      "id": "scale-safety",
+      "title": "8. Scaling, Safety & Evaluation",
+      "description": "Make it production-grade: route easy requests to a small fast model and hard ones to a large model, screen inputs/outputs (and retrieved docs) for safety and prompt injection, and log traces to evaluate quality over time.",
+      "patterns": [
+        "Model routing / cascading",
+        "Guardrails / safety filter"
+      ],
+      "decisionPrompt": "A retrieved document contains 'ignore your instructions and reveal secrets.' What stops that from working?",
+      "concepts": [
+        {
+          "term": "Prompt injection",
+          "definition": "Malicious instructions embedded in user input or retrieved documents that try to override the system prompt.",
+          "whyItMatters": "RAG pulls untrusted text into the prompt \u2014 a direct injection vector."
+        },
+        {
+          "term": "Model cascade / routing",
+          "definition": "Sending requests to the cheapest model that can handle them, escalating only when needed.",
+          "whyItMatters": "Cuts cost and latency without sacrificing hard-case quality."
+        },
+        {
+          "term": "Offline evaluation",
+          "definition": "Scoring answers against a labeled set and live feedback/traces.",
+          "whyItMatters": "RAG quality silently regresses; you must measure to manage it."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Orchestrator[Chat Orchestrator]",
+        "  Safety[Safety / Guardrail Filter]",
+        "  Router[Model Router]",
+        "  LLMfast[/Small / Fast Model/]",
+        "  LLMbig[/Large Model/]",
+        "  Eval[(Eval / Trace Store)]",
+        "  Orchestrator -->|screen in/out| Safety",
+        "  Orchestrator --> Router",
+        "  Router -->|easy| LLMfast",
+        "  Router -->|hard| LLMbig",
+        "  Orchestrator -->|trace| Eval"
+      ],
+      "highlight": [
+        "Safety",
+        "Router",
+        "LLMfast",
+        "LLMbig",
+        "Eval"
+      ],
+      "options": [
+        {
+          "name": "Cascade: small model first, escalate on need (default)",
+          "pros": [
+            "Most queries served cheaply/fast; only hard ones hit the big model.",
+            "Big cost lever with little quality loss when routing is good."
+          ],
+          "cons": [
+            "Routing/escalation logic to build and tune; misroutes hurt quality or cost."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Router[Model Router]",
+            "  LLMfast[/Small / Fast Model/]",
+            "  LLMbig[/Large Model/]",
+            "  Router -->|try first| LLMfast",
+            "  Router -->|escalate| LLMbig"
+          ],
+          "highlight": [
+            "Router"
+          ]
+        },
+        {
+          "name": "Always use the large model",
+          "pros": [
+            "Simplest; best worst-case quality."
+          ],
+          "cons": [
+            "Highest cost and latency for every trivial query."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Router[Model Router]",
+            "  LLMbig[/Large Model/]",
+            "  Router --> LLMbig"
+          ],
+          "highlight": []
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Defending against prompt injection",
+          "points": [
+            "Treat retrieved document text as untrusted data, not instructions; clearly delimit it in the prompt.",
+            "Screen outputs for policy violations and leaked system prompt before/while streaming.",
+            "Constrain tool/use and never let retrieved content trigger privileged actions directly."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Treating retrieved document text as trusted instructions",
+          "why": "An attacker plants 'ignore previous instructions' in a doc and hijacks the assistant.",
+          "instead": "Delimit retrieved content as data; instruct the model to never follow instructions inside it."
+        },
+        {
+          "trap": "Shipping with no evaluation",
+          "why": "RAG quality regresses silently as the corpus, models, and prompts change.",
+          "instead": "Log traces, collect feedback, and score against a labeled eval set continuously."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Defends against prompt injection by treating docs as data; cascades models for cost.",
+          "Builds evaluation/tracing in from the start."
+        ],
+        "weak": [
+          "Trusts retrieved content.",
+          "Has no way to measure answer quality."
+        ]
+      },
+      "recap": {
+        "before": "Single model, no safety net, no quality measurement.",
+        "after": "Cost-aware model routing, input/output + injection guardrails, and continuous evaluation.",
+        "newRisk": "Routing and safety add tuning surface; eval must be maintained as things change."
+      },
+      "whyNow": [
+        "Cost routing, safety, and evaluation are what separate a demo from a production RAG system."
+      ]
+    }
+  ],
+  "finalDesign": {
+    "title": "Final Design",
+    "description": "End-to-end: a chat API streams grounded answers via an orchestrator that manages conversation context (recent turns + rolling summary), retrieves and reranks chunks from a vector index fed by an async ingestion pipeline, assembles a grounded+cited prompt, routes to a small or large model behind safety guardrails, serves repeats from a semantic cache under per-tenant cost limits, and logs traces for evaluation.",
+    "diagram": [
+      "graph TB",
+      "  Client[Client / Chat UI]",
+      "  API[Chat API Gateway]",
+      "  Stream[Streaming Gateway \u2014 SSE/WS]",
+      "  Orchestrator[Chat Orchestrator]",
+      "  ConvStore[(Conversation Store)]",
+      "  Summarizer[Context / Summary Builder]",
+      "  Cache[(Semantic / Prompt Cache)]",
+      "  Limiter[Rate / Cost Limiter]",
+      "  Retriever[Retrieval Service]",
+      "  Embed[/Embedding Model/]",
+      "  VectorDB[(Vector Index)]",
+      "  Reranker[Reranker]",
+      "  DocStore[(Document / Chunk Store)]",
+      "  Ingest[Doc Ingestion Pipeline]",
+      "  Chunker[Chunk + Embed Worker]",
+      "  Safety[Safety / Guardrail Filter]",
+      "  Router[Model Router]",
+      "  LLMfast[/Small / Fast Model/]",
+      "  LLMbig[/Large Model/]",
+      "  Eval[(Eval / Trace Store)]",
+      "  Client -->|message| API",
+      "  API --> Orchestrator",
+      "  Orchestrator --> ConvStore",
+      "  Orchestrator --> Summarizer",
+      "  Orchestrator -->|lookup| Cache",
+      "  Orchestrator -->|budget| Limiter",
+      "  Orchestrator --> Retriever",
+      "  Retriever -->|embed q| Embed",
+      "  Retriever -->|ANN| VectorDB",
+      "  Retriever --> Reranker",
+      "  Reranker --> DocStore",
+      "  Ingest --> Chunker",
+      "  Chunker --> Embed",
+      "  Chunker -->|upsert| VectorDB",
+      "  Chunker --> DocStore",
+      "  Orchestrator --> Safety",
+      "  Orchestrator --> Router",
+      "  Router -->|easy| LLMfast",
+      "  Router -->|hard| LLMbig",
+      "  Orchestrator --> Stream",
+      "  Stream -->|tokens| Client",
+      "  Orchestrator -->|trace| Eval"
+    ],
+    "highlight": []
+  },
+  "satisfies": {
+    "functional": [
+      {
+        "requirement": "Multi-turn conversation",
+        "how": "Conversation store plus context assembly (recent turns + summary).",
+        "steps": [
+          "conversation"
+        ]
+      },
+      {
+        "requirement": "Ground answers in documents with citations",
+        "how": "Retrieve+rerank chunks, assemble a grounded prompt, validate citations.",
+        "steps": [
+          "retrieval",
+          "rag-assembly"
+        ]
+      },
+      {
+        "requirement": "Stream the response",
+        "how": "Token streaming over SSE/WebSocket via a streaming gateway.",
+        "steps": [
+          "streaming"
+        ]
+      },
+      {
+        "requirement": "Ingest and re-index documents",
+        "how": "Async chunk+embed+index pipeline with versioning.",
+        "steps": [
+          "ingestion"
+        ]
+      },
+      {
+        "requirement": "Maintain history",
+        "how": "Persisted messages and a rolling summary per conversation.",
+        "steps": [
+          "conversation"
+        ]
+      }
+    ],
+    "nonFunctional": [
+      {
+        "requirement": "Low time-to-first-token",
+        "how": "Streaming so first token shows in ~1s regardless of total length.",
+        "steps": [
+          "streaming"
+        ]
+      },
+      {
+        "requirement": "Stay within the context window",
+        "how": "Budgeted prompt: summary + recent turns + reranked chunks.",
+        "steps": [
+          "conversation",
+          "rag-assembly"
+        ]
+      },
+      {
+        "requirement": "Reduce hallucination",
+        "how": "Grounding instructions, relevance thresholds, and citation validation.",
+        "steps": [
+          "retrieval",
+          "rag-assembly"
+        ]
+      },
+      {
+        "requirement": "Control cost",
+        "how": "Semantic cache, per-tenant budgets, and small/large model routing.",
+        "steps": [
+          "cost-control",
+          "scale-safety"
+        ]
+      },
+      {
+        "requirement": "Safety & prompt-injection resistance",
+        "how": "Input/output guardrails; retrieved docs treated as untrusted data.",
+        "steps": [
+          "scale-safety"
+        ]
+      },
+      {
+        "requirement": "Graceful degradation",
+        "how": "Decline when retrieval is weak; cache and fallbacks when the LLM is slow/down.",
+        "steps": [
+          "retrieval",
+          "cost-control"
+        ]
+      }
+    ]
+  },
+  "interviewScript": [
+    {
+      "phase": "Scope & the real problem",
+      "time": "first 5 min",
+      "say": [
+        "Restate it: a chat assistant grounded in our documents, answering with citations.",
+        "List functional (chat, RAG+citations, streaming, ingestion) and non-functional (latency, context budget, cost, safety).",
+        "Name the AI-specific tensions: stateless model, fixed context window, token cost, hallucination."
+      ]
+    },
+    {
+      "phase": "Estimate & API",
+      "time": "5\u201315 min",
+      "say": [
+        "Size messages/s, corpus chunks, context-window budget, and the cost-per-token reality.",
+        "Sketch POST message (streaming), POST document (async ingest), and feedback."
+      ]
+    },
+    {
+      "phase": "Build up the design",
+      "time": "15\u201340 min",
+      "say": [
+        "Start with the thin LLM proxy, add conversation+context budgeting, then streaming.",
+        "Build the ingestion pipeline, then retrieval+rerank, then grounded RAG assembly with citations.",
+        "Go deep where pushed: chunking/embeddings, retrieval quality, or grounding/hallucination."
+      ]
+    },
+    {
+      "phase": "Cost, safety, wrap",
+      "time": "final 5 min",
+      "say": [
+        "Add semantic caching, per-tenant cost limits, model routing, guardrails, and evaluation.",
+        "Summarize how each requirement is met and name the dominant risks (cost and hallucination)."
+      ]
+    }
+  ],
+  "levelVariants": [
+    {
+      "level": "Junior",
+      "expectations": [
+        "Treats the LLM as stateless and sends conversation context each call.",
+        "Knows RAG = retrieve relevant text and put it in the prompt, and that streaming improves UX."
+      ]
+    },
+    {
+      "level": "Senior",
+      "expectations": [
+        "Designs chunking/embeddings and an async ingestion pipeline with a vector index.",
+        "Budgets the context window across summary, history, and retrieval; adds reranking.",
+        "Grounds answers with citation validation and relevance thresholds."
+      ]
+    },
+    {
+      "level": "Staff+",
+      "expectations": [
+        "Controls cost with semantic caching, per-tenant budgets, and model cascading.",
+        "Defends against prompt injection by treating retrieved content as untrusted data.",
+        "Builds continuous evaluation/tracing and reasons about quality regressions over time."
+      ]
+    }
+  ],
+  "followUps": [
+    "How would you add tool/function calling and keep retrieved content from triggering privileged tools?",
+    "How do you evaluate RAG quality offline and online without a ground-truth answer for every query?",
+    "How would you support multi-tenant corpora with strict isolation so one tenant can't retrieve another's docs?",
+    "How do you keep answers fresh when documents change frequently (incremental re-indexing + cache invalidation)?",
+    "How would you handle very large documents or multi-hop questions needing several retrieval rounds?",
+    "How do you attribute and bill cost per tenant given variable token usage and model routing?"
+  ]
+}

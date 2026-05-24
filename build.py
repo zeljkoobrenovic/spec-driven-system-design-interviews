@@ -2,7 +2,8 @@
 """Build the static site(s) from sources into docs/.
 
 Source of truth:
-  _templates/        shared HTML/CSS/JS shell (index.html, styles.css, app.js)
+  _templates/        shared shell: overview (index.html + overview.js), explorer
+                     (interview.html + interview.js), styles.css, icons/
   data/<group>/      one dataset group per directory; each group that is meant
                      to be published has an index.json manifest plus one
                      subdirectory per dataset (<id>/interview.json, etc.)
@@ -33,7 +34,15 @@ DATA = ROOT / "data"
 DOCS = ROOT / "docs"
 
 # Files the templates must contain for a build to make sense.
-REQUIRED_TEMPLATE_FILES = ("index.html", "styles.css", "app.js")
+# The overview page (index.html + overview.js) links to the per-interview
+# explorer (interview.html + interview.js); styles.css is shared by both.
+REQUIRED_TEMPLATE_FILES = (
+    "index.html",
+    "interview.html",
+    "styles.css",
+    "interview.js",
+    "overview.js",
+)
 
 
 def fail(msg):
@@ -65,8 +74,8 @@ def build_group(group):
     if out.exists():
         shutil.rmtree(out)
 
-    # 1. Shared template shell — the whole _templates/ tree (index.html,
-    #    styles.css, app.js, plus any icons/ or other assets).
+    # 1. Shared template shell — the whole _templates/ tree (both pages, their
+    #    JS, styles.css, plus icons/ and any other assets).
     shutil.copytree(TEMPLATES, out)
     out_data.mkdir(parents=True)
 

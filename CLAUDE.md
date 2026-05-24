@@ -6,34 +6,53 @@ where logic lives, and common pitfalls.
 
 ## What this is
 
-A static, single-page system-design interview explorer. No framework, one CDN
-dep (Mermaid v10). The page itself has no bundler — the only "build" is a copy
-step (`build.py`) that assembles deployable sites from sources into `docs/`.
+A static system-design interview explorer. No framework, one CDN dep
+(Mermaid v10). The pages have no bundler — the only "build" is a copy step
+(`build.py`) that assembles deployable sites from sources into `docs/`.
+
+Two pages, sharing `styles.css`:
+
+- **`index.html` (overview)** — a visual grid of all interviews, organized into
+  categories. Driven by `overview.js`. Each card shows an icon and links to the
+  explorer via `interview.html#<datasetId>`.
+- **`interview.html` (explorer)** — the per-interview step-by-step walkthrough.
+  Driven by `interview.js` (one IIFE). This is the original single-page app.
+
+> **"Group" is overloaded — watch out.** A *dataset group* is a top-level
+> directory under `data/` (e.g. `examples`, `book`) that builds into one
+> independent site `docs/<group>/`. A *category* is the `groups[]` array inside
+> a single site's `index.json` (e.g. "Fundamentals", "Media & Search") — the
+> sections the overview renders. The JSON key is `groups` for historical
+> reasons; in prose we call those **categories**.
 
 ### Source layout (what you edit)
 
 | Path                                | Role                                                     |
 |-------------------------------------|----------------------------------------------------------|
-| `_templates/index.html`             | DOM shell + Mermaid CDN tag (shared by every group)      |
-| `_templates/styles.css`             | All styling (shared)                                     |
-| `_templates/app.js`                 | All behavior, one IIFE, no modules (shared)              |
-| `data/<group>/index.json`           | One group's dataset manifest                             |
+| `_templates/index.html`             | Overview-page DOM shell (shared by every group)          |
+| `_templates/overview.js`            | Overview-page behavior (one IIFE)                        |
+| `_templates/interview.html`         | Explorer DOM shell + Mermaid CDN tag (shared)            |
+| `_templates/interview.js`           | Explorer behavior (one IIFE, no modules)                 |
+| `_templates/styles.css`             | All styling, both pages (shared)                         |
+| `_templates/icons/system-design.png`| Fallback interview icon (shared)                         |
+| `data/<group>/index.json`           | One site's manifest (`groups[]` of categories)           |
 | `data/<group>/<id>/interview.json`  | One dataset per subdirectory                             |
+| `data/<group>/<id>/icon.png`        | Optional per-interview icon (else falls back)            |
 
 Datasets are organized into **groups** (each a directory under `data/`).
-`data/examples/` is the canonical group of worked examples; `data/book/` is a
-separate group. A group is publishable once it has an `index.json` manifest.
+`data/examples/` is the canonical group of worked examples; `data/book/` is the
+book group (its first dataset is `payment-system`, plus `BOOK-STRUCTURE.md` as a
+planning note). A group is publishable once it has an `index.json` manifest.
 
 ### Build output (generated — never hand-edit)
 
-`build.py` produces one independent, deployable single-page site per
-publishable group:
+`build.py` produces one independent, deployable site per publishable group:
 
 | Path                                | Role                                                     |
 |-------------------------------------|----------------------------------------------------------|
-| `docs/<group>/`                     | Copy of the whole `_templates/` tree (html/css/js + any `icons/`/assets) |
+| `docs/<group>/`                     | Copy of the whole `_templates/` tree (both pages, css, `icons/`) |
 | `docs/<group>/data/index.json`      | Copy of `data/<group>/index.json`                        |
-| `docs/<group>/data/<id>/...`        | Copy of each dataset subdir                              |
+| `docs/<group>/data/<id>/...`        | Copy of each dataset subdir (incl. any `icon.png`)       |
 
 `docs/` is **committed** (GitHub Pages deploys from the `/docs` folder). After
 changing anything in `_templates/` or `data/`, re-run `build.py` and commit the
@@ -47,8 +66,10 @@ python3 build.py examples   # rebuild only the named group(s)
 ```
 
 The script wipes and regenerates each `docs/<group>/`, so removed or renamed
-datasets don't linger. Groups without an `index.json` (e.g. `data/book/` while
-it only holds planning notes) are skipped with a notice.
+datasets don't linger. Groups without an `index.json` are skipped with a
+notice. Loose files at a group root that aren't dataset directories (e.g.
+`data/book/BOOK-STRUCTURE.md`) are not copied — only `index.json` and dataset
+subdirectories ship.
 
 ## Running locally
 
@@ -57,7 +78,8 @@ Serve a built group from `docs/`:
 ```bash
 python3 build.py                       # ensure docs/ is current
 python3 -m http.server 8000 -d docs    # serve the docs/ tree
-# visit http://localhost:8000/examples/
+# visit http://localhost:8000/examples/            (overview = index.html)
+# explorer is http://localhost:8000/examples/interview.html#url-shortener
 ```
 
 The app fetches JSON, so `file://` does not work — always serve. Note you
@@ -69,13 +91,14 @@ have no sibling `data/` directory of their own.
 The user usually can't see browser-side rendering from your sandbox. Use:
 
 ```bash
-node --check _templates/app.js                                  # JS syntax
+node --check _templates/interview.js                            # explorer JS
+node --check _templates/overview.js                             # overview JS
 python3 -c "import json; json.load(open('data/examples/...'))"  # JSON validity
 python3 build.py                                                # copy step itself
 ```
 
-Edit `_templates/app.js` (the source), not the `docs/<group>/app.js` copies —
-those are overwritten on the next build.
+Edit the sources in `_templates/` (`interview.js`, `overview.js`, …), not the
+`docs/<group>/` copies — those are overwritten on the next build.
 
 For dataset edits, cross-check that `highlight` node IDs actually appear in
 their diagrams, and that `satisfies[*].steps[*]` slugs resolve to real step
@@ -87,9 +110,9 @@ HTTP-serve check (`python3 build.py`, start `python3 -m http.server -d docs` in
 the background, curl each asset under `/examples/` for 200, stop server) is fast
 and worth doing after large edits.
 
-## app.js structure
+## interview.js structure
 
-One IIFE. Top to bottom:
+The explorer (`interview.js`). One IIFE. Top to bottom:
 
 1. **Mermaid init** — `securityLevel: 'strict'`. Don't change unless you need
    clickable nodes inside diagrams.
@@ -110,14 +133,25 @@ One IIFE. Top to bottom:
    `renderOptionTabs`, `renderProsCons`, `renderStepExtras`. The diagram
    highlight pipeline is described below.
 9. **Intro renderers** — `renderIntroRequirements`, `renderIntroCapacity`,
-   `renderIntroApi`, `renderIntroDataModel`, `renderIntroApiFlows`,
-   `renderIntroSatisfies`, `renderIntroFollowUps`. Each returns a DOM node;
-   `renderIntroEntry()` dispatches by slug.
+   `renderIntroApi`, `renderIntroDataModel`, `renderIntroPatterns`,
+   `renderIntroApiFlows`, `renderIntroSatisfies`, `renderIntroInterviewScript`,
+   `renderIntroLevelVariants`, `renderIntroFollowUps`. Each returns a DOM node;
+   `renderIntroEntry()` dispatches by slug. (`renderTraps` and
+   `renderStepPatternTags` are per-step, appended in `renderStepExtras`.)
 10. **`renderCurrentEntry()`** — top-level rendering. Shows/hides
     `#diagram-block` vs `#intro-block` based on `entry.kind`.
 11. **Navigation** — `selectEntry`, `selectOption`, `updateHash`, `parseHash`.
-12. **Dataset loading** — `validateDataset`, `loadDataset`, `init`.
+12. **Dataset loading** — `validateDataset`, `normalizeManifest`,
+    `loadDataset`, `init`. `normalizeManifest` accepts both the grouped
+    manifest (`groups[]`) and the legacy flat one (`datasets[]`), returning a
+    flat `datasets` list (each tagged with `groupId`/`groupName`) plus the
+    `groups` for the dropdown's `<optgroup>`s.
 13. **Event wiring** — buttons, dataset dropdown, arrow keys, `hashchange`.
+
+The overview page (`overview.js`) is a separate, much smaller IIFE: fetch
+`data/index.json`, `normalizeGroups()` (same dual-shape logic), render one
+`.group-section` per category with a grid of `.interview-card`s. It shares no
+code with `interview.js` — keep the two manifest normalizers in sync by hand.
 
 ## Highlight pipeline (the subtle part)
 
@@ -138,6 +172,16 @@ flowcharts. Don't try to unify them.
    `class A,B,C newNode` to the Mermaid source before render.
 5. CSS in `styles.css` (`.node.newNode > rect|polygon|…`) targets the
    rendered SVG. Mermaid's class assignment ends up on the `.node` group.
+
+**Layout direction is forced at render time, not authored.**
+`forceFlowchartDirection(src, dir)` rewrites the `graph`/`flowchart` header so
+the authored `LR`/`TB` doesn't matter: requirements + capacity diagrams →
+`LR`, architecture steps + final design → `TB`. Applied in
+`renderIntroRequirements`/`renderIntroCapacity` (LR) and `renderDiagram` (TB,
+which serves both steps and the `final-design` intro entry). It only touches
+flowcharts — sequence/ER sources pass through. So don't fuss over the header
+direction when authoring a dataset diagram in one of those four slots; it gets
+normalized. (API-flow, deep-dive, and data-model diagrams are *not* forced.)
 
 ### Sequence diagrams (per-step `flows[]`)
 
@@ -226,6 +270,25 @@ parent must reference an existing step id; unknown parents are ignored.
   lose specificity to the base.
 - `.bullets`, `.mono`, `.muted` are used widely as small utilities.
 
+## Book-feature fields
+
+Four optional fields exist for the `book` group's pedagogy (all degrade to
+nothing when absent, so the `examples` datasets are unaffected):
+
+- `patterns` (dataset) → Overview "Patterns" entry. Each `{ name, what,
+  whenToUse?, steps? }`; `steps` cross-links to the steps that use it.
+- `step.patterns` → per-step pattern-tag chips (string names, ideally matching
+  a dataset-level pattern name).
+- `step.traps` → per-step "Common traps" section. Each `{ trap, why?, instead? }`.
+- `interviewScript` (dataset) → Wrap-up "Interview Script" entry. Each
+  `{ phase, time?, say }` (`say` is a string or array).
+- `levelVariants` (dataset) → Wrap-up "By Level" entry. Each
+  `{ level, expectations }`.
+
+`data/book/payment-system` is the reference dataset that uses all of them;
+`url-shortener` carries a smaller sample (`patterns`, `interviewScript`,
+`levelVariants`, and `traps` on the cache step).
+
 ## Common pitfalls
 
 - **Editing `interview.json`**: it's a single big JSON object. Use small
@@ -246,8 +309,15 @@ parent must reference an existing step id; unknown parents are ignored.
   flows live in `renderIntroApiFlows` (the Wrap-up entry). The Overview
   API section is the contract only.
 - **Adding a new dataset**: create it under `data/<group>/<id>/interview.json`
-  and register it in that group's `data/<group>/index.json`, otherwise it won't
-  appear in the dropdown. Then re-run `python3 build.py` and commit `docs/`.
+  and register it inside one of the `groups[]` categories in that group's
+  `data/<group>/index.json` (`{ id, name, path }`), otherwise it won't appear in
+  the dropdown or the overview. Optionally drop a `data/<group>/<id>/icon.png`
+  for the overview card (else it falls back to `icons/system-design.png`). Then
+  re-run `python3 build.py` and commit `docs/`.
+- **Manifest is grouped**: `index.json` is `{ groups: [{ id, name, datasets:
+  [...] }] }`. Both `interview.js` (`normalizeManifest`) and `overview.js`
+  (`normalizeGroups`) still accept a legacy flat `{ datasets: [...] }`, so don't
+  assume one shape when editing either parser.
 - **Editing the wrong copy**: edit sources (`_templates/`, `data/<group>/`),
   never the generated `docs/<group>/` copies — the next build overwrites them.
 - **Forgetting to rebuild**: changes to `_templates/` or `data/` are invisible
@@ -265,7 +335,7 @@ just make the edit and confirm. Task tracking is worth it when there are
 If a new optional field is added to the schema:
 1. Update `PLAN.md` with the new field in the schema block.
 2. If it needs validation, add a check in `validateDataset()`.
-3. Write the renderer; wire it in (`_templates/app.js`).
+3. Write the renderer; wire it in (`_templates/interview.js`).
 4. Add styling in `_templates/styles.css`.
 5. Add sample content to `data/examples/url-shortener/interview.json` so the
    feature is visible immediately (this is the canonical "worked example"

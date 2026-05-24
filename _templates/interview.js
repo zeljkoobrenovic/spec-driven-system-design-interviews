@@ -19,7 +19,6 @@
     // ---------- DOM ----------
     const els = {
         datasetTitle: document.getElementById("dataset-title"),
-        datasetDescription: document.getElementById("dataset-description"),
         datasetSelect: document.getElementById("dataset-select"),
         navList: document.getElementById("nav-list"),
         stepTitle: document.getElementById("step-title"),
@@ -62,6 +61,7 @@
         api: "api",
         dataModel: "data-model",
         patterns: "patterns",
+        concepts: "concepts",
         patternCatalog: "pattern-catalog",
         finalDesign: "final-design",
         apiFlows: "api-flows",
@@ -76,7 +76,6 @@
         INTRO_SLUGS.finalDesign,
         INTRO_SLUGS.apiFlows,
         INTRO_SLUGS.satisfies,
-        INTRO_SLUGS.interviewScript,
         INTRO_SLUGS.levelVariants,
         INTRO_SLUGS.followUps,
     ];
@@ -623,6 +622,37 @@
         return ul;
     }
 
+    function conceptKey(concept) {
+        const raw = typeof concept === "string"
+            ? concept
+            : concept && (concept.term || concept.name || concept.title || concept.definition || concept.description);
+        return String(raw || "")
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, " ")
+            .trim();
+    }
+
+    function collectDatasetConcepts(data) {
+        const out = new Map();
+        for (const step of data && Array.isArray(data.steps) ? data.steps : []) {
+            const concepts = Array.isArray(step.concepts) ? step.concepts : [];
+            for (const concept of concepts) {
+                const key = conceptKey(concept);
+                if (!key) continue;
+
+                const source = typeof concept === "string" ? {term: concept} : Object.assign({}, concept);
+                if (!out.has(key)) {
+                    source.steps = Array.isArray(source.steps) ? source.steps.slice() : [];
+                    out.set(key, source);
+                }
+
+                const target = out.get(key);
+                if (step.id && !target.steps.includes(step.id)) target.steps.push(step.id);
+            }
+        }
+        return Array.from(out.values());
+    }
+
     // ---------- Entries (sidebar model) ----------
 
     function buildEntries(data) {
@@ -642,8 +672,15 @@
         if (Array.isArray(data.patterns) && data.patterns.length > 0) {
             entries.push({kind: "intro", id: INTRO_SLUGS.patterns, title: "Patterns", payload: data.patterns});
         }
+        const conceptItems = collectDatasetConcepts(data);
+        if (conceptItems.length > 0) {
+            entries.push({kind: "intro", id: INTRO_SLUGS.concepts, title: "Concepts", payload: conceptItems});
+        }
         if (Array.isArray(data.patternCatalog) && data.patternCatalog.length > 0) {
             entries.push({kind: "intro", id: INTRO_SLUGS.patternCatalog, title: "Pattern Catalog", payload: data.patternCatalog});
+        }
+        if (Array.isArray(data.interviewScript) && data.interviewScript.length > 0) {
+            entries.push({kind: "intro", id: INTRO_SLUGS.interviewScript, title: "Interview Script", payload: data.interviewScript});
         }
         if (Array.isArray(data.steps)) {
             for (const step of data.steps) entries.push({kind: "step", id: step.id, title: step.title, payload: step});
@@ -665,9 +702,6 @@
             (Array.isArray(data.satisfies.nonFunctional) && data.satisfies.nonFunctional.length > 0)
         )) {
             entries.push({kind: "intro", id: INTRO_SLUGS.satisfies, title: "Design vs. Requirements", payload: data.satisfies});
-        }
-        if (Array.isArray(data.interviewScript) && data.interviewScript.length > 0) {
-            entries.push({kind: "intro", id: INTRO_SLUGS.interviewScript, title: "Interview Script", payload: data.interviewScript});
         }
         if (Array.isArray(data.levelVariants) && data.levelVariants.length > 0) {
             entries.push({kind: "intro", id: INTRO_SLUGS.levelVariants, title: "By Level", payload: data.levelVariants});
@@ -773,7 +807,8 @@
         card.appendChild(p);
     }
 
-    function renderTopConcepts(concepts) {
+    function renderTopConcepts(concepts, opts) {
+        opts = opts || {};
         if (!Array.isArray(concepts) || concepts.length === 0) return null;
         const cards = [];
         for (const concept of concepts) {
@@ -801,16 +836,21 @@
                 }
                 appendConceptLine(card, "Why it matters", concept.whyItMatters || concept.why);
                 appendConceptLine(card, "Example", concept.example);
+                if (opts.showSteps && Array.isArray(concept.steps) && concept.steps.length > 0) {
+                    card.appendChild(makeStepChips(concept.steps));
+                }
             }
             if (card.children.length > 0) cards.push(card);
         }
         if (cards.length === 0) return null;
 
         const wrap = document.createElement("div");
-        wrap.className = "step-concepts";
-        const h = document.createElement("h3");
-        h.textContent = "Concepts introduced";
-        wrap.appendChild(h);
+        wrap.className = "step-concepts" + (opts.className ? ` ${opts.className}` : "");
+        if (opts.showTitle !== false) {
+            const h = document.createElement("h3");
+            h.textContent = opts.title || "Concepts introduced";
+            wrap.appendChild(h);
+        }
         const grid = document.createElement("div");
         grid.className = "concept-grid";
         cards.forEach((card) => grid.appendChild(card));
@@ -2078,6 +2118,12 @@
 
     function renderIntroRequirements(req) {
         const outer = document.createElement("div");
+        const description = state.data && String(state.data.description || "").trim();
+        if (description) {
+            const list = makeBulletList(bulletsFrom(description), "dataset-description muted");
+            list.id = "dataset-description";
+            outer.appendChild(list);
+        }
         if (state.data && hasDiagram(state.data.requirementsDiagram)) {
             // Requirements diagrams lay out left-to-right.
             outer.appendChild(makeMermaidEl(forceFlowchartDirection(state.data.requirementsDiagram, "LR"), "", {
@@ -2382,9 +2428,11 @@
     // Names the reusable design patterns this case teaches and links them to
     // the steps where they appear.
     function renderIntroPatterns(items) {
+        const patterns = Array.isArray(items) ? items : [];
         const wrap = document.createElement("div");
         wrap.className = "patterns-list";
-        for (const p of items) {
+
+        for (const p of patterns) {
             const card = document.createElement("div");
             card.className = "pattern-card";
 
@@ -2415,7 +2463,18 @@
             }
             wrap.appendChild(card);
         }
+
         return wrap;
+    }
+
+    // Overview > Concepts. Deduped from step.concepts and linked to the steps
+    // where each concept appears.
+    function renderIntroConcepts(items) {
+        return renderTopConcepts(items, {
+            className: "overview-concepts",
+            showSteps: true,
+            showTitle: false,
+        });
     }
 
     // Pattern Catalog (catalog dataset). Each item: { name, category?, what,
@@ -2496,7 +2555,7 @@
         return outer;
     }
 
-    // Wrap-up > Interview Script. Each item: { phase, time?, say }.
+    // Overview > Interview Script. Each item: { phase, time?, say }.
     // What to say across the interview's phases (first 5 min, 15, 30, final 5).
     function renderIntroInterviewScript(items) {
         const wrap = document.createElement("div");
@@ -2562,6 +2621,9 @@
                 break;
             case INTRO_SLUGS.patterns:
                 node = renderIntroPatterns(entry.payload);
+                break;
+            case INTRO_SLUGS.concepts:
+                node = renderIntroConcepts(entry.payload);
                 break;
             case INTRO_SLUGS.patternCatalog:
                 node = renderIntroPatternCatalog(entry.payload);
@@ -2922,7 +2984,6 @@
             state.entries = buildEntries(data);
 
             els.datasetTitle.textContent = data.title || meta.name || "System Design Explorer";
-            els.datasetDescription.textContent = data.description || "";
 
             let startIndex = 0;
             if (initialEntryId) {

@@ -6,36 +6,76 @@ where logic lives, and common pitfalls.
 
 ## What this is
 
-A static, single-page system-design interview explorer. No build step, no
-framework, one CDN dep (Mermaid v10).
+A static, single-page system-design interview explorer. No framework, one CDN
+dep (Mermaid v10). The page itself has no bundler — the only "build" is a copy
+step (`build.py`) that assembles deployable sites from sources into `docs/`.
 
-Five files:
+### Source layout (what you edit)
 
-| File                                | Role                                                     |
+| Path                                | Role                                                     |
 |-------------------------------------|----------------------------------------------------------|
-| `index.html`                        | DOM shell + Mermaid CDN tag                              |
-| `styles.css`                        | All styling                                              |
-| `app.js`                            | All behavior (one IIFE, no modules)                      |
-| `data/index.json`                   | Dataset manifest                                         |
-| `data/<id>/interview.json`          | One dataset per subdirectory                             |
+| `_templates/index.html`             | DOM shell + Mermaid CDN tag (shared by every group)      |
+| `_templates/styles.css`             | All styling (shared)                                     |
+| `_templates/app.js`                 | All behavior, one IIFE, no modules (shared)              |
+| `data/<group>/index.json`           | One group's dataset manifest                             |
+| `data/<group>/<id>/interview.json`  | One dataset per subdirectory                             |
+
+Datasets are organized into **groups** (each a directory under `data/`).
+`data/examples/` is the canonical group of worked examples; `data/book/` is a
+separate group. A group is publishable once it has an `index.json` manifest.
+
+### Build output (generated — never hand-edit)
+
+`build.py` produces one independent, deployable single-page site per
+publishable group:
+
+| Path                                | Role                                                     |
+|-------------------------------------|----------------------------------------------------------|
+| `docs/<group>/`                     | Copy of the whole `_templates/` tree (html/css/js + any `icons/`/assets) |
+| `docs/<group>/data/index.json`      | Copy of `data/<group>/index.json`                        |
+| `docs/<group>/data/<id>/...`        | Copy of each dataset subdir                              |
+
+`docs/` is **committed** (GitHub Pages deploys from the `/docs` folder). After
+changing anything in `_templates/` or `data/`, re-run `build.py` and commit the
+regenerated `docs/`.
+
+## Building
+
+```bash
+python3 build.py            # rebuild every publishable group into docs/
+python3 build.py examples   # rebuild only the named group(s)
+```
+
+The script wipes and regenerates each `docs/<group>/`, so removed or renamed
+datasets don't linger. Groups without an `index.json` (e.g. `data/book/` while
+it only holds planning notes) are skipped with a notice.
 
 ## Running locally
 
+Serve a built group from `docs/`:
+
 ```bash
-python3 -m http.server 8000
-# visit http://localhost:8000/
+python3 build.py                       # ensure docs/ is current
+python3 -m http.server 8000 -d docs    # serve the docs/ tree
+# visit http://localhost:8000/examples/
 ```
 
-The app fetches JSON, so `file://` does not work — always serve.
+The app fetches JSON, so `file://` does not work — always serve. Note you
+serve the *built* output (`docs/<group>/`), not `_templates/`; the templates
+have no sibling `data/` directory of their own.
 
 ## Verification you can do without a browser
 
 The user usually can't see browser-side rendering from your sandbox. Use:
 
 ```bash
-node --check app.js                                   # JS syntax
-python3 -c "import json; json.load(open('data/...'))" # JSON validity
+node --check _templates/app.js                                  # JS syntax
+python3 -c "import json; json.load(open('data/examples/...'))"  # JSON validity
+python3 build.py                                                # copy step itself
 ```
+
+Edit `_templates/app.js` (the source), not the `docs/<group>/app.js` copies —
+those are overwritten on the next build.
 
 For dataset edits, cross-check that `highlight` node IDs actually appear in
 their diagrams, and that `satisfies[*].steps[*]` slugs resolve to real step
@@ -43,8 +83,9 @@ IDs. Both checks were done inline during initial population — repeat them
 when you touch those fields. Mermaid source itself can only be visually
 validated; if you change diagrams, say so explicitly to the user.
 
-HTTP-serve check (start server in the background, curl each asset for 200,
-stop server) is fast and worth doing after large edits.
+HTTP-serve check (`python3 build.py`, start `python3 -m http.server -d docs` in
+the background, curl each asset under `/examples/` for 200, stop server) is fast
+and worth doing after large edits.
 
 ## app.js structure
 
@@ -204,8 +245,13 @@ parent must reference an existing step id; unknown parents are ignored.
 - **Don't reintroduce flow diagrams to `renderIntroApi`**. Per-endpoint
   flows live in `renderIntroApiFlows` (the Wrap-up entry). The Overview
   API section is the contract only.
-- **Adding a new dataset**: register it in `data/index.json`, otherwise it
-  won't appear in the dropdown.
+- **Adding a new dataset**: create it under `data/<group>/<id>/interview.json`
+  and register it in that group's `data/<group>/index.json`, otherwise it won't
+  appear in the dropdown. Then re-run `python3 build.py` and commit `docs/`.
+- **Editing the wrong copy**: edit sources (`_templates/`, `data/<group>/`),
+  never the generated `docs/<group>/` copies — the next build overwrites them.
+- **Forgetting to rebuild**: changes to `_templates/` or `data/` are invisible
+  on the deployed site until `build.py` regenerates `docs/` and you commit it.
 
 ## When the user asks for a small UI tweak
 
@@ -219,7 +265,9 @@ just make the edit and confirm. Task tracking is worth it when there are
 If a new optional field is added to the schema:
 1. Update `PLAN.md` with the new field in the schema block.
 2. If it needs validation, add a check in `validateDataset()`.
-3. Write the renderer; wire it in.
-4. Add styling in `styles.css`.
-5. Add sample content to `data/url-shortener/interview.json` so the feature
-   is visible immediately (this is the canonical "worked example" dataset).
+3. Write the renderer; wire it in (`_templates/app.js`).
+4. Add styling in `_templates/styles.css`.
+5. Add sample content to `data/examples/url-shortener/interview.json` so the
+   feature is visible immediately (this is the canonical "worked example"
+   dataset).
+6. Re-run `python3 build.py` and commit the regenerated `docs/`.

@@ -7,20 +7,28 @@ ties the design back to the requirements.
 
 ## Goals
 
-- Zero build tooling. Open `index.html` via any static server.
+- No page-level bundler; the only build step is a copy script (`build.py`)
+  that assembles deployable sites into `docs/`. Open a built `index.html` via
+  any static server.
 - Vanilla HTML / CSS / JS. One external dependency: Mermaid (loaded from CDN).
 - Data-driven: every interview is one JSON file; the app reads it and renders.
 - Graceful: invalid JSON, missing fields, and Mermaid render errors must not
   break the page. They surface as inline errors.
 
-## Running
+## Building and running
 
-Open `index.html` via a static server so the JSON files can be fetched:
+Sources live in `_templates/` (the shared HTML/CSS/JS shell) and
+`data/<group>/` (dataset groups). `build.py` copies them into one deployable
+site per group under `docs/<group>/`:
 
 ```bash
-python3 -m http.server 8000
-# then visit http://localhost:8000/
+python3 build.py                       # build every publishable group
+python3 -m http.server 8000 -d docs    # serve the built output
+# then visit http://localhost:8000/examples/
 ```
+
+`docs/` is committed and deployed via GitHub Pages (the `/docs` folder). After
+editing `_templates/` or `data/`, re-run `build.py` and commit `docs/`.
 
 Opening `index.html` directly via `file://` will fail to fetch the JSON
 because of browser CORS rules — use a static server.
@@ -50,9 +58,10 @@ Navigation:
 
 ## Dataset shape
 
-A dataset is a JSON file in `data/<dataset-id>/interview.json`. The manifest
-`data/index.json` lists available datasets so the dataset dropdown can offer a
-choice.
+A dataset is a JSON file in `data/<group>/<dataset-id>/interview.json`. Each
+group's manifest `data/<group>/index.json` lists its datasets so the dataset
+dropdown can offer a choice. (At runtime the built site fetches `data/index.json`
+relative to its own `index.html`, i.e. `docs/<group>/data/index.json`.)
 
 All fields below are optional except `steps`.
 
@@ -238,16 +247,26 @@ rejects `classDef`/`class`):
 
 ## File map
 
-- `index.html`     — DOM shell; sidebar, content panes, mount points.
-- `styles.css`     — All styling, including the `.newNode` highlight rules
-                     applied to Mermaid-rendered SVG nodes.
-- `app.js`         — Dataset loading, sidebar grouping, all rendering, Mermaid
-                     orchestration, hash routing, keyboard nav, error capture.
-- `data/index.json`                          — Manifest of available datasets.
-- `data/<id>/interview.json`                 — One dataset per directory.
+Sources (edit these):
 
-Existing dataset: `data/url-shortener/interview.json` — a fully populated
-URL shortener walkthrough used as the worked example.
+- `_templates/index.html`  — DOM shell; sidebar, content panes, mount points.
+- `_templates/styles.css`  — All styling, including the `.newNode` highlight
+                             rules applied to Mermaid-rendered SVG nodes.
+- `_templates/app.js`      — Dataset loading, sidebar grouping, all rendering,
+                             Mermaid orchestration, hash routing, keyboard nav,
+                             error capture.
+- `data/<group>/index.json`              — One group's dataset manifest.
+- `data/<group>/<id>/interview.json`     — One dataset per directory.
+- `build.py`               — Copy step: `_templates/` + `data/<group>/` →
+                             `docs/<group>/`.
+
+Build output (generated, committed for GitHub Pages — do not hand-edit):
+
+- `docs/<group>/{index.html,styles.css,app.js}` — copies of the templates.
+- `docs/<group>/data/...`                        — copy of the group's data.
+
+Existing dataset: `data/examples/url-shortener/interview.json` — a fully
+populated URL shortener walkthrough used as the worked example.
 
 ## Implementation notes
 
@@ -265,14 +284,19 @@ URL shortener walkthrough used as the worked example.
 ## Extending
 
 Adding a new dataset:
-1. Create `data/<id>/interview.json` following the schema above.
-2. Add it to `data/index.json` (`id`, `name`, `path`).
-3. Reload. It appears in the dataset dropdown.
+1. Create `data/<group>/<id>/interview.json` following the schema above.
+2. Add it to that group's `data/<group>/index.json` (`id`, `name`, `path`).
+3. Run `python3 build.py`, reload. It appears in the dataset dropdown.
+
+Adding a new group (a new deployable site):
+1. Create `data/<group>/` with an `index.json` manifest and dataset subdirs.
+2. Run `python3 build.py`; it produces `docs/<group>/` automatically.
 
 Adding a new section type:
-1. Add a slug to `INTRO_SLUGS` in `app.js`.
+1. Add a slug to `INTRO_SLUGS` in `_templates/app.js`.
 2. Add a builder branch in `buildEntries()`.
 3. Add the section to the `Overview` or `Wrap-up` group via `WRAPUP_SLUGS`.
 4. Write a `renderIntro<Name>()` function returning a DOM node, and wire it
    into the switch in `renderIntroEntry()`.
-5. Add CSS in `styles.css` if the section needs custom layout.
+5. Add CSS in `_templates/styles.css` if the section needs custom layout.
+6. Run `python3 build.py` and commit the regenerated `docs/`.

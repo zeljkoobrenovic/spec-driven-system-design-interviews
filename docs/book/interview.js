@@ -57,6 +57,7 @@
         api: "api",
         dataModel: "data-model",
         patterns: "patterns",
+        patternCatalog: "pattern-catalog",
         finalDesign: "final-design",
         apiFlows: "api-flows",
         satisfies: "satisfies",
@@ -466,6 +467,9 @@
         }
         if (Array.isArray(data.patterns) && data.patterns.length > 0) {
             entries.push({kind: "intro", id: INTRO_SLUGS.patterns, title: "Patterns", payload: data.patterns});
+        }
+        if (Array.isArray(data.patternCatalog) && data.patternCatalog.length > 0) {
+            entries.push({kind: "intro", id: INTRO_SLUGS.patternCatalog, title: "Pattern Catalog", payload: data.patternCatalog});
         }
         if (Array.isArray(data.steps)) {
             for (const step of data.steps) entries.push({kind: "step", id: step.id, title: step.title, payload: step});
@@ -1768,6 +1772,79 @@
         return wrap;
     }
 
+    // Pattern Catalog (catalog dataset). Each item: { name, category?, what,
+    // whenToUse?, tradeoffs?, usedBy? }. A standalone reference of the reusable
+    // patterns the book teaches; cases reference these by name. Groups cards by
+    // `category` when present.
+    function renderIntroPatternCatalog(items) {
+        const outer = document.createElement("div");
+
+        // Group items by category (preserving first-seen order); ungrouped last.
+        const order = [];
+        const byCat = new Map();
+        for (const p of items) {
+            const cat = p.category || "";
+            if (!byCat.has(cat)) {
+                byCat.set(cat, []);
+                order.push(cat);
+            }
+            byCat.get(cat).push(p);
+        }
+
+        for (const cat of order) {
+            if (cat) {
+                const h = document.createElement("h3");
+                h.className = "catalog-category";
+                h.textContent = cat;
+                outer.appendChild(h);
+            }
+            const grid = document.createElement("div");
+            grid.className = "patterns-list";
+            for (const p of byCat.get(cat)) {
+                const card = document.createElement("div");
+                card.className = "pattern-card";
+
+                const name = document.createElement("div");
+                name.className = "pattern-name";
+                name.textContent = p.name || "";
+                card.appendChild(name);
+
+                if (p.what) {
+                    const what = document.createElement("p");
+                    what.className = "pattern-what";
+                    what.textContent = p.what;
+                    card.appendChild(what);
+                }
+                if (p.whenToUse) {
+                    const wt = document.createElement("p");
+                    wt.className = "pattern-when muted";
+                    wt.textContent = `When to use: ${p.whenToUse}`;
+                    card.appendChild(wt);
+                }
+                if (p.tradeoffs) {
+                    const tr = document.createElement("p");
+                    tr.className = "pattern-tradeoffs";
+                    tr.textContent = `Trade-off: ${p.tradeoffs}`;
+                    card.appendChild(tr);
+                }
+                if (Array.isArray(p.usedBy) && p.usedBy.length > 0) {
+                    const used = document.createElement("div");
+                    used.className = "pattern-tags";
+                    for (const u of p.usedBy) {
+                        const chip = document.createElement("span");
+                        chip.className = "pattern-tag";
+                        chip.textContent = String(u);
+                        used.appendChild(chip);
+                    }
+                    card.appendChild(used);
+                }
+                grid.appendChild(card);
+            }
+            outer.appendChild(grid);
+        }
+        return outer;
+    }
+
     // Wrap-up > Interview Script. Each item: { phase, time?, say }.
     // What to say across the interview's phases (first 5 min, 15, 30, final 5).
     function renderIntroInterviewScript(items) {
@@ -1834,6 +1911,9 @@
                 break;
             case INTRO_SLUGS.patterns:
                 node = renderIntroPatterns(entry.payload);
+                break;
+            case INTRO_SLUGS.patternCatalog:
+                node = renderIntroPatternCatalog(entry.payload);
                 break;
             case INTRO_SLUGS.satisfies:
                 node = renderIntroSatisfies(entry.payload);
@@ -1984,10 +2064,14 @@
 
     function validateDataset(d, path) {
         if (!d || typeof d !== "object") throw new Error(`Dataset ${path}: not an object`);
-        if (!Array.isArray(d.steps) || d.steps.length === 0) {
-            throw new Error(`Dataset ${path}: missing or empty "steps" array`);
+        const hasSteps = Array.isArray(d.steps) && d.steps.length > 0;
+        const hasCatalog = Array.isArray(d.patternCatalog) && d.patternCatalog.length > 0;
+        // A normal interview needs steps[]. A catalog dataset (no system to walk
+        // through) is valid with a non-empty patternCatalog[] instead.
+        if (!hasSteps && !hasCatalog) {
+            throw new Error(`Dataset ${path}: needs a non-empty "steps" array (or a "patternCatalog" for a catalog dataset)`);
         }
-        d.steps.forEach((step, i) => {
+        (d.steps || []).forEach((step, i) => {
             if (!step || typeof step !== "object") throw new Error(`Step ${i} is not an object`);
             if (!hasStepLikeDiagram(step)) {
                 throw new Error(`Step ${i} ("${step.title || step.id || ""}") must define a "diagram" or non-empty "options[].diagram"`);
@@ -1999,12 +2083,12 @@
         // Book-feature fields are optional, but if present must be arrays so the
         // renderers can iterate them. Contents stay free-form (rendered only if
         // present), matching the rest of the lenient schema.
-        for (const key of ["patterns", "interviewScript", "levelVariants"]) {
+        for (const key of ["patterns", "interviewScript", "levelVariants", "patternCatalog"]) {
             if (d[key] !== undefined && !Array.isArray(d[key])) {
                 throw new Error(`Dataset ${path}: "${key}" must be an array if present`);
             }
         }
-        d.steps.forEach((step, i) => {
+        (d.steps || []).forEach((step, i) => {
             for (const key of ["patterns", "traps"]) {
                 if (step[key] !== undefined && !Array.isArray(step[key])) {
                     throw new Error(`Step ${i} ("${step.title || step.id || ""}"): "${key}" must be an array if present`);

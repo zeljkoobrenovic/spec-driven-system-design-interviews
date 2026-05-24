@@ -41,8 +41,9 @@ Two pages, sharing `styles.css`:
 
 Datasets are organized into **groups** (each a directory under `data/`).
 `data/examples/` is the canonical group of worked examples; `data/book/` is the
-book group (its first dataset is `payment-system`, plus `BOOK-STRUCTURE.md` as a
-planning note). A group is publishable once it has an `index.json` manifest.
+book group (a pattern catalog + flagship cases like `payment-system` and
+`notification-system`, plus `BOOK-STRUCTURE.md` as a planning note). A group is
+publishable once it has an `index.json` manifest.
 
 ### Build output (generated — never hand-edit)
 
@@ -134,6 +135,7 @@ The explorer (`interview.js`). One IIFE. Top to bottom:
    highlight pipeline is described below.
 9. **Intro renderers** — `renderIntroRequirements`, `renderIntroCapacity`,
    `renderIntroApi`, `renderIntroDataModel`, `renderIntroPatterns`,
+   `renderIntroPatternCatalog`,
    `renderIntroApiFlows`, `renderIntroSatisfies`, `renderIntroInterviewScript`,
    `renderIntroLevelVariants`, `renderIntroFollowUps`. Each returns a DOM node;
    `renderIntroEntry()` dispatches by slug. (`renderTraps` and
@@ -272,8 +274,8 @@ parent must reference an existing step id; unknown parents are ignored.
 
 ## Book-feature fields
 
-Four optional fields exist for the `book` group's pedagogy (all degrade to
-nothing when absent, so the `examples` datasets are unaffected):
+Optional fields exist for the `book` group's pedagogy (all degrade to nothing
+when absent, so the `examples` datasets are unaffected):
 
 - `patterns` (dataset) → Overview "Patterns" entry. Each `{ name, what,
   whenToUse?, steps? }`; `steps` cross-links to the steps that use it.
@@ -284,10 +286,20 @@ nothing when absent, so the `examples` datasets are unaffected):
   `{ phase, time?, say }` (`say` is a string or array).
 - `levelVariants` (dataset) → Wrap-up "By Level" entry. Each
   `{ level, expectations }`.
+- `patternCatalog` (dataset) → standalone "Pattern Catalog" entry, grouped by
+  `category`. Each `{ name, category?, what, whenToUse?, tradeoffs?, usedBy? }`.
+  **A dataset with `patternCatalog` and no `steps` is valid** (a catalog, not a
+  walkthrough) — `validateDataset` requires `steps[]` *or* `patternCatalog[]`.
 
-`data/book/payment-system` is the reference dataset that uses all of them;
+`data/book/payment-system` is the reference dataset using the per-step/wrap-up
+fields; `data/book/notification-system` is a second full case;
+`data/book/patterns` is the catalog dataset (no steps, `patternCatalog` only).
 `url-shortener` carries a smaller sample (`patterns`, `interviewScript`,
 `levelVariants`, and `traps` on the cache step).
+
+The `book` group's categories live in `data/book/index.json`: Reference (the
+catalog), Messaging & Real-Time, Financial Systems — growing one flagship case
+per family. Foundational/social families are intentionally left to `examples`.
 
 ## Common pitfalls
 

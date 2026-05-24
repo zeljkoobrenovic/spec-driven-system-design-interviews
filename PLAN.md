@@ -145,7 +145,18 @@ All fields below are optional except `steps`.
     { "name": "Cache-aside", "what": "...", "whenToUse": "...", "steps": ["cache"] }
   ],
 
-  // ---- Architecture steps ----
+  // Standalone pattern reference. Renders as a "Pattern Catalog" entry, grouped
+  // by `category`. A dataset with patternCatalog[] and NO steps[] is valid — it
+  // is a catalog dataset, not a walkthrough (see data/book/patterns). `usedBy`
+  // are free-text case names (they may live in other datasets).
+  "patternCatalog": [
+    { "name": "Idempotency key", "category": "Reliability & correctness",
+      "what": "...", "whenToUse": "...", "tradeoffs": "...", "usedBy": ["Payment System"] }
+  ],
+
+  // ---- Architecture steps ---- (optional when patternCatalog is present)
+  "steps": [
+    {
   "steps": [
     {
       "id":          "cache",

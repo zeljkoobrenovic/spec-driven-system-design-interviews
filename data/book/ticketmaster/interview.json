@@ -87,24 +87,29 @@
     {
       "method": "POST",
       "path": "/v1/events/{id}/reservations",
-      "description": "Atomically reserve specific seats, creating a short-lived hold. Idempotency-Key dedupes retries.",
-      "request": "Idempotency-Key: rsv_9f\n{ \"seats\": [\"A12\", \"A13\"], \"user_id\": \"usr_1\" }",
-      "response": "201 Created\n{ \"hold_id\": \"hold_77\", \"expires_at\": \"...\", \"seats\": [\"A12\",\"A13\"] }\n\u2014 or 409 Conflict if any seat was just taken",
+      "description": "Atomically reserve specific seats (or a GA quantity), creating a short-lived hold. For high-demand events a valid admission token from the waiting room is required, so only admitted users can reserve. Idempotency-Key dedupes retries.",
+      "request": "Idempotency-Key: rsv_9f\nX-Admission-Token: q_abc\n{ \"seats\": [\"A12\", \"A13\"], \"user_id\": \"usr_1\" }\n// general admission: { \"pool_id\": \"floor\", \"quantity\": 2 }",
+      "response": "201 Created\n{ \"hold_id\": \"hold_77\", \"expires_at\": \"...\", \"seats\": [\"A12\",\"A13\"] }\n\u2014 401 if the admission token is missing/invalid, or 409 Conflict if any seat was just taken",
       "diagram": [
         "sequenceDiagram",
         "  participant C as Client",
         "  participant R as Reservation Service",
         "  participant L as Seat Lock Store",
         "  participant I as Inventory DB",
-        "  C->>R: POST reservations (seats, key)",
-        "  R->>L: acquire locks for seats (atomic)",
-        "  alt all seats free",
-        "    L-->>R: locked",
-        "    R->>I: mark held + create hold (TTL)",
-        "    R-->>C: 201 hold",
-        "  else any seat taken",
-        "    L-->>R: conflict",
-        "    R-->>C: 409 Conflict",
+        "  C->>R: POST reservations (seats, admission token, key)",
+        "  R->>R: validate admission token (signed, not expired, bound to user)",
+        "  alt token invalid",
+        "    R-->>C: 401 Unauthorized",
+        "  else admitted",
+        "    R->>L: acquire locks for seats (atomic)",
+        "    alt all seats free",
+        "      L-->>R: locked",
+        "      R->>I: mark held + create hold (TTL)",
+        "      R-->>C: 201 hold",
+        "    else any seat taken",
+        "      L-->>R: conflict",
+        "      R-->>C: 409 Conflict",
+        "    end",
         "  end"
       ]
     },
@@ -135,9 +140,16 @@
     {
       "method": "GET",
       "path": "/v1/queue/{event}/token",
-      "description": "Join the waiting room for a high-demand on-sale; returns a position/token used to gate admission.",
-      "request": "GET /v1/queue/evt_1/token",
+      "description": "Join the waiting room for a high-demand on-sale; returns a signed admission token bound to the user. The token is 'waiting' until admitted, then accepted by the reservations endpoint within its admission window.",
+      "request": "GET /v1/queue/evt_1/token  (authenticated)",
       "response": "200 OK\n{ \"token\": \"q_abc\", \"position\": 48213, \"status\": \"waiting\" }"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/queue/{event}/status",
+      "description": "Poll (or subscribe to) the waiting-room position; when admitted, the token becomes usable to reserve within its admission window.",
+      "request": "GET /v1/queue/evt_1/status?token=q_abc",
+      "response": "200 OK\n{ \"position\": 1203, \"status\": \"admitted\", \"admission_expires_at\": \"...\" }"
     }
   ],
   "dataModel": [
@@ -165,11 +177,11 @@
     },
     {
       "name": "seats",
-      "note": "One row per physical seat; the unit of contention. Status transitions are the heart of correctness.",
+      "note": "One row per physical seat; the unit of contention. Status transitions are the heart of correctness. Reserved-seating only; general admission uses ga_inventory below.",
       "fields": [
         {
-          "name": "seat_id",
-          "type": "varchar (event-scoped) PK"
+          "name": "(event_id, seat_id)",
+          "type": "composite PK"
         },
         {
           "name": "event_id",
@@ -220,8 +232,22 @@
       ]
     },
     {
+      "name": "order_seats",
+      "note": "Join table linking an order to its seats (preferred over a seat_ids array; enforces a seat belongs to one order).",
+      "fields": [
+        {
+          "name": "(order_id, event_id, seat_id)",
+          "type": "composite PK"
+        },
+        {
+          "name": "price",
+          "type": "bigint (minor units)"
+        }
+      ]
+    },
+    {
       "name": "orders",
-      "note": "A confirmed purchase produced by checkout; references the payment.",
+      "note": "A purchase produced by checkout, modeled as a state machine rather than a single confirmed row.",
       "fields": [
         {
           "name": "order_id",
@@ -236,38 +262,102 @@
           "type": "uuid"
         },
         {
-          "name": "seat_ids",
-          "type": "varchar[]"
+          "name": "status",
+          "type": "enum(pending_payment, confirmed, cancelled, refund_pending, refunded)"
         },
         {
-          "name": "payment_ref",
-          "type": "varchar"
+          "name": "total",
+          "type": "bigint (minor units)"
         },
         {
-          "name": "created_at",
+          "name": "updated_at",
           "type": "timestamptz"
         }
       ]
     },
     {
+      "name": "payment_attempts",
+      "note": "Durable record of each charge/refund attempt against an order, for idempotency and reconciliation.",
+      "fields": [
+        {
+          "name": "attempt_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "order_id",
+          "type": "uuid"
+        },
+        {
+          "name": "idempotency_key",
+          "type": "varchar"
+        },
+        {
+          "name": "provider_ref",
+          "type": "varchar"
+        },
+        {
+          "name": "status",
+          "type": "enum(pending, captured, failed, refunded, voided)"
+        }
+      ]
+    },
+    {
+      "name": "ga_inventory",
+      "note": "General-admission pools: a remaining-count per pool, decremented atomically (no per-seat rows).",
+      "fields": [
+        {
+          "name": "(event_id, pool_id)",
+          "type": "composite PK"
+        },
+        {
+          "name": "remaining",
+          "type": "int"
+        },
+        {
+          "name": "reserved",
+          "type": "int"
+        },
+        {
+          "name": "version",
+          "type": "int (optimistic lock)"
+        }
+      ]
+    },
+    {
       "name": "queue_tokens",
-      "note": "Waiting-room admission tokens for fairness during on-sale spikes.",
+      "note": "Waiting-room admission tokens for fairness during on-sale spikes; bound to identity and time-boxed so they actually gate load and abuse.",
       "fields": [
         {
           "name": "token",
-          "type": "varchar PK"
+          "type": "varchar PK (signed)"
         },
         {
           "name": "event_id",
           "type": "uuid"
         },
         {
+          "name": "user_id",
+          "type": "uuid (identity binding)"
+        },
+        {
           "name": "position",
           "type": "bigint"
         },
         {
+          "name": "issued_at",
+          "type": "timestamptz"
+        },
+        {
           "name": "admitted_at",
           "type": "timestamptz null"
+        },
+        {
+          "name": "admission_expires_at",
+          "type": "timestamptz null"
+        },
+        {
+          "name": "status",
+          "type": "enum(waiting, admitted, expired)"
         }
       ]
     }
@@ -835,7 +925,7 @@
     {
       "id": "checkout",
       "title": "6. Checkout & Payment Integration",
-      "description": "A valid hold is converted to a confirmed order by charging via the payment system (itself idempotent). Checkout re-verifies the hold is still valid, charges, then flips seats from held to sold atomically. Expired holds fail cleanly.",
+      "description": "Checkout drives an order state machine (pending_payment -> confirmed, with cancelled/refund_pending branches), not just a charge plus an order row. It re-verifies (and briefly renews) the hold, records a payment attempt, charges the idempotent payment system, then flips seats from held to sold via inventory CAS. Expired holds fail cleanly; a charge that can't be converted is refunded.",
       "patterns": [
         "Idempotency key",
         "Saga / state machine"
@@ -1156,21 +1246,22 @@
   ],
   "finalDesign": {
     "title": "Final Design",
-    "description": "End-to-end: CDN + read model for browse, a virtual waiting room with anti-abuse metering admission, atomic seat locking with TTL holds, an expiry worker recirculating abandoned seats, idempotent checkout integrated with the payment system via a compensating saga, inventory CAS as the authoritative no-oversell guard, and per-event sharding isolating hot drops.",
+    "description": "End-to-end: CDN + read model for browse; anti-abuse screens clients before the virtual waiting room issues admission tokens; admitted, token-bearing reservations route per event to atomic seat locking with TTL holds; an expiry worker releases abandoned holds back to authoritative inventory; idempotent checkout converts held seats to sold via inventory CAS and charges payment through a compensating saga; per-event sharding (inventory and locks) isolates hot drops.",
     "diagram": [
       "graph TB",
       "  Client[Client / Browser]",
       "  CDN[/CDN \u2014 static seat maps/]",
+      "  AntiBot[Anti-Abuse / Bot Filter]",
       "  WaitRoom[[Waiting Room Queue]]",
       "  Gate[Admission Gate]",
-      "  AntiBot[Anti-Abuse / Bot Filter]",
       "  API[Booking API]",
       "  Search[Event / Seat Read Model]",
       "  Cache[(Availability Cache)]",
       "  Router[Event Router]",
       "  ReserveA[Reservation Svc \u2014 Event A]",
       "  ReserveB[Reservation Svc \u2014 Event B]",
-      "  Lock[(Seat Lock Store)]",
+      "  LockA[(Seat Lock Store A)]",
+      "  LockB[(Seat Lock Store B)]",
       "  ShardA[(Inventory Shard A)]",
       "  ShardB[(Inventory Shard B)]",
       "  Hold[(Holds \u2014 TTL)]",
@@ -1181,24 +1272,28 @@
       "  Client -->|seat map| CDN",
       "  Client -->|availability| Search",
       "  Search --> Cache",
-      "  Client -->|on-sale| WaitRoom",
-      "  WaitRoom --> Gate",
-      "  Gate --> AntiBot",
-      "  AntiBot --> API",
+      "  Client -->|on-sale| AntiBot",
+      "  AntiBot -->|screened| WaitRoom",
+      "  WaitRoom -->|admission token| Gate",
+      "  Gate -->|admitted| API",
       "  API -->|reserve, by event| Router",
       "  Router -->|event A| ReserveA",
       "  Router -->|event B| ReserveB",
-      "  ReserveA -->|seat lock| Lock",
-      "  ReserveB -->|seat lock| Lock",
+      "  ReserveA -->|seat lock| LockA",
+      "  ReserveB -->|seat lock| LockB",
       "  ReserveA -->|hold + CAS| ShardA",
       "  ReserveB -->|hold + CAS| ShardB",
       "  ReserveA --> Hold",
       "  ReserveB --> Hold",
       "  Expiry --> Hold",
-      "  Expiry --> Lock",
+      "  Expiry -->|release| LockA",
+      "  Expiry -->|release| LockB",
+      "  Expiry -->|mark available| ShardA",
+      "  Expiry -->|mark available| ShardB",
       "  API --> Checkout",
-      "  Checkout --> Hold",
-      "  Checkout --> Payment",
+      "  Checkout -->|verify/renew| Hold",
+      "  Checkout -->|charge| Payment",
+      "  Checkout -->|held -> sold CAS| Router",
       "  Checkout --> Order",
       "  ShardA --> Cache",
       "  ShardB --> Cache"

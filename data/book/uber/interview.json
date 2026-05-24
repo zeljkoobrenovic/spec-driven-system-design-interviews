@@ -1,0 +1,1352 @@
+{
+  "title": "Uber \u2014 Ride Matching System Design",
+  "description": "Designing the core of a ride-hailing platform: match a rider requesting a trip with a nearby available driver, in seconds, while millions of drivers stream their location continuously. The hard problems are geospatial \u2014 indexing moving points and querying 'who is near me' at scale \u2014 plus matching under contention, real-time location ingest, and surge pricing. We build from a naive nearest-driver scan toward a geo-indexed, region-sharded matching system.",
+  "requirementsDiagram": [
+    "graph LR",
+    "  Rider[Rider App]",
+    "  Driver[Driver App]",
+    "  API[Ride API Gateway]",
+    "  Match[Matching Service]",
+    "  Dispatch[Dispatch Service]",
+    "  Rider -->|request ride| API",
+    "  Driver -->|location + status| API",
+    "  API --> Match",
+    "  Match --> Dispatch",
+    "  Dispatch -->|offer trip| Driver"
+  ],
+  "capacityDiagram": [
+    "graph LR",
+    "  Driver[Driver App]",
+    "  LocIngest[Location Ingest Service]",
+    "  GeoIndex[(Geo Index \u2014 driver cells)]",
+    "  Match[Matching Service]",
+    "  Driver -->|~10M drivers x 1 ping/4s| LocIngest",
+    "  LocIngest -->|update cells| GeoIndex",
+    "  Match -->|nearby query| GeoIndex"
+  ],
+  "requirements": {
+    "functional": [
+      "A rider requests a ride from a pickup location to a destination.",
+      "Drivers continuously report location and availability.",
+      "Match a request to a nearby, available driver and dispatch the trip.",
+      "Track trip lifecycle: requested, matched, en route, in progress, completed.",
+      "Compute fare and ETA; apply surge pricing when demand exceeds supply."
+    ],
+    "nonFunctional": [
+      "Match within a few seconds even in dense cities.",
+      "Ingest millions of driver location updates per second.",
+      "Each trip request matches at most one driver; a driver takes one trip at a time.",
+      "Fresh location data: 'nearby' must reflect where drivers are now, not minutes ago.",
+      "Scale to many cities with wildly uneven density (a few hot cities dominate).",
+      "Graceful degradation: widen search or queue rather than fail a request outright."
+    ]
+  },
+  "capacity": [
+    {
+      "label": "Active drivers",
+      "value": "~10M globally",
+      "note": "Each streams location continuously while online."
+    },
+    {
+      "label": "Location updates",
+      "value": "~2\u20133M/sec",
+      "note": "10M drivers pinging every ~4s; write-heavy and continuous."
+    },
+    {
+      "label": "Ride requests",
+      "value": "~10k\u2013100k/sec peak",
+      "note": "Spiky by city and time (rush hour, events)."
+    },
+    {
+      "label": "Match latency target",
+      "value": "p99 a few seconds",
+      "note": "Includes nearby query, ranking, and driver acceptance."
+    },
+    {
+      "label": "Geo query",
+      "value": "nearby drivers within radius",
+      "note": "The core read; must be fast over constantly-moving points."
+    },
+    {
+      "label": "Density skew",
+      "value": "extreme",
+      "note": "A handful of cities hold most drivers and requests at once."
+    }
+  ],
+  "api": [
+    {
+      "method": "POST",
+      "path": "/v1/rides",
+      "description": "Request a ride. Idempotency-Key dedupes retries so a rider isn't matched twice.",
+      "request": "Idempotency-Key: rq_8f\n{ \"pickup\": {\"lat\":37.77,\"lng\":-122.41}, \"dropoff\": {...}, \"product\": \"x\" }",
+      "response": "202 Accepted\n{ \"trip_id\": \"trip_9\", \"status\": \"matching\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant R as Rider",
+        "  participant A as Ride API",
+        "  participant M as Matching Service",
+        "  participant G as Geo Index",
+        "  participant D as Dispatch",
+        "  R->>A: POST /rides (pickup, key)",
+        "  A->>M: create trip (matching)",
+        "  M->>G: nearby available drivers(pickup)",
+        "  G-->>M: candidate drivers",
+        "  M->>D: offer to best candidate",
+        "  A-->>R: 202 matching"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/drivers/{id}/location",
+      "description": "High-frequency driver location update. Fire-and-forget; ingested asynchronously into the geo index.",
+      "request": "{ \"lat\": 37.776, \"lng\": -122.414, \"status\": \"available\", \"ts\": 1710000000 }",
+      "response": "200 OK (ack)"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/trips/{id}/accept",
+      "description": "Driver accepts an offered trip. First acceptance wins; the trip transitions to matched.",
+      "request": "{ \"driver_id\": \"drv_3\" }",
+      "response": "200 OK { \"status\": \"matched\" } \u2014 or 409 if already taken",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant D as Driver",
+        "  participant T as Trip Service",
+        "  participant I as Idempotency/Lock",
+        "  D->>T: accept(trip, driver)",
+        "  T->>I: claim trip (CAS matching->matched)",
+        "  alt won",
+        "    I-->>T: ok",
+        "    T-->>D: 200 matched",
+        "  else already matched",
+        "    I-->>T: taken",
+        "    T-->>D: 409 Conflict",
+        "  end"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/trips/{id}",
+      "description": "Fetch trip status, assigned driver, and live ETA.",
+      "request": "GET /v1/trips/trip_9",
+      "response": "200 OK { \"status\": \"en_route\", \"driver_id\": \"drv_3\", \"eta_s\": 240 }"
+    }
+  ],
+  "dataModel": [
+    {
+      "name": "drivers",
+      "note": "Driver profile and current availability. Location is hot and lives in a fast store, not here.",
+      "fields": [
+        {
+          "name": "driver_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "status",
+          "type": "enum(offline, available, on_trip)"
+        },
+        {
+          "name": "product",
+          "type": "varchar (x, xl, ...)"
+        },
+        {
+          "name": "rating",
+          "type": "float"
+        }
+      ]
+    },
+    {
+      "name": "driver_locations",
+      "note": "Latest location per driver, updated at high frequency. Often a key-value/in-memory store keyed by driver_id; projected into the geo index.",
+      "fields": [
+        {
+          "name": "driver_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "lat",
+          "type": "double"
+        },
+        {
+          "name": "lng",
+          "type": "double"
+        },
+        {
+          "name": "geo_cell",
+          "type": "varchar (geohash / S2 cell)"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "trips",
+      "note": "The trip lifecycle state machine; the unit of matching and billing.",
+      "fields": [
+        {
+          "name": "trip_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "rider_id",
+          "type": "uuid"
+        },
+        {
+          "name": "driver_id",
+          "type": "uuid null (until matched)"
+        },
+        {
+          "name": "status",
+          "type": "enum(matching, matched, en_route, in_progress, completed, cancelled)"
+        },
+        {
+          "name": "pickup",
+          "type": "geopoint"
+        },
+        {
+          "name": "dropoff",
+          "type": "geopoint"
+        },
+        {
+          "name": "fare",
+          "type": "bigint null"
+        }
+      ]
+    },
+    {
+      "name": "geo_index",
+      "note": "Spatial index mapping geo cells -> available drivers, enabling fast 'nearby' queries over moving points.",
+      "fields": [
+        {
+          "name": "geo_cell",
+          "type": "varchar (geohash / S2)"
+        },
+        {
+          "name": "driver_id",
+          "type": "uuid"
+        },
+        {
+          "name": "product",
+          "type": "varchar"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "surge_cells",
+      "note": "Per-cell demand/supply ratio driving the surge multiplier.",
+      "fields": [
+        {
+          "name": "geo_cell",
+          "type": "varchar"
+        },
+        {
+          "name": "demand",
+          "type": "int"
+        },
+        {
+          "name": "supply",
+          "type": "int"
+        },
+        {
+          "name": "multiplier",
+          "type": "float"
+        },
+        {
+          "name": "window",
+          "type": "timestamptz"
+        }
+      ]
+    }
+  ],
+  "patterns": [
+    {
+      "name": "Geo-indexing (geohash / S2)",
+      "what": "Encode locations into hierarchical cells so 'nearby' becomes a prefix/cell lookup instead of a full scan.",
+      "whenToUse": "Proximity queries over many points \u2014 ride matching, nearby search, maps.",
+      "steps": [
+        "geo-index"
+      ]
+    },
+    {
+      "name": "Write-heavy ingestion pipeline",
+      "what": "Absorb a firehose of updates via a stream and async workers rather than synchronous writes.",
+      "whenToUse": "Millions of high-frequency updates (driver pings) that can't hit the primary directly.",
+      "steps": [
+        "location-ingest"
+      ]
+    },
+    {
+      "name": "Matching / assignment",
+      "what": "Select the best candidate from a set and assign it atomically so no resource is double-assigned.",
+      "whenToUse": "Two-sided marketplaces pairing requests with limited supply.",
+      "steps": [
+        "matching"
+      ]
+    },
+    {
+      "name": "Distributed lock / CAS",
+      "what": "Atomically claim a trip or driver so concurrent offers don't double-book.",
+      "whenToUse": "Multiple offers race for the same driver or trip.",
+      "steps": [
+        "trip-state"
+      ]
+    },
+    {
+      "name": "Idempotency key",
+      "what": "Dedupe retried ride requests and accepts so a rider/driver isn't matched twice.",
+      "whenToUse": "State-changing calls over an unreliable mobile network.",
+      "steps": [
+        "matching",
+        "trip-state"
+      ]
+    },
+    {
+      "name": "State machine",
+      "what": "Model the trip as explicit states with allowed transitions.",
+      "whenToUse": "Multi-step lifecycles (matching -> matched -> en route -> completed) needing clear invariants.",
+      "steps": [
+        "trip-state"
+      ]
+    },
+    {
+      "name": "Geo-sharding by region",
+      "what": "Partition the geo index and matching by city/region so a hot city is isolated and queries stay local.",
+      "whenToUse": "Extreme density skew where a few cities dominate load.",
+      "steps": [
+        "scale"
+      ]
+    },
+    {
+      "name": "Real-time demand pricing",
+      "what": "Compute a per-cell multiplier from demand/supply to balance the marketplace.",
+      "whenToUse": "When supply can't meet demand and you want to ration/incentivize.",
+      "steps": [
+        "surge"
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "request-ride",
+      "title": "1. Request a Ride (the naive baseline)",
+      "description": "Start simple: a rider posts a request, and the service scans all available drivers to find the nearest one. With a few drivers this is fine; the design exists because there are millions of moving drivers and you can't scan them per request.",
+      "patterns": [
+        "Synchronous request/response"
+      ],
+      "decisionPrompt": "How do you find the nearest driver when there are 10M of them, all moving?",
+      "concepts": [
+        {
+          "term": "Two-sided matching",
+          "definition": "Pairing a demand-side request (rider) with a supply-side resource (driver).",
+          "whyItMatters": "Both sides are dynamic and limited, which shapes indexing and contention."
+        },
+        {
+          "term": "Proximity query",
+          "definition": "Finding points within a radius of a location.",
+          "whyItMatters": "Doing it by scanning every driver is O(drivers) per request \u2014 hopeless at scale."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Rider[Rider App]",
+        "  API[Ride API Gateway]",
+        "  Trip[Trip Service]",
+        "  TripDB[(Trips DB)]",
+        "  LocStore[(Driver Location Store)]",
+        "  Rider -->|request| API",
+        "  API --> Trip",
+        "  Trip -->|scan all drivers| LocStore",
+        "  Trip --> TripDB"
+      ],
+      "highlight": [
+        "Rider",
+        "API",
+        "Trip",
+        "TripDB",
+        "LocStore"
+      ],
+      "talkingPoints": [
+        "Name the two hard parts up front: ingesting location at scale, and querying nearby fast.",
+        "Point out a full scan per request is O(N drivers) \u2014 the whole design replaces it."
+      ],
+      "traps": [
+        {
+          "trap": "Scanning all drivers and computing distance per request",
+          "why": "O(drivers) per request collapses under millions of drivers and tens of thousands of requests/sec.",
+          "instead": "Index drivers spatially so 'nearby' is a cell lookup, not a scan."
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Linear nearest-driver search over a constantly-changing set.",
+          "mitigation": "A geospatial index (built up over the next steps)."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Identifies the geo-query and ingest scale as the core problems immediately.",
+          "Rejects the full scan on complexity grounds."
+        ],
+        "weak": [
+          "Treats 'find nearest' as a simple DB query.",
+          "Ignores that drivers move continuously."
+        ]
+      },
+      "whyNow": [
+        "A naive baseline makes the geo-index and ingest pipeline obvious responses to a concrete bottleneck."
+      ]
+    },
+    {
+      "id": "location-ingest",
+      "title": "2. Driver Location Ingestion at Scale",
+      "description": "Millions of drivers ping location every few seconds. Don't write each ping to the primary synchronously \u2014 accept fire-and-forget, push to a stream, and update a fast location store and the geo index asynchronously. Only the latest location per driver matters.",
+      "patterns": [
+        "Write-heavy ingestion pipeline"
+      ],
+      "decisionPrompt": "10M drivers ping every 4 seconds. How do you absorb ~2.5M writes/sec without melting your database?",
+      "concepts": [
+        {
+          "term": "Last-write-wins per key",
+          "definition": "Only the most recent location for a driver matters; older pings are discarded.",
+          "whyItMatters": "Lets you drop/overwrite instead of storing history, slashing write cost."
+        },
+        {
+          "term": "Ingestion stream",
+          "definition": "A high-throughput log/queue buffering updates for async processing.",
+          "whyItMatters": "Decouples the firehose from the stores so spikes don't overload them."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Driver[Driver App]",
+        "  API[Ride API Gateway]",
+        "  LocIngest[Location Ingest Service]",
+        "  LocStream[[Location Stream]]",
+        "  LocStore[(Driver Location Store)]",
+        "  GeoIndex[(Geo Index \u2014 driver cells)]",
+        "  Driver -->|ping every 4s| API",
+        "  API --> LocIngest",
+        "  LocIngest -->|publish| LocStream",
+        "  LocStream -->|update latest| LocStore",
+        "  LocStream -->|update cell| GeoIndex"
+      ],
+      "highlight": [
+        "LocIngest",
+        "LocStream",
+        "LocStore"
+      ],
+      "options": [
+        {
+          "name": "Stream + async workers, in-memory latest store (default)",
+          "pros": [
+            "Absorbs the firehose; workers update stores at their own pace.",
+            "In-memory KV (e.g. Redis) keyed by driver_id gives fast last-known location."
+          ],
+          "cons": [
+            "Location is eventually consistent (seconds stale).",
+            "Stream + workers are extra infrastructure."
+          ],
+          "diagram": [
+            "graph TB",
+            "  API[Ride API Gateway]",
+            "  LocStream[[Location Stream]]",
+            "  LocStore[(Driver Location Store)]",
+            "  API --> LocStream",
+            "  LocStream -->|latest only| LocStore"
+          ],
+          "highlight": [
+            "LocStream"
+          ]
+        },
+        {
+          "name": "Write each ping to a durable DB",
+          "pros": [
+            "Full location history; simple mental model."
+          ],
+          "cons": [
+            "~2.5M durable writes/sec is enormous and mostly wasted (history rarely needed).",
+            "The DB becomes the bottleneck."
+          ],
+          "diagram": [
+            "graph TB",
+            "  API[Ride API Gateway]",
+            "  LocStore[(Driver Location Store)]",
+            "  API -->|every ping| LocStore"
+          ],
+          "highlight": [
+            "LocStore"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Persisting every ping durably",
+          "why": "Millions of writes/sec of data you'll overwrite in 4 seconds wastes the most precious resource (write IOPS).",
+          "instead": "Keep only the latest per driver in a fast store; stream for async fan-out to the index."
+        },
+        {
+          "trap": "Updating the geo index synchronously in the ping path",
+          "why": "Index writes on the hot ingest path couple latency and throughput.",
+          "instead": "Ack the ping immediately; update the index asynchronously off the stream."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The ingest stream backs up during a spike.",
+          "expectedBehavior": "Location goes a bit staler; the system doesn't drop drivers or crash.",
+          "mitigation": "Bounded lag with last-write-wins means catching up just means newer pings; matching tolerates seconds of staleness."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Uses last-write-wins to avoid storing history.",
+          "Keeps the ping path async and the index off the hot path."
+        ],
+        "weak": [
+          "Writes every ping to a durable DB.",
+          "Updates the index synchronously per ping."
+        ]
+      },
+      "recap": {
+        "before": "Location was a giant table scanned per request.",
+        "after": "A firehose of pings is absorbed into a fast latest-location store and the index.",
+        "newRisk": "Location is eventually consistent \u2014 matching must tolerate slight staleness."
+      },
+      "whyNow": [
+        "The geo index is only useful if it's continuously and cheaply fed; ingest comes first."
+      ]
+    },
+    {
+      "id": "geo-index",
+      "title": "3. Geospatial Index for Nearby Drivers",
+      "description": "Replace the scan with a spatial index. Encode each driver's location into a geo cell (geohash or S2); 'nearby drivers' becomes 'drivers in this cell and its neighbors'. The matching service queries the index, not the raw location store.",
+      "patterns": [
+        "Geo-indexing (geohash / S2)"
+      ],
+      "decisionPrompt": "What cell size do you pick, and how do you avoid missing drivers just across a cell boundary?",
+      "concepts": [
+        {
+          "term": "Geohash / S2 cell",
+          "definition": "A hierarchical encoding of a region into a string/id where nearby points share prefixes/cells.",
+          "whyItMatters": "Turns proximity into a cheap prefix/cell lookup instead of distance math over everyone."
+        },
+        {
+          "term": "Neighbor (boundary) search",
+          "definition": "Querying a cell plus its adjacent cells.",
+          "whyItMatters": "A driver just over a cell edge is still nearby; you must include neighbors or miss them."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  LocStream[[Location Stream]]",
+        "  GeoIndex[(Geo Index \u2014 driver cells)]",
+        "  Match[Matching Service]",
+        "  LocStore[(Driver Location Store)]",
+        "  LocStream -->|driver -> cell| GeoIndex",
+        "  Match -->|cell + neighbors| GeoIndex",
+        "  Match -->|driver details| LocStore"
+      ],
+      "highlight": [
+        "GeoIndex"
+      ],
+      "options": [
+        {
+          "name": "Geohash buckets in an in-memory store (default)",
+          "pros": [
+            "Simple prefix math; 'nearby' = same prefix + 8 neighbors.",
+            "Cheap to update as drivers move between cells."
+          ],
+          "cons": [
+            "Fixed cell sizes don't adapt to density; boundary handling is manual.",
+            "Hot cells (downtown) get huge."
+          ],
+          "diagram": [
+            "graph TB",
+            "  GeoIndex[(Geo Index \u2014 driver cells)]",
+            "  Match[Matching Service]",
+            "  Match -->|prefix + neighbors| GeoIndex"
+          ],
+          "highlight": [
+            "GeoIndex"
+          ]
+        },
+        {
+          "name": "S2 cells with adaptive level",
+          "pros": [
+            "Hierarchical levels adapt resolution to density; good neighbor semantics on a sphere.",
+            "Battle-tested for planet-scale geo."
+          ],
+          "cons": [
+            "More complex library/ops; still needs hot-cell handling."
+          ],
+          "diagram": [
+            "graph TB",
+            "  GeoIndex[(Geo Index \u2014 driver cells)]",
+            "  Match[Matching Service]",
+            "  Match -->|S2 cell range| GeoIndex"
+          ],
+          "highlight": [
+            "GeoIndex"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Cell size and boundaries",
+          "points": [
+            "Cell size trades query precision against result-set size \u2014 too big returns far drivers, too small misses them and multiplies neighbor lookups.",
+            "Always query the target cell plus adjacent cells so a driver across a boundary isn't missed.",
+            "In dense areas a single cell can hold thousands of drivers \u2014 cap results and rank, or use a finer level there."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Querying only the rider's exact cell",
+          "why": "The closest driver may sit one meter across a cell boundary and be missed entirely.",
+          "instead": "Query the cell plus its neighbors (a ring) and then rank by true distance."
+        },
+        {
+          "trap": "One fixed cell size everywhere",
+          "why": "Downtown cells overflow while rural cells are empty \u2014 both queries degrade.",
+          "instead": "Use adaptive resolution (S2 levels) or special-case hot cells."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A downtown cell holds 5,000 available drivers.",
+          "expectedBehavior": "Nearby queries stay fast and bounded.",
+          "mitigation": "Cap candidates per cell, rank by distance/ETA, and consider a finer cell level for dense areas."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Reaches for geohash/S2 and handles cell boundaries with neighbor search.",
+          "Recognizes density skew and caps/ranks results."
+        ],
+        "weak": [
+          "Invents a custom grid without boundary handling.",
+          "Ignores hot-cell overflow."
+        ]
+      },
+      "recap": {
+        "before": "Finding nearby drivers meant scanning everyone.",
+        "after": "Nearby is a cheap cell + neighbor lookup over a continuously updated index.",
+        "newRisk": "Cell sizing and hot cells need tuning; results are as fresh as ingest."
+      },
+      "whyNow": [
+        "The spatial index is the key data structure that makes matching feasible."
+      ]
+    },
+    {
+      "id": "matching",
+      "title": "4. Matching & Dispatch",
+      "description": "Given nearby candidates, the matching service ranks them (distance/ETA, rating, acceptance likelihood) and dispatches an offer to the best one. Offers are time-boxed; if declined or unanswered, it moves to the next candidate. Idempotency stops duplicate requests creating duplicate matches.",
+      "patterns": [
+        "Matching / assignment",
+        "Idempotency key"
+      ],
+      "decisionPrompt": "You found 5 nearby drivers. How do you offer the trip so exactly one ends up assigned?",
+      "concepts": [
+        {
+          "term": "Offer / acceptance loop",
+          "definition": "Dispatch offers to one (or a few) candidates with a timeout, advancing on decline.",
+          "whyItMatters": "Drivers can refuse; matching is a negotiation, not an instant assignment."
+        },
+        {
+          "term": "Ranking",
+          "definition": "Ordering candidates by ETA, rating, and likelihood to accept.",
+          "whyItMatters": "Good ranking cuts time-to-match and improves both sides' experience."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  API[Ride API Gateway]",
+        "  Match[Matching Service]",
+        "  GeoIndex[(Geo Index \u2014 driver cells)]",
+        "  Dispatch[Dispatch Service]",
+        "  Driver[Driver App]",
+        "  Trip[Trip Service]",
+        "  API --> Match",
+        "  Match -->|nearby candidates| GeoIndex",
+        "  Match -->|best candidate| Dispatch",
+        "  Dispatch -->|time-boxed offer| Driver",
+        "  Match -->|create trip| Trip"
+      ],
+      "highlight": [
+        "Match",
+        "Dispatch"
+      ],
+      "options": [
+        {
+          "name": "Sequential best-first offers (default)",
+          "pros": [
+            "A driver is only ever offered one trip at a time \u2014 no double-offer confusion.",
+            "Simple fairness and clear accounting."
+          ],
+          "cons": [
+            "Slower if top candidates decline; each offer costs the timeout."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Match[Matching Service]",
+            "  Dispatch[Dispatch Service]",
+            "  Driver[Driver App]",
+            "  Match -->|rank| Dispatch",
+            "  Dispatch -->|offer #1, then #2| Driver"
+          ],
+          "highlight": [
+            "Dispatch"
+          ]
+        },
+        {
+          "name": "Broadcast to several drivers, first to accept wins",
+          "pros": [
+            "Lower time-to-match in sparse areas."
+          ],
+          "cons": [
+            "Same driver may get multiple trips' offers at once; needs careful locking to avoid double-assign.",
+            "Wasted notifications and driver annoyance."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Match[Matching Service]",
+            "  Dispatch[Dispatch Service]",
+            "  Driver[Driver App]",
+            "  Match --> Dispatch",
+            "  Dispatch -->|offer to N| Driver"
+          ],
+          "highlight": [
+            "Dispatch"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Assigning the trip to a driver without their acceptance",
+          "why": "Drivers can be unavailable/unwilling; force-assigning strands the rider when the driver no-shows.",
+          "instead": "Offer with a timeout and confirm on acceptance; advance to the next candidate otherwise."
+        },
+        {
+          "trap": "Non-idempotent ride requests",
+          "why": "A mobile retry creates a second trip and a second match.",
+          "instead": "Idempotency key collapses retries to one trip."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The top candidate's app is offline and never answers the offer.",
+          "expectedBehavior": "The rider still gets matched promptly.",
+          "mitigation": "Offer timeout advances to the next ranked candidate; widen the radius if the list is exhausted."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Models matching as a timed offer/accept loop with ranking.",
+          "Makes requests idempotent and avoids double-offers."
+        ],
+        "weak": [
+          "Force-assigns without acceptance.",
+          "Broadcasts without handling double-assignment."
+        ]
+      },
+      "recap": {
+        "before": "We could find nearby drivers but not assign one.",
+        "after": "Riders are matched via ranked, time-boxed offers to exactly one driver.",
+        "newRisk": "Concurrent offers can race for the same driver \u2014 needs atomic claiming next."
+      },
+      "whyNow": [
+        "A spatial index is only useful once it drives an actual assignment."
+      ]
+    },
+    {
+      "id": "trip-state",
+      "title": "5. Trip State Machine & Atomic Assignment",
+      "description": "Model the trip as a state machine (matching -> matched -> en route -> in progress -> completed) and make the matching->matched transition an atomic claim so two riders can't grab the same driver. Acceptance is idempotent and first-writer-wins.",
+      "patterns": [
+        "State machine",
+        "Distributed lock / CAS",
+        "Idempotency key"
+      ],
+      "decisionPrompt": "Two riders' matches both offer driver D at the same instant and D taps accept on both. Who gets the driver?",
+      "concepts": [
+        {
+          "term": "Atomic claim (CAS)",
+          "definition": "Compare-and-set the driver/trip from available->assigned; only one writer succeeds.",
+          "whyItMatters": "Prevents double-booking a driver under concurrent offers."
+        },
+        {
+          "term": "Trip state machine",
+          "definition": "Explicit states with allowed transitions and guards.",
+          "whyItMatters": "Makes invariants (one active trip per driver) enforceable and auditable."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Dispatch[Dispatch Service]",
+        "  Trip[Trip Service]",
+        "  Idem[(Idempotency Store)]",
+        "  TripDB[(Trips DB)]",
+        "  Driver[Driver App]",
+        "  Driver -->|accept| Dispatch",
+        "  Dispatch --> Trip",
+        "  Trip -->|CAS matching->matched| Idem",
+        "  Trip -->|persist state| TripDB"
+      ],
+      "highlight": [
+        "Trip",
+        "Idem",
+        "TripDB"
+      ],
+      "flows": [
+        {
+          "name": "Two accepts race for driver D",
+          "note": "Atomic claim means exactly one wins; the other gets 409.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant D1 as Trip 1",
+            "  participant D2 as Trip 2",
+            "  participant T as Trip Service",
+            "  participant L as Lock/CAS",
+            "  D1->>T: assign driver D",
+            "  D2->>T: assign driver D",
+            "  T->>L: CAS D available->busy (trip1)",
+            "  L-->>T: ok",
+            "  T->>L: CAS D available->busy (trip2)",
+            "  L-->>T: already busy",
+            "  T-->>D2: 409, re-match"
+          ],
+          "highlight": [
+            "L"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Marking the trip matched without atomically claiming the driver",
+          "why": "Two trips can both believe they got driver D \u2014 a double-booking.",
+          "instead": "CAS the driver from available->busy; only the winner proceeds, the loser re-matches."
+        },
+        {
+          "trap": "No state guards on transitions",
+          "why": "A late 'accept' on an already-cancelled trip corrupts state.",
+          "instead": "Guard each transition (only matching->matched, etc.); reject illegal ones."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A driver accepts, then their app crashes before the trip is persisted.",
+          "expectedBehavior": "No driver is silently stuck busy; the trip is recoverable or re-matched.",
+          "mitigation": "The claim has a TTL; if the trip isn't confirmed, the driver is released and re-offered."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Uses an atomic CAS to claim the driver and guards state transitions.",
+          "Handles the crash-after-claim with a TTL release."
+        ],
+        "weak": [
+          "Sets status without atomic claiming.",
+          "Allows illegal transitions."
+        ]
+      },
+      "recap": {
+        "before": "Concurrent offers could double-book a driver.",
+        "after": "Each driver and trip transitions atomically through a guarded state machine.",
+        "newRisk": "Stuck claims need TTL release; the lock store must be fast and available."
+      },
+      "whyNow": [
+        "Matching is only correct once assignment is atomic under concurrency."
+      ]
+    },
+    {
+      "id": "surge",
+      "title": "6. Surge Pricing",
+      "description": "When demand outstrips supply in an area, raise prices to ration demand and pull in drivers. Compute a per-cell demand/supply ratio over a sliding window into a surge multiplier, applied at quote time. It reuses the same geo cells as matching.",
+      "patterns": [
+        "Real-time demand pricing",
+        "Geo-indexing (geohash / S2)"
+      ],
+      "decisionPrompt": "How do you compute and apply surge per area without making prices flicker every second?",
+      "concepts": [
+        {
+          "term": "Demand/supply ratio",
+          "definition": "Open requests vs available drivers in a cell over a window.",
+          "whyItMatters": "It's the signal that drives the multiplier; smoothing avoids erratic prices."
+        },
+        {
+          "term": "Quote-time application",
+          "definition": "Lock the multiplier into the fare estimate shown to the rider.",
+          "whyItMatters": "Riders must see a stable price; you can't change it mid-trip."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Match[Matching Service]",
+        "  Pricing[Pricing Service]",
+        "  SurgeStore[(Surge / Demand Store)]",
+        "  GeoIndex[(Geo Index \u2014 driver cells)]",
+        "  Rider[Rider App]",
+        "  Match -->|demand signal| SurgeStore",
+        "  GeoIndex -->|supply signal| SurgeStore",
+        "  Pricing -->|read cell multiplier| SurgeStore",
+        "  Pricing -->|quote| Rider"
+      ],
+      "highlight": [
+        "Pricing",
+        "SurgeStore"
+      ],
+      "deepDives": [
+        {
+          "title": "Keeping prices stable and fair",
+          "points": [
+            "Compute the ratio over a sliding window and smooth it so prices don't oscillate second to second.",
+            "Lock the multiplier into the quote the rider accepts; never change it mid-trip.",
+            "Cap surge and be transparent \u2014 runaway multipliers erode trust and invite regulation."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Recomputing surge per request with no smoothing",
+          "why": "Prices flicker wildly as a single driver appears/disappears, confusing and angering riders.",
+          "instead": "Smooth over a window and cache per cell; refresh periodically."
+        },
+        {
+          "trap": "Changing the price after the rider accepted the quote",
+          "why": "Bait-and-switch destroys trust and may be illegal.",
+          "instead": "Freeze the multiplier into the accepted quote for the trip."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Computes surge per geo cell over a smoothed window and freezes it at quote time.",
+          "Reuses the matching cells and caps the multiplier."
+        ],
+        "weak": [
+          "Recomputes per request with no smoothing.",
+          "Lets price change after acceptance."
+        ]
+      },
+      "recap": {
+        "before": "One price regardless of local supply/demand.",
+        "after": "Per-cell surge balances the marketplace, frozen into each quote.",
+        "newRisk": "Surge math must be smoothed, capped, and transparent to keep trust."
+      },
+      "whyNow": [
+        "With matching working, marketplace balance (pricing) is the next lever in dense, supply-starved areas."
+      ]
+    },
+    {
+      "id": "eta",
+      "title": "7. ETA & Routing",
+      "description": "Riders and matching both need ETAs. A routing service computes travel time over a road graph with live traffic, feeding match ranking (nearest by ETA, not straight-line) and rider-facing arrival estimates. ETAs are cached and refreshed, not recomputed per poll.",
+      "patterns": [
+        "Read model / cache"
+      ],
+      "decisionPrompt": "Why is straight-line distance a bad way to pick the 'nearest' driver, and how do you scale ETA computation?",
+      "concepts": [
+        {
+          "term": "Road-graph routing",
+          "definition": "Shortest travel time over a graph of road segments, weighted by live traffic.",
+          "whyItMatters": "A driver 200m away across a river is farther by road than one 500m away on the same street."
+        },
+        {
+          "term": "ETA caching",
+          "definition": "Reusing recent route/ETA results rather than recomputing per request.",
+          "whyItMatters": "Routing is expensive; caching and incremental updates keep it affordable at scale."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Match[Matching Service]",
+        "  ETA[ETA / Routing Service]",
+        "  MapData[(Road Graph / Map Data)]",
+        "  Rider[Rider App]",
+        "  Match -->|rank by ETA| ETA",
+        "  ETA -->|route over| MapData",
+        "  ETA -->|arrival estimate| Rider"
+      ],
+      "highlight": [
+        "ETA",
+        "MapData"
+      ],
+      "traps": [
+        {
+          "trap": "Ranking candidates by straight-line (haversine) distance",
+          "why": "Road layout, one-ways, and rivers make geometric distance a poor proxy for arrival time.",
+          "instead": "Rank by routed ETA with live traffic; use geo distance only as a cheap pre-filter."
+        },
+        {
+          "trap": "Recomputing the route on every rider poll",
+          "why": "Routing is costly; per-poll recompute won't scale.",
+          "instead": "Cache the ETA and update incrementally as the driver moves."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The routing service is degraded.",
+          "expectedBehavior": "Matching still works, with rougher ETAs.",
+          "mitigation": "Fall back to geo-distance pre-filter for ranking and show an approximate ETA until routing recovers."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Ranks by routed ETA, using geo distance only as a pre-filter.",
+          "Caches ETAs and degrades gracefully."
+        ],
+        "weak": [
+          "Treats straight-line distance as arrival time.",
+          "Recomputes routes per poll."
+        ]
+      },
+      "recap": {
+        "before": "Nearness was geometric and ETAs were absent.",
+        "after": "Matching ranks by real travel time; riders see live ETAs from cached routing.",
+        "newRisk": "Routing is heavy \u2014 it must be cached and have a geo-distance fallback."
+      },
+      "whyNow": [
+        "Good matches and rider trust both depend on real ETAs, not straight-line guesses."
+      ]
+    },
+    {
+      "id": "scale",
+      "title": "8. Scaling by Region (geo-sharding)",
+      "description": "Density is wildly uneven \u2014 a few cities dominate. Shard the geo index and matching by region/city so each operates locally and a hot city is isolated. A region router directs requests and pings to the right shard; cross-region trips (airport runs) are handled explicitly.",
+      "patterns": [
+        "Geo-sharding by region",
+        "Write-heavy ingestion pipeline"
+      ],
+      "decisionPrompt": "New Year's Eve makes one city 50x its normal load. How do you keep it from degrading every other city?",
+      "concepts": [
+        {
+          "term": "Geo-sharding",
+          "definition": "Partitioning the index and matching by geographic region.",
+          "whyItMatters": "Most queries are local (driver and rider in the same city), so co-locating them by region keeps queries fast and isolates hot cities."
+        },
+        {
+          "term": "Locality of queries",
+          "definition": "A nearby query rarely crosses a city boundary.",
+          "whyItMatters": "Region is a natural shard key \u2014 it keeps the working set of a query on one shard."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  API[Ride API Gateway]",
+        "  Router[Region Router]",
+        "  RegionA[Matching \u2014 Region A]",
+        "  RegionB[Matching \u2014 Region B]",
+        "  GeoA[(Geo Index \u2014 Region A)]",
+        "  GeoB[(Geo Index \u2014 Region B)]",
+        "  API -->|by region| Router",
+        "  Router -->|hot city| RegionA",
+        "  Router -->|other cities| RegionB",
+        "  RegionA --> GeoA",
+        "  RegionB --> GeoB"
+      ],
+      "highlight": [
+        "Router",
+        "RegionA",
+        "RegionB",
+        "GeoA",
+        "GeoB"
+      ],
+      "options": [
+        {
+          "name": "Region shards with per-region autoscaling (default)",
+          "pros": [
+            "A hot city's load is contained; its matching/index scale independently.",
+            "Queries stay local \u2014 no cross-shard fan-out for the common case."
+          ],
+          "cons": [
+            "Cross-region trips (pickup in A, drop in B) need explicit handling.",
+            "Region boundaries and rebalancing need tooling."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Router[Region Router]",
+            "  RegionA[Matching \u2014 Region A]",
+            "  RegionB[Matching \u2014 Region B]",
+            "  Router -->|hot city| RegionA",
+            "  Router -->|rest| RegionB"
+          ],
+          "highlight": [
+            "RegionA"
+          ]
+        },
+        {
+          "name": "Single global index for all cities",
+          "pros": [
+            "Simplest; no routing or boundary logic."
+          ],
+          "cons": [
+            "One mega-city's spike degrades global query latency.",
+            "No blast-radius isolation; the index is a single hot spot."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Router[Region Router]",
+            "  GeoB[(Geo Index \u2014 Region B)]",
+            "  Router --> GeoB"
+          ],
+          "highlight": []
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Cross-region trips and boundaries",
+          "points": [
+            "Match in the pickup region; a trip whose dropoff is in another region just updates trip state, not the matching shard.",
+            "Riders/drivers near a region boundary may need to query two adjacent region shards.",
+            "Promote a city to its own dedicated shard when its load crosses a threshold; rebalance with care."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "A single global geo index for the whole planet",
+          "why": "One mega-event in one city makes every city's nearby query slow; it's a single hot spot.",
+          "instead": "Shard by region so locality keeps queries local and isolates hot cities."
+        },
+        {
+          "trap": "Sharding by a non-geographic key (e.g. driver_id)",
+          "why": "Nearby drivers scatter across shards, so every proximity query fans out everywhere.",
+          "instead": "Shard by region/city so a query's candidates live on one shard."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Shards by region for locality and hot-city isolation.",
+          "Handles cross-region trips and boundary queries explicitly."
+        ],
+        "weak": [
+          "Keeps one global index.",
+          "Shards by a key that scatters nearby drivers."
+        ]
+      },
+      "recap": {
+        "before": "One global index made every city share fate.",
+        "after": "Per-region shards keep queries local and isolate hot cities.",
+        "newRisk": "Cross-region trips and boundary queries need explicit handling; routing/rebalancing is ongoing work."
+      },
+      "whyNow": [
+        "At global scale with extreme density skew, a shared index is the final bottleneck and blast-radius risk."
+      ]
+    }
+  ],
+  "finalDesign": {
+    "title": "Final Design",
+    "description": "End-to-end: drivers stream location through an async ingest pipeline into a per-region geo index; a region router directs ride requests to the right regional matching service, which queries nearby candidates, ranks them by routed ETA, and dispatches time-boxed offers; the trip is an atomically-claimed state machine; surge pricing balances each cell; ETA/routing feeds both ranking and rider estimates.",
+    "diagram": [
+      "graph TB",
+      "  Rider[Rider App]",
+      "  Driver[Driver App]",
+      "  API[Ride API Gateway]",
+      "  LocIngest[Location Ingest Service]",
+      "  LocStream[[Location Stream]]",
+      "  LocStore[(Driver Location Store)]",
+      "  Router[Region Router]",
+      "  RegionA[Matching \u2014 Region A]",
+      "  RegionB[Matching \u2014 Region B]",
+      "  GeoA[(Geo Index \u2014 Region A)]",
+      "  GeoB[(Geo Index \u2014 Region B)]",
+      "  Dispatch[Dispatch Service]",
+      "  Trip[Trip Service]",
+      "  Idem[(Idempotency Store)]",
+      "  TripDB[(Trips DB)]",
+      "  Pricing[Pricing Service]",
+      "  SurgeStore[(Surge / Demand Store)]",
+      "  ETA[ETA / Routing Service]",
+      "  MapData[(Road Graph / Map Data)]",
+      "  Notify[/Push Notifications/]",
+      "  Driver -->|location pings| API",
+      "  API --> LocIngest",
+      "  LocIngest --> LocStream",
+      "  LocStream --> LocStore",
+      "  LocStream -->|update cells| GeoA",
+      "  LocStream --> GeoB",
+      "  Rider -->|request ride| API",
+      "  API -->|by region| Router",
+      "  Router --> RegionA",
+      "  Router --> RegionB",
+      "  RegionA -->|nearby| GeoA",
+      "  RegionB -->|nearby| GeoB",
+      "  RegionA --> Dispatch",
+      "  RegionA --> ETA",
+      "  ETA --> MapData",
+      "  RegionA --> Pricing",
+      "  Pricing --> SurgeStore",
+      "  Dispatch -->|offer| Notify",
+      "  Notify --> Driver",
+      "  Dispatch --> Trip",
+      "  Trip -->|CAS| Idem",
+      "  Trip --> TripDB"
+    ],
+    "highlight": []
+  },
+  "satisfies": {
+    "functional": [
+      {
+        "requirement": "Rider requests a ride",
+        "how": "Idempotent POST /rides creates a trip and triggers matching.",
+        "steps": [
+          "request-ride",
+          "matching"
+        ]
+      },
+      {
+        "requirement": "Drivers report location continuously",
+        "how": "Async ingest pipeline absorbs the ping firehose with last-write-wins.",
+        "steps": [
+          "location-ingest"
+        ]
+      },
+      {
+        "requirement": "Match and dispatch a nearby driver",
+        "how": "Geo-index nearby query feeds ranked, time-boxed offers.",
+        "steps": [
+          "geo-index",
+          "matching"
+        ]
+      },
+      {
+        "requirement": "Track trip lifecycle",
+        "how": "An explicit, atomically-claimed trip state machine.",
+        "steps": [
+          "trip-state"
+        ]
+      },
+      {
+        "requirement": "Fare, ETA, and surge",
+        "how": "Routing service for ETA; per-cell surge multiplier frozen at quote.",
+        "steps": [
+          "eta",
+          "surge"
+        ]
+      }
+    ],
+    "nonFunctional": [
+      {
+        "requirement": "Match within seconds",
+        "how": "Geo-index cell lookups plus ETA-ranked offers keep time-to-match low.",
+        "steps": [
+          "geo-index",
+          "matching",
+          "eta"
+        ]
+      },
+      {
+        "requirement": "Ingest millions of updates/sec",
+        "how": "Stream + async workers with last-write-wins, off the primary.",
+        "steps": [
+          "location-ingest"
+        ]
+      },
+      {
+        "requirement": "No double-booking",
+        "how": "Atomic CAS claim on the driver/trip transition.",
+        "steps": [
+          "trip-state"
+        ]
+      },
+      {
+        "requirement": "Fresh 'nearby' data",
+        "how": "Continuous index updates; matching tolerates seconds of staleness.",
+        "steps": [
+          "location-ingest",
+          "geo-index"
+        ]
+      },
+      {
+        "requirement": "Scale with density skew",
+        "how": "Geo-sharding by region isolates hot cities and keeps queries local.",
+        "steps": [
+          "scale"
+        ]
+      },
+      {
+        "requirement": "Graceful degradation",
+        "how": "Widen radius / advance candidates on decline; geo-distance fallback when routing degrades.",
+        "steps": [
+          "matching",
+          "eta"
+        ]
+      }
+    ]
+  },
+  "interviewScript": [
+    {
+      "phase": "Scope & the real problem",
+      "time": "first 5 min",
+      "say": [
+        "Restate it: match a rider to a nearby available driver in seconds, with millions of drivers moving.",
+        "List functional (request, locate, match, trip lifecycle, pricing) and non-functional (latency, ingest scale, no double-book).",
+        "Name the two hard problems: ingesting location at scale and querying 'nearby' fast."
+      ]
+    },
+    {
+      "phase": "Estimate & API",
+      "time": "5\u201315 min",
+      "say": [
+        "Size drivers, ping rate (=> updates/sec), and request rate; note the write-heavy location firehose.",
+        "Sketch POST /rides (idempotent), the high-frequency location update, and accept."
+      ]
+    },
+    {
+      "phase": "Build up the design",
+      "time": "15\u201340 min",
+      "say": [
+        "Start with the naive scan to expose the geo-query problem, then add ingest, then the geo index.",
+        "Add matching/dispatch, the atomic trip state machine, then surge and ETA.",
+        "Go deep where pushed: geohash vs S2 and cell boundaries, or atomic assignment."
+      ]
+    },
+    {
+      "phase": "Scale & wrap",
+      "time": "final 5 min",
+      "say": [
+        "Geo-shard by region to isolate hot cities; handle cross-region trips.",
+        "Summarize how each requirement is met and name the dominant risk (hot-cell / hot-city density)."
+      ]
+    }
+  ],
+  "levelVariants": [
+    {
+      "level": "Junior",
+      "expectations": [
+        "Recognizes that scanning all drivers won't scale and reaches for a spatial index.",
+        "Separates high-frequency location data from the trip database."
+      ]
+    },
+    {
+      "level": "Senior",
+      "expectations": [
+        "Designs geohash/S2 indexing with neighbor (boundary) queries and an async ingest pipeline.",
+        "Models matching as ranked time-boxed offers with an atomic trip claim.",
+        "Ranks by routed ETA, not straight-line distance."
+      ]
+    },
+    {
+      "level": "Staff+",
+      "expectations": [
+        "Geo-shards by region for locality and hot-city isolation; handles cross-region and boundaries.",
+        "Reasons about staleness vs. freshness in the location pipeline and its effect on matching.",
+        "Designs surge to be smoothed, capped, and frozen at quote; quantifies the tradeoffs."
+      ]
+    }
+  ],
+  "followUps": [
+    "How would you support carpooling/pooled rides (matching multiple riders to one driver en route)?",
+    "How do you prevent and detect GPS spoofing by drivers gaming incentives or surge?",
+    "How would you handle scheduled/reserved rides hours in advance alongside on-demand?",
+    "How do you keep the rider's live map of the approaching driver smooth and accurate?",
+    "How would you match for airport queues or venues where FIFO driver fairness matters?",
+    "How do you reconcile the fast location store, the geo index, and trip state after a regional outage?"
+  ]
+}

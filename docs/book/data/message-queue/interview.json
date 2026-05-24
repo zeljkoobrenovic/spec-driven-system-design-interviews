@@ -1,0 +1,1111 @@
+{
+  "title": "Message Queue \u2014 System Design",
+  "description": "Designing a distributed message queue / log (think Kafka or SQS): producers append messages, consumers read them, and the system guarantees durability, ordering within a partition, and well-defined delivery semantics at high throughput. The interesting problems are the classic distributed-systems ones: partitioning for scale, offsets and consumer groups, at-least-once vs exactly-once effect, ordering, acknowledgement/visibility, replication, and dead-lettering. We build from an in-memory queue toward a partitioned, replicated, consumer-group log.",
+  "requirementsDiagram": [
+    "graph LR",
+    "  Producer[Producer]",
+    "  Broker[Broker]",
+    "  Log[(Append-Only Log)]",
+    "  Consumer[Consumer]",
+    "  Producer -->|publish| Broker",
+    "  Broker -->|append| Log",
+    "  Consumer -->|poll| Broker",
+    "  Broker -->|deliver| Consumer"
+  ],
+  "capacityDiagram": [
+    "graph LR",
+    "  Producer[Producer]",
+    "  Broker[Broker]",
+    "  P0[(Partition 0)]",
+    "  P1[(Partition 1)]",
+    "  Producer -->|~1M msgs/s| Broker",
+    "  Broker --> P0",
+    "  Broker --> P1"
+  ],
+  "requirements": {
+    "functional": [
+      "Producers publish messages to a named topic.",
+      "Consumers subscribe and read messages, tracking their position.",
+      "Messages are durable once acknowledged to the producer.",
+      "Support multiple independent consumer groups over the same topic.",
+      "Dead-letter messages that repeatedly fail processing."
+    ],
+    "nonFunctional": [
+      "High throughput: millions of messages per second.",
+      "Durability: an acknowledged message is not lost on broker failure.",
+      "Ordering within a partition is preserved.",
+      "Well-defined delivery semantics (at-least-once by default; exactly-once effect via dedup).",
+      "Horizontal scalability by adding partitions and brokers.",
+      "Consumers can fail and resume without losing or massively reprocessing messages."
+    ]
+  },
+  "capacity": [
+    {
+      "label": "Throughput",
+      "value": "~1M msgs/s",
+      "note": "Sequential append to a log is the key to high write throughput."
+    },
+    {
+      "label": "Message size",
+      "value": "~1 KB typical",
+      "note": "Many small messages; batching amortizes per-message overhead."
+    },
+    {
+      "label": "Retention",
+      "value": "hours to days",
+      "note": "The log retains messages for a window so consumers can replay."
+    },
+    {
+      "label": "Consumers",
+      "value": "many groups",
+      "note": "Each group reads independently at its own offset."
+    },
+    {
+      "label": "Durability",
+      "value": "replicated, no loss after ack",
+      "note": "Acked messages survive broker failure via replication."
+    },
+    {
+      "label": "Ordering scope",
+      "value": "per partition",
+      "note": "Global ordering doesn't scale; ordering is guaranteed within a partition only."
+    }
+  ],
+  "api": [
+    {
+      "method": "POST",
+      "path": "/v1/topics/{topic}/messages",
+      "description": "Publish a message. Optional key decides the partition; producer may batch.",
+      "request": "{ \"key\": \"user_1\", \"value\": \"...\", \"idempotency_id\": \"p_42\" }",
+      "response": "200 OK { \"partition\": 0, \"offset\": 109823 }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant P as Producer",
+        "  participant B as Broker (leader)",
+        "  participant F as Follower",
+        "  P->>B: publish(key, value)",
+        "  B->>B: append to partition log",
+        "  B->>F: replicate",
+        "  F-->>B: acked",
+        "  B-->>P: 200 (partition, offset)"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/topics/{topic}/poll",
+      "description": "Poll for messages from the partitions assigned to this consumer group member, starting at the committed offset.",
+      "request": "GET /poll?group=g1&max=500",
+      "response": "200 OK { \"records\": [ { \"partition\":0, \"offset\":109824, \"value\":\"...\" } ] }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/topics/{topic}/commit",
+      "description": "Commit the consumer group's offset after processing.",
+      "request": "{ \"group\": \"g1\", \"partition\": 0, \"offset\": 110324 }",
+      "response": "200 OK"
+    }
+  ],
+  "dataModel": [
+    {
+      "name": "topics",
+      "note": "A named stream, split into partitions.",
+      "fields": [
+        {
+          "name": "topic",
+          "type": "varchar PK"
+        },
+        {
+          "name": "partitions",
+          "type": "int"
+        },
+        {
+          "name": "retention_ms",
+          "type": "bigint"
+        }
+      ]
+    },
+    {
+      "name": "partition_log",
+      "note": "Append-only, ordered sequence of records per partition. Offset is the position.",
+      "fields": [
+        {
+          "name": "partition",
+          "type": "int"
+        },
+        {
+          "name": "offset",
+          "type": "bigint"
+        },
+        {
+          "name": "key",
+          "type": "bytes null"
+        },
+        {
+          "name": "value",
+          "type": "bytes"
+        },
+        {
+          "name": "ts",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "consumer_offsets",
+      "note": "Per (group, partition) committed position. The only consumer-side state.",
+      "fields": [
+        {
+          "name": "group",
+          "type": "varchar"
+        },
+        {
+          "name": "partition",
+          "type": "int"
+        },
+        {
+          "name": "committed_offset",
+          "type": "bigint"
+        }
+      ]
+    },
+    {
+      "name": "dedup_ids",
+      "note": "Producer idempotency ids to dedupe retried publishes (exactly-once produce).",
+      "fields": [
+        {
+          "name": "producer_id",
+          "type": "varchar"
+        },
+        {
+          "name": "seq",
+          "type": "bigint"
+        }
+      ]
+    }
+  ],
+  "patterns": [
+    {
+      "name": "Append-only log",
+      "what": "Store messages as an immutable, ordered, append-only sequence; position = offset.",
+      "whenToUse": "High-throughput durable streams where sequential writes and replay matter.",
+      "steps": [
+        "durable-log"
+      ]
+    },
+    {
+      "name": "Partitioning by key",
+      "what": "Split a topic into partitions; key hashing keeps a key's messages ordered on one partition.",
+      "whenToUse": "Scaling throughput while preserving per-key ordering.",
+      "steps": [
+        "durable-log",
+        "scale"
+      ]
+    },
+    {
+      "name": "Consumer groups + offsets",
+      "what": "Independent groups track their own offset; partitions are balanced across group members.",
+      "whenToUse": "Multiple independent readers and horizontal consumer scaling.",
+      "steps": [
+        "consumer-groups"
+      ]
+    },
+    {
+      "name": "At-least-once + idempotency",
+      "what": "Redeliver until acked, and dedupe so the effect is exactly-once.",
+      "whenToUse": "Reliable delivery over unreliable consumers/networks.",
+      "steps": [
+        "delivery-semantics"
+      ]
+    },
+    {
+      "name": "Visibility timeout / ack",
+      "what": "Hide an in-flight message until acked or a timeout requeues it.",
+      "whenToUse": "Queue-style consumption where a consumer may crash mid-process.",
+      "steps": [
+        "ack-visibility"
+      ]
+    },
+    {
+      "name": "Dead-letter queue",
+      "what": "Route repeatedly-failing messages aside instead of blocking or dropping.",
+      "whenToUse": "Any retrying consumer with poison messages.",
+      "steps": [
+        "ack-visibility"
+      ]
+    },
+    {
+      "name": "Leader-follower replication",
+      "what": "Replicate each partition to followers; ack after replication for durability.",
+      "whenToUse": "No-loss durability and availability under broker failure.",
+      "steps": [
+        "replication"
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "in-memory-queue",
+      "title": "1. In-Memory Queue (the baseline)",
+      "description": "Start with a single broker holding an in-memory FIFO queue: producers push, one consumer pops. It works until the broker restarts (messages lost) or load exceeds one node \u2014 which is exactly why the rest of the design exists.",
+      "patterns": [
+        "Synchronous request/response"
+      ],
+      "decisionPrompt": "What happens to un-consumed messages when the broker process restarts?",
+      "concepts": [
+        {
+          "term": "Producer / consumer",
+          "definition": "The writer and reader of the queue.",
+          "whyItMatters": "Decoupling them in time is the whole point of a queue."
+        },
+        {
+          "term": "Durability gap",
+          "definition": "In-memory messages vanish on crash.",
+          "whyItMatters": "Motivates the durable, replicated log."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Producer[Producer]",
+        "  Broker[Broker]",
+        "  Consumer[Consumer]",
+        "  Producer -->|push| Broker",
+        "  Broker -->|pop| Consumer"
+      ],
+      "highlight": [
+        "Producer",
+        "Broker",
+        "Consumer"
+      ],
+      "talkingPoints": [
+        "Name durability and single-node throughput as the two things this can't do.",
+        "Frame the log as the fix for both."
+      ],
+      "traps": [
+        {
+          "trap": "Keeping messages only in memory",
+          "why": "A restart loses every un-consumed message.",
+          "instead": "Persist to a durable, append-only log."
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "One node caps throughput and loses data on crash.",
+          "mitigation": "Durable partitioned log + replication (next steps)."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Immediately flags durability and single-node limits."
+        ],
+        "weak": [
+          "Treats an in-memory queue as sufficient."
+        ]
+      },
+      "whyNow": [
+        "A baseline makes durability, partitioning, and replication concrete responses to real gaps."
+      ]
+    },
+    {
+      "id": "durable-log",
+      "title": "2. Durable Partitioned Log",
+      "description": "Persist each topic as an append-only log, split into partitions. Sequential appends give high write throughput; a message's offset is its position. A key hashes to a partition so a key's messages stay ordered.",
+      "patterns": [
+        "Append-only log",
+        "Partitioning by key"
+      ],
+      "decisionPrompt": "Why an append-only log instead of a table with a 'consumed' flag, and how do you keep throughput high?",
+      "concepts": [
+        {
+          "term": "Offset",
+          "definition": "A monotonic position of a record within a partition.",
+          "whyItMatters": "Consumers track progress by offset; it enables replay."
+        },
+        {
+          "term": "Sequential append",
+          "definition": "Writing to the end of a file/log, not random updates.",
+          "whyItMatters": "Sequential I/O is far faster than random \u2014 the basis of log throughput."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Producer[Producer]",
+        "  Router[Partition Router]",
+        "  P0[(Partition 0)]",
+        "  P1[(Partition 1)]",
+        "  P2[(Partition 2)]",
+        "  Producer --> Router",
+        "  Router -->|hash key| P0",
+        "  Router --> P1",
+        "  Router --> P2"
+      ],
+      "highlight": [
+        "Router",
+        "P0",
+        "P1",
+        "P2"
+      ],
+      "options": [
+        {
+          "name": "Append-only log per partition (default)",
+          "pros": [
+            "Sequential writes -> very high throughput.",
+            "Natural retention + replay window; offsets are cheap."
+          ],
+          "cons": [
+            "No in-place update/delete; consumers must track offsets."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Producer[Producer]",
+            "  P0[(Partition 0)]",
+            "  Producer -->|append| P0"
+          ],
+          "highlight": [
+            "P0"
+          ]
+        },
+        {
+          "name": "Row-per-message table with consumed flag",
+          "pros": [
+            "Familiar; ad-hoc queries."
+          ],
+          "cons": [
+            "Random updates to flip flags thrash the DB; doesn't reach log throughput.",
+            "Index bloat and vacuuming at high volume."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Producer[Producer]",
+            "  Log[(Append-Only Log)]",
+            "  Producer -->|insert + update flag| Log"
+          ],
+          "highlight": [
+            "Log"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Using a relational table with a consumed flag as the queue",
+          "why": "Constant random updates and index churn can't match sequential-append throughput.",
+          "instead": "Append-only log; consumers advance an offset rather than mutating rows."
+        },
+        {
+          "trap": "Hashing keys to partitions but later changing the partition count",
+          "why": "Re-hashing scatters a key's history across partitions, breaking per-key ordering.",
+          "instead": "Treat partition count as semi-fixed; grow with care, or use sticky/explicit partitioning."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A partition's disk fills.",
+          "expectedBehavior": "Other partitions keep serving; retention reclaims space.",
+          "mitigation": "Per-partition retention/compaction; alert on disk and lag."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Chooses an append-only log and explains sequential-I/O throughput.",
+          "Maps keys to partitions for ordering."
+        ],
+        "weak": [
+          "Reaches for a DB table with flags.",
+          "Ignores per-key ordering."
+        ]
+      },
+      "recap": {
+        "before": "Messages were volatile and single-node.",
+        "after": "Durable, ordered, partitioned logs with offsets and high append throughput.",
+        "newRisk": "Consumers must now track offsets; partition count affects ordering."
+      },
+      "whyNow": [
+        "The log is the core data structure everything else builds on."
+      ]
+    },
+    {
+      "id": "consumer-groups",
+      "title": "3. Consumer Groups & Offsets",
+      "description": "Let independent consumer groups read the same topic, each tracking its own committed offset. Within a group, partitions are balanced across members so they scale out; a coordinator reassigns partitions when members join or leave (rebalance).",
+      "patterns": [
+        "Consumer groups + offsets"
+      ],
+      "decisionPrompt": "Three consumers in one group read a 3-partition topic. One crashes. What happens?",
+      "concepts": [
+        {
+          "term": "Consumer group",
+          "definition": "A set of consumers that jointly consume a topic, each partition owned by one member.",
+          "whyItMatters": "Gives parallel consumption with each message processed once per group."
+        },
+        {
+          "term": "Rebalance",
+          "definition": "Reassigning partitions when membership changes.",
+          "whyItMatters": "Keeps work distributed and recovers a crashed member's partitions."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Coord[Group Coordinator]",
+        "  Group[Consumer Group]",
+        "  C1[Consumer 1]",
+        "  C2[Consumer 2]",
+        "  P0[(Partition 0)]",
+        "  P1[(Partition 1)]",
+        "  Offsets[(Consumer Offsets)]",
+        "  Coord --> Group",
+        "  Group --> C1",
+        "  Group --> C2",
+        "  C1 --> P0",
+        "  C2 --> P1",
+        "  C1 --> Offsets",
+        "  C2 --> Offsets"
+      ],
+      "highlight": [
+        "Coord",
+        "Group",
+        "C1",
+        "C2",
+        "Offsets"
+      ],
+      "deepDives": [
+        {
+          "title": "Offset commit timing",
+          "points": [
+            "Commit after processing for at-least-once (a crash before commit reprocesses, not loses).",
+            "Commit before processing for at-most-once (a crash loses, never duplicates).",
+            "Rebalances briefly pause consumption; keep them rare and fast (static membership, sticky assignment)."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Committing the offset before processing the message",
+          "why": "A crash after commit but before processing loses the message silently.",
+          "instead": "Commit after successful processing (at-least-once) unless you explicitly want at-most-once."
+        },
+        {
+          "trap": "Storing offsets on the consumer's local disk",
+          "why": "A replacement instance after a crash has no idea where to resume.",
+          "instead": "Commit offsets to the broker/durable store keyed by (group, partition)."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A group member crashes mid-batch.",
+          "expectedBehavior": "Its partitions are reassigned and resume from the last committed offset.",
+          "mitigation": "Coordinator rebalances; uncommitted messages are redelivered to the new owner."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Explains group ownership, rebalancing, and commit-after-process.",
+          "Stores offsets durably keyed by group."
+        ],
+        "weak": [
+          "Commits before processing.",
+          "Keeps offsets only locally."
+        ]
+      },
+      "recap": {
+        "before": "A single reader per topic.",
+        "after": "Independent groups read in parallel, resuming from durable offsets after failure.",
+        "newRisk": "Rebalances pause consumption; commit timing decides delivery semantics."
+      },
+      "whyNow": [
+        "Groups + offsets are how consumption scales and survives failure."
+      ]
+    },
+    {
+      "id": "delivery-semantics",
+      "title": "4. Delivery Semantics & Idempotency",
+      "description": "Make the guarantees explicit. The default is at-least-once (redeliver until acked), which means duplicates; achieve exactly-once effect by deduping with producer idempotency ids and idempotent consumers. True exactly-once delivery is impossible, but exactly-once effect is achievable.",
+      "patterns": [
+        "At-least-once + idempotency"
+      ],
+      "decisionPrompt": "A producer's publish times out and it retries. How do you avoid a duplicate message in the log?",
+      "concepts": [
+        {
+          "term": "Exactly-once effect",
+          "definition": "At-least-once delivery plus dedup yields a single effect.",
+          "whyItMatters": "It's the achievable, useful guarantee \u2014 not exactly-once delivery."
+        },
+        {
+          "term": "Producer idempotency id",
+          "definition": "A (producer, sequence) tag the broker uses to drop duplicate appends.",
+          "whyItMatters": "Makes producer retries safe without duplicating log records."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Producer[Producer]",
+        "  Broker[Broker]",
+        "  Idem[(Dedup Store)]",
+        "  P0[(Partition 0)]",
+        "  Consumer[Consumer]",
+        "  Producer -->|publish + idem id| Broker",
+        "  Broker -->|dedup| Idem",
+        "  Broker -->|append once| P0",
+        "  P0 --> Consumer"
+      ],
+      "highlight": [
+        "Idem"
+      ],
+      "flows": [
+        {
+          "name": "Duplicate publish is deduped",
+          "note": "Broker drops the retry by idempotency id.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant P as Producer",
+            "  participant B as Broker",
+            "  participant I as Dedup",
+            "  P->>B: publish(seq=42) [retry]",
+            "  B->>I: seen seq=42?",
+            "  I-->>B: yes",
+            "  B-->>P: ack (no new append)"
+          ],
+          "highlight": [
+            "I"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Promising exactly-once delivery",
+          "why": "It's impossible over an unreliable network; consumers can always crash between act and ack.",
+          "instead": "Provide at-least-once delivery + dedup to get exactly-once effect."
+        },
+        {
+          "trap": "Non-idempotent consumers on an at-least-once queue",
+          "why": "Redelivery double-applies side effects (double charge, double email).",
+          "instead": "Make consumer processing idempotent (dedupe by message id / use upserts)."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "Consumer processes a message, then crashes before committing the offset.",
+          "expectedBehavior": "The message is reprocessed, not lost; the effect happens once.",
+          "mitigation": "At-least-once redelivery + idempotent processing."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Distinguishes exactly-once delivery (impossible) from effect (achievable).",
+          "Makes producers and consumers idempotent."
+        ],
+        "weak": [
+          "Claims exactly-once delivery.",
+          "Assumes no duplicates."
+        ]
+      },
+      "recap": {
+        "before": "Delivery guarantees were vague.",
+        "after": "At-least-once with idempotency gives a clear exactly-once effect.",
+        "newRisk": "Dedup stores and idempotent consumers are now required."
+      },
+      "whyNow": [
+        "Before relying on the queue for real work, its guarantees must be precise."
+      ]
+    },
+    {
+      "id": "ack-visibility",
+      "title": "5. Acknowledgement, Visibility & Dead-Lettering",
+      "description": "For queue-style consumption, a polled message becomes invisible for a visibility timeout; the consumer acks on success or it reappears for retry after the timeout. Messages that fail repeatedly go to a dead-letter queue instead of blocking or vanishing.",
+      "patterns": [
+        "Visibility timeout / ack",
+        "Dead-letter queue"
+      ],
+      "decisionPrompt": "A consumer takes a message but crashes before finishing. How does it get reprocessed without being lost or stuck forever?",
+      "concepts": [
+        {
+          "term": "Visibility timeout",
+          "definition": "A window during which a delivered message is hidden from other consumers.",
+          "whyItMatters": "Prevents two consumers processing the same message while one is still working."
+        },
+        {
+          "term": "Dead-letter queue",
+          "definition": "A side queue for messages that exceed a retry limit.",
+          "whyItMatters": "Keeps poison messages from blocking the queue while preserving them."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Consumer[Consumer]",
+        "  Ack[Ack / Visibility Tracker]",
+        "  P0[(Partition 0)]",
+        "  DLQ[(Dead-Letter Queue)]",
+        "  P0 --> Consumer",
+        "  Consumer -->|ack| Ack",
+        "  Ack -->|timeout: requeue| P0",
+        "  Ack -->|max retries| DLQ"
+      ],
+      "highlight": [
+        "Ack",
+        "DLQ"
+      ],
+      "traps": [
+        {
+          "trap": "Deleting the message as soon as it's delivered",
+          "why": "If the consumer then crashes, the message is gone \u2014 at-most-once by accident.",
+          "instead": "Hide it for a visibility timeout; delete only on ack, requeue on timeout."
+        },
+        {
+          "trap": "Retrying a poison message forever",
+          "why": "It blocks progress and burns capacity.",
+          "instead": "Cap retries and dead-letter it for inspection."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A malformed message always throws on processing.",
+          "expectedBehavior": "It stops blocking the queue after a few tries.",
+          "mitigation": "Retry limit routes it to the DLQ; the rest of the queue flows."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Uses visibility timeout + ack and a DLQ with a retry cap."
+        ],
+        "weak": [
+          "Deletes on delivery.",
+          "Retries poison messages indefinitely."
+        ]
+      },
+      "recap": {
+        "before": "A crash mid-process could lose or duplicate-block a message.",
+        "after": "In-flight messages are tracked; failures retry then dead-letter.",
+        "newRisk": "Visibility timeout tuning and DLQ monitoring are now needed."
+      },
+      "whyNow": [
+        "Queue-style consumers need safe in-flight handling once delivery semantics are set."
+      ]
+    },
+    {
+      "id": "replication",
+      "title": "6. Replication & Durability",
+      "description": "Replicate each partition from a leader to followers; the leader acks a publish only after enough followers have the record (in-sync replicas). On leader failure, a follower is promoted. This is what makes 'no loss after ack' true.",
+      "patterns": [
+        "Leader-follower replication"
+      ],
+      "decisionPrompt": "When exactly do you tell the producer its message is safely stored?",
+      "concepts": [
+        {
+          "term": "In-sync replicas (ISR)",
+          "definition": "Followers caught up to the leader; acks wait for a quorum of them.",
+          "whyItMatters": "Acking before replication risks loss if the leader then dies."
+        },
+        {
+          "term": "Leader election",
+          "definition": "Promoting a follower when the leader fails.",
+          "whyItMatters": "Keeps the partition available without losing acked data."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Producer[Producer]",
+        "  Leader[(Leader Replica)]",
+        "  Follower[(Follower Replica)]",
+        "  Producer -->|publish| Leader",
+        "  Leader -->|replicate| Follower",
+        "  Follower -->|in-sync ack| Leader",
+        "  Leader -->|ack after ISR| Producer"
+      ],
+      "highlight": [
+        "Leader",
+        "Follower"
+      ],
+      "options": [
+        {
+          "name": "Ack after quorum/ISR replication (default)",
+          "pros": [
+            "No loss of acked data if the leader fails.",
+            "Tunable durability via the required replica count."
+          ],
+          "cons": [
+            "Higher publish latency; availability depends on enough replicas."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Leader[(Leader Replica)]",
+            "  Follower[(Follower Replica)]",
+            "  Leader -->|wait for ISR| Follower"
+          ],
+          "highlight": [
+            "Follower"
+          ]
+        },
+        {
+          "name": "Ack immediately on leader write",
+          "pros": [
+            "Lowest latency."
+          ],
+          "cons": [
+            "A leader crash before replication loses acked messages \u2014 violates the durability requirement."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Producer[Producer]",
+            "  Leader[(Leader Replica)]",
+            "  Producer --> Leader",
+            "  Leader -->|instant ack| Producer"
+          ],
+          "highlight": [
+            "Leader"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Acking the producer on the leader's local write only",
+          "why": "If the leader dies before replicating, an 'acked' message is lost.",
+          "instead": "Ack after a quorum of in-sync replicas have it (tunable)."
+        },
+        {
+          "trap": "Electing an out-of-sync follower as leader",
+          "why": "Promoting a replica missing recent records silently loses acked data.",
+          "instead": "Only elect from in-sync replicas; refuse otherwise (or accept explicit unclean-election risk)."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The partition leader's host dies.",
+          "expectedBehavior": "An in-sync follower takes over with no acked data lost.",
+          "mitigation": "ISR-only leader election; producers retry to the new leader."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Acks after ISR replication and elects only in-sync followers.",
+          "Articulates the latency/durability tradeoff."
+        ],
+        "weak": [
+          "Acks on local write.",
+          "Allows unclean leader election unknowingly."
+        ]
+      },
+      "recap": {
+        "before": "A broker failure could lose acked messages.",
+        "after": "Acked messages survive failure via ISR replication and safe failover.",
+        "newRisk": "Durability costs publish latency and needs enough live replicas."
+      },
+      "whyNow": [
+        "'No loss after ack' is a core requirement that only replication delivers."
+      ]
+    },
+    {
+      "id": "scale",
+      "title": "7. Scaling Partitions & Brokers",
+      "description": "Scale throughput by adding partitions and spreading partition leaders across brokers. A router maps keys to partitions; metadata tracks which broker leads each. Adding capacity means rebalancing partitions, done carefully to preserve ordering and minimize movement.",
+      "patterns": [
+        "Partitioning by key",
+        "Leader-follower replication"
+      ],
+      "decisionPrompt": "One topic's throughput outgrows a single broker. What do you add, and what breaks if you do it naively?",
+      "concepts": [
+        {
+          "term": "Partition as the unit of parallelism",
+          "definition": "More partitions = more parallel producers/consumers and brokers.",
+          "whyItMatters": "It's the primary scaling lever; consumer parallelism is capped by partition count."
+        },
+        {
+          "term": "Leader spread",
+          "definition": "Distributing partition leaders across brokers.",
+          "whyItMatters": "Avoids one broker being the hot leader for everything."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Router[Partition Router]",
+        "  P0[(Partition 0)]",
+        "  P1[(Partition 1)]",
+        "  P2[(Partition 2)]",
+        "  Leader[(Leader Replica)]",
+        "  Follower[(Follower Replica)]",
+        "  Router -->|hash key| P0",
+        "  Router --> P1",
+        "  Router --> P2",
+        "  P0 --> Leader",
+        "  P0 --> Follower"
+      ],
+      "highlight": [
+        "Router",
+        "P0",
+        "P1",
+        "P2"
+      ],
+      "options": [
+        {
+          "name": "More partitions, leaders spread across brokers (default)",
+          "pros": [
+            "Scales producer and consumer throughput linearly.",
+            "Spreads load; no single hot broker."
+          ],
+          "cons": [
+            "Consumer parallelism capped at partition count.",
+            "Adding partitions can disturb key->partition mapping/ordering."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Router[Partition Router]",
+            "  P0[(Partition 0)]",
+            "  P1[(Partition 1)]",
+            "  Router --> P0",
+            "  Router --> P1"
+          ],
+          "highlight": [
+            "P1"
+          ]
+        },
+        {
+          "name": "One big partition, scale the broker",
+          "pros": [
+            "Total ordering across the topic; simple."
+          ],
+          "cons": [
+            "No parallelism \u2014 one consumer at a time; single-node throughput ceiling."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Router[Partition Router]",
+            "  P0[(Partition 0)]",
+            "  Router --> P0"
+          ],
+          "highlight": []
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Repartitioning without chaos",
+          "points": [
+            "Pick partition count generously up front; growing it remaps keys and disturbs per-key ordering.",
+            "Spread leaders evenly and move replicas gradually to avoid a rebalance storm.",
+            "Consumer parallelism within a group can't exceed partition count \u2014 size accordingly."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Requiring total ordering across the whole topic",
+          "why": "Total order forces a single partition, killing parallelism and throughput.",
+          "instead": "Scope ordering to a partition (per key); accept no cross-partition order."
+        },
+        {
+          "trap": "Doubling partitions under load with no plan",
+          "why": "Keys remap, breaking per-key ordering and confusing stateful consumers.",
+          "instead": "Over-provision partitions early; repartition rarely and deliberately."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Scales via partitions, spreads leaders, scopes ordering per key.",
+          "Knows consumer parallelism is bounded by partitions."
+        ],
+        "weak": [
+          "Wants global ordering at scale.",
+          "Repartitions casually."
+        ]
+      },
+      "recap": {
+        "before": "Throughput was capped by one broker/partition.",
+        "after": "Partitions and spread leaders scale throughput horizontally.",
+        "newRisk": "Partition count bounds parallelism and ordering scope; repartitioning is disruptive."
+      },
+      "whyNow": [
+        "Partitioning is the final scaling lever once durability and semantics are solid."
+      ]
+    }
+  ],
+  "finalDesign": {
+    "title": "Final Design",
+    "description": "End-to-end: producers (with idempotency ids) publish to a key-routed, partitioned append-only log; each partition is leader-replicated and acked only after the in-sync set has it; consumer groups read in parallel from durable committed offsets with rebalancing on failure; queue-style consumers use visibility timeouts, acks, and a DLQ; partitions and leaders spread across brokers to scale.",
+    "diagram": [
+      "graph TB",
+      "  Producer[Producer]",
+      "  Idem[(Dedup Store)]",
+      "  Router[Partition Router]",
+      "  P0[(Partition 0)]",
+      "  P1[(Partition 1)]",
+      "  P2[(Partition 2)]",
+      "  Leader[(Leader Replica)]",
+      "  Follower[(Follower Replica)]",
+      "  Coord[Group Coordinator]",
+      "  Group[Consumer Group]",
+      "  C1[Consumer 1]",
+      "  C2[Consumer 2]",
+      "  Offsets[(Consumer Offsets)]",
+      "  Ack[Ack / Visibility Tracker]",
+      "  DLQ[(Dead-Letter Queue)]",
+      "  Producer -->|idem id| Idem",
+      "  Producer --> Router",
+      "  Router -->|hash key| P0",
+      "  Router --> P1",
+      "  Router --> P2",
+      "  P0 --> Leader",
+      "  Leader -->|replicate| Follower",
+      "  Coord --> Group",
+      "  Group --> C1",
+      "  Group --> C2",
+      "  C1 --> P0",
+      "  C2 --> P1",
+      "  C1 --> Offsets",
+      "  C2 --> Offsets",
+      "  C1 --> Ack",
+      "  Ack -->|timeout| P0",
+      "  Ack -->|max retries| DLQ"
+    ],
+    "highlight": []
+  },
+  "satisfies": {
+    "functional": [
+      {
+        "requirement": "Producers publish to a topic",
+        "how": "Key-routed append to a partitioned log.",
+        "steps": [
+          "durable-log"
+        ]
+      },
+      {
+        "requirement": "Consumers read and track position",
+        "how": "Consumer groups with durable committed offsets.",
+        "steps": [
+          "consumer-groups"
+        ]
+      },
+      {
+        "requirement": "Durable after ack",
+        "how": "Leader-follower replication; ack after in-sync replicas.",
+        "steps": [
+          "replication"
+        ]
+      },
+      {
+        "requirement": "Multiple independent consumer groups",
+        "how": "Each group tracks its own offsets over the same log.",
+        "steps": [
+          "consumer-groups"
+        ]
+      },
+      {
+        "requirement": "Dead-letter failing messages",
+        "how": "Retry cap routes poison messages to a DLQ.",
+        "steps": [
+          "ack-visibility"
+        ]
+      }
+    ],
+    "nonFunctional": [
+      {
+        "requirement": "High throughput",
+        "how": "Sequential append + partitioning across brokers.",
+        "steps": [
+          "durable-log",
+          "scale"
+        ]
+      },
+      {
+        "requirement": "Durability (no loss after ack)",
+        "how": "ISR replication and safe leader election.",
+        "steps": [
+          "replication"
+        ]
+      },
+      {
+        "requirement": "Per-partition ordering",
+        "how": "Key hashing keeps a key's records ordered on one partition.",
+        "steps": [
+          "durable-log"
+        ]
+      },
+      {
+        "requirement": "Defined delivery semantics",
+        "how": "At-least-once + producer/consumer idempotency for exactly-once effect.",
+        "steps": [
+          "delivery-semantics"
+        ]
+      },
+      {
+        "requirement": "Horizontal scalability",
+        "how": "Add partitions and spread leaders across brokers.",
+        "steps": [
+          "scale"
+        ]
+      },
+      {
+        "requirement": "Consumer failure recovery",
+        "how": "Rebalance + resume from committed offsets; visibility timeout requeues in-flight.",
+        "steps": [
+          "consumer-groups",
+          "ack-visibility"
+        ]
+      }
+    ]
+  },
+  "interviewScript": [
+    {
+      "phase": "Scope & guarantees",
+      "time": "first 5 min",
+      "say": [
+        "Restate it: durable, ordered, high-throughput messaging with clear delivery semantics.",
+        "List functional (publish, consume, groups, DLQ) and non-functional (throughput, durability, ordering, semantics).",
+        "Pin down the guarantees early \u2014 they drive everything (at-least-once + idempotency is the usual answer)."
+      ]
+    },
+    {
+      "phase": "Estimate & API",
+      "time": "5\u201315 min",
+      "say": [
+        "Size msgs/s, message size, retention, and number of consumer groups.",
+        "Sketch publish, poll, and commit; note the offset is the consumer's only state."
+      ]
+    },
+    {
+      "phase": "Build up the design",
+      "time": "15\u201340 min",
+      "say": [
+        "Start in-memory to expose durability, then the append-only partitioned log.",
+        "Add consumer groups + offsets, delivery semantics + idempotency, visibility/ack + DLQ, then replication.",
+        "Go deep where pushed: exactly-once effect, ISR replication, or repartitioning."
+      ]
+    },
+    {
+      "phase": "Scale & wrap",
+      "time": "final 5 min",
+      "say": [
+        "Scale by partitions and leader spread; scope ordering per key.",
+        "Summarize how each requirement is met and name the dominant tension (ordering vs parallelism, latency vs durability)."
+      ]
+    }
+  ],
+  "levelVariants": [
+    {
+      "level": "Junior",
+      "expectations": [
+        "Knows a durable log beats an in-memory queue and that consumers track an offset.",
+        "Understands a queue decouples producer and consumer."
+      ]
+    },
+    {
+      "level": "Senior",
+      "expectations": [
+        "Designs partitioning for throughput and per-key ordering, with consumer groups and offsets.",
+        "Articulates at-least-once + idempotency for exactly-once effect.",
+        "Uses visibility timeouts, acks, and a DLQ."
+      ]
+    },
+    {
+      "level": "Staff+",
+      "expectations": [
+        "Specifies ISR replication, ack semantics, and safe leader election for no-loss durability.",
+        "Reasons about repartitioning, ordering-vs-parallelism, and rebalance impact.",
+        "Quantifies latency/durability/throughput tradeoffs."
+      ]
+    }
+  ],
+  "followUps": [
+    "How would you implement log compaction to retain only the latest value per key?",
+    "How do you support exactly-once across consume->process->produce (transactional messaging)?",
+    "How would you handle a slow consumer that falls far behind retention and risks data loss?",
+    "How do you do geo-replication across regions and what consistency do you give?",
+    "How would you expose backpressure to producers when brokers are saturated?",
+    "How do you monitor consumer lag and rebalance storms in production?"
+  ]
+}

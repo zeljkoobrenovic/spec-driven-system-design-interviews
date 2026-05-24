@@ -1,0 +1,1386 @@
+{
+  "title": "Notification System \u2014 System Design",
+  "description": "Designing a system that delivers notifications \u2014 push, email, SMS, in-app \u2014 reliably and at scale, without spamming users or losing messages. We build from a single synchronous send toward a queued, deduplicated, preference-aware, multi-channel fanout platform, treating reliable asynchronous delivery and user control as the core problems.",
+  "requirementsDiagram": [
+    "graph LR",
+    "  Client[Client / Service]",
+    "  API[Notification API]",
+    "  Router[Channel Router]",
+    "  Push[/APNs / FCM/]",
+    "  Email[/Email Provider/]",
+    "  SMS[/SMS Provider/]",
+    "  Client -->|send notification| API",
+    "  API --> Router",
+    "  Router --> Push",
+    "  Router --> Email",
+    "  Router --> SMS"
+  ],
+  "capacityDiagram": [
+    "graph LR",
+    "  API[Notification API]",
+    "  Queue[[Message Queue]]",
+    "  Worker[Delivery Worker]",
+    "  Provider[/Push/Email/SMS Provider/]",
+    "  API -->|~50k notif/s peak| Queue",
+    "  Queue -->|pull| Worker",
+    "  Worker -->|deliver| Provider"
+  ],
+  "requirements": {
+    "functional": [
+      "Accept a notification request from internal services (e.g. 'order shipped').",
+      "Deliver across multiple channels: push, email, SMS, in-app.",
+      "Respect per-user preferences and opt-outs per channel and category.",
+      "Fan out one event to many recipients (e.g. a broadcast or a followed topic).",
+      "Support templated content with localization.",
+      "Track delivery status and expose it to senders."
+    ],
+    "nonFunctional": [
+      "Reliable delivery: a accepted notification is eventually delivered or explicitly failed.",
+      "At-least-once delivery with deduplication so users aren't notified twice.",
+      "Low latency for time-sensitive notifications (OTP, security alerts).",
+      "High throughput with bursty load (marketing blasts, breaking news).",
+      "Do not spam: rate-limit per user and collapse duplicates.",
+      "Graceful degradation when a downstream provider is slow or down."
+    ]
+  },
+  "capacity": [
+    {
+      "label": "Notification throughput",
+      "value": "~50,000/s peak",
+      "note": "Marketing blasts and breaking-news fanout spike far above average."
+    },
+    {
+      "label": "Recipients per broadcast",
+      "value": "up to ~10M",
+      "note": "One event can fan out to millions of subscribers."
+    },
+    {
+      "label": "Channels",
+      "value": "push, email, SMS, in-app",
+      "note": "Each has a different provider, latency, and failure profile."
+    },
+    {
+      "label": "Delivery latency target",
+      "value": "p99 < a few seconds (urgent)",
+      "note": "OTP/security alerts are urgent; marketing can be minutes."
+    },
+    {
+      "label": "Dedup window",
+      "value": "minutes to hours",
+      "note": "Retries and duplicate events must not double-notify within the window."
+    },
+    {
+      "label": "Retention of delivery status",
+      "value": "~30 days",
+      "note": "For debugging, analytics, and user-facing 'delivered' state."
+    }
+  ],
+  "api": [
+    {
+      "method": "POST",
+      "path": "/v1/notifications",
+      "description": "Enqueue a notification for one or more recipients. Idempotency-Key dedupes retries of the same logical event.",
+      "request": "Idempotency-Key: evt_7c1f\n{\n  \"event\": \"order.shipped\",\n  \"recipients\": [\"usr_1\", \"usr_2\"],\n  \"channels\": [\"push\", \"email\"],\n  \"template\": \"order_shipped\",\n  \"data\": { \"order_id\": \"ord_9\" }\n}",
+      "response": "202 Accepted\n{ \"notification_id\": \"ntf_456\", \"status\": \"queued\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Client Service",
+        "  participant A as Notification API",
+        "  participant I as Dedup Store",
+        "  participant Q as Queue",
+        "  C->>A: POST /notifications (Idempotency-Key)",
+        "  A->>I: claim key",
+        "  alt new",
+        "    A->>Q: enqueue per recipient/channel",
+        "    A-->>C: 202 queued",
+        "  else duplicate",
+        "    A-->>C: 202 (same notification_id, no re-enqueue)",
+        "  end"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/notifications/{id}",
+      "description": "Fetch a notification's per-channel delivery status.",
+      "request": "GET /v1/notifications/ntf_456",
+      "response": "200 OK\n{ \"id\": \"ntf_456\", \"channels\": { \"push\": \"delivered\", \"email\": \"sent\" } }"
+    },
+    {
+      "method": "PUT",
+      "path": "/v1/users/{id}/preferences",
+      "description": "Set per-channel, per-category notification preferences and quiet hours.",
+      "request": "{ \"marketing\": { \"email\": false }, \"security\": { \"push\": true, \"sms\": true }, \"quiet_hours\": \"22:00-07:00\" }",
+      "response": "200 OK"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/topics/{topic}/subscribers",
+      "description": "Subscribe a user to a topic for fanout (e.g. a channel they follow).",
+      "request": "{ \"user_id\": \"usr_1\" }",
+      "response": "201 Created"
+    }
+  ],
+  "dataModel": [
+    {
+      "name": "notifications",
+      "note": "One row per logical notification request, with per-channel delivery state.",
+      "fields": [
+        {
+          "name": "notification_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "event",
+          "type": "varchar"
+        },
+        {
+          "name": "template",
+          "type": "varchar"
+        },
+        {
+          "name": "payload",
+          "type": "jsonb"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "deliveries",
+      "note": "One row per (notification, recipient, channel) attempt; the unit workers act on.",
+      "fields": [
+        {
+          "name": "delivery_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "notification_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "user_id",
+          "type": "uuid"
+        },
+        {
+          "name": "channel",
+          "type": "enum(push, email, sms, in_app)"
+        },
+        {
+          "name": "status",
+          "type": "enum(queued, sent, delivered, failed, suppressed)"
+        },
+        {
+          "name": "attempts",
+          "type": "int"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "preferences",
+      "note": "Per-user, per-category, per-channel opt-in/out plus quiet hours.",
+      "fields": [
+        {
+          "name": "user_id",
+          "type": "uuid"
+        },
+        {
+          "name": "category",
+          "type": "varchar (marketing, security, ...)"
+        },
+        {
+          "name": "channel",
+          "type": "enum(push, email, sms, in_app)"
+        },
+        {
+          "name": "enabled",
+          "type": "bool"
+        },
+        {
+          "name": "quiet_hours",
+          "type": "varchar null"
+        }
+      ]
+    },
+    {
+      "name": "subscriptions",
+      "note": "Topic -> subscriber mapping for fanout-on-read.",
+      "fields": [
+        {
+          "name": "topic",
+          "type": "varchar"
+        },
+        {
+          "name": "user_id",
+          "type": "uuid"
+        },
+        {
+          "name": "subscribed_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "dedup_keys",
+      "note": "Idempotency keys for accepted events; suppresses duplicate enqueue.",
+      "fields": [
+        {
+          "name": "key",
+          "type": "varchar PK"
+        },
+        {
+          "name": "notification_id",
+          "type": "uuid"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz"
+        }
+      ]
+    }
+  ],
+  "patterns": [
+    {
+      "name": "Work queue",
+      "what": "Decouple accept from deliver with a durable queue and pull-based workers.",
+      "whenToUse": "When the producer is fast and bursty but downstream delivery is slow or rate-limited.",
+      "steps": [
+        "queue-workers"
+      ]
+    },
+    {
+      "name": "Fanout-on-write vs fanout-on-read",
+      "what": "Materialize a copy per recipient up front (write) or resolve recipients at send time (read).",
+      "whenToUse": "Choose by recipient count and fanout frequency \u2014 big topics favor fanout-on-read.",
+      "steps": [
+        "fanout"
+      ]
+    },
+    {
+      "name": "Idempotency key",
+      "what": "Dedupe retried events so a user is notified at most once per logical event.",
+      "whenToUse": "At-least-once pipelines where producers and workers both retry.",
+      "steps": [
+        "idempotency"
+      ]
+    },
+    {
+      "name": "Dead-letter queue",
+      "what": "Route messages that exhaust retries to a separate queue for inspection instead of dropping or blocking.",
+      "whenToUse": "Any retrying consumer where some messages are permanently bad.",
+      "steps": [
+        "queue-workers",
+        "channels"
+      ]
+    },
+    {
+      "name": "Preference / policy filter",
+      "what": "Apply user opt-outs, categories, and quiet hours before delivery.",
+      "whenToUse": "Whenever users must control what reaches them \u2014 almost always for notifications.",
+      "steps": [
+        "preferences"
+      ]
+    },
+    {
+      "name": "Rate limiting / throttling",
+      "what": "Cap notifications per user and smooth bursts so users aren't spammed and providers aren't overwhelmed.",
+      "whenToUse": "High-volume, multi-tenant, or provider-constrained delivery.",
+      "steps": [
+        "rate-limiting"
+      ]
+    },
+    {
+      "name": "Provider abstraction / adapter",
+      "what": "A uniform channel interface behind per-provider adapters with their own retry/failover.",
+      "whenToUse": "Multiple interchangeable downstreams (APNs/FCM, multiple email/SMS vendors).",
+      "steps": [
+        "channels"
+      ]
+    },
+    {
+      "name": "Sharded queues",
+      "what": "Partition the queue so throughput scales and one hot tenant can't starve others.",
+      "whenToUse": "When a single queue/consumer group becomes the throughput bottleneck.",
+      "steps": [
+        "scale"
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "single-send",
+      "title": "1. Synchronous Single-Channel Send (baseline)",
+      "description": "Start minimal: a service calls the notification API, which calls a provider (say push) synchronously and returns the result. This surfaces the core tension \u2014 delivery depends on a slow, flaky third party \u2014 before we add machinery.",
+      "patterns": [
+        "Synchronous request/response"
+      ],
+      "decisionPrompt": "What happens to the caller when the push provider is slow, down, or rate-limiting you?",
+      "concepts": [
+        {
+          "term": "Provider",
+          "definition": "An external delivery service (APNs/FCM for push, an email/SMS vendor).",
+          "whyItMatters": "You don't control its latency or uptime, so synchronous coupling is fragile."
+        },
+        {
+          "term": "Delivery vs sent",
+          "definition": "'Sent' means handed to the provider; 'delivered' means it reached the device \u2014 often confirmed later.",
+          "whyItMatters": "Status is inherently asynchronous, which pushes the design toward queues."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client / Service]",
+        "  API[Notification API]",
+        "  Provider[/Push/Email/SMS Provider/]",
+        "  DB[(Notifications DB)]",
+        "  Client -->|send| API",
+        "  API -->|deliver| Provider",
+        "  API -->|status| DB"
+      ],
+      "highlight": [
+        "Client",
+        "API",
+        "Provider",
+        "DB"
+      ],
+      "talkingPoints": [
+        "State the read/write profile and that bursty fanout is the real load, not steady traffic.",
+        "Point out the caller is blocked on a third party \u2014 unacceptable at 50k/s."
+      ],
+      "traps": [
+        {
+          "trap": "Calling the provider synchronously on the request path",
+          "why": "A slow or down provider blocks callers, exhausts threads, and drops notifications under load.",
+          "instead": "Accept fast, enqueue, and deliver asynchronously with retries."
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Provider latency and outages propagate straight back to callers.",
+          "mitigation": "Introduce a queue and workers (next step)."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Immediately separates 'accept' from 'deliver'.",
+          "Names provider flakiness as the dominant failure mode."
+        ],
+        "weak": [
+          "Assumes providers are fast and reliable.",
+          "Blocks the caller until delivery confirms."
+        ]
+      },
+      "whyNow": [
+        "A concrete baseline makes each later addition a response to a real failure."
+      ]
+    },
+    {
+      "id": "queue-workers",
+      "title": "2. Queue + Workers (reliable async delivery)",
+      "description": "Put a durable queue between accept and deliver. The API enqueues and returns 202 immediately; pull-based workers deliver with retries and backoff. Permanently failing messages go to a dead-letter queue rather than blocking or vanishing.",
+      "patterns": [
+        "Work queue",
+        "Dead-letter queue",
+        "Retry with backoff"
+      ],
+      "decisionPrompt": "How do workers retry without amplifying load during a provider outage, and where do poison messages go?",
+      "concepts": [
+        {
+          "term": "At-least-once delivery",
+          "definition": "The queue may redeliver a message, so a notification can be processed more than once.",
+          "whyItMatters": "It's the reliable default, but forces deduplication downstream."
+        },
+        {
+          "term": "Exponential backoff + jitter",
+          "definition": "Increasing, randomized retry delays.",
+          "whyItMatters": "Prevents synchronized retry storms that hammer a recovering provider."
+        },
+        {
+          "term": "Dead-letter queue (DLQ)",
+          "definition": "A side queue for messages that exhaust retries.",
+          "whyItMatters": "Keeps poison messages from blocking the main queue while preserving them for inspection."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client / Service]",
+        "  API[Notification API]",
+        "  Queue[[Message Queue]]",
+        "  Worker[Delivery Worker]",
+        "  Provider[/Push/Email/SMS Provider/]",
+        "  DB[(Notifications DB)]",
+        "  DLQ[[Dead-Letter Queue]]",
+        "  Client -->|send| API",
+        "  API -->|enqueue| Queue",
+        "  API -->|202| Client",
+        "  Queue -->|pull| Worker",
+        "  Worker -->|deliver| Provider",
+        "  Worker -->|status| DB",
+        "  Worker -->|give up| DLQ"
+      ],
+      "highlight": [
+        "Queue",
+        "Worker",
+        "DLQ"
+      ],
+      "options": [
+        {
+          "name": "Pull-based workers from a durable queue (default)",
+          "pros": [
+            "Absorbs bursts; workers consume at their own pace.",
+            "Natural backpressure \u2014 the queue grows instead of dropping.",
+            "Retries and DLQ are straightforward."
+          ],
+          "cons": [
+            "Adds a queue to operate and monitor (lag, depth)."
+          ],
+          "diagram": [
+            "graph TB",
+            "  API[Notification API]",
+            "  Queue[[Message Queue]]",
+            "  Worker[Delivery Worker]",
+            "  API --> Queue",
+            "  Queue -->|pull| Worker"
+          ],
+          "highlight": [
+            "Queue"
+          ]
+        },
+        {
+          "name": "Push-based fan to workers (no queue)",
+          "pros": [
+            "Lower latency in the happy path."
+          ],
+          "cons": [
+            "No buffer \u2014 bursts overload workers and providers.",
+            "Backpressure and retries become ad-hoc and lossy."
+          ],
+          "diagram": [
+            "graph TB",
+            "  API[Notification API]",
+            "  Worker[Delivery Worker]",
+            "  API -->|push| Worker"
+          ],
+          "highlight": [
+            "Worker"
+          ]
+        }
+      ],
+      "flows": [
+        {
+          "name": "Deliver with retry, then DLQ",
+          "note": "Transient failures retry with backoff; permanent ones dead-letter.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant Q as Queue",
+            "  participant W as Worker",
+            "  participant P as Provider",
+            "  participant D as DLQ",
+            "  Q->>W: deliver message",
+            "  W->>P: send",
+            "  alt transient failure",
+            "    P-->>W: 5xx / timeout",
+            "    W->>Q: requeue (backoff)",
+            "  else permanent failure",
+            "    P-->>W: 4xx invalid token",
+            "    W->>D: dead-letter",
+            "  end"
+          ],
+          "highlight": [
+            "D"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Retrying everything forever",
+          "why": "Permanently bad messages (invalid token) retry endlessly, wasting capacity and blocking the queue.",
+          "instead": "Cap retries; route exhausted messages to a DLQ and stop."
+        },
+        {
+          "trap": "Fixed-interval retries with no jitter",
+          "why": "All workers retry in lockstep and hammer the recovering provider.",
+          "instead": "Exponential backoff with jitter."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The push provider is down for 10 minutes.",
+          "expectedBehavior": "No notifications lost; delivery resumes when it recovers.",
+          "mitigation": "Messages stay queued and retry with backoff; queue depth alerts ops; nothing is dropped."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Adds backoff+jitter and a DLQ without being asked.",
+          "Treats the queue as the buffer that gives backpressure."
+        ],
+        "weak": [
+          "Retries indefinitely.",
+          "Drops messages when workers fall behind."
+        ]
+      },
+      "recap": {
+        "before": "Delivery was synchronous and fragile.",
+        "after": "Accept is fast; delivery is reliable, retried, and buffered.",
+        "newRisk": "At-least-once means duplicates \u2014 handled next."
+      },
+      "whyNow": [
+        "Reliable async delivery is the backbone everything else builds on."
+      ]
+    },
+    {
+      "id": "idempotency",
+      "title": "3. Idempotency & Deduplication (notify once)",
+      "description": "At-least-once queues and retrying producers mean the same logical event can arrive twice. An idempotency key on accept and a dedup check on deliver ensure a user is notified at most once per event within a window.",
+      "patterns": [
+        "Idempotency key",
+        "Dedup store"
+      ],
+      "decisionPrompt": "Where do you dedupe \u2014 at accept, at deliver, or both \u2014 and what's the dedup window?",
+      "concepts": [
+        {
+          "term": "Idempotency key",
+          "definition": "A client-supplied key identifying one logical event so retries are recognized.",
+          "whyItMatters": "Lets producers safely retry without creating duplicate notifications."
+        },
+        {
+          "term": "Deduplication window",
+          "definition": "The time span over which identical (user, event) pairs are collapsed.",
+          "whyItMatters": "Bounds dedup storage and defines what 'duplicate' means operationally."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client / Service]",
+        "  API[Notification API]",
+        "  Idem[(Idempotency / Dedup Store)]",
+        "  Queue[[Message Queue]]",
+        "  Worker[Delivery Worker]",
+        "  Provider[/Push/Email/SMS Provider/]",
+        "  Client -->|Idempotency-Key| API",
+        "  API -->|claim/dedupe| Idem",
+        "  API -->|enqueue if new| Queue",
+        "  Queue --> Worker",
+        "  Worker -->|dedupe delivery| Idem",
+        "  Worker --> Provider"
+      ],
+      "highlight": [
+        "Idem"
+      ],
+      "flows": [
+        {
+          "name": "Duplicate event is suppressed",
+          "note": "Same key at accept short-circuits before enqueue.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant A as API",
+            "  participant I as Dedup Store",
+            "  C->>A: POST (key=K) [retry]",
+            "  A->>I: claim K",
+            "  I-->>A: K seen -> notification_id",
+            "  A-->>C: 202 (no re-enqueue)"
+          ],
+          "highlight": [
+            "I"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Deduping only at accept, not at delivery",
+          "why": "A worker retry after a crash can still deliver twice even if accept was deduped.",
+          "instead": "Dedupe the delivery attempt too, keyed by (delivery_id) or (user, event, channel)."
+        },
+        {
+          "trap": "Server-generated dedup keys",
+          "why": "A producer retry gets a fresh key and the event is treated as new.",
+          "instead": "The producer supplies a stable key per logical event."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A producer retries POST after a timeout it didn't see succeed.",
+          "expectedBehavior": "Exactly one notification per recipient/channel.",
+          "mitigation": "Accept dedupes by key and returns the original notification_id; delivery dedupes by delivery_id."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Dedupes at both accept and deliver.",
+          "Defines an explicit dedup window and its storage cost."
+        ],
+        "weak": [
+          "Assumes the queue delivers exactly once.",
+          "Generates keys server-side."
+        ]
+      },
+      "recap": {
+        "before": "Retries could notify a user multiple times.",
+        "after": "At-most-once effect per logical event within the window.",
+        "newRisk": "Dedup store sizing and window choice become real decisions."
+      },
+      "whyNow": [
+        "Before fanning out to millions, duplicates must be controlled or they multiply."
+      ]
+    },
+    {
+      "id": "fanout",
+      "title": "4. Fanout (one event, many recipients)",
+      "description": "Broadcasts and topic notifications target many users. A fanout service expands one event into per-recipient deliveries. Choose fanout-on-write (materialize per recipient now) vs fanout-on-read (resolve subscribers at send time) by scale.",
+      "patterns": [
+        "Fanout-on-write vs fanout-on-read",
+        "Work queue"
+      ],
+      "decisionPrompt": "A topic has 10M subscribers and a creator posts hourly. Do you fan out on write or on read?",
+      "concepts": [
+        {
+          "term": "Fanout-on-write",
+          "definition": "Create a delivery per recipient when the event arrives.",
+          "whyItMatters": "Fast reads/sends but expensive for huge audiences and frequent events."
+        },
+        {
+          "term": "Fanout-on-read",
+          "definition": "Store the event once; resolve recipients lazily at delivery time.",
+          "whyItMatters": "Cheap for huge, rarely-active audiences; shifts work to send time."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client / Service]",
+        "  API[Notification API]",
+        "  Fanout[Fanout Service]",
+        "  Topic[[Subscriptions / Topics]]",
+        "  Queue[[Message Queue]]",
+        "  Worker[Delivery Worker]",
+        "  Client -->|broadcast| API",
+        "  API --> Fanout",
+        "  Fanout -->|expand subscribers| Topic",
+        "  Fanout -->|per-recipient| Queue",
+        "  Queue --> Worker"
+      ],
+      "highlight": [
+        "Fanout",
+        "Topic"
+      ],
+      "options": [
+        {
+          "name": "Hybrid: write for small audiences, read for large (default)",
+          "pros": [
+            "Cheap sends for huge topics; fast for small ones.",
+            "Avoids materializing 10M rows per post."
+          ],
+          "cons": [
+            "Two code paths; a threshold to tune."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Fanout[Fanout Service]",
+            "  Topic[[Subscriptions / Topics]]",
+            "  Queue[[Message Queue]]",
+            "  Fanout -->|small: materialize| Queue",
+            "  Fanout -->|large: resolve at send| Topic"
+          ],
+          "highlight": [
+            "Fanout"
+          ]
+        },
+        {
+          "name": "Always fanout-on-write",
+          "pros": [
+            "Simple, uniform; delivery is just draining a queue."
+          ],
+          "cons": [
+            "A 10M-subscriber post writes 10M deliveries up front \u2014 expensive and bursty."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Fanout[Fanout Service]",
+            "  Queue[[Message Queue]]",
+            "  Fanout -->|materialize all| Queue"
+          ],
+          "highlight": [
+            "Queue"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Fanning out on write for celebrity-scale topics",
+          "why": "One post materializes millions of rows in a burst, overloading the queue and DB.",
+          "instead": "Use fanout-on-read (or hybrid) above a subscriber threshold."
+        },
+        {
+          "trap": "Expanding subscribers synchronously in the API",
+          "why": "Resolving millions of recipients blocks the request.",
+          "instead": "Hand off to an async fanout worker that streams recipients into the queue."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "Fanout worker crashes halfway through a 10M expansion.",
+          "expectedBehavior": "Resumes without duplicating already-enqueued recipients.",
+          "mitigation": "Checkpoint progress (cursor) and dedupe per (notification, user) so resume is idempotent."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Picks the fanout strategy by audience size and frequency.",
+          "Keeps expansion async and resumable."
+        ],
+        "weak": [
+          "Uses one fanout strategy for all cases.",
+          "Expands recipients on the request path."
+        ]
+      },
+      "recap": {
+        "before": "One event meant one delivery.",
+        "after": "One event expands to per-recipient deliveries at any scale.",
+        "newRisk": "Huge fanouts are bursty; expansion must be async, checkpointed, and idempotent."
+      },
+      "whyNow": [
+        "Fanout is the load multiplier; everything downstream must tolerate its bursts."
+      ]
+    },
+    {
+      "id": "preferences",
+      "title": "5. User Preferences & Quiet Hours",
+      "description": "Insert a preference/policy filter before delivery: per-channel, per-category opt-outs, quiet hours, and channel fallback. Suppressed deliveries are recorded as 'suppressed', not silently dropped.",
+      "patterns": [
+        "Preference / policy filter"
+      ],
+      "decisionPrompt": "Where in the pipeline do you apply preferences, and how do you keep that check fast at 50k/s?",
+      "concepts": [
+        {
+          "term": "Quiet hours",
+          "definition": "A per-user window during which non-urgent notifications are held or dropped.",
+          "whyItMatters": "Respecting them is the difference between useful and spammy."
+        },
+        {
+          "term": "Category vs channel preference",
+          "definition": "Users opt out of a category (marketing) and/or a channel (SMS) independently.",
+          "whyItMatters": "Real consent is multi-dimensional, not a single on/off switch."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Queue[[Message Queue]]",
+        "  Worker[Delivery Worker]",
+        "  PrefSvc[Preference Service]",
+        "  Prefs[(Preferences Store)]",
+        "  Router[Channel Router]",
+        "  Provider[/Push/Email/SMS Provider/]",
+        "  DB[(Notifications DB)]",
+        "  Queue --> Worker",
+        "  Worker -->|check| PrefSvc",
+        "  PrefSvc --> Prefs",
+        "  Worker -->|allowed| Router",
+        "  Router --> Provider",
+        "  Worker -->|suppressed| DB"
+      ],
+      "highlight": [
+        "PrefSvc",
+        "Prefs",
+        "Router"
+      ],
+      "deepDives": [
+        {
+          "title": "Keeping preference checks fast",
+          "points": [
+            "Cache preferences in the worker (read-through) with short TTL; opt-outs are read far more than written.",
+            "Always honor urgent/transactional categories (OTP, security) regardless of marketing opt-outs.",
+            "Record suppression with a reason so senders can see 'why didn't my notification arrive'."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Checking preferences only at accept time",
+          "why": "Preferences can change between accept and delivery (often minutes later for big fanouts).",
+          "instead": "Apply the policy filter at delivery time, close to the send."
+        },
+        {
+          "trap": "Treating quiet hours as a hard drop for everything",
+          "why": "Security alerts and OTPs must pierce quiet hours.",
+          "instead": "Classify by category; urgent categories bypass quiet hours."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The preference service is unavailable.",
+          "expectedBehavior": "Fail safe \u2014 don't spam, don't lose.",
+          "mitigation": "For non-urgent categories, hold/retry; for urgent, fall back to a conservative default (deliver) and log."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Applies preferences at delivery time and caches reads.",
+          "Separates urgent categories from quiet hours."
+        ],
+        "weak": [
+          "Applies preferences once at accept.",
+          "Drops everything during quiet hours."
+        ]
+      },
+      "recap": {
+        "before": "Everyone got everything.",
+        "after": "Users control channels, categories, and timing; urgent always gets through.",
+        "newRisk": "The preference check is now on the hot path \u2014 must be cached and fail-safe."
+      },
+      "whyNow": [
+        "Not spamming users is a core requirement, applied right before sending."
+      ]
+    },
+    {
+      "id": "channels",
+      "title": "6. Multi-Channel Routing & Providers",
+      "description": "Generalize delivery across channels via a router and per-provider adapters. Each channel (push/email/SMS) has its own provider, retry profile, and failover. Templates render channel-appropriate content.",
+      "patterns": [
+        "Provider abstraction / adapter",
+        "Dead-letter queue"
+      ],
+      "decisionPrompt": "How do you add a second SMS vendor for failover without touching the rest of the pipeline?",
+      "concepts": [
+        {
+          "term": "Channel adapter",
+          "definition": "A uniform interface implemented per provider (APNs, FCM, SendGrid, Twilio).",
+          "whyItMatters": "Lets you add/replace/fail over providers without changing workers."
+        },
+        {
+          "term": "Provider failover",
+          "definition": "Routing to a secondary provider when the primary fails or degrades.",
+          "whyItMatters": "A single vendor outage shouldn't stop a whole channel."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Worker[Delivery Worker]",
+        "  Template[Template Service]",
+        "  Router[Channel Router]",
+        "  Push[/APNs / FCM/]",
+        "  Email[/Email Provider/]",
+        "  SMS[/SMS Provider/]",
+        "  DLQ[[Dead-Letter Queue]]",
+        "  Worker --> Template",
+        "  Worker --> Router",
+        "  Router --> Push",
+        "  Router --> Email",
+        "  Router --> SMS",
+        "  Router -->|exhausted| DLQ"
+      ],
+      "highlight": [
+        "Template",
+        "Push",
+        "Email",
+        "SMS"
+      ],
+      "flows": [
+        {
+          "name": "SMS provider failover",
+          "note": "Primary degrades; router fails over to secondary.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant W as Worker",
+            "  participant R as Router",
+            "  participant S1 as SMS Primary",
+            "  participant S2 as SMS Secondary",
+            "  W->>R: send SMS",
+            "  R->>S1: deliver",
+            "  S1-->>R: 5xx / timeout",
+            "  R->>S2: deliver (failover)",
+            "  S2-->>R: ok"
+          ],
+          "highlight": [
+            "S2"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Hardcoding one provider per channel into the worker",
+          "why": "Adding failover or swapping vendors means rewriting workers and risking regressions.",
+          "instead": "Put providers behind a uniform adapter interface the router selects at runtime."
+        },
+        {
+          "trap": "Rendering content once for all channels",
+          "why": "An SMS isn't an email isn't a push payload (length, format, links).",
+          "instead": "Render per channel via templates with channel-specific variants."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "Primary email vendor has elevated bounce rates.",
+          "expectedBehavior": "Traffic shifts to a healthy vendor without losing messages.",
+          "mitigation": "Health-aware routing with failover; bounces feed back into suppression lists."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Abstracts providers behind adapters and routes by health.",
+          "Renders channel-specific content via templates."
+        ],
+        "weak": [
+          "Couples workers to a specific vendor.",
+          "Ignores per-channel content differences."
+        ]
+      },
+      "recap": {
+        "before": "One channel, one provider.",
+        "after": "Many channels, swappable providers with failover and per-channel templates.",
+        "newRisk": "More providers means more health signals and suppression handling to manage."
+      },
+      "whyNow": [
+        "Multi-channel is a core requirement; doing it cleanly needs an abstraction, not if/else per vendor."
+      ]
+    },
+    {
+      "id": "rate-limiting",
+      "title": "7. Rate Limiting & Throttling",
+      "description": "Cap notifications per user (don't spam) and smooth bursts toward providers (respect their limits). Combine per-user rate limits, digest/collapse for chatty categories, and provider-side throttling.",
+      "patterns": [
+        "Rate limiting / throttling"
+      ],
+      "decisionPrompt": "How do you stop a buggy producer from notifying one user 500 times in a minute?",
+      "concepts": [
+        {
+          "term": "Token bucket",
+          "definition": "A per-key limiter that refills at a steady rate and allows bursts up to a cap.",
+          "whyItMatters": "Bounds per-user volume while tolerating short bursts."
+        },
+        {
+          "term": "Digest / collapse",
+          "definition": "Coalescing many notifications into one summary.",
+          "whyItMatters": "Turns spam into a useful roll-up for chatty categories."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Queue[[Message Queue]]",
+        "  Worker[Delivery Worker]",
+        "  Limiter[Rate Limiter / Throttler]",
+        "  Router[Channel Router]",
+        "  Provider[/Push/Email/SMS Provider/]",
+        "  DB[(Notifications DB)]",
+        "  Queue --> Worker",
+        "  Worker -->|per-user check| Limiter",
+        "  Worker -->|allowed| Router",
+        "  Router --> Provider",
+        "  Worker -->|collapsed/suppressed| DB"
+      ],
+      "highlight": [
+        "Limiter"
+      ],
+      "options": [
+        {
+          "name": "Per-user token bucket + provider throttle (default)",
+          "pros": [
+            "Caps per-user spam and respects provider quotas.",
+            "Bursts allowed up to a cap, then smoothed."
+          ],
+          "cons": [
+            "Distributed counters need a fast shared store (e.g. Redis)."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Worker[Delivery Worker]",
+            "  Limiter[Rate Limiter / Throttler]",
+            "  Router[Channel Router]",
+            "  Worker --> Limiter",
+            "  Limiter -->|under limit| Router"
+          ],
+          "highlight": [
+            "Limiter"
+          ]
+        },
+        {
+          "name": "Global fixed-rate throttle only",
+          "pros": [
+            "Trivial to implement."
+          ],
+          "cons": [
+            "Doesn't stop spamming a single user.",
+            "Either too loose globally or too strict for everyone."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Worker[Delivery Worker]",
+            "  Router[Channel Router]",
+            "  Worker -->|fixed rate| Router"
+          ],
+          "highlight": [
+            "Router"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Only limiting globally, not per user",
+          "why": "A bug or abusive sender can still bombard one user while staying under the global cap.",
+          "instead": "Limit per user (and per category), plus a global/provider throttle."
+        },
+        {
+          "trap": "Dropping over-limit notifications silently",
+          "why": "Users miss things and senders can't tell why.",
+          "instead": "Collapse into a digest or defer, and record the decision."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A producer bug emits the same alert 500x/min for one user.",
+          "expectedBehavior": "The user sees at most a small, bounded number (or a digest).",
+          "mitigation": "Per-user token bucket caps delivery; excess is collapsed and the anomaly is alerted."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Limits per user and per provider, not just globally.",
+          "Collapses excess into digests instead of dropping."
+        ],
+        "weak": [
+          "Relies on a single global rate.",
+          "Silently drops over-limit messages."
+        ]
+      },
+      "recap": {
+        "before": "A bad producer could spam a user unboundedly.",
+        "after": "Per-user and per-provider limits with digest fallback.",
+        "newRisk": "Limiter state is shared and hot \u2014 needs a fast, available counter store."
+      },
+      "whyNow": [
+        "With multi-channel fanout live, abuse and provider-limit breaches are the next real risk."
+      ]
+    },
+    {
+      "id": "scale",
+      "title": "8. Scaling the Pipeline",
+      "description": "Shard the queue by tenant/recipient so throughput scales and one noisy tenant can't starve others. Autoscale workers on queue depth, and keep the dedup/limiter stores partitioned and fast.",
+      "patterns": [
+        "Sharded queues",
+        "Work queue"
+      ],
+      "decisionPrompt": "A single tenant's marketing blast is starving everyone else's notifications. What do you change?",
+      "concepts": [
+        {
+          "term": "Queue sharding / partitioning",
+          "definition": "Splitting the queue by a key (tenant, user) across partitions/consumer groups.",
+          "whyItMatters": "Scales throughput and isolates noisy tenants."
+        },
+        {
+          "term": "Fair scheduling",
+          "definition": "Allocating delivery capacity across tenants so one can't monopolize it.",
+          "whyItMatters": "Prevents one blast from delaying everyone's urgent notifications."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  API[Notification API]",
+        "  QueueA[[Queue Shard A]]",
+        "  QueueB[[Queue Shard B]]",
+        "  Worker[Delivery Worker]",
+        "  Provider[/Push/Email/SMS Provider/]",
+        "  API -->|by tenant| QueueA",
+        "  API -->|by tenant| QueueB",
+        "  QueueA --> Worker",
+        "  QueueB --> Worker",
+        "  Worker --> Provider"
+      ],
+      "highlight": [
+        "QueueA",
+        "QueueB"
+      ],
+      "options": [
+        {
+          "name": "Per-tenant partitions + priority lanes (default)",
+          "pros": [
+            "Isolates noisy tenants; urgent lane bypasses bulk blasts.",
+            "Scales horizontally by adding partitions."
+          ],
+          "cons": [
+            "More partitions to manage; needs autoscaling on depth."
+          ],
+          "diagram": [
+            "graph TB",
+            "  QueueA[[Queue Shard A]]",
+            "  QueueB[[Queue Shard B]]",
+            "  Worker[Delivery Worker]",
+            "  QueueA -->|bulk| Worker",
+            "  QueueB -->|urgent| Worker"
+          ],
+          "highlight": [
+            "QueueB"
+          ]
+        },
+        {
+          "name": "Single queue, scale workers only",
+          "pros": [
+            "Simplest; no partitioning logic."
+          ],
+          "cons": [
+            "One huge blast still head-of-line-blocks everyone.",
+            "No tenant isolation."
+          ],
+          "diagram": [
+            "graph TB",
+            "  QueueA[[Queue Shard A]]",
+            "  Worker[Delivery Worker]",
+            "  QueueA --> Worker"
+          ],
+          "highlight": []
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Priority and fairness",
+          "points": [
+            "Separate urgent (OTP/security) from bulk (marketing) into different lanes.",
+            "Within bulk, round-robin or weight by tenant so no one starves others.",
+            "Autoscale worker count on queue depth and age of the oldest message."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "One global queue for urgent and bulk together",
+          "why": "A marketing blast head-of-line-blocks time-sensitive OTPs.",
+          "instead": "Separate priority lanes; urgent never waits behind bulk."
+        },
+        {
+          "trap": "Sharding by a key that doesn't isolate tenants",
+          "why": "A noisy tenant still spreads across all partitions and starves others.",
+          "instead": "Partition by tenant (and add fair scheduling) so blast radius is contained."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Separates urgent vs bulk lanes and isolates tenants.",
+          "Autoscales on queue depth/age, not CPU alone."
+        ],
+        "weak": [
+          "Keeps everything in one queue.",
+          "Lets one tenant monopolize delivery."
+        ]
+      },
+      "recap": {
+        "before": "One queue capped throughput and let tenants interfere.",
+        "after": "Sharded, prioritized, autoscaled delivery with tenant isolation.",
+        "newRisk": "More partitions and lanes to operate; routing keys must be chosen well."
+      },
+      "whyNow": [
+        "At 50k/s with bursty fanout, a single queue is the final bottleneck and fairness risk."
+      ]
+    }
+  ],
+  "finalDesign": {
+    "title": "Final Design",
+    "description": "End-to-end: a fast accept API with idempotency, a sharded durable queue with priority lanes, async fanout (hybrid write/read), preference-filtered delivery workers, multi-provider channel routing with failover and templates, per-user rate limiting with digests, DLQ for poison messages, and delivery tracking.",
+    "diagram": [
+      "graph TB",
+      "  Client[Client / Service]",
+      "  API[Notification API]",
+      "  Idem[(Idempotency / Dedup Store)]",
+      "  Fanout[Fanout Service]",
+      "  Topic[[Subscriptions / Topics]]",
+      "  QueueA[[Queue Shard A]]",
+      "  QueueB[[Queue Shard B]]",
+      "  Worker[Delivery Worker]",
+      "  PrefSvc[Preference Service]",
+      "  Prefs[(Preferences Store)]",
+      "  Limiter[Rate Limiter / Throttler]",
+      "  Template[Template Service]",
+      "  Router[Channel Router]",
+      "  Push[/APNs / FCM/]",
+      "  Email[/Email Provider/]",
+      "  SMS[/SMS Provider/]",
+      "  DLQ[[Dead-Letter Queue]]",
+      "  DB[(Notifications DB)]",
+      "  Client -->|send| API",
+      "  API -->|dedupe| Idem",
+      "  API --> Fanout",
+      "  Fanout --> Topic",
+      "  Fanout -->|by tenant| QueueA",
+      "  Fanout -->|urgent| QueueB",
+      "  QueueA --> Worker",
+      "  QueueB --> Worker",
+      "  Worker --> PrefSvc",
+      "  PrefSvc --> Prefs",
+      "  Worker --> Limiter",
+      "  Worker --> Template",
+      "  Worker --> Router",
+      "  Router --> Push",
+      "  Router --> Email",
+      "  Router --> SMS",
+      "  Router -->|exhausted| DLQ",
+      "  Worker -->|status| DB"
+    ],
+    "highlight": []
+  },
+  "satisfies": {
+    "functional": [
+      {
+        "requirement": "Accept notification requests from services",
+        "how": "Fast 202 accept API that enqueues for async delivery.",
+        "steps": [
+          "single-send",
+          "queue-workers"
+        ]
+      },
+      {
+        "requirement": "Deliver across multiple channels",
+        "how": "Channel router with per-provider adapters and templates.",
+        "steps": [
+          "channels"
+        ]
+      },
+      {
+        "requirement": "Respect user preferences and opt-outs",
+        "how": "Preference/policy filter applied at delivery time with caching.",
+        "steps": [
+          "preferences"
+        ]
+      },
+      {
+        "requirement": "Fan out one event to many recipients",
+        "how": "Async fanout service, hybrid write/read by audience size.",
+        "steps": [
+          "fanout"
+        ]
+      },
+      {
+        "requirement": "Templated, localized content",
+        "how": "Template service renders channel-specific variants.",
+        "steps": [
+          "channels"
+        ]
+      },
+      {
+        "requirement": "Track delivery status",
+        "how": "Per-(notification, recipient, channel) delivery rows updated by workers.",
+        "steps": [
+          "queue-workers",
+          "preferences"
+        ]
+      }
+    ],
+    "nonFunctional": [
+      {
+        "requirement": "Reliable delivery",
+        "how": "Durable queue, retries with backoff, DLQ for poison messages.",
+        "steps": [
+          "queue-workers"
+        ]
+      },
+      {
+        "requirement": "At-least-once with dedup (notify once)",
+        "how": "Idempotency at accept and dedup at delivery within a window.",
+        "steps": [
+          "idempotency"
+        ]
+      },
+      {
+        "requirement": "Low latency for urgent notifications",
+        "how": "Priority lanes keep OTP/security ahead of bulk blasts.",
+        "steps": [
+          "scale"
+        ]
+      },
+      {
+        "requirement": "High, bursty throughput",
+        "how": "Sharded queues and autoscaled workers absorb fanout bursts.",
+        "steps": [
+          "fanout",
+          "scale"
+        ]
+      },
+      {
+        "requirement": "Do not spam",
+        "how": "Per-user rate limits and digest collapse.",
+        "steps": [
+          "rate-limiting"
+        ]
+      },
+      {
+        "requirement": "Graceful provider degradation",
+        "how": "Health-aware routing with failover; backoff and DLQ.",
+        "steps": [
+          "queue-workers",
+          "channels"
+        ]
+      }
+    ]
+  },
+  "interviewScript": [
+    {
+      "phase": "Scope & requirements",
+      "time": "first 5 min",
+      "say": [
+        "Restate it: deliver multi-channel notifications reliably, at scale, without spamming.",
+        "List channels, fanout, preferences as functional; reliability, dedup, no-spam, urgent-latency as non-functional.",
+        "Call out the headline tension: a slow third-party provider plus huge bursty fanout."
+      ]
+    },
+    {
+      "phase": "Estimate & API",
+      "time": "5\u201315 min",
+      "say": [
+        "Size peak notifications/s, max recipients per broadcast, and per-channel latency targets.",
+        "Sketch POST /notifications (with Idempotency-Key), GET status, preferences, topic subscribe."
+      ]
+    },
+    {
+      "phase": "Build up the design",
+      "time": "15\u201340 min",
+      "say": [
+        "Start synchronous, then add the queue+workers backbone with retries and a DLQ.",
+        "Layer idempotency/dedup, then fanout, preferences, multi-channel routing, and rate limiting.",
+        "Go deep where pushed: fanout strategy, dedup, or fairness/priority lanes."
+      ]
+    },
+    {
+      "phase": "Scale & wrap",
+      "time": "final 5 min",
+      "say": [
+        "Shard queues by tenant with priority lanes; autoscale on depth.",
+        "Summarize how each requirement is met and name the top bottleneck (provider limits / fanout bursts)."
+      ]
+    }
+  ],
+  "levelVariants": [
+    {
+      "level": "Junior",
+      "expectations": [
+        "Puts a queue between accept and delivery and explains why.",
+        "Knows retries need backoff and that failures shouldn't be dropped."
+      ]
+    },
+    {
+      "level": "Senior",
+      "expectations": [
+        "Designs dedup at accept and delivery; defines a dedup window.",
+        "Chooses fanout-on-write vs read by audience size; keeps expansion async.",
+        "Applies preferences at delivery with caching and urgent-category bypass."
+      ]
+    },
+    {
+      "level": "Staff+",
+      "expectations": [
+        "Isolates tenants with sharded queues and fair scheduling; separates urgent vs bulk lanes.",
+        "Designs provider failover and health-aware routing across vendors.",
+        "Reasons about blast radius, backpressure, and the cost of each delivery guarantee."
+      ]
+    }
+  ],
+  "followUps": [
+    "How do you handle delivery receipts and read-tracking that arrive asynchronously from providers?",
+    "How would you implement scheduled and recurring notifications (send at 9am local time)?",
+    "How do you manage device-token lifecycle and prune invalid tokens fed back from providers?",
+    "How would you add an in-app inbox that must stay consistent with push delivery?",
+    "How do you A/B test notification content and measure engagement without double-counting?",
+    "How would you enforce global compliance (unsubscribe, GDPR deletion) across all channels and history?"
+  ]
+}

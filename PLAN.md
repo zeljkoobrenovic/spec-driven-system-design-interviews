@@ -5,22 +5,35 @@ interview-style: requirements first, then capacity, API contract, data model,
 the architecture evolution as a sequence of steps, and finally a wrap-up that
 ties the design back to the requirements.
 
+Two pages share one stylesheet: an **overview** (`index.html` + `overview.js`)
+showing a grid of all interviews grouped into categories, and the
+**explorer** (`interview.html` + `interview.js`) for one interview at a time.
+Overview cards link to `interview.html#<datasetId>`.
+
 ## Goals
 
-- Zero build tooling. Open `index.html` via any static server.
+- No page-level bundler; the only build step is a copy script (`build.py`)
+  that assembles deployable sites into `docs/`. Open a built `index.html` via
+  any static server.
 - Vanilla HTML / CSS / JS. One external dependency: Mermaid (loaded from CDN).
 - Data-driven: every interview is one JSON file; the app reads it and renders.
 - Graceful: invalid JSON, missing fields, and Mermaid render errors must not
   break the page. They surface as inline errors.
 
-## Running
+## Building and running
 
-Open `index.html` via a static server so the JSON files can be fetched:
+Sources live in `_templates/` (the shared HTML/CSS/JS shell) and
+`data/<group>/` (dataset groups). `build.py` copies them into one deployable
+site per group under `docs/<group>/`:
 
 ```bash
-python3 -m http.server 8000
-# then visit http://localhost:8000/
+python3 build.py                       # build every publishable group
+python3 -m http.server 8000 -d docs    # serve the built output
+# then visit http://localhost:8000/examples/
 ```
+
+`docs/` is committed and deployed via GitHub Pages (the `/docs` folder). After
+editing `_templates/` or `data/`, re-run `build.py` and commit `docs/`.
 
 Opening `index.html` directly via `file://` will fail to fetch the JSON
 because of browser CORS rules — use a static server.
@@ -48,11 +61,39 @@ Navigation:
 - Prev/Next buttons do the same.
 - The URL hash is `#<datasetId>/<entryId>` and is shareable.
 
-## Dataset shape
+## Manifest shape (`index.json`)
 
-A dataset is a JSON file in `data/<dataset-id>/interview.json`. The manifest
-`data/index.json` lists available datasets so the dataset dropdown can offer a
-choice.
+A dataset is a JSON file in `data/<group>/<dataset-id>/interview.json`. Each
+group's manifest `data/<group>/index.json` lists its datasets, organized into
+**categories** the overview renders as sections and the explorer renders as
+dropdown `<optgroup>`s. (At runtime the built site fetches `data/index.json`
+relative to its own page, i.e. `docs/<group>/data/index.json`.)
+
+```jsonc
+{
+  "groups": [                          // categories within this site
+    {
+      "id": "fundamentals",
+      "name": "Fundamentals",
+      "datasets": [
+        {
+          "id": "url-shortener",       // also the #hash and icon-dir name
+          "name": "URL Shortener",     // shown in card + dropdown
+          "path": "data/url-shortener/interview.json"
+        }
+      ]
+    }
+  ]
+}
+```
+
+The overview shows each dataset's icon from `data/<id>/icon.png` (derived from
+`path`), falling back to `icons/system-design.png` if that file is missing. A
+legacy flat `{ "datasets": [...] }` manifest is still accepted by both
+`normalizeManifest` (explorer) and `normalizeGroups` (overview); it renders as
+one unnamed category.
+
+## Dataset shape
 
 All fields below are optional except `steps`.
 
@@ -63,8 +104,8 @@ All fields below are optional except `steps`.
 
   // ---- Overview ----
   // Mermaid fields are arrays of source lines. The renderer joins with "\n".
-  "requirementsDiagram": ["graph TB", "  ..."],   // optional; rendered above Requirements
-  "capacityDiagram":     ["graph TB", "  ..."],   // optional; rendered above Capacity
+  "requirementsDiagram": ["graph LR", "  ..."],   // optional; above Requirements (direction forced to LR)
+  "capacityDiagram":     ["graph LR", "  ..."],   // optional; above Capacity (direction forced to LR)
   "dataModelDiagram":    ["erDiagram", "  ..."],  // optional explicit ER; otherwise auto-derived
 
   "requirements": {
@@ -98,7 +139,24 @@ All fields below are optional except `steps`.
     }
   ],
 
-  // ---- Architecture steps ----
+  // Reusable design patterns this case teaches. Renders as an Overview entry
+  // ("Patterns"); `steps` cross-links each pattern to where it appears.
+  "patterns": [
+    { "name": "Cache-aside", "what": "...", "whenToUse": "...", "steps": ["cache"] }
+  ],
+
+  // Standalone pattern reference. Renders as a "Pattern Catalog" entry, grouped
+  // by `category`. A dataset with patternCatalog[] and NO steps[] is valid — it
+  // is a catalog dataset, not a walkthrough (see data/book/patterns). `usedBy`
+  // are free-text case names (they may live in other datasets).
+  "patternCatalog": [
+    { "name": "Idempotency key", "category": "Reliability & correctness",
+      "what": "...", "whenToUse": "...", "tradeoffs": "...", "usedBy": ["Payment System"] }
+  ],
+
+  // ---- Architecture steps ---- (optional when patternCatalog is present)
+  "steps": [
+    {
   "steps": [
     {
       "id":          "cache",
@@ -133,6 +191,10 @@ All fields below are optional except `steps`.
         }
       ],
       "whyNow": ["Why this step belongs here in the build order."],
+      "patterns": ["Cache-aside", "TTL expiry"],   // optional; reusable-pattern tags (chips), names from dataset-level patterns[]
+      "traps": [                                    // optional; common mistakes at this step
+        { "trap": "The mistake", "why": "Why it's wrong", "instead": "The better move" }
+      ],
       "recap": {
         "before": "What the system could do before this step.",
         "after": "What the system can do now.",
@@ -191,17 +253,40 @@ All fields below are optional except `steps`.
     ],
     "nonFunctional": [ /* same shape */ ]
   },
+
+  // What to say across the interview's phases. Wrap-up entry ("Interview Script").
+  "interviewScript": [
+    { "phase": "Scope & requirements", "time": "first 5 min", "say": ["...", "..."] }
+  ],
+
+  // Junior / senior / staff expectations side by side. Wrap-up entry ("By Level").
+  "levelVariants": [
+    { "level": "Senior", "expectations": ["...", "..."] }
+  ],
+
   "followUps": ["Dataset-wide follow-up questions..."]
 }
 ```
+
+The four fields above (`patterns`, `step.patterns`, `step.traps`,
+`interviewScript`, `levelVariants`) are the **book differentiators** — all
+optional, so the 17 example datasets render unchanged. `patterns` and
+`step.traps` are exercised in the canonical `url-shortener` example;
+`data/book/payment-system` uses all of them.
 
 ### Highlighting "new" elements
 
 Mermaid source fields (`requirementsDiagram`, `capacityDiagram`,
 `dataModelDiagram`, and every `diagram`) are stored as string arrays with one
-array element per Mermaid source line. `app.js` joins those arrays with `\n`
+array element per Mermaid source line. `interview.js` joins those arrays with `\n`
 before rendering. The renderer still accepts legacy string values, but new
 datasets should use arrays.
+
+Flowchart **layout direction is forced at render time** via
+`forceFlowchartDirection()`, so the authored header direction is ignored for
+these four slots: `requirementsDiagram` and `capacityDiagram` render `LR`;
+architecture `steps[].diagram` and `finalDesign.diagram` render `TB`. (Other
+diagrams — API flows, deep dives, data model — keep their authored direction.)
 
 The main step diagram (a flowchart) marks nodes that are new or changed
 relative to the previous step:
@@ -238,16 +323,32 @@ rejects `classDef`/`class`):
 
 ## File map
 
-- `index.html`     — DOM shell; sidebar, content panes, mount points.
-- `styles.css`     — All styling, including the `.newNode` highlight rules
-                     applied to Mermaid-rendered SVG nodes.
-- `app.js`         — Dataset loading, sidebar grouping, all rendering, Mermaid
-                     orchestration, hash routing, keyboard nav, error capture.
-- `data/index.json`                          — Manifest of available datasets.
-- `data/<id>/interview.json`                 — One dataset per directory.
+Sources (edit these):
 
-Existing dataset: `data/url-shortener/interview.json` — a fully populated
-URL shortener walkthrough used as the worked example.
+- `_templates/index.html`     — Overview page: shell for the interview grid.
+- `_templates/overview.js`    — Overview behavior: fetch manifest, render cards.
+- `_templates/interview.html` — Explorer page: sidebar, content panes, mounts.
+- `_templates/interview.js`   — Explorer behavior: dataset loading, sidebar
+                                grouping, all rendering, Mermaid orchestration,
+                                hash routing, keyboard nav, error capture.
+- `_templates/styles.css`     — All styling for both pages, including the
+                                `.newNode` highlight rules applied to
+                                Mermaid-rendered SVG nodes.
+- `_templates/icons/system-design.png` — Fallback interview icon.
+- `data/<group>/index.json`              — One site's manifest (`groups[]`).
+- `data/<group>/<id>/interview.json`     — One dataset per directory.
+- `data/<group>/<id>/icon.png`           — Optional per-interview icon.
+- `build.py`               — Copy step: `_templates/` + `data/<group>/` →
+                             `docs/<group>/`.
+
+Build output (generated, committed for GitHub Pages — do not hand-edit):
+
+- `docs/<group>/{index.html,overview.js,interview.html,interview.js,styles.css}`
+  plus `icons/` — copies of the templates.
+- `docs/<group>/data/...`                        — copy of the group's data.
+
+Existing dataset: `data/examples/url-shortener/interview.json` — a fully
+populated URL shortener walkthrough used as the worked example.
 
 ## Implementation notes
 
@@ -265,14 +366,25 @@ URL shortener walkthrough used as the worked example.
 ## Extending
 
 Adding a new dataset:
-1. Create `data/<id>/interview.json` following the schema above.
-2. Add it to `data/index.json` (`id`, `name`, `path`).
-3. Reload. It appears in the dataset dropdown.
+1. Create `data/<group>/<id>/interview.json` following the schema above.
+2. Add it to a category in that group's `data/<group>/index.json`
+   (`groups[i].datasets[]`: `id`, `name`, `path`).
+3. Optionally add `data/<group>/<id>/icon.png` for the overview card.
+4. Run `python3 build.py`, reload. It appears in the overview and dropdown.
+
+Adding a new category (a section within one site):
+1. Add a `{ id, name, datasets: [...] }` entry to `groups[]` in that site's
+   `index.json`. The overview adds a section and the dropdown an `<optgroup>`.
+
+Adding a new group (a new deployable site):
+1. Create `data/<group>/` with an `index.json` manifest and dataset subdirs.
+2. Run `python3 build.py`; it produces `docs/<group>/` automatically.
 
 Adding a new section type:
-1. Add a slug to `INTRO_SLUGS` in `app.js`.
+1. Add a slug to `INTRO_SLUGS` in `_templates/interview.js`.
 2. Add a builder branch in `buildEntries()`.
 3. Add the section to the `Overview` or `Wrap-up` group via `WRAPUP_SLUGS`.
 4. Write a `renderIntro<Name>()` function returning a DOM node, and wire it
    into the switch in `renderIntroEntry()`.
-5. Add CSS in `styles.css` if the section needs custom layout.
+5. Add CSS in `_templates/styles.css` if the section needs custom layout.
+6. Run `python3 build.py` and commit the regenerated `docs/`.

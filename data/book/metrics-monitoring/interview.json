@@ -1,0 +1,1174 @@
+{
+  "title": "Metrics & Monitoring \u2014 System Design",
+  "description": "Designing a metrics and monitoring system: collect time-series measurements from thousands of services, store them efficiently, query them for dashboards, and alert when something breaks. The interesting problems are data-intensive: an enormous write volume of timestamped points, time-series storage with downsampling, controlling label cardinality (the silent killer), fast range queries, and reliable alerting. We build from a naive metrics table toward a sharded, downsampled, cardinality-guarded time-series platform with alerting.",
+  "requirementsDiagram": [
+    "graph LR",
+    "  App[Instrumented Service]",
+    "  Ingest[Ingestion Service]",
+    "  TSDB[(Time-Series DB)]",
+    "  Query[Query Service]",
+    "  Alert[Alerting Engine]",
+    "  App -->|metrics| Ingest",
+    "  Ingest --> TSDB",
+    "  Query --> TSDB",
+    "  Alert --> TSDB"
+  ],
+  "capacityDiagram": [
+    "graph LR",
+    "  App[Instrumented Service]",
+    "  Ingest[Ingestion Service]",
+    "  TSDB[(Time-Series DB)]",
+    "  Roll[Rollup / Downsample Worker]",
+    "  Cold[(Cold Store \u2014 rollups)]",
+    "  App -->|~10M points/s| Ingest",
+    "  Ingest --> TSDB",
+    "  Roll -->|downsample| TSDB",
+    "  Roll --> Cold"
+  ],
+  "requirements": {
+    "functional": [
+      "Ingest time-series metrics (name + labels + value + timestamp) from many services.",
+      "Query metrics over time ranges with aggregation (rate, sum, percentiles, group-by label).",
+      "Render dashboards backed by those queries.",
+      "Evaluate alert rules and notify when thresholds/conditions are met.",
+      "Retain recent data at full resolution and older data downsampled."
+    ],
+    "nonFunctional": [
+      "Absorb a huge, continuous write volume (millions of points/sec).",
+      "Fast range queries for interactive dashboards (sub-second for recent data).",
+      "Bounded storage growth via downsampling and retention.",
+      "Control label cardinality so a bad label can't explode the index.",
+      "Reliable alerting \u2014 don't miss a real alert; avoid storms of false ones.",
+      "Graceful degradation: drop/sample under overload rather than fall over."
+    ]
+  },
+  "capacity": [
+    {
+      "label": "Ingest rate",
+      "value": "~10M points/s",
+      "note": "Thousands of hosts x many metrics x labels, every few seconds."
+    },
+    {
+      "label": "Active series",
+      "value": "10s\u2013100s of millions",
+      "note": "A unique (metric, label-set) is one series; cardinality dominates cost."
+    },
+    {
+      "label": "Recent query latency",
+      "value": "sub-second",
+      "note": "Dashboards need interactive reads over recent data."
+    },
+    {
+      "label": "Retention",
+      "value": "full-res days, rollups for months",
+      "note": "Old data is downsampled, not kept raw."
+    },
+    {
+      "label": "Write:read",
+      "value": "write-heavy",
+      "note": "Far more points written than queried, but queries scan wide ranges."
+    },
+    {
+      "label": "Alert evaluation",
+      "value": "every ~10\u201360s",
+      "note": "Rules run continuously over recent data."
+    }
+  ],
+  "api": [
+    {
+      "method": "POST",
+      "path": "/v1/ingest",
+      "description": "Push a batch of samples. Fire-and-forget; buffered and written asynchronously.",
+      "request": "{ \"samples\": [ { \"metric\": \"http_requests_total\", \"labels\": {\"svc\":\"api\",\"code\":\"200\"}, \"value\": 42, \"ts\": 1710000000 } ] }",
+      "response": "202 Accepted"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/query_range",
+      "description": "Range query with aggregation over a time window and step.",
+      "request": "GET /query_range?expr=rate(http_requests_total[5m])&start=..&end=..&step=15s",
+      "response": "200 OK { \"series\": [ { \"labels\": {...}, \"points\": [[ts,val],...] } ] }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/rules",
+      "description": "Create an alert rule (expression + threshold + duration + routing).",
+      "request": "{ \"expr\": \"error_rate > 0.05\", \"for\": \"5m\", \"route\": \"oncall\" }",
+      "response": "201 Created"
+    }
+  ],
+  "dataModel": [
+    {
+      "name": "series",
+      "note": "A unique (metric name + label set). The cardinality unit; indexed for lookup.",
+      "fields": [
+        {
+          "name": "series_id",
+          "type": "uint64 PK"
+        },
+        {
+          "name": "metric",
+          "type": "varchar"
+        },
+        {
+          "name": "labels",
+          "type": "map<str,str>"
+        }
+      ]
+    },
+    {
+      "name": "samples",
+      "note": "Append-only (series_id, ts, value) points, stored in time-ordered, compressed chunks.",
+      "fields": [
+        {
+          "name": "series_id",
+          "type": "uint64"
+        },
+        {
+          "name": "ts",
+          "type": "timestamptz"
+        },
+        {
+          "name": "value",
+          "type": "double"
+        }
+      ]
+    },
+    {
+      "name": "rollups",
+      "note": "Pre-aggregated lower-resolution samples (1m, 1h) for older data and fast wide queries.",
+      "fields": [
+        {
+          "name": "series_id",
+          "type": "uint64"
+        },
+        {
+          "name": "bucket",
+          "type": "timestamptz"
+        },
+        {
+          "name": "resolution",
+          "type": "enum(1m,1h,1d)"
+        },
+        {
+          "name": "agg",
+          "type": "struct(min,max,sum,count)"
+        }
+      ]
+    },
+    {
+      "name": "alert_rules",
+      "note": "Continuously-evaluated rules.",
+      "fields": [
+        {
+          "name": "rule_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "expr",
+          "type": "text"
+        },
+        {
+          "name": "for_duration",
+          "type": "interval"
+        },
+        {
+          "name": "route",
+          "type": "varchar"
+        }
+      ]
+    }
+  ],
+  "patterns": [
+    {
+      "name": "Time-series storage (chunked, compressed)",
+      "what": "Store samples in time-ordered, columnar, delta/double-delta compressed chunks per series.",
+      "whenToUse": "Append-mostly timestamped data queried by range.",
+      "steps": [
+        "tsdb"
+      ]
+    },
+    {
+      "name": "Downsampling / rollups",
+      "what": "Pre-aggregate older data to coarser resolutions and drop raw points.",
+      "whenToUse": "Bounding storage and speeding wide-range queries over long history.",
+      "steps": [
+        "rollups"
+      ]
+    },
+    {
+      "name": "Push vs pull collection",
+      "what": "Agents push samples, or the system scrapes/pulls targets on a schedule.",
+      "whenToUse": "Choose by service-discovery and network topology; pull eases liveness, push eases ephemeral jobs.",
+      "steps": [
+        "collection"
+      ]
+    },
+    {
+      "name": "Cardinality control",
+      "what": "Limit unique label combinations so the series index doesn't explode.",
+      "whenToUse": "Always \u2014 high-cardinality labels (user id, request id) are the #1 way TSDBs fall over.",
+      "steps": [
+        "cardinality"
+      ]
+    },
+    {
+      "name": "Pre-aggregation / read model",
+      "what": "Materialize common aggregations so queries don't scan raw samples.",
+      "whenToUse": "Dashboards repeatedly running the same heavy aggregations.",
+      "steps": [
+        "query",
+        "rollups"
+      ]
+    },
+    {
+      "name": "Rule-based alerting",
+      "what": "Continuously evaluate expressions with a 'for' duration to debounce, then route notifications.",
+      "whenToUse": "Turning metrics into actionable, non-flappy alerts.",
+      "steps": [
+        "query"
+      ]
+    },
+    {
+      "name": "Sharding by series",
+      "what": "Partition series across nodes by a hash of the series id/labels.",
+      "whenToUse": "When ingest/query volume outgrows one node.",
+      "steps": [
+        "scale"
+      ]
+    },
+    {
+      "name": "Work queue / ingestion buffer",
+      "what": "Buffer incoming samples so write spikes don't overwhelm storage.",
+      "whenToUse": "Bursty, high-volume ingestion.",
+      "steps": [
+        "ingest"
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "naive-ingest",
+      "title": "1. Naive Metrics Table (the baseline)",
+      "description": "Start by writing every metric sample as a row in a relational table and querying with GROUP BY. It works for one service; at millions of points/sec with millions of series it falls over \u2014 motivating a purpose-built time-series store.",
+      "patterns": [
+        "Synchronous request/response"
+      ],
+      "decisionPrompt": "Why does a row-per-sample relational table collapse at metrics scale?",
+      "concepts": [
+        {
+          "term": "Time series",
+          "definition": "A sequence of (timestamp, value) points for one metric+label set.",
+          "whyItMatters": "Its append-mostly, range-queried shape is unlike OLTP rows."
+        },
+        {
+          "term": "Series / cardinality",
+          "definition": "Each unique label combination is a distinct series.",
+          "whyItMatters": "Cardinality, not raw volume, is what usually kills these systems."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  App[Instrumented Service]",
+        "  Ingest[Ingestion Service]",
+        "  TSDB[(Time-Series DB)]",
+        "  App -->|sample per row| Ingest",
+        "  Ingest -->|INSERT| TSDB"
+      ],
+      "highlight": [
+        "App",
+        "Ingest",
+        "TSDB"
+      ],
+      "talkingPoints": [
+        "Name write volume, range queries, and cardinality as the three forces.",
+        "Reject a generic RDBMS for the sample store."
+      ],
+      "traps": [
+        {
+          "trap": "Storing each sample as a relational row with a btree index",
+          "why": "Index maintenance and storage explode; range scans are slow at billions of rows.",
+          "instead": "Use a time-series store: chunked, compressed, time-ordered per series."
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Row-per-sample writes and indexes don't scale.",
+          "mitigation": "Purpose-built TSDB storage (next)."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Identifies cardinality and range-query patterns immediately."
+        ],
+        "weak": [
+          "Treats metrics like ordinary OLTP rows."
+        ]
+      },
+      "whyNow": [
+        "The baseline exposes why time-series storage and cardinality control are needed."
+      ]
+    },
+    {
+      "id": "ingest",
+      "title": "2. Ingestion Pipeline",
+      "description": "Accept samples fire-and-forget into a buffer, then write to storage asynchronously. Batching and a buffer absorb spikes and decouple producers from storage. Under overload, sample or shed rather than block producers.",
+      "patterns": [
+        "Work queue / ingestion buffer"
+      ],
+      "decisionPrompt": "10M points/sec arrive in bursts. How do you absorb them without blocking the services emitting metrics?",
+      "concepts": [
+        {
+          "term": "Fire-and-forget ingest",
+          "definition": "Producers don't wait for durable storage; metrics are best-effort.",
+          "whyItMatters": "Monitoring must never slow the systems it watches."
+        },
+        {
+          "term": "Buffer + batch",
+          "definition": "Queue samples and write in batches.",
+          "whyItMatters": "Amortizes write cost and smooths spikes."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  App[Instrumented Service]",
+        "  Agent[Collector Agent]",
+        "  Ingest[Ingestion Service]",
+        "  Queue[[Ingestion Buffer]]",
+        "  TSDB[(Time-Series DB)]",
+        "  App --> Agent",
+        "  Agent --> Ingest",
+        "  Ingest --> Queue",
+        "  Queue -->|batched writes| TSDB"
+      ],
+      "highlight": [
+        "Agent",
+        "Ingest",
+        "Queue"
+      ],
+      "options": [
+        {
+          "name": "Buffer + async batch writes (default)",
+          "pros": [
+            "Absorbs bursts; batching maximizes write throughput.",
+            "Producers never block on storage."
+          ],
+          "cons": [
+            "Recent samples can be lost on buffer failure (acceptable for metrics).",
+            "Buffer to operate."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Ingest[Ingestion Service]",
+            "  Queue[[Ingestion Buffer]]",
+            "  TSDB[(Time-Series DB)]",
+            "  Ingest --> Queue",
+            "  Queue --> TSDB"
+          ],
+          "highlight": [
+            "Queue"
+          ]
+        },
+        {
+          "name": "Synchronous durable writes",
+          "pros": [
+            "No sample loss."
+          ],
+          "cons": [
+            "Slow path blocks producers; metrics shouldn't impose that.",
+            "Can't absorb spikes."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Ingest[Ingestion Service]",
+            "  TSDB[(Time-Series DB)]",
+            "  Ingest -->|sync| TSDB"
+          ],
+          "highlight": [
+            "TSDB"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Making metric ingestion a blocking, durable write",
+          "why": "Monitoring overhead then degrades the very services it observes.",
+          "instead": "Fire-and-forget into a buffer; metrics are best-effort, not transactional."
+        },
+        {
+          "trap": "No overload behavior",
+          "why": "A metrics flood can OOM ingestion and take monitoring down exactly when you need it.",
+          "instead": "Sample/shed under pressure and protect the buffer with limits."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "Ingestion buffer saturates during an incident.",
+          "expectedBehavior": "Monitoring stays up, perhaps lower-resolution.",
+          "mitigation": "Shed/sample low-priority series; keep alert-critical metrics flowing."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Keeps ingest fire-and-forget and plans overload behavior."
+        ],
+        "weak": [
+          "Blocks producers on durable writes.",
+          "No load-shedding."
+        ]
+      },
+      "recap": {
+        "before": "Samples hit storage synchronously per row.",
+        "after": "Buffered, batched, best-effort ingestion that absorbs spikes.",
+        "newRisk": "Best-effort means possible recent-sample loss; overload policy needed."
+      },
+      "whyNow": [
+        "A resilient intake path must exist before optimizing storage."
+      ]
+    },
+    {
+      "id": "tsdb",
+      "title": "3. Time-Series Storage",
+      "description": "Store samples per series in time-ordered, compressed chunks (delta-of-delta timestamps, XOR-compressed values), with recent data in a hot store and an index from labels to series ids. This is what makes both writes and range reads cheap.",
+      "patterns": [
+        "Time-series storage (chunked, compressed)"
+      ],
+      "decisionPrompt": "How do you store billions of points so both appends and range reads are cheap?",
+      "concepts": [
+        {
+          "term": "Chunked, compressed storage",
+          "definition": "Group a series' points into time chunks with specialized compression.",
+          "whyItMatters": "Cuts storage ~10x and makes range scans sequential."
+        },
+        {
+          "term": "Inverted label index",
+          "definition": "labels -> series ids, so queries find matching series fast.",
+          "whyItMatters": "Query selection happens on the index; sample scan happens on chunks."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Queue[[Ingestion Buffer]]",
+        "  TSDB[(Time-Series DB)]",
+        "  Recent[(Hot Store \u2014 recent)]",
+        "  Query[Query Service]",
+        "  Queue --> TSDB",
+        "  TSDB --> Recent",
+        "  Query -->|label lookup| TSDB",
+        "  Query -->|scan chunks| Recent"
+      ],
+      "highlight": [
+        "TSDB",
+        "Recent"
+      ],
+      "deepDives": [
+        {
+          "title": "Why a TSDB beats a generic store",
+          "points": [
+            "Timestamps compress with delta-of-delta; float values with XOR \u2014 both near-free for regular intervals.",
+            "Append-mostly per-series chunks turn writes and range reads into sequential I/O.",
+            "An inverted index maps label matchers to series ids without scanning samples."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Indexing every sample by timestamp in a btree",
+          "why": "Btree maintenance per point is the bottleneck; you want append-mostly chunks.",
+          "instead": "Chunk per series with columnar compression; index labels, not samples."
+        },
+        {
+          "trap": "Keeping all data at full resolution forever",
+          "why": "Storage grows without bound and wide queries scan too much.",
+          "instead": "Downsample old data into rollups (next step)."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A wide dashboard query spans 30 days at full resolution.",
+          "expectedBehavior": "It stays fast and doesn't scan raw points across a month.",
+          "mitigation": "Serve long ranges from rollups; raw only for recent windows."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Chooses chunked/compressed per-series storage with a label index."
+        ],
+        "weak": [
+          "Generic table with per-sample indexing.",
+          "No plan for long-range reads."
+        ]
+      },
+      "recap": {
+        "before": "Samples were rows with heavy indexes.",
+        "after": "Compressed time-ordered chunks + a label index make writes and reads cheap.",
+        "newRisk": "Full-resolution storage still grows; long ranges need rollups."
+      },
+      "whyNow": [
+        "Storage is the core of a TSDB; everything reads and writes through it."
+      ]
+    },
+    {
+      "id": "rollups",
+      "title": "4. Downsampling & Retention",
+      "description": "Bound storage and speed wide queries by pre-aggregating older data into coarser resolutions (raw -> 1m -> 1h) and expiring raw points past a retention window. Queries pick the finest resolution that covers the requested range.",
+      "patterns": [
+        "Downsampling / rollups",
+        "Pre-aggregation / read model"
+      ],
+      "decisionPrompt": "A user asks for a 90-day CPU graph. What do you actually read?",
+      "concepts": [
+        {
+          "term": "Downsampling",
+          "definition": "Aggregating raw points into lower-resolution buckets (min/max/sum/count).",
+          "whyItMatters": "A 90-day graph needs hourly points, not millions of raw ones."
+        },
+        {
+          "term": "Retention tiers",
+          "definition": "Raw for days, 1m for weeks, 1h for months.",
+          "whyItMatters": "Caps storage while preserving useful history."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Recent[(Hot Store \u2014 recent)]",
+        "  Roll[Rollup / Downsample Worker]",
+        "  Cold[(Cold Store \u2014 rollups)]",
+        "  Query[Query Service]",
+        "  Recent --> Roll",
+        "  Roll -->|1m, 1h rollups| Cold",
+        "  Query -->|recent: raw| Recent",
+        "  Query -->|long range: rollups| Cold"
+      ],
+      "highlight": [
+        "Roll",
+        "Cold"
+      ],
+      "traps": [
+        {
+          "trap": "Querying raw samples for long time ranges",
+          "why": "Scanning months of raw points is slow and expensive.",
+          "instead": "Pick the coarsest rollup that satisfies the step; raw only for recent, fine-grained views."
+        },
+        {
+          "trap": "Downsampling by averaging only",
+          "why": "Averages hide spikes \u2014 a 1-second outage vanishes in an hourly mean.",
+          "instead": "Keep min/max/sum/count per bucket so spikes and percentiles survive."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "An alert needs to catch a 5-second error spike but the query hits hourly rollups.",
+          "expectedBehavior": "The spike isn't averaged away.",
+          "mitigation": "Alerts evaluate against recent raw/fine data; rollups serve historical dashboards."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Tiered retention and resolution-aware queries; preserves min/max.",
+          "Separates alert (fine) from dashboard (coarse) reads."
+        ],
+        "weak": [
+          "Keeps everything raw.",
+          "Averages away spikes in rollups."
+        ]
+      },
+      "recap": {
+        "before": "All data was raw and wide queries were slow.",
+        "after": "Tiered rollups bound storage and make long-range reads fast.",
+        "newRisk": "Downsampling loses detail \u2014 keep enough aggregates and alert on fine data."
+      },
+      "whyNow": [
+        "Without downsampling, storage and wide queries grow without bound."
+      ]
+    },
+    {
+      "id": "collection",
+      "title": "5. Collection: Push vs Pull",
+      "description": "Decide how samples arrive: agents push to ingestion, or the system pulls/scrapes targets on a schedule via service discovery. Each suits different topologies; many systems do both (pull for long-lived services, push for ephemeral jobs).",
+      "patterns": [
+        "Push vs pull collection"
+      ],
+      "decisionPrompt": "Pull gives you free liveness checks but struggles with short-lived jobs. When do you push instead?",
+      "concepts": [
+        {
+          "term": "Pull/scrape",
+          "definition": "The system periodically fetches metrics from discovered targets.",
+          "whyItMatters": "A failed scrape is itself a liveness signal; central control of frequency."
+        },
+        {
+          "term": "Push",
+          "definition": "Targets send metrics to a gateway.",
+          "whyItMatters": "Works for ephemeral jobs and networks where targets aren't reachable."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  App[Instrumented Service]",
+        "  Agent[Collector Agent]",
+        "  Ingest[Ingestion Service]",
+        "  Queue[[Ingestion Buffer]]",
+        "  App -->|expose /metrics| Agent",
+        "  Agent -->|scrape or receive push| Ingest",
+        "  Ingest --> Queue"
+      ],
+      "highlight": [
+        "Agent"
+      ],
+      "options": [
+        {
+          "name": "Pull/scrape with a push gateway for ephemeral jobs (default)",
+          "pros": [
+            "Scrape failures = free liveness; central scrape control.",
+            "Push gateway covers short-lived jobs."
+          ],
+          "cons": [
+            "Service discovery needed; firewalled targets are hard to scrape."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Agent[Collector Agent]",
+            "  App[Instrumented Service]",
+            "  Agent -->|scrape| App"
+          ],
+          "highlight": [
+            "Agent"
+          ]
+        },
+        {
+          "name": "Push-only",
+          "pros": [
+            "Simple for targets; works behind NAT/firewalls.",
+            "Natural for batch/ephemeral jobs."
+          ],
+          "cons": [
+            "No free liveness signal; a dead target is silent.",
+            "Targets control rate -> harder to throttle centrally."
+          ],
+          "diagram": [
+            "graph TB",
+            "  App[Instrumented Service]",
+            "  Ingest[Ingestion Service]",
+            "  App -->|push| Ingest"
+          ],
+          "highlight": [
+            "Ingest"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Pull-scraping short-lived batch jobs",
+          "why": "The job finishes before the next scrape, so its metrics are never collected.",
+          "instead": "Let ephemeral jobs push to a gateway; scrape long-lived services."
+        },
+        {
+          "trap": "Ignoring missed scrapes",
+          "why": "A silent target may be down \u2014 the absence is signal.",
+          "instead": "Treat scrape failure as a liveness alert, not just missing data."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Picks pull for liveness, push for ephemeral, and uses both.",
+          "Treats scrape failure as signal."
+        ],
+        "weak": [
+          "Assumes one model fits all.",
+          "Misses liveness from failed scrapes."
+        ]
+      },
+      "recap": {
+        "before": "Collection mechanism was unspecified.",
+        "after": "Pull for long-lived services (free liveness) + push gateway for ephemeral jobs.",
+        "newRisk": "Service discovery and gateway add moving parts."
+      },
+      "whyNow": [
+        "How data arrives shapes liveness detection and the ingestion edge."
+      ]
+    },
+    {
+      "id": "cardinality",
+      "title": "6. Cardinality Control",
+      "description": "Cardinality \u2014 the number of unique label combinations \u2014 is the silent killer of TSDBs. A single unbounded label (user id, request id, URL with ids) creates millions of series and blows up the index. Guard ingestion: drop, limit, or relabel high-cardinality labels.",
+      "patterns": [
+        "Cardinality control"
+      ],
+      "decisionPrompt": "Someone adds a 'user_id' label to a high-traffic metric. What happens, and how do you prevent it?",
+      "concepts": [
+        {
+          "term": "Cardinality",
+          "definition": "Count of distinct (metric, label-set) series.",
+          "whyItMatters": "Memory and index size scale with active series, not sample volume."
+        },
+        {
+          "term": "Cardinality explosion",
+          "definition": "An unbounded label multiplying series.",
+          "whyItMatters": "It's the most common way these systems OOM and crash."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Ingest[Ingestion Service]",
+        "  Cardinality[Cardinality Guard]",
+        "  TSDB[(Time-Series DB)]",
+        "  Ingest --> Cardinality",
+        "  Cardinality -->|within limits| TSDB",
+        "  Cardinality -->|drop/relabel high-card| Ingest"
+      ],
+      "highlight": [
+        "Cardinality"
+      ],
+      "deepDives": [
+        {
+          "title": "Taming cardinality",
+          "points": [
+            "Reject or strip labels with unbounded value spaces (ids, emails, raw URLs) at ingest.",
+            "Enforce a per-metric series limit; alert owners when a metric's cardinality spikes.",
+            "Offer aggregation at write time (drop the offending label) instead of storing every combination."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Allowing arbitrary high-cardinality labels",
+          "why": "One bad label (request id) creates millions of series and OOMs the index.",
+          "instead": "Guard at ingest: cap per-metric cardinality, drop/relabel unbounded labels, alert on spikes."
+        },
+        {
+          "trap": "Putting unbounded ids in label values to 'slice by anything'",
+          "why": "Metrics aren't a logging/tracing system; high-cardinality belongs in logs/traces.",
+          "instead": "Keep labels low-cardinality; use logs/traces for per-entity detail."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A deploy adds a label with per-request ids.",
+          "expectedBehavior": "The index doesn't explode and the system stays up.",
+          "mitigation": "Cardinality guard drops/limits the new series and pages the metric owner."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Treats cardinality as the primary scaling risk and guards ingest.",
+          "Pushes high-cardinality data to logs/traces."
+        ],
+        "weak": [
+          "Never mentions cardinality.",
+          "Allows arbitrary labels."
+        ]
+      },
+      "recap": {
+        "before": "Any label combination was accepted.",
+        "after": "Cardinality is bounded and monitored at the ingest edge.",
+        "newRisk": "Guard rules need tuning; legitimate new series must still be allowed."
+      },
+      "whyNow": [
+        "Cardinality is the failure mode interviewers most want addressed; it must be controlled before scaling out."
+      ]
+    },
+    {
+      "id": "query",
+      "title": "7. Querying & Alerting",
+      "description": "A query service evaluates range expressions (rate, percentiles, group-by) over the index + chunks, cached for repeated dashboard queries. An alerting engine continuously evaluates rules with a 'for' duration to debounce, then routes notifications.",
+      "patterns": [
+        "Pre-aggregation / read model",
+        "Rule-based alerting"
+      ],
+      "decisionPrompt": "How do you keep dashboards fast and stop a flapping metric from paging on-call every 10 seconds?",
+      "concepts": [
+        {
+          "term": "Query caching / pre-aggregation",
+          "definition": "Reuse results for recurring dashboard queries; materialize common aggregations.",
+          "whyItMatters": "Dashboards re-run the same heavy queries on a refresh interval."
+        },
+        {
+          "term": "'for' duration (debounce)",
+          "definition": "An alert fires only if the condition holds for a sustained period.",
+          "whyItMatters": "Prevents a momentary blip from paging on-call."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Query[Query Service]",
+        "  Cache[(Query Cache)]",
+        "  TSDB[(Time-Series DB)]",
+        "  Alert[Alerting Engine]",
+        "  Rules[(Alert Rules)]",
+        "  Notify[/Notify \u2014 page/email/]",
+        "  Query --> Cache",
+        "  Query --> TSDB",
+        "  Alert --> Rules",
+        "  Alert --> TSDB",
+        "  Alert --> Notify"
+      ],
+      "highlight": [
+        "Query",
+        "Cache",
+        "Alert",
+        "Rules",
+        "Notify"
+      ],
+      "deepDives": [
+        {
+          "title": "Alerting that people trust",
+          "points": [
+            "Evaluate rules on recent fine-resolution data on a fixed interval.",
+            "Require the condition to hold 'for' a duration to debounce transient spikes.",
+            "Deduplicate and group notifications; route by severity so on-call isn't drowned."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Alerting on a single instantaneous breach",
+          "why": "Normal jitter pages on-call constantly; people start ignoring alerts.",
+          "instead": "Use a 'for' duration so only sustained conditions fire."
+        },
+        {
+          "trap": "Re-scanning raw data for every dashboard refresh",
+          "why": "Identical heavy queries every 15s waste the cluster.",
+          "instead": "Cache query results and pre-aggregate common expressions."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A metric flaps above/below threshold every few seconds.",
+          "expectedBehavior": "On-call isn't paged repeatedly.",
+          "mitigation": "'for' duration + notification dedup/grouping suppress the flapping."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Debounces alerts with 'for' and caches/pre-aggregates queries.",
+          "Groups and routes notifications by severity."
+        ],
+        "weak": [
+          "Alerts on instantaneous values.",
+          "Re-scans raw data per refresh."
+        ]
+      },
+      "recap": {
+        "before": "Data was stored but not usefully queried or alerted on.",
+        "after": "Fast cached queries and debounced, routed alerting.",
+        "newRisk": "Cache freshness and rule tuning become ongoing concerns."
+      },
+      "whyNow": [
+        "Storage is only valuable once it drives dashboards and trustworthy alerts."
+      ]
+    },
+    {
+      "id": "scale",
+      "title": "8. Scaling by Sharding",
+      "description": "Shard series across nodes by a hash of series id/labels so ingest and queries scale horizontally. A metric router directs samples and queries to the owning shard; queries spanning shards fan out and merge. Replicate shards for availability.",
+      "patterns": [
+        "Sharding by series"
+      ],
+      "decisionPrompt": "Ingest and active series outgrow one node. How do you split the load while keeping a series' data together?",
+      "concepts": [
+        {
+          "term": "Shard by series",
+          "definition": "Hash the series id/labels to a shard so all of a series' samples co-locate.",
+          "whyItMatters": "Keeps a series' chunks together for efficient append and range read."
+        },
+        {
+          "term": "Scatter-gather query",
+          "definition": "Fan a multi-series query to relevant shards and merge results.",
+          "whyItMatters": "Queries spanning many series must aggregate across shards."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Router[Metric Router]",
+        "  ShardA[(TSDB Shard A)]",
+        "  ShardB[(TSDB Shard B)]",
+        "  Query[Query Service]",
+        "  Router -->|hash series| ShardA",
+        "  Router --> ShardB",
+        "  Query -->|fan out| ShardA",
+        "  Query --> ShardB"
+      ],
+      "highlight": [
+        "Router",
+        "ShardA",
+        "ShardB"
+      ],
+      "options": [
+        {
+          "name": "Hash-shard by series + replicas (default)",
+          "pros": [
+            "Linear ingest/query scaling; a series stays on one shard.",
+            "Replicas give availability and read scaling."
+          ],
+          "cons": [
+            "Cross-shard queries fan out and merge; hot series/shards need rebalancing."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Router[Metric Router]",
+            "  ShardA[(TSDB Shard A)]",
+            "  ShardB[(TSDB Shard B)]",
+            "  Router --> ShardA",
+            "  Router --> ShardB"
+          ],
+          "highlight": [
+            "ShardB"
+          ]
+        },
+        {
+          "name": "Single big node + vertical scale",
+          "pros": [
+            "Simplest; no routing or fan-out."
+          ],
+          "cons": [
+            "Hard ceiling on ingest and active series; single point of failure."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Router[Metric Router]",
+            "  ShardA[(TSDB Shard A)]",
+            "  Router --> ShardA"
+          ],
+          "highlight": []
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Hot shards and fan-out",
+          "points": [
+            "A few popular metrics can make one shard hot \u2014 rebalance or split those series.",
+            "Multi-series queries scatter to shards and gather; push aggregation down to each shard first.",
+            "Replicate shards so a node loss doesn't lose recent data or block queries."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Sharding by time instead of series",
+          "why": "Every current write lands on one 'now' shard \u2014 a moving hotspot \u2014 and a series' data scatters across time shards.",
+          "instead": "Shard by series so writes spread and a series stays co-located."
+        },
+        {
+          "trap": "Gathering raw points from all shards then aggregating centrally",
+          "why": "Ships huge volumes over the network.",
+          "instead": "Push partial aggregation to each shard; merge the small results."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Shards by series, pushes aggregation down, replicates shards.",
+          "Handles hot shards and fan-out."
+        ],
+        "weak": [
+          "Shards by time (hotspot).",
+          "Centralizes raw aggregation."
+        ]
+      },
+      "recap": {
+        "before": "One node capped ingest and series count.",
+        "after": "Series-sharded, replicated cluster scaling ingest and queries horizontally.",
+        "newRisk": "Cross-shard queries and hot shards need fan-out and rebalancing."
+      },
+      "whyNow": [
+        "Sharding is the final lever once storage, cardinality, and queries are sound."
+      ]
+    }
+  ],
+  "finalDesign": {
+    "title": "Final Design",
+    "description": "End-to-end: agents push/scrape samples into a buffered ingestion path guarded for cardinality; series are hash-sharded across replicated time-series nodes storing compressed chunks with a label index; a rollup worker downsamples into tiered retention; a cached query service answers dashboards (raw for recent, rollups for long ranges); an alerting engine evaluates debounced rules and routes notifications.",
+    "diagram": [
+      "graph TB",
+      "  App[Instrumented Service]",
+      "  Agent[Collector Agent]",
+      "  Ingest[Ingestion Service]",
+      "  Queue[[Ingestion Buffer]]",
+      "  Cardinality[Cardinality Guard]",
+      "  Router[Metric Router]",
+      "  ShardA[(TSDB Shard A)]",
+      "  ShardB[(TSDB Shard B)]",
+      "  Roll[Rollup / Downsample Worker]",
+      "  Cold[(Cold Store \u2014 rollups)]",
+      "  Query[Query Service]",
+      "  Cache[(Query Cache)]",
+      "  Dash[Dashboards]",
+      "  Alert[Alerting Engine]",
+      "  Rules[(Alert Rules)]",
+      "  Notify[/Notify \u2014 page/email/]",
+      "  App --> Agent",
+      "  Agent --> Ingest",
+      "  Ingest --> Queue",
+      "  Queue --> Cardinality",
+      "  Cardinality --> Router",
+      "  Router --> ShardA",
+      "  Router --> ShardB",
+      "  ShardA --> Roll",
+      "  Roll --> Cold",
+      "  Query --> Cache",
+      "  Query --> Router",
+      "  Query --> Cold",
+      "  Dash --> Query",
+      "  Alert --> Rules",
+      "  Alert --> Router",
+      "  Alert --> Notify"
+    ],
+    "highlight": []
+  },
+  "satisfies": {
+    "functional": [
+      {
+        "requirement": "Ingest time-series metrics",
+        "how": "Buffered, batched, fire-and-forget ingestion.",
+        "steps": [
+          "ingest",
+          "collection"
+        ]
+      },
+      {
+        "requirement": "Query with aggregation over ranges",
+        "how": "Query service over label index + chunks, cached.",
+        "steps": [
+          "query",
+          "tsdb"
+        ]
+      },
+      {
+        "requirement": "Dashboards",
+        "how": "Cached/pre-aggregated query results, resolution-aware.",
+        "steps": [
+          "query",
+          "rollups"
+        ]
+      },
+      {
+        "requirement": "Alerting",
+        "how": "Rule engine with 'for' debounce and routed notifications.",
+        "steps": [
+          "query"
+        ]
+      },
+      {
+        "requirement": "Tiered retention",
+        "how": "Downsample raw -> 1m -> 1h with expiry.",
+        "steps": [
+          "rollups"
+        ]
+      }
+    ],
+    "nonFunctional": [
+      {
+        "requirement": "Absorb huge write volume",
+        "how": "Buffered async batch writes; series sharding.",
+        "steps": [
+          "ingest",
+          "scale"
+        ]
+      },
+      {
+        "requirement": "Fast recent-range queries",
+        "how": "Compressed chunks + label index + query cache.",
+        "steps": [
+          "tsdb",
+          "query"
+        ]
+      },
+      {
+        "requirement": "Bounded storage",
+        "how": "Downsampling and retention tiers.",
+        "steps": [
+          "rollups"
+        ]
+      },
+      {
+        "requirement": "Cardinality control",
+        "how": "Ingest-time guard: cap, drop, relabel high-cardinality labels.",
+        "steps": [
+          "cardinality"
+        ]
+      },
+      {
+        "requirement": "Reliable alerting",
+        "how": "Debounced rules on fine data, grouped/routed notifications.",
+        "steps": [
+          "query"
+        ]
+      },
+      {
+        "requirement": "Graceful degradation",
+        "how": "Sample/shed under overload; keep alert-critical metrics flowing.",
+        "steps": [
+          "ingest"
+        ]
+      }
+    ]
+  },
+  "interviewScript": [
+    {
+      "phase": "Scope & forces",
+      "time": "first 5 min",
+      "say": [
+        "Restate it: collect, store, query, and alert on time-series at scale.",
+        "List functional (ingest, query, dashboards, alerts, retention) and non-functional (write volume, query speed, cardinality, alert reliability).",
+        "Name the three forces: write volume, range queries, and cardinality."
+      ]
+    },
+    {
+      "phase": "Estimate & API",
+      "time": "5\u201315 min",
+      "say": [
+        "Size points/sec, active series, retention tiers, and alert cadence.",
+        "Sketch ingest, query_range, and rule creation."
+      ]
+    },
+    {
+      "phase": "Build up the design",
+      "time": "15\u201340 min",
+      "say": [
+        "Start naive to expose TSDB needs, then ingestion buffer, time-series storage, rollups.",
+        "Cover collection (push/pull), then cardinality control, then query + alerting.",
+        "Go deep where pushed: storage compression, cardinality, or alert debouncing."
+      ]
+    },
+    {
+      "phase": "Scale & wrap",
+      "time": "final 5 min",
+      "say": [
+        "Shard by series with replicas; push aggregation down on fan-out.",
+        "Summarize requirements and name the dominant risk (cardinality explosion)."
+      ]
+    }
+  ],
+  "levelVariants": [
+    {
+      "level": "Junior",
+      "expectations": [
+        "Knows metrics are time-series needing a purpose-built store, not OLTP rows.",
+        "Understands dashboards query ranges and alerts watch thresholds."
+      ]
+    },
+    {
+      "level": "Senior",
+      "expectations": [
+        "Designs compressed chunked storage with a label index and tiered downsampling.",
+        "Treats ingestion as fire-and-forget with overload handling.",
+        "Debounces alerts and caches queries."
+      ]
+    },
+    {
+      "level": "Staff+",
+      "expectations": [
+        "Makes cardinality control a first-class concern at the ingest edge.",
+        "Shards by series with fan-out aggregation and replication.",
+        "Quantifies storage/query/cardinality tradeoffs and degradation behavior."
+      ]
+    }
+  ],
+  "followUps": [
+    "How would you support high-cardinality exploration (exemplars/trace links) without exploding the TSDB?",
+    "How do you make alerting itself highly available so it never misses during an outage?",
+    "How would you implement long-term storage in object storage with a query layer on top?",
+    "How do you handle late-arriving or out-of-order samples?",
+    "How would you support multi-tenancy with per-tenant cardinality and query limits?",
+    "How do you backfill historical data and recompute rollups after a schema change?"
+  ]
+}

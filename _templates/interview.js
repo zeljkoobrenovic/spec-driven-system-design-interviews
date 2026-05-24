@@ -39,7 +39,8 @@
 
     // ---------- State ----------
     const state = {
-        datasets: [],
+        datasets: [],           // flat list, each with groupId/groupName
+        groups: [],             // [{ id, name, datasets }, ...]
         currentDatasetId: null,
         data: null,
         entries: [],            // [{ kind, id, title, payload? }, ...]
@@ -55,14 +56,25 @@
         capacity: "capacity",
         api: "api",
         dataModel: "data-model",
+        patterns: "patterns",
+        patternCatalog: "pattern-catalog",
         finalDesign: "final-design",
         apiFlows: "api-flows",
         satisfies: "satisfies",
+        interviewScript: "interview-script",
+        levelVariants: "by-level",
         followUps: "follow-ups",
     };
 
     // Slugs that belong in the bottom "Wrap-up" sidebar group, in order.
-    const WRAPUP_ORDER = [INTRO_SLUGS.finalDesign, INTRO_SLUGS.apiFlows, INTRO_SLUGS.satisfies, INTRO_SLUGS.followUps];
+    const WRAPUP_ORDER = [
+        INTRO_SLUGS.finalDesign,
+        INTRO_SLUGS.apiFlows,
+        INTRO_SLUGS.satisfies,
+        INTRO_SLUGS.interviewScript,
+        INTRO_SLUGS.levelVariants,
+        INTRO_SLUGS.followUps,
+    ];
     const WRAPUP_SLUGS = new Set(WRAPUP_ORDER);
 
     // ---------- Utilities ----------
@@ -184,6 +196,7 @@
         if (has(/\b(cdn|edge)\b/)) return "edge";
         if (has(/\b(geo ?dns|dns)\b/)) return "dns";
         if (has(/\b(load balancer|balancer|\blb\b)\b/)) return "load balancer";
+        if (has(/\bapi gateway\b/) || has(/\bapi\b/) || has(/\b(endpoint|graphql)\b/)) return "api";
         if (has(/\b(router|gateway)\b/)) return "router";
         if (has(/\b(queue|stream|event bus|message bus|topic|log)\b/) || shape === "subroutine" && has(/\bq\b/)) return "queue";
         if (has(/\b(cache|redis|memcached)\b/)) return "cache";
@@ -194,7 +207,7 @@
         if (has(/\b(generator|allocator|id gen|idgen)\b/)) return "generator";
         if (has(/\b(auth|rate limit|limiter|policy|rules?)\b/)) return "policy";
         if (has(/\b(metrics?|alerts?|dashboard|logs?|analytics|tools|observability)\b/)) return "observability";
-        if (has(/\b(api|service|server|app|web tier|post svc|feed svc|user svc)\b/)) return "service";
+        if (has(/\b(service|server|app|web tier|post svc|feed svc|user svc)\b/)) return "service";
         if (has(/\b(workers?)\b/)) return "worker";
         if (has(/\b(client|user|viewer|author|browser|mobile|operator|admin)\b/)) return "client";
         if (has(/\b(graph|social graph)\b/)) return "graph";
@@ -216,6 +229,7 @@
         generator: {className: "nodeTypeGenerator", fill: "#fffbeb", stroke: "#d97706"},
         policy: {className: "nodeTypePolicy", fill: "#fef2f2", stroke: "#dc2626"},
         observability: {className: "nodeTypeObservability", fill: "#f0fdfa", stroke: "#0f766e"},
+        api: {className: "nodeTypeApi", fill: "#eff6ff", stroke: "#2563eb"},
         service: {className: "nodeTypeService", fill: "#fff7ed", stroke: "#ea580c"},
         client: {className: "nodeTypeClient", fill: "#f8fafc", stroke: "#64748b"},
         graph: {className: "nodeTypeGraph", fill: "#fdf4ff", stroke: "#c026d3"},
@@ -453,6 +467,12 @@
         if (Array.isArray(data.dataModel) && data.dataModel.length > 0) {
             entries.push({kind: "intro", id: INTRO_SLUGS.dataModel, title: "Data Model", payload: data.dataModel});
         }
+        if (Array.isArray(data.patterns) && data.patterns.length > 0) {
+            entries.push({kind: "intro", id: INTRO_SLUGS.patterns, title: "Patterns", payload: data.patterns});
+        }
+        if (Array.isArray(data.patternCatalog) && data.patternCatalog.length > 0) {
+            entries.push({kind: "intro", id: INTRO_SLUGS.patternCatalog, title: "Pattern Catalog", payload: data.patternCatalog});
+        }
         if (Array.isArray(data.steps)) {
             for (const step of data.steps) entries.push({kind: "step", id: step.id, title: step.title, payload: step});
         }
@@ -473,6 +493,12 @@
             (Array.isArray(data.satisfies.nonFunctional) && data.satisfies.nonFunctional.length > 0)
         )) {
             entries.push({kind: "intro", id: INTRO_SLUGS.satisfies, title: "Design vs. Requirements", payload: data.satisfies});
+        }
+        if (Array.isArray(data.interviewScript) && data.interviewScript.length > 0) {
+            entries.push({kind: "intro", id: INTRO_SLUGS.interviewScript, title: "Interview Script", payload: data.interviewScript});
+        }
+        if (Array.isArray(data.levelVariants) && data.levelVariants.length > 0) {
+            entries.push({kind: "intro", id: INTRO_SLUGS.levelVariants, title: "By Level", payload: data.levelVariants});
         }
         if (Array.isArray(data.followUps) && data.followUps.length > 0) {
             entries.push({kind: "intro", id: INTRO_SLUGS.followUps, title: "Follow-up Questions", payload: data.followUps});
@@ -648,6 +674,25 @@
         return /^\s*(graph|flowchart)\b/.test(firstLine || "") ? firstLine.trim() : "graph TB";
     }
 
+    // Force a flowchart's layout direction regardless of how it was authored.
+    // Requirements/capacity diagrams render left-to-right (LR); architecture
+    // steps and the final design render top-to-bottom (TB). Rewrites the
+    // direction token on the first `graph`/`flowchart` header line, preserving
+    // any trailing `;`. Non-flowcharts (sequence, ER) pass through untouched.
+    function forceFlowchartDirection(diagramSrc, direction) {
+        const src = diagramSource(diagramSrc);
+        if (!isFlowchartDiagram(src)) return src;
+        const lines = src.split("\n");
+        const i = lines.findIndex((line) => line.trim());
+        if (i < 0) return src;
+        // graph|flowchart [DIR] [;]  ->  keyword + forced direction (+ ;)
+        lines[i] = lines[i].replace(
+            /^(\s*)(graph|flowchart)\b[ \t]*(?:LR|RL|TB|BT|TD)?[ \t]*(;?)[ \t]*$/,
+            (m, indent, keyword, semi) => `${indent}${keyword} ${direction}${semi}`
+        );
+        return lines.join("\n");
+    }
+
     function flowchartNodeDefinition(line) {
         const patterns = [
             /^(\s*)([A-Za-z_][A-Za-z0-9_-]*)\[\((.+)\)\](\s*)$/,
@@ -813,7 +858,9 @@
             ? defaultEffectiveFor(prevStep)
             : null;
         const highlights = resolveHighlights(tempStep, prevEffective);
-        const displaySrc = annotateFlowchartNodeTypes(diagramSrc || "");
+        // Architecture steps and the final design always lay out top-to-bottom.
+        const directedSrc = forceFlowchartDirection(diagramSrc || "", "TB");
+        const displaySrc = annotateFlowchartNodeTypes(directedSrc);
         const src = augmentDiagramWithHighlights(displaySrc, highlights);
 
         const renderId = `mermaid-svg-${Date.now()}`;
@@ -997,6 +1044,42 @@
         return wrap.children.length > 0 ? makeSection("Failure drills", wrap, "failure-drills") : null;
     }
 
+    // Per-step common traps. Each item: { trap, why?, instead? }.
+    // The mistake, why it's wrong, and the better move — the book's "common
+    // traps" differentiator, scoped to the step where the trap arises.
+    function renderTraps(traps) {
+        if (!Array.isArray(traps) || traps.length === 0) return null;
+        const wrap = document.createElement("div");
+        wrap.className = "trap-list";
+        for (const t of traps) {
+            if (!t) continue;
+            const card = document.createElement("div");
+            card.className = "trap-card";
+            const h = document.createElement("h4");
+            h.textContent = t.trap || t.title || "Trap";
+            card.appendChild(h);
+            if (t.why) card.appendChild(makeLabeledText("Why it's wrong", t.why));
+            if (t.instead || t.better) card.appendChild(makeLabeledText("Do instead", t.instead || t.better));
+            wrap.appendChild(card);
+        }
+        return wrap.children.length > 0 ? makeSection("Common traps", wrap, "traps") : null;
+    }
+
+    // Per-step pattern tags: string IDs/names rendered as chips. Surfaces the
+    // reusable patterns (see Overview > Patterns) exercised by this step.
+    function renderStepPatternTags(patterns) {
+        if (!Array.isArray(patterns) || patterns.length === 0) return null;
+        const wrap = document.createElement("div");
+        wrap.className = "pattern-tags";
+        for (const p of patterns) {
+            const chip = document.createElement("span");
+            chip.className = "pattern-tag";
+            chip.textContent = String(p);
+            wrap.appendChild(chip);
+        }
+        return makeSection("Patterns", wrap, "step-patterns");
+    }
+
     function renderInterviewerSignals(signals) {
         if (!signals || typeof signals !== "object") return null;
         const strong = bulletsFrom(signals.strong || []);
@@ -1032,6 +1115,8 @@
 
     function renderStepExtras(step) {
         els.stepExtras.innerHTML = "";
+
+        appendStepExtra(renderStepPatternTags(step.patterns));
 
         if (Array.isArray(step.flows) && step.flows.length > 0) {
             // Only render valid flows (must have a non-empty diagram source).
@@ -1092,6 +1177,7 @@
         appendStepExtra(renderWhyNow(step.whyNow));
         appendStepExtra(renderRecap(step.recap));
         appendStepExtra(renderFailureDrills(step.failureDrills));
+        appendStepExtra(renderTraps(step.traps));
 
         if (Array.isArray(step.deepDives) && step.deepDives.length > 0) {
             const wrap = document.createElement("div");
@@ -1363,7 +1449,8 @@
     function renderIntroRequirements(req) {
         const outer = document.createElement("div");
         if (state.data && hasDiagram(state.data.requirementsDiagram)) {
-            outer.appendChild(makeMermaidEl(state.data.requirementsDiagram));
+            // Requirements diagrams lay out left-to-right.
+            outer.appendChild(makeMermaidEl(forceFlowchartDirection(state.data.requirementsDiagram, "LR")));
         }
         const wrap = document.createElement("div");
         wrap.className = "req-columns";
@@ -1396,7 +1483,8 @@
     function renderIntroCapacity(rows) {
         const outer = document.createElement("div");
         if (state.data && hasDiagram(state.data.capacityDiagram)) {
-            outer.appendChild(makeMermaidEl(state.data.capacityDiagram));
+            // Capacity-estimation diagrams lay out left-to-right.
+            outer.appendChild(makeMermaidEl(forceFlowchartDirection(state.data.capacityDiagram, "LR")));
         }
         const table = document.createElement("table");
         table.className = "capacity-table";
@@ -1651,6 +1739,159 @@
         return wrap;
     }
 
+    // Overview > Patterns. Each item: { name, what, whenToUse?, steps? }.
+    // Names the reusable design patterns this case teaches and links them to
+    // the steps where they appear.
+    function renderIntroPatterns(items) {
+        const wrap = document.createElement("div");
+        wrap.className = "patterns-list";
+        for (const p of items) {
+            const card = document.createElement("div");
+            card.className = "pattern-card";
+
+            const name = document.createElement("div");
+            name.className = "pattern-name";
+            name.textContent = p.name || "";
+            card.appendChild(name);
+
+            if (p.what) {
+                const what = document.createElement("p");
+                what.className = "pattern-what";
+                what.textContent = p.what;
+                card.appendChild(what);
+            }
+            if (p.whenToUse) {
+                const wt = document.createElement("p");
+                wt.className = "pattern-when muted";
+                wt.textContent = `When to use: ${p.whenToUse}`;
+                card.appendChild(wt);
+            }
+            if (Array.isArray(p.steps) && p.steps.length > 0) {
+                card.appendChild(makeStepChips(p.steps));
+            }
+            wrap.appendChild(card);
+        }
+        return wrap;
+    }
+
+    // Pattern Catalog (catalog dataset). Each item: { name, category?, what,
+    // whenToUse?, tradeoffs?, usedBy? }. A standalone reference of the reusable
+    // patterns the book teaches; cases reference these by name. Groups cards by
+    // `category` when present.
+    function renderIntroPatternCatalog(items) {
+        const outer = document.createElement("div");
+
+        // Group items by category (preserving first-seen order); ungrouped last.
+        const order = [];
+        const byCat = new Map();
+        for (const p of items) {
+            const cat = p.category || "";
+            if (!byCat.has(cat)) {
+                byCat.set(cat, []);
+                order.push(cat);
+            }
+            byCat.get(cat).push(p);
+        }
+
+        for (const cat of order) {
+            if (cat) {
+                const h = document.createElement("h3");
+                h.className = "catalog-category";
+                h.textContent = cat;
+                outer.appendChild(h);
+            }
+            const grid = document.createElement("div");
+            grid.className = "patterns-list";
+            for (const p of byCat.get(cat)) {
+                const card = document.createElement("div");
+                card.className = "pattern-card";
+
+                const name = document.createElement("div");
+                name.className = "pattern-name";
+                name.textContent = p.name || "";
+                card.appendChild(name);
+
+                if (p.what) {
+                    const what = document.createElement("p");
+                    what.className = "pattern-what";
+                    what.textContent = p.what;
+                    card.appendChild(what);
+                }
+                if (p.whenToUse) {
+                    const wt = document.createElement("p");
+                    wt.className = "pattern-when muted";
+                    wt.textContent = `When to use: ${p.whenToUse}`;
+                    card.appendChild(wt);
+                }
+                if (p.tradeoffs) {
+                    const tr = document.createElement("p");
+                    tr.className = "pattern-tradeoffs";
+                    tr.textContent = `Trade-off: ${p.tradeoffs}`;
+                    card.appendChild(tr);
+                }
+                if (Array.isArray(p.usedBy) && p.usedBy.length > 0) {
+                    const used = document.createElement("div");
+                    used.className = "pattern-tags";
+                    for (const u of p.usedBy) {
+                        const chip = document.createElement("span");
+                        chip.className = "pattern-tag";
+                        chip.textContent = String(u);
+                        used.appendChild(chip);
+                    }
+                    card.appendChild(used);
+                }
+                grid.appendChild(card);
+            }
+            outer.appendChild(grid);
+        }
+        return outer;
+    }
+
+    // Wrap-up > Interview Script. Each item: { phase, time?, say }.
+    // What to say across the interview's phases (first 5 min, 15, 30, final 5).
+    function renderIntroInterviewScript(items) {
+        const wrap = document.createElement("div");
+        wrap.className = "script-timeline";
+        for (const s of items) {
+            const card = document.createElement("div");
+            card.className = "script-phase";
+
+            const head = document.createElement("div");
+            head.className = "script-head";
+            const phase = document.createElement("span");
+            phase.className = "script-phase-name";
+            phase.textContent = s.phase || "";
+            head.appendChild(phase);
+            if (s.time) {
+                const time = document.createElement("span");
+                time.className = "script-time mono";
+                time.textContent = s.time;
+                head.appendChild(time);
+            }
+            card.appendChild(head);
+            card.appendChild(makeBulletList(bulletsFrom(s.say || [])));
+            wrap.appendChild(card);
+        }
+        return wrap;
+    }
+
+    // Wrap-up > By Level. Each item: { level, expectations }.
+    // Junior / senior / staff expectations side by side.
+    function renderIntroLevelVariants(items) {
+        const wrap = document.createElement("div");
+        wrap.className = "level-columns";
+        for (const lv of items) {
+            const col = document.createElement("div");
+            col.className = "level-col";
+            const h = document.createElement("h3");
+            h.textContent = lv.level || "";
+            col.appendChild(h);
+            col.appendChild(makeBulletList(bulletsFrom(lv.expectations || [])));
+            wrap.appendChild(col);
+        }
+        return wrap;
+    }
+
     function renderIntroEntry(entry) {
         els.introBlock.innerHTML = "";
         let node;
@@ -1670,8 +1911,20 @@
             case INTRO_SLUGS.apiFlows:
                 node = renderIntroApiFlows(entry.payload);
                 break;
+            case INTRO_SLUGS.patterns:
+                node = renderIntroPatterns(entry.payload);
+                break;
+            case INTRO_SLUGS.patternCatalog:
+                node = renderIntroPatternCatalog(entry.payload);
+                break;
             case INTRO_SLUGS.satisfies:
                 node = renderIntroSatisfies(entry.payload);
+                break;
+            case INTRO_SLUGS.interviewScript:
+                node = renderIntroInterviewScript(entry.payload);
+                break;
+            case INTRO_SLUGS.levelVariants:
+                node = renderIntroLevelVariants(entry.payload);
                 break;
             case INTRO_SLUGS.followUps:
                 node = renderIntroFollowUps(entry.payload);
@@ -1813,10 +2066,14 @@
 
     function validateDataset(d, path) {
         if (!d || typeof d !== "object") throw new Error(`Dataset ${path}: not an object`);
-        if (!Array.isArray(d.steps) || d.steps.length === 0) {
-            throw new Error(`Dataset ${path}: missing or empty "steps" array`);
+        const hasSteps = Array.isArray(d.steps) && d.steps.length > 0;
+        const hasCatalog = Array.isArray(d.patternCatalog) && d.patternCatalog.length > 0;
+        // A normal interview needs steps[]. A catalog dataset (no system to walk
+        // through) is valid with a non-empty patternCatalog[] instead.
+        if (!hasSteps && !hasCatalog) {
+            throw new Error(`Dataset ${path}: needs a non-empty "steps" array (or a "patternCatalog" for a catalog dataset)`);
         }
-        d.steps.forEach((step, i) => {
+        (d.steps || []).forEach((step, i) => {
             if (!step || typeof step !== "object") throw new Error(`Step ${i} is not an object`);
             if (!hasStepLikeDiagram(step)) {
                 throw new Error(`Step ${i} ("${step.title || step.id || ""}") must define a "diagram" or non-empty "options[].diagram"`);
@@ -1825,6 +2082,21 @@
         if (d.finalDesign && !hasStepLikeDiagram(d.finalDesign)) {
             throw new Error(`Dataset ${path}: "finalDesign" must define a "diagram" or non-empty "options[].diagram"`);
         }
+        // Book-feature fields are optional, but if present must be arrays so the
+        // renderers can iterate them. Contents stay free-form (rendered only if
+        // present), matching the rest of the lenient schema.
+        for (const key of ["patterns", "interviewScript", "levelVariants", "patternCatalog"]) {
+            if (d[key] !== undefined && !Array.isArray(d[key])) {
+                throw new Error(`Dataset ${path}: "${key}" must be an array if present`);
+            }
+        }
+        (d.steps || []).forEach((step, i) => {
+            for (const key of ["patterns", "traps"]) {
+                if (step[key] !== undefined && !Array.isArray(step[key])) {
+                    throw new Error(`Step ${i} ("${step.title || step.id || ""}"): "${key}" must be an array if present`);
+                }
+            }
+        });
     }
 
     async function loadDataset(datasetId, initialEntryId) {
@@ -1860,23 +2132,61 @@
         }
     }
 
+    // Accepts both the grouped manifest ({ groups: [{ id, name, datasets }] })
+    // and the legacy flat manifest ({ datasets: [...] }). Returns
+    // { groups, datasets } where `datasets` is the flat list and each dataset
+    // carries its resolved `group` / `groupName`.
+    function normalizeManifest(manifest) {
+        if (manifest && Array.isArray(manifest.groups)) {
+            const groups = manifest.groups
+                .filter((g) => g && Array.isArray(g.datasets))
+                .map((g) => ({
+                    id: g.id || g.name || "group",
+                    name: g.name || g.id || "Group",
+                    datasets: g.datasets,
+                }));
+            const datasets = [];
+            groups.forEach((g) => {
+                g.datasets.forEach((d) => {
+                    datasets.push(Object.assign({groupId: g.id, groupName: g.name}, d));
+                });
+            });
+            return {groups, datasets};
+        }
+        if (manifest && Array.isArray(manifest.datasets)) {
+            const datasets = manifest.datasets.slice();
+            return {groups: [{id: "all", name: "Interviews", datasets}], datasets};
+        }
+        return {groups: [], datasets: []};
+    }
+
     function populateDatasetSelect() {
         els.datasetSelect.innerHTML = "";
-        state.datasets.forEach((d) => {
-            const opt = document.createElement("option");
-            opt.value = d.id;
-            opt.textContent = d.name || d.id;
-            els.datasetSelect.appendChild(opt);
+        const single = state.groups.length <= 1;
+        state.groups.forEach((g) => {
+            const parent = single
+                ? els.datasetSelect
+                : els.datasetSelect.appendChild(
+                      Object.assign(document.createElement("optgroup"), {label: g.name})
+                  );
+            g.datasets.forEach((d) => {
+                const opt = document.createElement("option");
+                opt.value = d.id;
+                opt.textContent = d.name || d.id;
+                parent.appendChild(opt);
+            });
         });
     }
 
     async function init() {
         try {
             const manifest = await fetchJson("data/index.json");
-            if (!manifest || !Array.isArray(manifest.datasets) || manifest.datasets.length === 0) {
-                throw new Error('data/index.json must contain a non-empty "datasets" array');
+            const {groups, datasets} = normalizeManifest(manifest);
+            if (datasets.length === 0) {
+                throw new Error('data/index.json must contain a non-empty "groups" or "datasets" array');
             }
-            state.datasets = manifest.datasets;
+            state.groups = groups;
+            state.datasets = datasets;
             populateDatasetSelect();
 
             const hash = parseHash();

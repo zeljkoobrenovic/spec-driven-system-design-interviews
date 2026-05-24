@@ -1,0 +1,1071 @@
+{
+  "title": "Search Autocomplete \u2014 System Design",
+  "description": "Designing search autocomplete (typeahead): as a user types a prefix, instantly suggest the most likely completions. The interesting problems are a read-heavy, latency-critical prefix lookup (every keystroke is a query), ranking suggestions by popularity, keeping suggestions fresh from the live query stream, and doing it for millions of QPS within tens of milliseconds. We build from a naive prefix scan toward a trie-backed, top-k-precomputed, cached, sharded suggestion service.",
+  "requirementsDiagram": [
+    "graph LR",
+    "  Client[Client / Search Box]",
+    "  API[Autocomplete API]",
+    "  Trie[(Prefix Index \u2014 Trie)]",
+    "  TopK[(Precomputed Top-K per Prefix)]",
+    "  Client -->|prefix per keystroke| API",
+    "  API -->|lookup| Trie",
+    "  Trie --> TopK",
+    "  TopK -->|suggestions| Client"
+  ],
+  "capacityDiagram": [
+    "graph LR",
+    "  Client[Client / Search Box]",
+    "  Cache[(Edge / Prefix Cache)]",
+    "  API[Autocomplete API]",
+    "  Trie[(Prefix Index \u2014 Trie)]",
+    "  Client -->|~1M QPS| Cache",
+    "  Cache -->|miss| API",
+    "  API --> Trie"
+  ],
+  "requirements": {
+    "functional": [
+      "Given a prefix, return the top suggestions that start with it.",
+      "Rank suggestions by popularity (and recency).",
+      "Reflect newly trending queries within minutes.",
+      "Tolerate minor typos (fuzzy matching).",
+      "Optionally personalize suggestions to the user."
+    ],
+    "nonFunctional": [
+      "Very low latency: tens of milliseconds per keystroke.",
+      "Extremely read-heavy and high QPS (every keystroke queries).",
+      "Suggestions stay reasonably fresh as query popularity shifts.",
+      "Scale to a large vocabulary and global traffic.",
+      "Graceful degradation: return fewer/cached suggestions rather than fail.",
+      "Suggestions are eventually consistent \u2014 slight staleness is fine."
+    ]
+  },
+  "capacity": [
+    {
+      "label": "Query rate",
+      "value": "~1M QPS",
+      "note": "Each keystroke is a request; reads dominate everything."
+    },
+    {
+      "label": "Latency target",
+      "value": "p99 < ~50ms",
+      "note": "It must feel instant as the user types."
+    },
+    {
+      "label": "Vocabulary",
+      "value": "100M+ distinct queries",
+      "note": "The set of completable strings is huge and long-tailed."
+    },
+    {
+      "label": "Suggestions returned",
+      "value": "top ~5\u201310",
+      "note": "Only the best few per prefix matter."
+    },
+    {
+      "label": "Freshness",
+      "value": "minutes",
+      "note": "Trending terms should appear soon, but not instantly."
+    },
+    {
+      "label": "Read:write",
+      "value": "overwhelmingly read",
+      "note": "Index updates are batched; reads are constant and hot."
+    }
+  ],
+  "api": [
+    {
+      "method": "GET",
+      "path": "/v1/suggest",
+      "description": "Return ranked completions for a prefix. Aggressively cacheable; served from the edge when possible.",
+      "request": "GET /suggest?q=sys&limit=8",
+      "response": "200 OK { \"suggestions\": [\"system design\", \"system design interview\", \"sysadmin\"] }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/events/query",
+      "description": "Record an executed search (feeds popularity). Fire-and-forget into the event stream.",
+      "request": "{ \"query\": \"system design\", \"user_id\": \"usr_1\", \"ts\": 1710000000 }",
+      "response": "202 Accepted"
+    }
+  ],
+  "dataModel": [
+    {
+      "name": "terms",
+      "note": "Completable strings with a popularity score.",
+      "fields": [
+        {
+          "name": "term",
+          "type": "varchar PK"
+        },
+        {
+          "name": "score",
+          "type": "double (popularity/recency-weighted)"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "prefix_topk",
+      "note": "Precomputed top-k completions per prefix \u2014 the read-optimized structure.",
+      "fields": [
+        {
+          "name": "prefix",
+          "type": "varchar PK"
+        },
+        {
+          "name": "suggestions",
+          "type": "array<term> (ranked)"
+        },
+        {
+          "name": "built_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "query_counts",
+      "note": "Rolling popularity counts aggregated from the query event stream.",
+      "fields": [
+        {
+          "name": "term",
+          "type": "varchar"
+        },
+        {
+          "name": "window",
+          "type": "timestamptz"
+        },
+        {
+          "name": "count",
+          "type": "bigint"
+        }
+      ]
+    },
+    {
+      "name": "user_history",
+      "note": "Optional per-user recent/started queries for personalization.",
+      "fields": [
+        {
+          "name": "user_id",
+          "type": "uuid"
+        },
+        {
+          "name": "term",
+          "type": "varchar"
+        },
+        {
+          "name": "last_used",
+          "type": "timestamptz"
+        }
+      ]
+    }
+  ],
+  "patterns": [
+    {
+      "name": "Trie / prefix index",
+      "what": "A tree keyed by characters so all completions of a prefix sit under one node.",
+      "whenToUse": "Prefix lookups over a large vocabulary.",
+      "steps": [
+        "trie"
+      ]
+    },
+    {
+      "name": "Precomputed top-k",
+      "what": "Store the ranked best-k completions per prefix node so a query is a direct read, not a subtree scan.",
+      "whenToUse": "Read-heavy ranking where computing per query is too slow.",
+      "steps": [
+        "topk"
+      ]
+    },
+    {
+      "name": "Edge caching",
+      "what": "Cache popular prefixes near users (CDN/edge) since the same short prefixes are queried constantly.",
+      "whenToUse": "High QPS with a heavily skewed prefix distribution.",
+      "steps": [
+        "caching"
+      ]
+    },
+    {
+      "name": "Stream aggregation",
+      "what": "Aggregate the live query stream into rolling popularity counts.",
+      "whenToUse": "Deriving freshness/trends from a firehose of events.",
+      "steps": [
+        "freshness"
+      ]
+    },
+    {
+      "name": "Batch index rebuild (CQRS)",
+      "what": "Rebuild the read-optimized index offline from counts, then swap it in atomically.",
+      "whenToUse": "When the query structure is expensive to update in place.",
+      "steps": [
+        "freshness"
+      ]
+    },
+    {
+      "name": "Fuzzy matching",
+      "what": "Tolerate typos via edit-distance or n-gram expansion of the prefix.",
+      "whenToUse": "Real users mistype; exact prefix match alone misses intent.",
+      "steps": [
+        "spelling"
+      ]
+    },
+    {
+      "name": "Sharding by prefix",
+      "what": "Partition the index by leading characters across nodes.",
+      "whenToUse": "When the index or QPS outgrows one node.",
+      "steps": [
+        "scale"
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "naive-prefix",
+      "title": "1. Naive Prefix Scan (the baseline)",
+      "description": "Start with a table of terms and a LIKE 'prefix%' query at request time, sorted by popularity. It works for a small list; at 1M QPS over 100M terms with a tens-of-ms budget it's hopeless \u2014 which motivates a prefix index and precomputation.",
+      "patterns": [
+        "Synchronous request/response"
+      ],
+      "decisionPrompt": "Why can't you run a 'LIKE prefix%' ORDER BY score query on every keystroke?",
+      "concepts": [
+        {
+          "term": "Prefix query",
+          "definition": "Find all strings starting with a given prefix.",
+          "whyItMatters": "It's the core operation, run on literally every keystroke."
+        },
+        {
+          "term": "Latency budget",
+          "definition": "Tens of ms end-to-end including network.",
+          "whyItMatters": "Leaves almost no room for a scan-and-sort per request."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client / Search Box]",
+        "  API[Autocomplete API]",
+        "  DB[(Query / Term DB)]",
+        "  Client -->|prefix| API",
+        "  API -->|LIKE prefix%| DB"
+      ],
+      "highlight": [
+        "Client",
+        "API",
+        "DB"
+      ],
+      "talkingPoints": [
+        "Frame it as a read-heavy, latency-critical prefix problem.",
+        "Reject per-query scan-and-sort; precompute instead."
+      ],
+      "traps": [
+        {
+          "trap": "Running LIKE 'prefix%' ORDER BY popularity per keystroke",
+          "why": "Scanning and ranking matching rows per request can't meet a tens-of-ms budget at 1M QPS.",
+          "instead": "Use a prefix index and precompute the top-k per prefix."
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Per-request scan + sort over a huge term set.",
+          "mitigation": "Trie + precomputed top-k (next steps)."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Identifies read-heaviness and the latency budget as the drivers."
+        ],
+        "weak": [
+          "Thinks a DB LIKE query is fine at scale."
+        ]
+      },
+      "whyNow": [
+        "The baseline makes the trie and precomputation obvious responses."
+      ]
+    },
+    {
+      "id": "trie",
+      "title": "2. Trie Prefix Index",
+      "description": "Build a trie (prefix tree) keyed by characters: every completion of a prefix lives in the subtree under that prefix's node. Looking up a prefix becomes walking down the characters, turning a scan into an O(prefix length) traversal.",
+      "patterns": [
+        "Trie / prefix index"
+      ],
+      "decisionPrompt": "How does a trie turn 'find all completions of a prefix' from a scan into a cheap lookup?",
+      "concepts": [
+        {
+          "term": "Trie",
+          "definition": "A tree where each edge is a character and each path spells a prefix.",
+          "whyItMatters": "All completions of a prefix share a subtree, so lookup is a short walk."
+        },
+        {
+          "term": "Subtree of completions",
+          "definition": "Everything under a prefix node completes that prefix.",
+          "whyItMatters": "Reduces 'which terms match' to a tree position."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  API[Autocomplete API]",
+        "  Trie[(Prefix Index \u2014 Trie)]",
+        "  Builder[Index Builder]",
+        "  DB[(Query / Term DB)]",
+        "  API -->|walk prefix| Trie",
+        "  Builder -->|build from terms| Trie",
+        "  DB --> Builder"
+      ],
+      "highlight": [
+        "Trie",
+        "Builder"
+      ],
+      "options": [
+        {
+          "name": "Trie in memory (default)",
+          "pros": [
+            "O(prefix length) lookup; compact with shared prefixes.",
+            "In-memory => microsecond traversal."
+          ],
+          "cons": [
+            "Still must rank the subtree's completions (addressed by top-k).",
+            "Rebuild/update strategy needed."
+          ],
+          "diagram": [
+            "graph TB",
+            "  API[Autocomplete API]",
+            "  Trie[(Prefix Index \u2014 Trie)]",
+            "  API -->|traverse| Trie"
+          ],
+          "highlight": [
+            "Trie"
+          ]
+        },
+        {
+          "name": "Sorted list + binary search on prefix",
+          "pros": [
+            "Dead simple; a prefix range is contiguous when sorted."
+          ],
+          "cons": [
+            "Range can be huge for short prefixes; still must scan+rank the range.",
+            "Updates shift the array."
+          ],
+          "diagram": [
+            "graph TB",
+            "  API[Autocomplete API]",
+            "  DB[(Query / Term DB)]",
+            "  API -->|binary search range| DB"
+          ],
+          "highlight": [
+            "DB"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Walking the entire subtree to gather completions per query",
+          "why": "A short prefix like 's' has millions of completions \u2014 gathering them all per keystroke is slow.",
+          "instead": "Precompute and store the top-k at each node (next step), so lookup returns immediately."
+        },
+        {
+          "trap": "Storing the trie only on disk",
+          "why": "Per-keystroke disk traversal blows the latency budget.",
+          "instead": "Keep the hot trie in memory; persist for rebuild."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A one-character prefix is queried heavily.",
+          "expectedBehavior": "It still returns in time.",
+          "mitigation": "Precomputed top-k at that node + caching make it a constant-time read."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Chooses a trie and notes the subtree-ranking problem.",
+          "Keeps it in memory."
+        ],
+        "weak": [
+          "Subtree scan per query.",
+          "Disk-bound trie."
+        ]
+      },
+      "recap": {
+        "before": "Prefix matching was a scan.",
+        "after": "A trie makes finding completions an O(prefix) walk.",
+        "newRisk": "Ranking the subtree's completions is still expensive \u2014 precompute it."
+      },
+      "whyNow": [
+        "The trie is the core index; top-k precomputation builds directly on it."
+      ]
+    },
+    {
+      "id": "topk",
+      "title": "3. Precomputed Top-K per Prefix",
+      "description": "At each trie node (prefix), precompute and store the ranked top-k completions by popularity. A query then walks to the node and returns its stored list directly \u2014 no subtree scan or per-query ranking. This is the key read optimization.",
+      "patterns": [
+        "Precomputed top-k"
+      ],
+      "decisionPrompt": "A prefix has a million completions but you show 8. How do you avoid ranking a million per keystroke?",
+      "concepts": [
+        {
+          "term": "Top-k at node",
+          "definition": "Each prefix node caches its best-k completions, precomputed offline.",
+          "whyItMatters": "Turns a query into a single read instead of a scan + sort."
+        },
+        {
+          "term": "Read/write asymmetry",
+          "definition": "Expensive ranking happens at build time; queries are cheap reads.",
+          "whyItMatters": "Matches the workload \u2014 billions of reads, batched writes."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Builder[Index Builder]",
+        "  Trie[(Prefix Index \u2014 Trie)]",
+        "  TopK[(Precomputed Top-K per Prefix)]",
+        "  API[Autocomplete API]",
+        "  Builder -->|rank completions| TopK",
+        "  TopK --> Trie",
+        "  API -->|walk + read top-k| Trie"
+      ],
+      "highlight": [
+        "TopK"
+      ],
+      "deepDives": [
+        {
+          "title": "Building and storing top-k",
+          "points": [
+            "Compute each node's top-k bottom-up: a node's candidates are its children's top-k plus its own terminal term.",
+            "Store the k suggestions inline at the node so a lookup is one read.",
+            "k is small (5\u201310), so storage overhead per node is bounded."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Ranking completions at query time",
+          "why": "Sorting a large candidate set per keystroke blows the latency budget at 1M QPS.",
+          "instead": "Precompute top-k per node offline; the query just reads it."
+        },
+        {
+          "trap": "Storing full completion lists at every node",
+          "why": "Wastes memory and isn't needed \u2014 only the top few are shown.",
+          "instead": "Store only top-k (5\u201310) per node."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "Popularity shifts so the precomputed top-k is stale.",
+          "expectedBehavior": "Suggestions are slightly behind, not wrong-shaped.",
+          "mitigation": "Periodic rebuild from fresh counts (freshness step); staleness of minutes is acceptable."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Precomputes top-k bottom-up and reads it directly.",
+          "Keeps k small."
+        ],
+        "weak": [
+          "Ranks per query.",
+          "Stores everything per node."
+        ]
+      },
+      "recap": {
+        "before": "Each query ranked a subtree.",
+        "after": "Each prefix node returns its precomputed top-k in one read.",
+        "newRisk": "Top-k goes stale as popularity shifts; it must be rebuilt periodically."
+      },
+      "whyNow": [
+        "Precomputed top-k is what makes the read path fast enough."
+      ]
+    },
+    {
+      "id": "caching",
+      "title": "4. Edge Caching",
+      "description": "Prefix queries are wildly skewed \u2014 short, common prefixes dominate. Cache suggestion responses at the edge/CDN and in a prefix cache so the hottest prefixes never reach the index. Short TTLs keep them fresh enough.",
+      "patterns": [
+        "Edge caching"
+      ],
+      "decisionPrompt": "The same few thousand short prefixes are queried constantly. How do you avoid hitting the index for them?",
+      "concepts": [
+        {
+          "term": "Skewed prefix distribution",
+          "definition": "A small set of prefixes accounts for most traffic.",
+          "whyItMatters": "Caching the hot head absorbs the vast majority of QPS."
+        },
+        {
+          "term": "Edge cache + TTL",
+          "definition": "Cache responses near users with a short expiry.",
+          "whyItMatters": "Cuts latency and load while bounding staleness."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client / Search Box]",
+        "  CDN[/CDN/]",
+        "  Cache[(Edge / Prefix Cache)]",
+        "  API[Autocomplete API]",
+        "  Trie[(Prefix Index \u2014 Trie)]",
+        "  Client --> CDN",
+        "  CDN -->|miss| Cache",
+        "  Cache -->|miss| API",
+        "  API --> Trie"
+      ],
+      "highlight": [
+        "CDN",
+        "Cache"
+      ],
+      "traps": [
+        {
+          "trap": "Sending every keystroke to the index",
+          "why": "The hot head of prefixes hammers the index needlessly when their answer rarely changes within seconds.",
+          "instead": "Cache suggestions at the edge with a short TTL; only misses hit the index."
+        },
+        {
+          "trap": "Caching with no TTL",
+          "why": "Trending terms never appear because the cache never refreshes.",
+          "instead": "Short TTL (seconds\u2013minutes) balances freshness against hit rate."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The index is briefly unavailable.",
+          "expectedBehavior": "Common prefixes still return suggestions.",
+          "mitigation": "Edge cache serves the hot head; stale-while-revalidate covers a short outage."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Exploits prefix skew with edge caching + short TTL.",
+          "Uses stale-while-revalidate for resilience."
+        ],
+        "weak": [
+          "No caching.",
+          "Infinite TTL blocking freshness."
+        ]
+      },
+      "recap": {
+        "before": "Every keystroke reached the index.",
+        "after": "The hot head is served from cache; misses hit the precomputed index.",
+        "newRisk": "TTL trades freshness vs hit rate; cache must handle high fan-in."
+      },
+      "whyNow": [
+        "Caching is the cheapest way to absorb 1M QPS given the skew."
+      ]
+    },
+    {
+      "id": "freshness",
+      "title": "5. Freshness from the Query Stream",
+      "description": "Keep suggestions current: executed searches flow into an event stream, an aggregator maintains rolling popularity counts, and the index is rebuilt (or incrementally updated) from those counts periodically and swapped in atomically.",
+      "patterns": [
+        "Stream aggregation",
+        "Batch index rebuild (CQRS)"
+      ],
+      "decisionPrompt": "A new term suddenly trends. How does it start showing up in suggestions within minutes?",
+      "concepts": [
+        {
+          "term": "Rolling popularity counts",
+          "definition": "Time-windowed counts of executed queries.",
+          "whyItMatters": "They are the popularity signal that ranks suggestions and surfaces trends."
+        },
+        {
+          "term": "Atomic index swap",
+          "definition": "Build a new top-k index offline, then switch reads to it in one step.",
+          "whyItMatters": "Updates the read path without partial/inconsistent states."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client / Search Box]",
+        "  Stream[[Query Event Stream]]",
+        "  Agg[Popularity Aggregator]",
+        "  Counts[(Query Counts)]",
+        "  Builder[Index Builder]",
+        "  TopK[(Precomputed Top-K per Prefix)]",
+        "  Client -->|executed query| Stream",
+        "  Stream --> Agg",
+        "  Agg --> Counts",
+        "  Builder --> Counts",
+        "  Builder -->|rebuild + swap| TopK"
+      ],
+      "highlight": [
+        "Stream",
+        "Agg",
+        "Counts",
+        "Builder"
+      ],
+      "options": [
+        {
+          "name": "Periodic batch rebuild + atomic swap (default)",
+          "pros": [
+            "Simple, consistent; rebuild every few minutes from fresh counts.",
+            "Read path untouched during build, then swapped."
+          ],
+          "cons": [
+            "Freshness limited to the rebuild interval.",
+            "Full rebuild cost for large vocab."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Builder[Index Builder]",
+            "  TopK[(Precomputed Top-K per Prefix)]",
+            "  Builder -->|rebuild| TopK"
+          ],
+          "highlight": [
+            "Builder"
+          ]
+        },
+        {
+          "name": "Incremental in-place updates",
+          "pros": [
+            "Near-real-time freshness."
+          ],
+          "cons": [
+            "Updating top-k lists in place under heavy reads is tricky and error-prone.",
+            "Risk of inconsistent reads mid-update."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Agg[Popularity Aggregator]",
+            "  TopK[(Precomputed Top-K per Prefix)]",
+            "  Agg -->|update node| TopK"
+          ],
+          "highlight": [
+            "TopK"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Updating the live index in place under 1M QPS reads",
+          "why": "Concurrent mutation of top-k lists risks inconsistent or torn reads on the hot path.",
+          "instead": "Rebuild offline and swap atomically; reads always see a complete version."
+        },
+        {
+          "trap": "Counting raw query volume without decay",
+          "why": "Yesterday's blockbuster outranks today's trend forever.",
+          "instead": "Use a time-decayed/windowed count so popularity reflects recent behavior."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The aggregator lags during a traffic spike.",
+          "expectedBehavior": "Suggestions get a bit staler, never wrong-shaped.",
+          "mitigation": "Reads keep serving the last good index; the rebuild catches up when the stream drains."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Aggregates the stream into decayed counts and rebuilds+swaps atomically.",
+          "Keeps mutation off the read path."
+        ],
+        "weak": [
+          "Mutates the live index in place.",
+          "Uses undecayed lifetime counts."
+        ]
+      },
+      "recap": {
+        "before": "The index was static after build.",
+        "after": "Rolling counts from the query stream drive periodic atomic rebuilds.",
+        "newRisk": "Freshness is bounded by the rebuild interval; counts need decay."
+      },
+      "whyNow": [
+        "Without the stream feeding rebuilds, suggestions go stale and miss trends."
+      ]
+    },
+    {
+      "id": "spelling",
+      "title": "6. Typo Tolerance & Personalization",
+      "description": "Real users mistype and have individual intent. Add fuzzy matching (edit-distance / n-gram expansion) so 'recieve' still suggests 'receive', and optionally blend personalized suggestions from the user's own history with the global top-k.",
+      "patterns": [
+        "Fuzzy matching"
+      ],
+      "decisionPrompt": "A user types 'systen' \u2014 how do you still suggest 'system design' without scanning everything?",
+      "concepts": [
+        {
+          "term": "Edit distance / fuzzy prefix",
+          "definition": "Match prefixes within a small number of character edits.",
+          "whyItMatters": "Captures intent despite typos, which exact prefix match misses."
+        },
+        {
+          "term": "Personalization blend",
+          "definition": "Merge the user's history with global suggestions, weighted.",
+          "whyItMatters": "Surfaces what this user likely means without ignoring global popularity."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  API[Autocomplete API]",
+        "  Spell[Spell / Fuzzy Matcher]",
+        "  Trie[(Prefix Index \u2014 Trie)]",
+        "  Personalizer[Personalization Service]",
+        "  Profile[(User History)]",
+        "  API --> Spell",
+        "  Spell -->|candidate prefixes| Trie",
+        "  API --> Personalizer",
+        "  Personalizer --> Profile"
+      ],
+      "highlight": [
+        "Spell",
+        "Personalizer",
+        "Profile"
+      ],
+      "deepDives": [
+        {
+          "title": "Fuzzy matching cheaply",
+          "points": [
+            "Generate a few edit-distance-1 variants of the prefix and look each up \u2014 bounded extra work.",
+            "Or index n-grams so near-miss prefixes share keys; rank exact matches above fuzzy ones.",
+            "Blend personalization as a re-rank on top of global top-k, not a separate slow path."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Doing a global edit-distance search over the whole vocabulary",
+          "why": "Comparing the prefix to every term is far too slow for the latency budget.",
+          "instead": "Expand the prefix into a few bounded variants (or use n-gram keys) and look those up."
+        },
+        {
+          "trap": "Replacing global suggestions entirely with personal history",
+          "why": "A user with little history then gets poor, narrow suggestions.",
+          "instead": "Blend/re-rank personal over global; fall back to global when history is thin."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "Personalization data is unavailable.",
+          "expectedBehavior": "Suggestions still work, just non-personalized.",
+          "mitigation": "Personalization is a re-rank layer over global top-k; absence degrades gracefully."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Bounds fuzzy matching via prefix variants/n-grams.",
+          "Treats personalization as a re-rank with graceful fallback."
+        ],
+        "weak": [
+          "Global edit-distance scan.",
+          "Replaces global suggestions with sparse personal data."
+        ]
+      },
+      "recap": {
+        "before": "Only exact-prefix, global suggestions.",
+        "after": "Typo-tolerant matching and optional personalization layered on.",
+        "newRisk": "Fuzzy and personalization add latency/complexity \u2014 keep them bounded and optional."
+      },
+      "whyNow": [
+        "Quality features come after the fast, fresh core works."
+      ]
+    },
+    {
+      "id": "scale",
+      "title": "7. Scaling by Prefix Sharding",
+      "description": "When the index or QPS outgrows one node, shard by leading characters across nodes, fronted by a prefix router and the edge cache. Replicate shards for the read load. Most traffic is still absorbed by caching; sharding handles index size and misses.",
+      "patterns": [
+        "Sharding by prefix",
+        "Edge caching"
+      ],
+      "decisionPrompt": "The trie no longer fits on one machine and misses still total huge QPS. How do you split it?",
+      "concepts": [
+        {
+          "term": "Prefix sharding",
+          "definition": "Partition the index by leading character(s) across nodes.",
+          "whyItMatters": "A query routes to exactly one shard by its prefix; no fan-out."
+        },
+        {
+          "term": "Read replicas",
+          "definition": "Multiple copies of a shard to serve read load.",
+          "whyItMatters": "Autocomplete is read-only at query time \u2014 replicate freely."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Cache[(Edge / Prefix Cache)]",
+        "  Router[Prefix Router]",
+        "  ShardA[(Index Shard A\u2013M)]",
+        "  ShardB[(Index Shard N\u2013Z)]",
+        "  Cache -->|miss| Router",
+        "  Router -->|by first char| ShardA",
+        "  Router --> ShardB"
+      ],
+      "highlight": [
+        "Router",
+        "ShardA",
+        "ShardB"
+      ],
+      "options": [
+        {
+          "name": "Shard by leading characters + replicas (default)",
+          "pros": [
+            "A prefix maps to one shard \u2014 no scatter-gather.",
+            "Read replicas scale QPS; the index need not fit one node."
+          ],
+          "cons": [
+            "Skew: some leading letters are far more common; needs balancing.",
+            "Routing + rebuild coordination."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Router[Prefix Router]",
+            "  ShardA[(Index Shard A\u2013M)]",
+            "  ShardB[(Index Shard N\u2013Z)]",
+            "  Router --> ShardA",
+            "  Router --> ShardB"
+          ],
+          "highlight": [
+            "ShardA"
+          ]
+        },
+        {
+          "name": "Replicate the whole index to every node",
+          "pros": [
+            "No routing; any node answers any prefix.",
+            "Simple."
+          ],
+          "cons": [
+            "Every node must hold the entire index \u2014 caps vocabulary by one machine's memory."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Router[Prefix Router]",
+            "  ShardA[(Index Shard A\u2013M)]",
+            "  Router --> ShardA"
+          ],
+          "highlight": []
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Handling prefix skew",
+          "points": [
+            "Letters/prefixes aren't uniform ('s','t' >> 'x','z') \u2014 balance by splitting hot ranges finer.",
+            "The edge cache absorbs the skewed hot head, so shards mostly serve the long tail.",
+            "Replicate hot shards more heavily than cold ones."
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Sharding by a hash of the full query",
+          "why": "Then completions of one prefix scatter across all shards, forcing scatter-gather per keystroke.",
+          "instead": "Shard by leading characters so a prefix maps to a single shard."
+        },
+        {
+          "trap": "Ignoring prefix skew",
+          "why": "The 's' shard melts while the 'z' shard idles.",
+          "instead": "Split hot prefix ranges finer and replicate them more."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Shards by prefix (no fan-out), replicates reads, balances skew.",
+          "Lets the cache absorb the hot head."
+        ],
+        "weak": [
+          "Hashes the full query (scatter-gather).",
+          "Ignores letter-frequency skew."
+        ]
+      },
+      "recap": {
+        "before": "One node held the whole index and all misses.",
+        "after": "Prefix-sharded, replicated index behind the cache scales size and QPS.",
+        "newRisk": "Prefix skew needs active balancing; rebuilds must coordinate across shards."
+      },
+      "whyNow": [
+        "Sharding is the final lever once the fast, fresh, cached core is built."
+      ]
+    }
+  ],
+  "finalDesign": {
+    "title": "Final Design",
+    "description": "End-to-end: keystrokes hit an edge/CDN cache that absorbs the skewed hot head; misses route by prefix to a sharded, replicated in-memory trie whose nodes hold precomputed top-k completions; executed searches stream into a popularity aggregator whose decayed counts drive periodic atomic index rebuilds; fuzzy matching and optional personalization re-rank on top.",
+    "diagram": [
+      "graph TB",
+      "  Client[Client / Search Box]",
+      "  CDN[/CDN/]",
+      "  Cache[(Edge / Prefix Cache)]",
+      "  Router[Prefix Router]",
+      "  ShardA[(Index Shard A\u2013M)]",
+      "  ShardB[(Index Shard N\u2013Z)]",
+      "  TopK[(Precomputed Top-K per Prefix)]",
+      "  Spell[Spell / Fuzzy Matcher]",
+      "  Personalizer[Personalization Service]",
+      "  Profile[(User History)]",
+      "  Stream[[Query Event Stream]]",
+      "  Agg[Popularity Aggregator]",
+      "  Counts[(Query Counts)]",
+      "  Builder[Index Builder]",
+      "  Client --> CDN",
+      "  CDN -->|miss| Cache",
+      "  Cache -->|miss| Router",
+      "  Router -->|by prefix| ShardA",
+      "  Router --> ShardB",
+      "  ShardA --> TopK",
+      "  ShardA --> Spell",
+      "  Router --> Personalizer",
+      "  Personalizer --> Profile",
+      "  Client -->|executed query| Stream",
+      "  Stream --> Agg",
+      "  Agg --> Counts",
+      "  Builder --> Counts",
+      "  Builder -->|rebuild + swap| ShardA",
+      "  Builder --> ShardB"
+    ],
+    "highlight": []
+  },
+  "satisfies": {
+    "functional": [
+      {
+        "requirement": "Top completions for a prefix",
+        "how": "Trie walk to a node holding precomputed top-k.",
+        "steps": [
+          "trie",
+          "topk"
+        ]
+      },
+      {
+        "requirement": "Rank by popularity",
+        "how": "Top-k built from decayed popularity counts.",
+        "steps": [
+          "topk",
+          "freshness"
+        ]
+      },
+      {
+        "requirement": "Reflect trending queries",
+        "how": "Query stream -> rolling counts -> periodic rebuild.",
+        "steps": [
+          "freshness"
+        ]
+      },
+      {
+        "requirement": "Tolerate typos",
+        "how": "Bounded fuzzy prefix expansion / n-grams.",
+        "steps": [
+          "spelling"
+        ]
+      },
+      {
+        "requirement": "Personalize",
+        "how": "Re-rank global top-k with user history.",
+        "steps": [
+          "spelling"
+        ]
+      }
+    ],
+    "nonFunctional": [
+      {
+        "requirement": "Tens-of-ms latency",
+        "how": "Edge cache + in-memory trie + precomputed top-k = constant-time reads.",
+        "steps": [
+          "topk",
+          "caching"
+        ]
+      },
+      {
+        "requirement": "1M QPS, read-heavy",
+        "how": "Edge caching absorbs the hot head; prefix shards + replicas serve misses.",
+        "steps": [
+          "caching",
+          "scale"
+        ]
+      },
+      {
+        "requirement": "Freshness in minutes",
+        "how": "Stream aggregation drives periodic atomic rebuilds.",
+        "steps": [
+          "freshness"
+        ]
+      },
+      {
+        "requirement": "Scale vocabulary & traffic",
+        "how": "Prefix sharding with read replicas.",
+        "steps": [
+          "scale"
+        ]
+      },
+      {
+        "requirement": "Graceful degradation",
+        "how": "Cache (stale-while-revalidate) serves during index outages; personalization is optional.",
+        "steps": [
+          "caching",
+          "spelling"
+        ]
+      },
+      {
+        "requirement": "Eventually consistent suggestions",
+        "how": "Atomic index swaps; bounded staleness is acceptable.",
+        "steps": [
+          "freshness"
+        ]
+      }
+    ]
+  },
+  "interviewScript": [
+    {
+      "phase": "Scope & forces",
+      "time": "first 5 min",
+      "say": [
+        "Restate it: instant top completions for a prefix, ranked by popularity, at huge QPS.",
+        "List functional (suggest, rank, freshness, typos) and non-functional (latency, QPS, freshness, eventual consistency).",
+        "Name the forces: read-heavy, latency-critical prefix lookup with skewed traffic."
+      ]
+    },
+    {
+      "phase": "Estimate & API",
+      "time": "5\u201315 min",
+      "say": [
+        "Size QPS, latency budget, vocabulary, and how few suggestions you return.",
+        "Sketch GET /suggest (cacheable) and the query-event ingest."
+      ]
+    },
+    {
+      "phase": "Build up the design",
+      "time": "15\u201340 min",
+      "say": [
+        "Start naive to expose the latency problem, then a trie, then precomputed top-k.",
+        "Add edge caching for the skew, then stream-driven rebuilds for freshness.",
+        "Go deep where pushed: top-k build, freshness/rebuild, or fuzzy matching."
+      ]
+    },
+    {
+      "phase": "Scale & wrap",
+      "time": "final 5 min",
+      "say": [
+        "Shard by prefix with replicas; let the cache absorb the hot head; balance skew.",
+        "Summarize requirements and name the dominant tension (freshness vs read-path simplicity)."
+      ]
+    }
+  ],
+  "levelVariants": [
+    {
+      "level": "Junior",
+      "expectations": [
+        "Reaches for a trie for prefix lookup instead of a DB scan.",
+        "Knows results should be ranked by popularity and reads dominate."
+      ]
+    },
+    {
+      "level": "Senior",
+      "expectations": [
+        "Precomputes top-k per node and caches the skewed hot head with TTLs.",
+        "Drives freshness via stream aggregation and atomic rebuilds.",
+        "Adds bounded fuzzy matching."
+      ]
+    },
+    {
+      "level": "Staff+",
+      "expectations": [
+        "Keeps all mutation off the 1M-QPS read path via offline rebuild + atomic swap.",
+        "Shards by prefix with replicas and handles letter-frequency skew.",
+        "Quantifies the freshness/latency/consistency tradeoffs."
+      ]
+    }
+  ],
+  "followUps": [
+    "How would you support multi-word / mid-phrase completion rather than just prefix-of-the-whole-string?",
+    "How do you internationalize for languages without spaces or with large alphabets?",
+    "How would you filter unsafe or offensive suggestions and prevent manipulation of popularity?",
+    "How do you A/B test ranking changes without disrupting the live read path?",
+    "How would you support entity-aware suggestions (people, products) beyond raw query strings?",
+    "How do you handle a sudden viral spike for a brand-new term faster than the rebuild interval?"
+  ]
+}

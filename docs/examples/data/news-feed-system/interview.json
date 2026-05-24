@@ -1,0 +1,2773 @@
+{
+  "title": "News Feed System - System Design",
+  "description": "A step-by-step walkthrough of designing a reverse-chronological social news feed for web and mobile clients, covering post publishing, hybrid fanout, feed retrieval, hydration, media delivery, cache layers, ranking readiness, and multi-region operation.",
+  "requirementsDiagram": [
+    "graph TB",
+    "  Author((Author))",
+    "  Viewer((Viewer))",
+    "  Client[Web / Mobile App]",
+    "  Feed[[News Feed System]]",
+    "  Media[/Media CDN/]",
+    "  Notifications[/Notifications/]",
+    "  Author -->|publish post| Client",
+    "  Viewer -->|open feed| Client",
+    "  Client --> Feed",
+    "  Feed -->|image / video URLs| Media",
+    "  Feed --> Notifications"
+  ],
+  "capacityDiagram": [
+    "graph TB",
+    "  DAU[10M DAU]",
+    "  Reads[~100M feed opens/day\\n~1.2k avg RPS, ~6k peak]",
+    "  Posts[~2M posts/day\\n~25 avg QPS, ~150 peak]",
+    "  Fanout[~600M feed entries/day\\nif avg fanout is 300]",
+    "  FeedCache[(Feed Cache\\nlatest 500-1000 IDs/user)]",
+    "  Media[Media CDN\\nlarge byte volume]",
+    "  Queue[[Fanout Queue]]",
+    "  DAU --> Reads",
+    "  DAU --> Posts",
+    "  Posts --> Queue",
+    "  Queue --> Fanout",
+    "  Fanout --> FeedCache",
+    "  Posts --> Media"
+  ],
+  "requirements": {
+    "functional": [
+      "Users can publish text posts with optional images or videos from web and mobile clients.",
+      "Users can view a feed of friends' posts sorted by reverse chronological order.",
+      "The system supports up to 5000 friends per user.",
+      "Feed retrieval returns enough metadata to render author info, post text, media URLs, reactions, and pagination cursors.",
+      "The system filters feed entries based on privacy settings, mutes, blocks, and deleted posts.",
+      "The design can notify friends that new content is available without blocking the publish path."
+    ],
+    "nonFunctional": [
+      "Support roughly 10 million daily active users.",
+      "Keep feed reads fast: target p99 under 200 ms for the first page when the feed cache is warm.",
+      "Keep publishing durable: a committed post must not be lost even if fanout is delayed.",
+      "Handle celebrity or high-fanout users without overloading fanout workers or feed caches.",
+      "Scale media delivery separately from metadata by using object storage and CDN.",
+      "Make feed generation eventually consistent; a post may take seconds to appear in all friends' feeds."
+    ]
+  },
+  "capacity": [
+    {
+      "label": "Daily active users",
+      "value": "10M",
+      "note": "Given by the interview input."
+    },
+    {
+      "label": "Feed opens",
+      "value": "~100M / day",
+      "note": "Assume 10 feed opens per DAU per day; ~1.2k avg RPS, ~6k peak at 5x."
+    },
+    {
+      "label": "Posts",
+      "value": "~2M / day",
+      "note": "Assume 10% of DAU publish 2 posts/day; ~25 avg QPS, ~150 peak."
+    },
+    {
+      "label": "Fanout writes",
+      "value": "~600M entries / day",
+      "note": "2M posts/day x 300 average eligible friends; celebrity accounts are not pushed to every follower."
+    },
+    {
+      "label": "Friend limit",
+      "value": "5000 / user",
+      "note": "Worst-case fanout bound from the prompt; average is much lower."
+    },
+    {
+      "label": "Feed cache",
+      "value": "latest 500-1000 IDs/user",
+      "note": "Store post IDs and timestamps, not full post objects; hydrate on read."
+    },
+    {
+      "label": "Post metadata",
+      "value": "~2-5 TB / year",
+      "note": "2M posts/day with small metadata rows; media bytes live in object storage/CDN."
+    },
+    {
+      "label": "Consistency",
+      "value": "seconds",
+      "note": "Publish is durable immediately; fanout and feed visibility are eventually consistent."
+    }
+  ],
+  "api": [
+    {
+      "method": "POST",
+      "path": "/v1/me/feed",
+      "description": "Publish a post. Media upload can be pre-signed and completed before this call references the media asset IDs.",
+      "request": "{ \"content\": \"Hello\", \"mediaIds\": [\"m_123\"], \"visibility\": \"friends\" }",
+      "response": "{ \"postId\": \"p_456\", \"createdAt\": \"ISO-8601\", \"fanoutStatus\": \"queued\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Client",
+        "  participant LB as Load Balancer",
+        "  participant W as Web Server",
+        "  participant P as Post Service",
+        "  participant DB as Post DB",
+        "  participant Q as Fanout Queue",
+        "  participant N as Notification Service",
+        "  C->>LB: POST /v1/me/feed",
+        "  LB->>W: forward",
+        "  W->>W: auth + rate limit",
+        "  W->>P: create post",
+        "  P->>DB: INSERT post",
+        "  DB-->>P: committed",
+        "  P-)Q: publish fanout job",
+        "  P-)N: publish notification hint",
+        "  P-->>C: 201 { postId, fanoutStatus }"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/me/feed",
+      "description": "Retrieve the viewer's feed page. Cursor pagination avoids offset scans and keeps the feed stable while new posts arrive.",
+      "request": "?cursor=opaque&limit=20",
+      "response": "{ \"items\": [{ \"postId\": \"p_456\", \"author\": {...}, \"content\": \"...\", \"media\": [...] }], \"nextCursor\": \"opaque\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Client",
+        "  participant LB as Load Balancer",
+        "  participant W as Web Server",
+        "  participant F as Feed Service",
+        "  participant FC as Feed Cache",
+        "  participant P as Post Cache",
+        "  participant U as User Cache",
+        "  C->>LB: GET /v1/me/feed?limit=20",
+        "  LB->>W: forward",
+        "  W->>W: auth + rate limit",
+        "  W->>F: get feed page",
+        "  F->>FC: read post IDs by viewer + cursor",
+        "  FC-->>F: post IDs",
+        "  F->>P: batch get posts",
+        "  P-->>F: post objects",
+        "  F->>U: batch get authors",
+        "  U-->>F: user profiles",
+        "  F-->>C: 200 hydrated feed + nextCursor"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/media/uploads",
+      "description": "Create a pre-signed media upload so large images/videos bypass the web tier.",
+      "request": "{ \"contentType\": \"image/jpeg\", \"bytes\": 2400000 }",
+      "response": "{ \"mediaId\": \"m_123\", \"uploadUrl\": \"https://...\", \"expiresAt\": \"ISO-8601\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Client",
+        "  participant W as Web Server",
+        "  participant M as Media Service",
+        "  participant O as Object Storage",
+        "  participant CDN as CDN",
+        "  C->>W: POST /v1/media/uploads",
+        "  W->>M: request upload URL",
+        "  M->>O: create pre-signed PUT",
+        "  O-->>M: upload URL",
+        "  M-->>C: mediaId + uploadUrl",
+        "  C->>O: PUT media bytes",
+        "  O-)CDN: media becomes cacheable"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/me/friends/{userId}",
+      "description": "Create a friendship or follow edge. The graph change affects future feed generation.",
+      "request": "{ \"action\": \"follow\" }",
+      "response": "{ \"status\": \"following\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Client",
+        "  participant W as Web Server",
+        "  participant G as Graph Service",
+        "  participant DB as Graph DB",
+        "  participant K as Graph Cache",
+        "  C->>W: POST /v1/me/friends/:userId",
+        "  W->>G: create relationship",
+        "  G->>DB: INSERT edge",
+        "  DB-->>G: committed",
+        "  G->>K: invalidate follower/following sets",
+        "  G-->>C: 200 { status }"
+      ]
+    }
+  ],
+  "dataModelDiagram": [
+    "erDiagram",
+    "  users ||--o{ posts : authors",
+    "  users ||--o{ social_edges : follows",
+    "  posts ||--o{ media_assets : contains",
+    "  posts ||--o{ feed_entries : appears_in",
+    "  posts ||--o{ reactions : receives",
+    "  users ||--o{ feed_entries : owns",
+    "  users {",
+    "    bigint user_id PK",
+    "    varchar handle",
+    "    varchar display_name",
+    "    text avatar_url",
+    "    timestamp created_at",
+    "  }",
+    "  posts {",
+    "    bigint post_id PK",
+    "    bigint author_id FK",
+    "    text content",
+    "    varchar visibility",
+    "    varchar status",
+    "    timestamp created_at",
+    "    timestamp deleted_at",
+    "  }",
+    "  social_edges {",
+    "    bigint follower_id FK",
+    "    bigint followee_id FK",
+    "    varchar state",
+    "    timestamp created_at",
+    "  }",
+    "  feed_entries {",
+    "    bigint viewer_id FK",
+    "    timestamp sort_ts",
+    "    bigint post_id FK",
+    "    bigint author_id FK",
+    "    varchar source",
+    "  }",
+    "  media_assets {",
+    "    varchar media_id PK",
+    "    bigint post_id FK",
+    "    varchar media_type",
+    "    text object_key",
+    "    text cdn_url",
+    "    varchar status",
+    "  }",
+    "  reactions {",
+    "    bigint user_id FK",
+    "    bigint post_id FK",
+    "    varchar reaction_type",
+    "    timestamp created_at",
+    "  }"
+  ],
+  "dataModel": [
+    {
+      "name": "users",
+      "note": "Author and viewer profile metadata. Hot profiles are cached for feed hydration.",
+      "fields": [
+        {
+          "name": "user_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "handle",
+          "type": "varchar(64) UNIQUE"
+        },
+        {
+          "name": "display_name",
+          "type": "varchar(128)"
+        },
+        {
+          "name": "avatar_url",
+          "type": "text"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "posts",
+      "note": "Durable post metadata. Media bytes are external; this row stores references and visibility state.",
+      "fields": [
+        {
+          "name": "post_id",
+          "type": "bigint PK",
+          "note": "Time-sortable ID such as Snowflake"
+        },
+        {
+          "name": "author_id",
+          "type": "bigint FK"
+        },
+        {
+          "name": "content",
+          "type": "text"
+        },
+        {
+          "name": "visibility",
+          "type": "varchar(24)",
+          "note": "public | friends | custom"
+        },
+        {
+          "name": "status",
+          "type": "varchar(16)",
+          "note": "active | deleted | hidden"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp"
+        },
+        {
+          "name": "deleted_at",
+          "type": "timestamp NULL"
+        }
+      ]
+    },
+    {
+      "name": "social_edges",
+      "note": "Follower/friend graph. Cached in follower/following sets for fanout and read-time merge.",
+      "fields": [
+        {
+          "name": "follower_id",
+          "type": "bigint"
+        },
+        {
+          "name": "followee_id",
+          "type": "bigint"
+        },
+        {
+          "name": "state",
+          "type": "varchar(16)",
+          "note": "active | muted | blocked"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "feed_entries",
+      "note": "Materialized inbox entries for push-fanout users. Store IDs only; hydrate posts and authors at read time.",
+      "fields": [
+        {
+          "name": "viewer_id",
+          "type": "bigint"
+        },
+        {
+          "name": "sort_ts",
+          "type": "timestamp"
+        },
+        {
+          "name": "post_id",
+          "type": "bigint"
+        },
+        {
+          "name": "author_id",
+          "type": "bigint"
+        },
+        {
+          "name": "source",
+          "type": "varchar(16)",
+          "note": "fanout | pull | promoted"
+        }
+      ]
+    },
+    {
+      "name": "media_assets",
+      "note": "Object-storage metadata for images and videos.",
+      "fields": [
+        {
+          "name": "media_id",
+          "type": "varchar(64) PK"
+        },
+        {
+          "name": "post_id",
+          "type": "bigint FK"
+        },
+        {
+          "name": "media_type",
+          "type": "varchar(16)"
+        },
+        {
+          "name": "object_key",
+          "type": "text"
+        },
+        {
+          "name": "cdn_url",
+          "type": "text"
+        },
+        {
+          "name": "status",
+          "type": "varchar(16)",
+          "note": "uploading | ready | failed"
+        }
+      ]
+    },
+    {
+      "name": "reactions",
+      "note": "Interaction data used for counters, ranking features, and viewer-specific state.",
+      "fields": [
+        {
+          "name": "user_id",
+          "type": "bigint"
+        },
+        {
+          "name": "post_id",
+          "type": "bigint"
+        },
+        {
+          "name": "reaction_type",
+          "type": "varchar(16)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp"
+        }
+      ]
+    }
+  ],
+  "satisfies": {
+    "functional": [
+      {
+        "requirement": "Users can publish text posts with optional images or videos.",
+        "how": "The web tier authenticates and rate-limits, the Post Service commits post metadata, media bytes are uploaded to object storage/CDN, and a fanout job is queued after the durable write.",
+        "steps": [
+          "client-and-api",
+          "durable-post-store",
+          "media-pipeline",
+          "fanout-on-write"
+        ]
+      },
+      {
+        "requirement": "Users can view friends' posts sorted by reverse chronological order.",
+        "how": "Feed entries are stored as post IDs ordered by sort_ts. The Feed Service reads IDs from the feed cache and hydrates posts/authors in timestamp order.",
+        "steps": [
+          "feed-cache",
+          "feed-retrieval",
+          "hydration-and-cache-layers"
+        ]
+      },
+      {
+        "requirement": "Support up to 5000 friends per user.",
+        "how": "The Graph Service stores follower/friend relationships and caches friend sets. Hybrid fanout pushes normal authors and pulls high-fanout authors to avoid worst-case fanout spikes.",
+        "steps": [
+          "graph-service",
+          "fanout-on-write",
+          "hybrid-fanout"
+        ]
+      },
+      {
+        "requirement": "Return metadata to render author info, media, reactions, and pagination.",
+        "how": "The retrieval path uses feed IDs as the skeleton, then batch-loads post, user, media, action, and counter caches before returning cursor-paginated JSON.",
+        "steps": [
+          "feed-retrieval",
+          "hydration-and-cache-layers",
+          "media-pipeline"
+        ]
+      },
+      {
+        "requirement": "Filter by privacy settings, mutes, blocks, and deleted posts.",
+        "how": "Fanout filters eligibility at publish time for push entries; retrieval rechecks post status and viewer-specific filters so old or invalid entries do not render.",
+        "steps": [
+          "graph-service",
+          "fanout-on-write",
+          "feed-retrieval"
+        ]
+      },
+      {
+        "requirement": "Notify friends without blocking publish.",
+        "how": "Notification hints are emitted asynchronously after the post is committed; the publish API returns once durable storage and fanout enqueue succeed.",
+        "steps": [
+          "durable-post-store",
+          "fanout-on-write"
+        ]
+      }
+    ],
+    "nonFunctional": [
+      {
+        "requirement": "Support roughly 10 million DAU.",
+        "how": "Stateless web servers scale behind a load balancer; feed cache, post store, graph store, fanout queues, and workers are sharded independently.",
+        "steps": [
+          "client-and-api",
+          "feed-cache",
+          "fanout-on-write",
+          "hydration-and-cache-layers"
+        ]
+      },
+      {
+        "requirement": "Keep feed reads fast.",
+        "how": "Warm feeds are precomputed as ID lists, fetched in one cache call, and hydrated through batch cache reads; media is served by CDN instead of the app tier.",
+        "steps": [
+          "feed-cache",
+          "feed-retrieval",
+          "hydration-and-cache-layers",
+          "media-pipeline"
+        ]
+      },
+      {
+        "requirement": "Keep publishing durable.",
+        "how": "The post is committed before fanout starts. If fanout workers fail, jobs are retried from the queue and feed entries can be rebuilt from posts plus graph state.",
+        "steps": [
+          "durable-post-store",
+          "fanout-on-write"
+        ]
+      },
+      {
+        "requirement": "Handle celebrity or high-fanout users.",
+        "how": "Hybrid fanout avoids pushing celebrity posts to millions of followers. Their posts are stored in an author outbox and merged into follower feeds on read.",
+        "steps": [
+          "hybrid-fanout",
+          "feed-retrieval"
+        ]
+      },
+      {
+        "requirement": "Scale media delivery separately.",
+        "how": "Clients upload media directly to object storage with pre-signed URLs, and feed responses contain CDN URLs rather than media bytes.",
+        "steps": [
+          "media-pipeline"
+        ]
+      },
+      {
+        "requirement": "Make feed generation eventually consistent.",
+        "how": "Fanout jobs and notification jobs are asynchronous. Feed reads can fall back to read-time merge for recent posts if push fanout is delayed.",
+        "steps": [
+          "fanout-on-write",
+          "hybrid-fanout",
+          "multi-region-and-observability"
+        ]
+      }
+    ]
+  },
+  "followUps": [
+    "How would you move from reverse chronological order to ML-ranked feed without rebuilding the whole system?",
+    "How would you prevent one celebrity post from flooding the fanout queue?",
+    "How would you rebuild a user's feed cache after cache loss?",
+    "How would you handle unfollow, mute, block, or privacy changes after feed entries already exist?",
+    "How would you keep media uploads from creating posts with broken images or videos?",
+    "How would you paginate when new posts arrive while the user is scrolling?",
+    "How would you guarantee idempotent fanout worker retries?",
+    "How would you measure feed freshness and fanout lag?",
+    "What changes are needed for multi-region active-active publishing?"
+  ],
+  "steps": [
+    {
+      "id": "client-and-api",
+      "title": "1. Client, Web Tier, and APIs",
+      "description": "Start with the client-facing surface. Web and mobile clients call a stateless web tier through a load balancer. The web tier authenticates requests, enforces rate limits, and routes publish and read calls to internal services.",
+      "decisionPrompt": "Define the client-facing contract before internals: what endpoints exist, what synchronous guarantees do they provide, and what work must stay out of the web request?",
+      "concepts": [
+        {
+          "term": "Stateless web tier",
+          "definition": "A set of web servers that do not keep user session or request progress in local memory between requests.",
+          "whyItMatters": "Any request can go to any server, so the tier can scale horizontally and survive individual server failures."
+        },
+        {
+          "term": "Rate limiting",
+          "definition": "A policy that rejects or slows requests when a user, IP, or app exceeds an allowed request budget.",
+          "whyItMatters": "In a feed system, one abusive publish can amplify into many fanout writes."
+        }
+      ],
+      "whyNow": [
+        "This fixes the contract that every later component must satisfy.",
+        "Authentication and rate limits are cheapest at the edge, before one publish can amplify into many fanout writes."
+      ],
+      "recap": {
+        "before": "The problem is only a product goal: publish posts and read a reverse-chronological feed.",
+        "after": "The system has a stateless request boundary, clear publish and read APIs, and internal service ownership.",
+        "newRisk": "The web tier can accidentally become stateful or do heavy fanout work synchronously."
+      },
+      "failureDrills": [
+        {
+          "scenario": "An authenticated spammer publishes thousands of posts per minute.",
+          "expectedBehavior": "The request path rejects or throttles work before Post Service and fanout queues are touched.",
+          "mitigation": "Apply per-user, per-IP, and reputation-based limits at the web tier, then monitor rejected publish rates."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Separates public API contracts from internal service calls.",
+          "Keeps the web tier stateless and pushes large media bytes out of the request path."
+        ],
+        "weak": [
+          "Starts with ranking or machine learning despite a chronological-feed requirement.",
+          "Lets web servers do durable writes, fanout, and media processing in one synchronous request."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  Client[Web / Mobile Client]",
+        "  LB[Load Balancer]",
+        "  Web[Stateless Web Servers]",
+        "  PostSvc[Post Service]",
+        "  FeedSvc[Feed Service]",
+        "  Auth[Auth / Rate Limit]",
+        "  Client -->|API call| LB",
+        "  LB --> Web",
+        "  Web -->|auth/check| Auth",
+        "  Web -->|publish| PostSvc",
+        "  Web -->|read feed| FeedSvc"
+      ],
+      "highlight": [
+        "Client",
+        "LB",
+        "Web",
+        "Auth",
+        "PostSvc",
+        "FeedSvc"
+      ],
+      "options": [
+        {
+          "name": "REST APIs (default)",
+          "pros": [
+            "Simple, interview-friendly contract for publish and feed retrieval",
+            "Works for both web and mobile clients",
+            "Easy to cache and observe at HTTP boundaries"
+          ],
+          "cons": [
+            "Clients may overfetch unless endpoints are designed carefully",
+            "Real-time updates need polling, long polling, or an extra channel",
+            "Schema evolution requires versioning discipline"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Web / Mobile Client]",
+            "  LB[Load Balancer]",
+            "  Web[REST Web Servers]",
+            "  PostSvc[Post Service]",
+            "  FeedSvc[Feed Service]",
+            "  Auth[Auth / Rate Limit]",
+            "  Client -->|API call| LB",
+            "  LB --> Web",
+            "  Web -->|auth/check| Auth",
+            "  Web -->|publish| PostSvc",
+            "  Web -->|read feed| FeedSvc"
+          ],
+          "highlight": [
+            "Client",
+            "LB",
+            "Web",
+            "Auth",
+            "PostSvc",
+            "FeedSvc"
+          ]
+        },
+        {
+          "name": "GraphQL gateway",
+          "pros": [
+            "Clients can request exactly the fields they render",
+            "Good fit for feed cards with evolving metadata",
+            "Can aggregate post, author, media, and counters behind one API"
+          ],
+          "cons": [
+            "Query cost control and caching are harder",
+            "N+1 resolver mistakes can hurt feed latency",
+            "More machinery than needed for the basic interview scope"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Web / Mobile Client]",
+            "  LB[Load Balancer]",
+            "  Gateway[GraphQL Gateway]",
+            "  PostSvc[Post Service]",
+            "  FeedSvc[Feed Service]",
+            "  UserSvc[User Service]",
+            "  Client -->|API call| LB",
+            "  LB --> Gateway",
+            "  Gateway -->|resolver call| PostSvc",
+            "  Gateway -->|resolver call| FeedSvc",
+            "  Gateway -->|profile fields| UserSvc"
+          ],
+          "highlight": [
+            "Gateway",
+            "UserSvc"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "API boundaries",
+          "points": [
+            "POST /v1/me/feed creates durable post metadata and queues fanout.",
+            "GET /v1/me/feed returns a cursor-paginated hydrated feed page.",
+            "Media upload gets its own pre-signed flow so large bytes bypass web servers."
+          ]
+        },
+        {
+          "title": "Web tier responsibilities",
+          "points": [
+            "Authenticate auth_token and derive viewer_id.",
+            "Rate-limit publishing to reduce spam and fanout abuse.",
+            "Keep web servers stateless so any request can land on any server."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Web servers can become a fanout bottleneck if they do heavy work synchronously.",
+          "mitigation": "Commit the post, enqueue fanout, and return quickly."
+        },
+        {
+          "issue": "Spam publishing can amplify into millions of fanout writes.",
+          "mitigation": "Apply per-user and reputation-based rate limits before Post Service."
+        }
+      ],
+      "talkingPoints": [
+        "Do not start with ML ranking; the prompt explicitly says reverse chronological order.",
+        "Keep the first step focused on contracts and request routing, not storage internals."
+      ],
+      "flows": [
+        {
+          "name": "Publish request routing",
+          "note": "The web tier validates the request, then delegates persistence to Post Service.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant LB as Load Balancer",
+            "  participant W as Web Server",
+            "  participant A as Auth / Rate Limit",
+            "  participant P as Post Service",
+            "  C->>LB: POST /v1/me/feed",
+            "  LB->>W: forward",
+            "  W->>A: authenticate + rate limit",
+            "  alt allowed",
+            "    A-->>W: ok",
+            "    W->>P: create post",
+            "    P-->>W: postId",
+            "    W-->>C: 201 { postId }",
+            "  else blocked",
+            "    A-->>W: reject",
+            "    W-->>C: 429 / 401",
+            "  end"
+          ]
+        },
+        {
+          "name": "Feed read request routing",
+          "note": "The web tier is only a gateway; feed assembly happens behind the Feed Service boundary.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant LB as Load Balancer",
+            "  participant W as Web Server",
+            "  participant A as Auth / Rate Limit",
+            "  participant F as Feed Service",
+            "  C->>LB: GET /v1/me/feed?cursor=...",
+            "  LB->>W: forward",
+            "  W->>A: authenticate viewer",
+            "  A-->>W: viewer_id",
+            "  W->>F: get feed page(viewer_id, cursor)",
+            "  F-->>W: feed JSON",
+            "  W-->>C: 200 feed page"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "durable-post-store",
+      "title": "2. Durable Post Store",
+      "description": "Publishing must be durable before any fanout or notification work begins. Store post metadata in a write-optimized Post DB, cache hot posts by ID, and keep media references separate from media bytes.",
+      "decisionPrompt": "Choose the publish durability boundary: what record and event are committed before success, and how does the design recover if downstream fanout fails?",
+      "concepts": [
+        {
+          "term": "Source of truth",
+          "definition": "The authoritative storage location used to decide whether a post exists and what its core metadata is.",
+          "whyItMatters": "Caches and feed entries are derived from this record; they can be rebuilt if they drift."
+        },
+        {
+          "term": "Outbox pattern",
+          "definition": "Write the domain record and a durable event in the same transaction, then let workers publish or process that event later.",
+          "whyItMatters": "It closes the gap between a successful post commit and a failed fanout enqueue."
+        }
+      ],
+      "whyNow": [
+        "Fanout can retry, lag, or fail, but the post itself must not disappear after the client sees success.",
+        "Separating metadata from media bytes keeps the write path small and reliable."
+      ],
+      "recap": {
+        "before": "Requests reach internal services, but there is no durable record of published content.",
+        "after": "Each post has a stable ID, author, timestamp, visibility metadata, and media references in a source-of-truth store.",
+        "newRisk": "The system now has to handle the gap between a committed post and unfinished downstream fanout."
+      },
+      "failureDrills": [
+        {
+          "scenario": "Post DB commit succeeds, but enqueueing fanout fails.",
+          "expectedBehavior": "The post remains durable and can be discovered by repair or retry logic.",
+          "mitigation": "Use an outbox table or durable event log written with the post, then let workers retry fanout idempotently."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Defines the post write as the first correctness boundary.",
+          "Mentions idempotent post creation and outbox-style fanout handoff."
+        ],
+        "weak": [
+          "Stores only precomputed feed entries and has no authoritative post record.",
+          "Treats cache writes as durable publish success."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  Web[Web Servers]",
+        "  PostSvc[Post Service]",
+        "  IDGen[ID Generator]",
+        "  PostDB[(Post DB)]",
+        "  PostCache[(Post Cache)]",
+        "  FanoutQ[[Fanout Queue]]",
+        "  Web -->|publish| PostSvc",
+        "  PostSvc -->|allocate ID| IDGen",
+        "  PostSvc -->|write post| PostDB",
+        "  PostSvc -->|warm cache| PostCache",
+        "  PostSvc -->|enqueue| FanoutQ"
+      ],
+      "highlight": [
+        "IDGen",
+        "PostDB",
+        "PostCache",
+        "FanoutQ"
+      ],
+      "options": [
+        {
+          "name": "SQL / relational posts",
+          "pros": [
+            "Simple transactions for post metadata and visibility state",
+            "Good fit for moderation, deletes, and author timelines",
+            "Indexes make author history queries straightforward"
+          ],
+          "cons": [
+            "Needs sharding as post volume grows",
+            "Hot authors can create write concentration",
+            "Large media metadata or counters should not live in the same row"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Web[Web Servers]",
+            "  PostSvc[Post Service]",
+            "  IDGen[ID Generator]",
+            "  PostDB[(SQL Post DB)]",
+            "  PostCache[(Post Cache)]",
+            "  FanoutQ[[Fanout Queue]]",
+            "  Web -->|publish| PostSvc",
+            "  PostSvc -->|allocate ID| IDGen",
+            "  PostSvc -->|write post| PostDB",
+            "  PostSvc -->|warm cache| PostCache",
+            "  PostSvc -->|enqueue| FanoutQ"
+          ],
+          "highlight": [
+            "IDGen",
+            "PostDB",
+            "PostCache",
+            "FanoutQ"
+          ]
+        },
+        {
+          "name": "Wide-column posts",
+          "pros": [
+            "High write throughput and natural partitioning by author_id or post_id",
+            "Good for append-heavy timelines",
+            "Handles very large post volume with predictable access patterns"
+          ],
+          "cons": [
+            "Fewer transactional guarantees across entities",
+            "Secondary access patterns need denormalized tables",
+            "Operational model is harder to explain for a first pass"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Web[Web Servers]",
+            "  PostSvc[Post Service]",
+            "  IDGen[ID Generator]",
+            "  Wide[(Wide-column Post Store)]",
+            "  AuthorIndex[(Author Timeline Index)]",
+            "  PostCache[(Post Cache)]",
+            "  FanoutQ[[Fanout Queue]]",
+            "  Web -->|publish| PostSvc",
+            "  PostSvc -->|allocate ID| IDGen",
+            "  PostSvc -->|write post| Wide",
+            "  PostSvc -->|author lookup| AuthorIndex",
+            "  PostSvc -->|warm cache| PostCache",
+            "  PostSvc --> FanoutQ"
+          ],
+          "highlight": [
+            "Wide",
+            "AuthorIndex"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Post IDs",
+          "points": [
+            "Use time-sortable IDs so reverse chronological order is easy.",
+            "Snowflake-style IDs work well because they embed timestamp and worker identity.",
+            "The feed cache can sort by created_at or by the post ID timestamp component."
+          ]
+        },
+        {
+          "title": "Durability boundary",
+          "points": [
+            "The publish API returns success only after the post row is committed.",
+            "Fanout jobs can be retried because post data is durable.",
+            "The Post Cache is an optimization and can be rebuilt from the Post DB."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Fanout queue publish succeeds but post commit fails, creating dangling work.",
+          "mitigation": "Use an outbox table or publish the fanout event after the post transaction commits."
+        },
+        {
+          "issue": "One storage shard receives too many writes from time-ordered IDs.",
+          "mitigation": "Shard by author_id or hashed post_id, not only by timestamp."
+        }
+      ],
+      "talkingPoints": [
+        "Post storage is the source of truth; feed cache is derived state.",
+        "Deletes should mark status and invalidate caches; do not rely on physically removing every feed entry immediately."
+      ],
+      "flows": [
+        {
+          "name": "Commit post then enqueue fanout",
+          "note": "Fanout starts only after the durable write succeeds.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant W as Web Server",
+            "  participant P as Post Service",
+            "  participant ID as ID Generator",
+            "  participant DB as Post DB",
+            "  participant K as Post Cache",
+            "  participant Q as Fanout Queue",
+            "  W->>P: create post",
+            "  P->>ID: next post ID",
+            "  ID-->>P: post_id",
+            "  P->>DB: INSERT post",
+            "  DB-->>P: committed",
+            "  P->>K: SET post_id -> post summary",
+            "  P-)Q: enqueue fanout(post_id, author_id)",
+            "  P-->>W: 201 { postId }"
+          ]
+        },
+        {
+          "name": "Delete post",
+          "note": "Feed entries can remain as tombstones; retrieval filters them out while asynchronous cleanup catches up.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant P as Post Service",
+            "  participant DB as Post DB",
+            "  participant K as Post Cache",
+            "  participant Q as Cleanup Queue",
+            "  C->>P: DELETE /v1/posts/:postId",
+            "  P->>DB: UPDATE status='deleted'",
+            "  DB-->>P: committed",
+            "  P->>K: DEL post_id",
+            "  P-)Q: enqueue feed-entry cleanup",
+            "  P-->>C: 204 No Content"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "graph-service",
+      "title": "3. Social Graph and Eligibility",
+      "description": "The feed is defined by relationships and viewer-specific filters. Store friend/follow edges in a graph service, cache follower/following sets, and apply mutes, blocks, privacy, and custom audience rules before fanout or rendering.",
+      "decisionPrompt": "Design recipient eligibility: combine graph edges, privacy, blocks, and mutes into a rule that is safe both at fanout time and read time.",
+      "concepts": [
+        {
+          "term": "Social graph",
+          "definition": "The relationship model that records who follows, friends, blocks, or can otherwise see whom.",
+          "whyItMatters": "The graph is the starting point for deciding which feeds a post can enter."
+        },
+        {
+          "term": "Eligibility filter",
+          "definition": "A rule layer that removes viewers who should not see content even if a graph edge exists.",
+          "whyItMatters": "Privacy, mutes, blocks, and audience settings can change faster than precomputed feed entries."
+        }
+      ],
+      "whyNow": [
+        "Fanout cannot be correct until the recipient set is correct.",
+        "Eligibility is not just graph membership; viewer-specific filters can override the raw edge list."
+      ],
+      "recap": {
+        "before": "Posts are durable, but the system does not know which viewers should receive them.",
+        "after": "A graph and eligibility layer can produce the intended recipient set for fanout and read-time filtering.",
+        "newRisk": "Privacy changes can race with already-materialized feed entries."
+      },
+      "failureDrills": [
+        {
+          "scenario": "A viewer blocks an author after one of the author's posts was already fanned out.",
+          "expectedBehavior": "The blocked content stops appearing even if its ID remains in a feed cache.",
+          "mitigation": "Apply block and privacy checks again during feed retrieval, and lazily remove invalid feed entries."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Distinguishes graph edges from eligibility rules.",
+          "Keeps a read-time safety filter for privacy-sensitive changes."
+        ],
+        "weak": [
+          "Assumes fanout-time eligibility is enough forever.",
+          "Ignores mutes, blocks, private accounts, or custom audiences."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  Web[Web Servers]",
+        "  GraphSvc[Graph Service]",
+        "  GraphDB[(Graph DB)]",
+        "  GraphCache[(Follower / Following Cache)]",
+        "  Privacy[Privacy Filter]",
+        "  FanoutSvc[Fanout Service]",
+        "  Web -->|graph API| GraphSvc",
+        "  GraphSvc -->|read/write edges| GraphDB",
+        "  GraphSvc -->|hot graph| GraphCache",
+        "  FanoutSvc -->|recipient query| GraphSvc",
+        "  GraphSvc -->|filter| Privacy"
+      ],
+      "highlight": [
+        "GraphSvc",
+        "GraphDB",
+        "GraphCache",
+        "Privacy"
+      ],
+      "options": [
+        {
+          "name": "Graph service with cache (default)",
+          "pros": [
+            "Keeps relationship logic behind one service boundary",
+            "Can cache follower and following sets for fanout and feed reads",
+            "Supports mutes, blocks, and privacy filters centrally"
+          ],
+          "cons": [
+            "Graph cache invalidation is subtle on follow/unfollow/mute",
+            "Large follower sets need pagination and sharding",
+            "Fanout depends on graph freshness"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Web[Web Servers]",
+            "  GraphSvc[Graph Service]",
+            "  GraphDB[(Graph DB)]",
+            "  GraphCache[(Follower / Following Cache)]",
+            "  Privacy[Privacy Filter]",
+            "  FanoutSvc[Fanout Service]",
+            "  Web -->|graph API| GraphSvc",
+            "  GraphSvc -->|read/write edges| GraphDB",
+            "  GraphSvc -->|hot graph| GraphCache",
+            "  FanoutSvc -->|recipient query| GraphSvc",
+            "  GraphSvc -->|filter| Privacy"
+          ],
+          "highlight": [
+            "GraphSvc",
+            "GraphDB",
+            "GraphCache",
+            "Privacy"
+          ]
+        },
+        {
+          "name": "Denormalized follower tables",
+          "pros": [
+            "Simple key-value access by follower_id or followee_id",
+            "Efficient batch reads for fanout workers",
+            "Avoids specialized graph database dependency"
+          ],
+          "cons": [
+            "Friend recommendation queries are weaker",
+            "Relationship changes update multiple denormalized views",
+            "Complex privacy rules can spread across services"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Web[Web Servers]",
+            "  EdgeTable[(Follower Edge Store)]",
+            "  FollowingIndex[(Following Index)]",
+            "  FollowerIndex[(Follower Index)]",
+            "  Privacy[Privacy Filter]",
+            "  FanoutSvc[Fanout Service]",
+            "  Web -->|edge write| EdgeTable",
+            "  EdgeTable --> FollowingIndex",
+            "  EdgeTable --> FollowerIndex",
+            "  FanoutSvc -->|followers| FollowerIndex",
+            "  FanoutSvc -->|filter| Privacy"
+          ],
+          "highlight": [
+            "EdgeTable",
+            "FollowingIndex",
+            "FollowerIndex"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Eligibility",
+          "points": [
+            "Publishing fanout must exclude viewers who are blocked, muted, or outside the post's visibility scope.",
+            "Read-time hydration should still recheck status because relationships and privacy can change after fanout.",
+            "Graph updates invalidate follower/following cache entries."
+          ]
+        },
+        {
+          "title": "Friend vs follow",
+          "points": [
+            "A friend graph is often bidirectional; a follow graph is directional.",
+            "The feed model works for both if fanout asks for eligible recipients.",
+            "Celebrity handling is usually modeled as one-to-many follow rather than mutual friendship."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Fetching 5000 friends synchronously on publish adds latency.",
+          "mitigation": "Publish only the fanout job synchronously; fanout workers read friend sets asynchronously."
+        },
+        {
+          "issue": "Large follower sets can create hot graph-cache keys.",
+          "mitigation": "Page follower lists, shard by author_id plus bucket, and classify celebrities for pull fanout."
+        }
+      ],
+      "talkingPoints": [
+        "Graph state is part of correctness, not just recommendation data.",
+        "Eligibility must be enforced both at fanout time and read time to handle changes."
+      ],
+      "flows": [
+        {
+          "name": "Follow user",
+          "note": "Relationship changes update durable graph state and invalidate graph caches.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant G as Graph Service",
+            "  participant DB as Graph DB",
+            "  participant K as Graph Cache",
+            "  C->>G: follow target user",
+            "  G->>DB: INSERT relationship edge",
+            "  DB-->>G: committed",
+            "  G->>K: invalidate follower/following sets",
+            "  G-->>C: 200 following"
+          ]
+        },
+        {
+          "name": "Fetch eligible recipients",
+          "note": "Fanout workers page through eligible recipients rather than building one giant in-memory list.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant F as Fanout Worker",
+            "  participant G as Graph Service",
+            "  participant K as Graph Cache",
+            "  participant P as Privacy Filter",
+            "  F->>G: recipients(author_id, post_visibility)",
+            "  G->>K: get followers page",
+            "  K-->>G: follower IDs",
+            "  G->>P: remove muted / blocked / excluded viewers",
+            "  P-->>G: eligible viewer IDs",
+            "  G-->>F: next recipient page"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "fanout-on-write",
+      "title": "4. Fanout on Write",
+      "description": "For normal authors, precompute feed entries when a post is published. Fanout workers read eligible friends from the graph, then append post IDs to each viewer's feed cache. This makes feed reads very fast.",
+      "decisionPrompt": "Choose push versus pull for normal authors: justify paying write-time fanout cost, then define queueing, retry, and duplicate-prevention behavior.",
+      "concepts": [
+        {
+          "term": "Fanout on write",
+          "definition": "Do the distribution work when content is published by pushing post IDs into recipient feed stores.",
+          "whyItMatters": "It makes the common read path fast, at the cost of heavier publish-time background work."
+        },
+        {
+          "term": "Idempotency",
+          "definition": "A repeated operation has the same final effect as running it once.",
+          "whyItMatters": "Fanout workers retry, so appending the same post twice must not create duplicate feed entries."
+        }
+      ],
+      "whyNow": [
+        "The feed requirement is read-heavy, so precomputing normal-author posts turns common reads into cheap cache reads.",
+        "This is the first point where asynchronous work and idempotency become central."
+      ],
+      "recap": {
+        "before": "The system can identify recipients but has no materialized feed for fast reads.",
+        "after": "Normal-author posts are appended into viewer feed caches by background workers.",
+        "newRisk": "Fanout lag means publish success and feed visibility are no longer the same moment."
+      },
+      "failureDrills": [
+        {
+          "scenario": "A fanout worker retries the same post after a timeout.",
+          "expectedBehavior": "Viewer feeds do not contain duplicate entries.",
+          "mitigation": "Make feed append operations idempotent with a post_id uniqueness check or sorted-set score overwrite."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "States the read/write tradeoff and why push fanout suits normal users.",
+          "Mentions queues, retries, idempotency, and fanout lag as first-class concerns."
+        ],
+        "weak": [
+          "Does all fanout inline during the publish request.",
+          "Does not discuss duplicate fanout or partial fanout recovery."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  PostSvc[Post Service]",
+        "  FanoutQ[[Fanout Queue]]",
+        "  FanoutSvc[Fanout Service]",
+        "  Graph[(Graph Service)]",
+        "  Workers[Fanout Workers]",
+        "  FeedCache[(News Feed Cache)]",
+        "  Notify[Notification Service]",
+        "  PostSvc -->|enqueue| FanoutQ",
+        "  FanoutQ -->|consume| FanoutSvc",
+        "  FanoutSvc -->|recipients| Graph",
+        "  FanoutSvc -->|dispatch| Workers",
+        "  Workers -->|append IDs| FeedCache",
+        "  Workers --> Notify"
+      ],
+      "highlight": [
+        "FanoutQ",
+        "FanoutSvc",
+        "Workers",
+        "FeedCache",
+        "Notify"
+      ],
+      "options": [
+        {
+          "name": "Push fanout (default for normal users)",
+          "pros": [
+            "Feed reads are fast because the feed is precomputed",
+            "New posts can appear quickly and trigger notifications",
+            "Works well when average friend count is moderate"
+          ],
+          "cons": [
+            "Wastes work for inactive viewers",
+            "Hot authors can generate huge write bursts",
+            "Feed cache memory grows with active users and retained entries"
+          ],
+          "diagram": [
+            "graph TB",
+            "  PostSvc[Post Service]",
+            "  FanoutQ[[Fanout Queue]]",
+            "  Graph[(Graph Service)]",
+            "  Workers[Fanout Workers]",
+            "  FeedCache[(News Feed Cache)]",
+            "  Notify[Notification Service]",
+            "  PostSvc -->|enqueue| FanoutQ",
+            "  FanoutQ -->|consume| Workers",
+            "  Workers -->|recipients| Graph",
+            "  Workers -->|append IDs| FeedCache",
+            "  Workers -->|notify| Notify"
+          ],
+          "highlight": [
+            "FanoutQ",
+            "Workers",
+            "FeedCache",
+            "Notify"
+          ]
+        },
+        {
+          "name": "Synchronous fanout",
+          "pros": [
+            "Simpler mental model for tiny systems",
+            "Publisher knows immediately whether feed writes completed",
+            "No queue infrastructure at the start"
+          ],
+          "cons": [
+            "Publish latency grows with friend count",
+            "Publisher request can time out for large audiences",
+            "One bad graph or cache dependency breaks posting"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Web[Web Server]",
+            "  PostSvc[Post Service]",
+            "  Graph[(Graph Service)]",
+            "  FeedCache[(News Feed Cache)]",
+            "  Web -->|publish| PostSvc",
+            "  PostSvc -->|recipients| Graph",
+            "  PostSvc -->|append IDs| FeedCache"
+          ],
+          "highlight": [
+            "Graph",
+            "FeedCache"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Feed entry shape",
+          "points": [
+            "Store viewer_id, post_id, author_id, and sort_ts.",
+            "Do not store full post or user objects in the feed cache.",
+            "Limit each viewer's feed list to recent entries such as the latest 500-1000."
+          ]
+        },
+        {
+          "title": "Worker correctness",
+          "points": [
+            "Fanout jobs must be idempotent because workers retry.",
+            "Use a deterministic entry key such as viewer_id + post_id to avoid duplicates.",
+            "Track fanout lag and dead-letter failed recipient pages."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "A post from a high-fanout author creates a write storm.",
+          "mitigation": "Route high-fanout authors to pull fanout in the hybrid step."
+        },
+        {
+          "issue": "Inactive users consume cache memory.",
+          "mitigation": "Keep only active users' feed caches warm and rebuild inactive feeds on demand."
+        }
+      ],
+      "talkingPoints": [
+        "Fanout-on-write optimizes reads, which are much more frequent than posts.",
+        "The publish response should not wait for every recipient feed entry to be written."
+      ],
+      "flows": [
+        {
+          "name": "Async fanout to friends",
+          "note": "The post is already durable; fanout writes are derived and retryable.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant P as Post Service",
+            "  participant Q as Fanout Queue",
+            "  participant W as Fanout Worker",
+            "  participant G as Graph Service",
+            "  participant F as Feed Cache",
+            "  participant N as Notification Service",
+            "  P-)Q: enqueue post_id + author_id",
+            "  W->>Q: consume job",
+            "  W->>G: get eligible recipients",
+            "  G-->>W: viewer IDs page",
+            "  loop each viewer page",
+            "    W->>F: ZADD viewer_feed sort_ts post_id",
+            "  end",
+            "  W-)N: notify active friends"
+          ]
+        },
+        {
+          "name": "Worker retry without duplicates",
+          "note": "Retries must not insert duplicate feed entries.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant W as Fanout Worker",
+            "  participant F as Feed Cache",
+            "  participant Q as Fanout Queue",
+            "  W->>F: append entry viewer_id + post_id",
+            "  alt cache timeout",
+            "    F--xW: timeout",
+            "    W-->>Q: do not ack job",
+            "    Q-->>W: redeliver later",
+            "    W->>F: append same deterministic entry",
+            "    F-->>W: idempotent ok",
+            "  else success",
+            "    F-->>W: ok",
+            "    W-->>Q: ack",
+            "  end"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "feed-cache",
+      "title": "5. News Feed Cache",
+      "description": "The news feed cache is the read-optimized materialized inbox. It stores ordered post IDs for each viewer, not full post objects, so feed reads avoid scanning all friends' timelines.",
+      "decisionPrompt": "Design the materialized feed representation: what IDs are stored per viewer, how deep is the cache window, and how is it rebuilt after loss?",
+      "concepts": [
+        {
+          "term": "Materialized feed",
+          "definition": "A precomputed list of feed entry IDs stored per viewer, usually ordered by time or rank.",
+          "whyItMatters": "Reads can page through ready IDs instead of scanning every followed author's timeline."
+        },
+        {
+          "term": "Cache window",
+          "definition": "The bounded slice of recent feed entries kept hot in memory.",
+          "whyItMatters": "Keeping only the active window controls memory use and makes rebuilds practical."
+        }
+      ],
+      "whyNow": [
+        "Fanout needs a concrete destination for per-viewer feed entries.",
+        "Storing IDs instead of full cards keeps cache mutation cheap when posts, profiles, or counters change."
+      ],
+      "recap": {
+        "before": "Workers can compute recipients, but the read path still lacks an ordered inbox.",
+        "after": "Each viewer has a bounded, cursor-readable list of post IDs.",
+        "newRisk": "A cache rebuild or eviction can temporarily degrade feed reads."
+      },
+      "failureDrills": [
+        {
+          "scenario": "A large Redis shard is lost.",
+          "expectedBehavior": "The system serves a degraded but correct feed rather than returning corrupt data.",
+          "mitigation": "Rebuild from recent fanout events, author outboxes, or a durable feed log; cap cache windows to the most recent entries."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Stores compact ordered IDs and hydrates content later.",
+          "Discusses retention windows, pagination cursors, and rebuild strategy."
+        ],
+        "weak": [
+          "Stores full post, author, media, and counter payloads in every viewer feed.",
+          "Assumes cache loss is impossible or harmless without a rebuild path."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  FeedSvc[Feed Service]",
+        "  FeedCache[(Feed Cache\\nviewer -> ordered post IDs)]",
+        "  RedisA[(Shard A)]",
+        "  RedisB[(Shard B)]",
+        "  RedisC[(Shard C)]",
+        "  RebuildQ[[Rebuild Queue]]",
+        "  FeedSvc -->|read IDs| FeedCache",
+        "  FeedCache -->|shard| RedisA",
+        "  FeedCache --> RedisB",
+        "  FeedCache --> RedisC",
+        "  FeedSvc -->|rebuild miss| RebuildQ"
+      ],
+      "highlight": [
+        "FeedCache",
+        "RedisA",
+        "RedisB",
+        "RedisC",
+        "RebuildQ"
+      ],
+      "options": [
+        {
+          "name": "Redis sorted sets (default)",
+          "pros": [
+            "Natural fit for reverse chronological reads by score",
+            "Fast trim to keep only the newest N entries",
+            "Easy cursor pagination by score and post ID"
+          ],
+          "cons": [
+            "Memory overhead can be high",
+            "Large active-user counts need careful sharding",
+            "Cache loss requires rebuild from posts and graph"
+          ],
+          "diagram": [
+            "graph TB",
+            "  FeedSvc[Feed Service]",
+            "  FeedCache[(Redis Sorted Sets)]",
+            "  RedisA[(Shard A)]",
+            "  RedisB[(Shard B)]",
+            "  RedisC[(Shard C)]",
+            "  RebuildQ[[Rebuild Queue]]",
+            "  FeedSvc -->|read IDs| FeedCache",
+            "  FeedCache -->|shard| RedisA",
+            "  FeedCache --> RedisB",
+            "  FeedCache --> RedisC",
+            "  FeedSvc -->|rebuild miss| RebuildQ"
+          ],
+          "highlight": [
+            "FeedCache",
+            "RedisA",
+            "RedisB",
+            "RedisC",
+            "RebuildQ"
+          ]
+        },
+        {
+          "name": "Persistent inbox table",
+          "pros": [
+            "Survives cache restarts without a rebuild",
+            "Works for inactive users without keeping all data in memory",
+            "Can page old feed entries beyond the cache window"
+          ],
+          "cons": [
+            "Read latency is higher than an in-memory cache",
+            "Write amplification is expensive at fanout volume",
+            "Needs compaction and TTL policies"
+          ],
+          "diagram": [
+            "graph TB",
+            "  FeedSvc[Feed Service]",
+            "  Inbox[(Persistent Feed Inbox)]",
+            "  HotCache[(Small Hot Feed Cache)]",
+            "  Compactor[TTL / Compaction Worker]",
+            "  FeedSvc -->|read hot IDs| HotCache",
+            "  HotCache -->|miss| Inbox",
+            "  Inbox -->|compact| Compactor"
+          ],
+          "highlight": [
+            "Inbox",
+            "HotCache",
+            "Compactor"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Pagination",
+          "points": [
+            "Use cursor pagination containing sort_ts and post_id.",
+            "Avoid offset pagination because new posts shift offsets while a user scrolls.",
+            "Fetch a little more than requested to account for deleted or hidden posts filtered at read time."
+          ]
+        },
+        {
+          "title": "Cache size",
+          "points": [
+            "Most users do not scroll thousands of items, so keep a bounded recent window.",
+            "For inactive users, the system can rebuild or merge on read instead of keeping a warm inbox forever.",
+            "Track cache hit rate and rebuild latency as first-class metrics."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "One viewer with many feed writes becomes a hot cache key.",
+          "mitigation": "Shard very large feed lists by viewer_id and time bucket, or move them to read-time merge."
+        },
+        {
+          "issue": "Feed cache loss causes a cold-start storm.",
+          "mitigation": "Throttle rebuilds, prioritize active users, and use persistent post/graph data as source of truth."
+        }
+      ],
+      "talkingPoints": [
+        "The feed cache is derived state, so the design must explain rebuilds.",
+        "Store IDs only; hydration belongs in the retrieval path."
+      ],
+      "flows": [
+        {
+          "name": "Read feed IDs",
+          "note": "The feed cache returns an ordered skeleton; hydration happens later.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant F as Feed Service",
+            "  participant K as Feed Cache",
+            "  F->>K: ZREVRANGE viewer_feed by cursor limit+buffer",
+            "  K-->>F: post IDs + sort timestamps",
+            "  F->>F: drop invalid entries after hydration filters",
+            "  F-->>F: produce next cursor"
+          ]
+        },
+        {
+          "name": "Cache miss rebuild",
+          "note": "A missing feed cache is rebuilt from recent friends' posts and hybrid pull sources.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant F as Feed Service",
+            "  participant K as Feed Cache",
+            "  participant R as Rebuild Queue",
+            "  participant G as Graph Service",
+            "  participant P as Post Store",
+            "  F->>K: read viewer feed",
+            "  K-->>F: miss",
+            "  F-)R: enqueue rebuild(viewer_id)",
+            "  F->>G: get following set",
+            "  G-->>F: author IDs",
+            "  F->>P: fetch recent posts by authors",
+            "  P-->>F: recent post IDs",
+            "  F->>K: warm viewer feed window",
+            "  F-->>F: return first page"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "hybrid-fanout",
+      "title": "6. Hybrid Fanout for Celebrities",
+      "description": "Pure push fanout is fast for readers but dangerous for high-fanout authors. Use a hybrid model: push normal authors into follower feed caches, but store celebrity posts in author outboxes and merge them at read time.",
+      "decisionPrompt": "Set the hybrid fanout policy: which authors bypass push fanout, how are their posts merged on read, and what bounds the merge latency?",
+      "concepts": [
+        {
+          "term": "Hybrid fanout",
+          "definition": "Use push fanout for normal authors and pull or merge high-fanout authors at read time.",
+          "whyItMatters": "It avoids queue and cache-write explosions for celebrity posts without making every read expensive."
+        },
+        {
+          "term": "Read-time merge",
+          "definition": "Combine precomputed feed IDs with a small set of pulled candidate posts while serving a feed request.",
+          "whyItMatters": "The merge must be bounded so celebrity support does not break read latency."
+        }
+      ],
+      "whyNow": [
+        "The previous push model is intentionally incomplete at celebrity scale.",
+        "A hybrid model teaches the core system-design tradeoff: shift exceptional write amplification to bounded read-time merge work."
+      ],
+      "recap": {
+        "before": "Push fanout makes normal reads fast but can overload queues and caches for very large authors.",
+        "after": "Normal authors are pushed, while celebrity posts are pulled from author outboxes during feed reads.",
+        "newRisk": "Read-time merge now has to be bounded, paginated, and latency-aware."
+      },
+      "failureDrills": [
+        {
+          "scenario": "A celebrity with 50 million followers posts during peak traffic.",
+          "expectedBehavior": "Publish succeeds without creating a queue storm or massive cache write burst.",
+          "mitigation": "Classify high-fanout authors, write to an author outbox, and merge a small recent window at read time."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Names both sides of the hybrid policy and explains the threshold tradeoff.",
+          "Limits read-time merge work by recency windows, cursor state, or candidate caps."
+        ],
+        "weak": [
+          "Uses one fanout strategy for all authors regardless of follower count.",
+          "Moves all work to read time and makes every feed read scan all followed authors."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  PostSvc[Post Service]",
+        "  Classifier[Audience Classifier]",
+        "  PushQ[[Push Fanout Queue]]",
+        "  AuthorOutbox[(Author Outbox)]",
+        "  FeedCache[(Feed Cache)]",
+        "  FeedSvc[Feed Service]",
+        "  PostSvc -->|classify| Classifier",
+        "  Classifier -->|normal author| PushQ",
+        "  PushQ -->|normal authors| FeedCache",
+        "  Classifier -->|celebrity author| AuthorOutbox",
+        "  FeedSvc -->|read IDs| FeedCache",
+        "  FeedSvc -->|pull posts| AuthorOutbox"
+      ],
+      "highlight": [
+        "Classifier",
+        "PushQ",
+        "AuthorOutbox"
+      ],
+      "options": [
+        {
+          "name": "Hybrid push/pull (default)",
+          "pros": [
+            "Keeps normal user feeds fast",
+            "Avoids write storms for high-fanout authors",
+            "Lets the threshold be tuned by queue lag and audience size"
+          ],
+          "cons": [
+            "Read path is more complex because it merges inbox and outbox sources",
+            "Celebrity posts may appear with slightly different freshness",
+            "Requires author classification and monitoring"
+          ],
+          "diagram": [
+            "graph TB",
+            "  PostSvc[Post Service]",
+            "  Classifier[Audience Classifier]",
+            "  PushQ[[Push Fanout Queue]]",
+            "  AuthorOutbox[(Author Outbox)]",
+            "  FeedCache[(Feed Cache)]",
+            "  FeedSvc[Feed Service]",
+            "  PostSvc -->|classify| Classifier",
+            "  Classifier -->|normal author| PushQ",
+            "  PushQ -->|normal authors| FeedCache",
+            "  Classifier -->|celebrity author| AuthorOutbox",
+            "  FeedSvc -->|read IDs| FeedCache",
+            "  FeedSvc -->|pull posts| AuthorOutbox"
+          ],
+          "highlight": [
+            "Classifier",
+            "PushQ",
+            "AuthorOutbox"
+          ]
+        },
+        {
+          "name": "Pure pull on read",
+          "pros": [
+            "No fanout write amplification",
+            "Inactive users cost almost nothing",
+            "Relationship and privacy changes are naturally reflected at read time"
+          ],
+          "cons": [
+            "Feed reads are slow for users with many friends",
+            "Requires merging many author timelines per request",
+            "Harder to meet low p99 latency without heavy caching"
+          ],
+          "diagram": [
+            "graph TB",
+            "  FeedSvc[Feed Service]",
+            "  Graph[(Graph Service)]",
+            "  AuthorFeeds[(Author Timelines)]",
+            "  Merge[Read-time Merge]",
+            "  PostCache[(Post Cache)]",
+            "  FeedSvc -->|followees| Graph",
+            "  Graph -->|followees| FeedSvc",
+            "  FeedSvc -->|pull timelines| AuthorFeeds",
+            "  AuthorFeeds -->|candidates| Merge",
+            "  Merge -->|hydrate| PostCache"
+          ],
+          "highlight": [
+            "AuthorFeeds",
+            "Merge"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Classification",
+          "points": [
+            "Use follower count, recent engagement, and observed fanout cost to decide push vs pull.",
+            "The threshold is operational, not fixed forever.",
+            "A celebrity can be pushed to close friends but pulled by the long tail."
+          ]
+        },
+        {
+          "title": "Merge semantics",
+          "points": [
+            "Read-time merge combines the viewer inbox with recent posts from followed high-fanout authors.",
+            "Because ordering is reverse chronological, a k-way merge by timestamp is enough for this prompt.",
+            "If the product later needs ranking, this merge point becomes a ranking candidate generator."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Read-time merge for many celebrities increases feed latency.",
+          "mitigation": "Cache merged celebrity candidates per viewer segment or precompute for active followers."
+        },
+        {
+          "issue": "Classifier mistakes can overload either the write path or read path.",
+          "mitigation": "Monitor fanout lag, feed read latency, and dynamically adjust thresholds."
+        }
+      ],
+      "talkingPoints": [
+        "Hybrid fanout is the central tradeoff in this interview.",
+        "Do not push every celebrity post to millions of feeds just to preserve a simple model."
+      ],
+      "flows": [
+        {
+          "name": "Normal author push",
+          "note": "Most authors use fanout-on-write because their audience is moderate.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant P as Post Service",
+            "  participant C as Audience Classifier",
+            "  participant Q as Push Fanout Queue",
+            "  participant W as Fanout Worker",
+            "  participant F as Feed Cache",
+            "  P->>C: classify author",
+            "  C-->>P: normal",
+            "  P-)Q: enqueue fanout job",
+            "  W->>Q: consume",
+            "  W->>F: append post ID to recipients"
+          ]
+        },
+        {
+          "name": "Celebrity pull",
+          "note": "Celebrity posts stay in the author outbox and are merged when a follower reads.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant P as Post Service",
+            "  participant C as Audience Classifier",
+            "  participant O as Author Outbox",
+            "  participant F as Feed Service",
+            "  participant G as Graph Service",
+            "  P->>C: classify author",
+            "  C-->>P: high fanout",
+            "  P->>O: append post to author timeline",
+            "  F->>G: followed high-fanout authors(viewer)",
+            "  G-->>F: author IDs",
+            "  F->>O: fetch recent posts by those authors",
+            "  O-->>F: candidate posts"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "feed-retrieval",
+      "title": "7. Feed Retrieval and Hydration",
+      "description": "A feed page is not just IDs. The Feed Service reads feed IDs, merges hybrid pull candidates, filters invalid entries, batch-fetches posts, authors, media, viewer actions, and counters, then returns JSON to the client.",
+      "decisionPrompt": "Design the read path from feed IDs to cards: batch hydration, privacy rechecks, and fallback behavior when noncritical dependencies are slow.",
+      "concepts": [
+        {
+          "term": "Hydration",
+          "definition": "Turn compact feed IDs into full renderable cards by fetching post, author, media, counter, and viewer-state data.",
+          "whyItMatters": "The selected feed is only a skeleton until these dependent objects are attached."
+        },
+        {
+          "term": "Batch read",
+          "definition": "Fetch many objects of the same kind in one request instead of one request per feed card.",
+          "whyItMatters": "Batching prevents N+1 latency and protects downstream services."
+        }
+      ],
+      "whyNow": [
+        "The materialized feed is only an index; the product needs complete, viewer-specific cards.",
+        "This step exposes the latency budget and N+1 query risk that interviewers usually probe."
+      ],
+      "recap": {
+        "before": "The system can produce ordered post IDs, including hybrid celebrity candidates.",
+        "after": "The read path can hydrate a page with posts, authors, media, counters, and viewer action state.",
+        "newRisk": "Hydration fanout can dominate latency if dependencies are not batched and cached."
+      },
+      "failureDrills": [
+        {
+          "scenario": "Profile cache misses for every author on a 50-item feed page.",
+          "expectedBehavior": "The request batches backend reads and degrades gracefully instead of issuing serial calls.",
+          "mitigation": "Use batch APIs, request coalescing, small timeouts, and partial fallback fields for non-critical metadata."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Separates feed selection from hydration.",
+          "Batches dependency reads and treats counters and viewer actions as separately cached data."
+        ],
+        "weak": [
+          "Fetches each post, author, media object, and counter one by one.",
+          "Ignores deleted posts or privacy changes during read-time filtering."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  Client[Client]",
+        "  FeedSvc[Feed Service]",
+        "  FeedCache[(Feed Cache)]",
+        "  Outbox[(Celebrity Outboxes)]",
+        "  PostCache[(Post Cache)]",
+        "  UserCache[(User Cache)]",
+        "  ActionCache[(Action Cache)]",
+        "  CounterCache[(Counter Cache)]",
+        "  CDN[Media CDN]",
+        "  Client -->|feed request| FeedSvc",
+        "  FeedSvc -->|read IDs| FeedCache",
+        "  FeedSvc -->|pull candidates| Outbox",
+        "  FeedSvc -->|hydrate posts| PostCache",
+        "  FeedSvc -->|hydrate users| UserCache",
+        "  FeedSvc --> ActionCache",
+        "  FeedSvc --> CounterCache",
+        "  FeedSvc --> CDN"
+      ],
+      "highlight": [
+        "Outbox",
+        "ActionCache",
+        "CounterCache",
+        "CDN"
+      ],
+      "options": [
+        {
+          "name": "Server-side hydration (default)",
+          "pros": [
+            "Client receives render-ready feed cards",
+            "Server can batch cache lookups and enforce privacy filters",
+            "Simpler mobile clients and consistent behavior across platforms"
+          ],
+          "cons": [
+            "Feed Service does more work per request",
+            "Large hydrated responses can increase latency",
+            "Schema changes affect server and client contracts"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  FeedSvc[Feed Service]",
+            "  FeedCache[(Feed Cache)]",
+            "  PostCache[(Post Cache)]",
+            "  UserCache[(User Cache)]",
+            "  CounterCache[(Counter Cache)]",
+            "  Client -->|feed request| FeedSvc",
+            "  FeedSvc -->|read IDs| FeedCache",
+            "  FeedSvc -->|hydrate posts| PostCache",
+            "  FeedSvc -->|hydrate users| UserCache",
+            "  FeedSvc -->|counters| CounterCache"
+          ],
+          "highlight": [
+            "PostCache",
+            "UserCache",
+            "CounterCache"
+          ]
+        },
+        {
+          "name": "Client-side hydration",
+          "pros": [
+            "Initial feed endpoint can return a compact list of post IDs",
+            "Clients can lazy-load details as cards enter the viewport",
+            "Useful for experimental clients with different card shapes"
+          ],
+          "cons": [
+            "Many client round trips can hurt mobile latency and battery",
+            "Harder to enforce consistent filtering",
+            "More complex client caching logic"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  FeedSvc[Feed Service]",
+            "  FeedCache[(Feed Cache)]",
+            "  PostAPI[Post API]",
+            "  UserAPI[User API]",
+            "  Client -->|feed request| FeedSvc",
+            "  FeedSvc -->|read IDs| FeedCache",
+            "  FeedSvc -->|IDs only| Client",
+            "  Client -->|request| PostAPI",
+            "  Client -->|request| UserAPI"
+          ],
+          "highlight": [
+            "PostAPI",
+            "UserAPI"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Hydration layers",
+          "points": [
+            "Post cache stores text, media references, author_id, status, and created_at.",
+            "User cache stores display name and avatar.",
+            "Action and counter caches store viewer-specific liked/replied state and aggregate counts."
+          ]
+        },
+        {
+          "title": "Filtering",
+          "points": [
+            "A feed entry can outlive the post or relationship that created it.",
+            "Retrieval drops deleted posts, blocked authors, muted authors, or posts outside current visibility.",
+            "Fetch more than the page size so filtering does not return an empty page."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Hydration causes too many cache round trips.",
+          "mitigation": "Batch by cache layer and use request-level timeouts with graceful omission of noncritical counters."
+        },
+        {
+          "issue": "Post or user cache misses create DB fanout on reads.",
+          "mitigation": "Use multi-get, cache-aside backfill, and short-circuit if too many misses occur."
+        }
+      ],
+      "talkingPoints": [
+        "Feed IDs are the skeleton; hydration is where user-visible correctness happens.",
+        "Reverse chronological ordering is simple, but the hydration pipeline should be ready to support ranking features later."
+      ],
+      "flows": [
+        {
+          "name": "Warm feed retrieval",
+          "note": "The common path is cache-heavy and returns render-ready feed cards.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant F as Feed Service",
+            "  participant FC as Feed Cache",
+            "  participant PC as Post Cache",
+            "  participant UC as User Cache",
+            "  participant CC as Counter Cache",
+            "  C->>F: GET /v1/me/feed",
+            "  F->>FC: read feed IDs",
+            "  FC-->>F: post IDs",
+            "  F->>PC: batch get posts",
+            "  PC-->>F: posts",
+            "  F->>UC: batch get authors",
+            "  UC-->>F: user profiles",
+            "  F->>CC: batch get counters",
+            "  CC-->>F: counts",
+            "  F-->>C: hydrated feed page"
+          ]
+        },
+        {
+          "name": "Hybrid merge on read",
+          "note": "Celebrity outbox candidates are merged with the viewer's materialized inbox.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant F as Feed Service",
+            "  participant FC as Feed Cache",
+            "  participant G as Graph Service",
+            "  participant O as Author Outbox",
+            "  participant M as Merge",
+            "  F->>FC: read viewer inbox IDs",
+            "  FC-->>F: pushed post IDs",
+            "  F->>G: high-fanout authors followed by viewer",
+            "  G-->>F: author IDs",
+            "  F->>O: fetch recent posts by author IDs",
+            "  O-->>F: pull candidates",
+            "  F->>M: merge by timestamp",
+            "  M-->>F: ordered candidate IDs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "media-pipeline",
+      "title": "8. Media Pipeline and CDN",
+      "description": "Images and videos dominate bytes and must not flow through the feed web tier. Clients upload media directly to object storage, workers transcode or validate assets, and feed cards reference CDN URLs.",
+      "decisionPrompt": "Separate media bytes from feed metadata: choose upload, processing, validation, and CDN delivery states without blocking publish or read latency.",
+      "concepts": [
+        {
+          "term": "Pre-signed upload",
+          "definition": "A short-lived URL that lets a client upload directly to object storage without sending bytes through app servers.",
+          "whyItMatters": "It keeps large media transfer off the feed request path."
+        },
+        {
+          "term": "CDN",
+          "definition": "A geographically distributed cache that serves static media from edge locations near users.",
+          "whyItMatters": "It reduces latency and origin bandwidth for images and videos."
+        }
+      ],
+      "whyNow": [
+        "Text metadata and media bytes have very different scale, latency, and failure characteristics.",
+        "A separate media pipeline prevents the feed services from becoming file-transfer servers."
+      ],
+      "recap": {
+        "before": "Posts can reference media IDs, but the media lifecycle is not defined.",
+        "after": "Uploads go directly to object storage, processors create safe variants, and clients fetch media through a CDN.",
+        "newRisk": "A post can exist while its media is still processing or has failed validation."
+      },
+      "failureDrills": [
+        {
+          "scenario": "Video transcoding lags for several minutes after publish.",
+          "expectedBehavior": "The feed can show a processing state or omit the media without blocking the whole post.",
+          "mitigation": "Track media state explicitly, publish only approved variants, and update cached cards when processing completes."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Uses pre-signed upload URLs and keeps bytes off app servers.",
+          "Models media as a state machine with validation, variants, and CDN invalidation."
+        ],
+        "weak": [
+          "Uploads large files through the same web servers that serve feed reads.",
+          "Assumes media is immediately available and safe as soon as metadata is written."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  Client[Client]",
+        "  MediaSvc[Media Service]",
+        "  ObjectStore[(Object Storage)]",
+        "  Processor[Media Processor]",
+        "  CDN[CDN]",
+        "  PostSvc[Post Service]",
+        "  FeedSvc[Feed Service]",
+        "  Client -->|pre-signed upload| MediaSvc",
+        "  MediaSvc -->|store bytes| ObjectStore",
+        "  ObjectStore -->|object event| Processor",
+        "  Processor -->|variants| CDN",
+        "  PostSvc -->|attach media| MediaSvc",
+        "  FeedSvc --> CDN"
+      ],
+      "highlight": [
+        "MediaSvc",
+        "ObjectStore",
+        "Processor",
+        "CDN"
+      ],
+      "options": [
+        {
+          "name": "Direct upload + CDN (default)",
+          "pros": [
+            "Large bytes bypass web servers",
+            "CDN handles global delivery and caching",
+            "Upload and post publish can fail independently with clear states"
+          ],
+          "cons": [
+            "Requires media state machine: uploading, processing, ready, failed",
+            "Post publish must handle media not ready yet",
+            "Security requires signed URLs and content validation"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  MediaSvc[Media Service]",
+            "  ObjectStore[(Object Storage)]",
+            "  Processor[Media Processor]",
+            "  CDN[CDN]",
+            "  Client -->|pre-signed upload| MediaSvc",
+            "  MediaSvc -->|store bytes| ObjectStore",
+            "  ObjectStore -->|object event| Processor",
+            "  Processor -->|variants| CDN"
+          ],
+          "highlight": [
+            "MediaSvc",
+            "ObjectStore",
+            "Processor",
+            "CDN"
+          ]
+        },
+        {
+          "name": "Proxy upload through app",
+          "pros": [
+            "Simpler client implementation",
+            "Server can validate bytes before storage",
+            "Works for very small images in early prototypes"
+          ],
+          "cons": [
+            "Web tier becomes a bandwidth bottleneck",
+            "Video uploads can exhaust server resources",
+            "Harder to scale independently from feed metadata"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  Web[Web Server]",
+            "  MediaSvc[Media Service]",
+            "  ObjectStore[(Object Storage)]",
+            "  CDN[CDN]",
+            "  Client -->|upload via app| Web",
+            "  Web -->|call| MediaSvc",
+            "  MediaSvc -->|store bytes| ObjectStore",
+            "  ObjectStore -->|object event| CDN"
+          ],
+          "highlight": [
+            "Web",
+            "MediaSvc",
+            "ObjectStore"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "State machine",
+          "points": [
+            "Media starts as uploading, moves to processing, then ready or failed.",
+            "Feed cards can hide pending media or show placeholders until ready.",
+            "Deleting a post should revoke or garbage-collect unused media objects later."
+          ]
+        },
+        {
+          "title": "CDN behavior",
+          "points": [
+            "Feed responses contain CDN URLs, not media bytes.",
+            "Images can be resized into multiple variants; videos need transcoding and thumbnails.",
+            "CDN invalidation is needed for deleted or policy-violating media."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Media processing lag delays feed card completeness.",
+          "mitigation": "Publish text immediately, show media placeholders, and update card state when processing completes."
+        },
+        {
+          "issue": "Abusive media uploads can drive storage and processing cost.",
+          "mitigation": "Use upload quotas, content scanning, and lifecycle cleanup for abandoned uploads."
+        }
+      ],
+      "talkingPoints": [
+        "Separate metadata QPS from media bandwidth.",
+        "The feed service should treat media as references with readiness state."
+      ],
+      "flows": [
+        {
+          "name": "Direct media upload",
+          "note": "The client uploads bytes to object storage, then references the media ID when publishing.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant M as Media Service",
+            "  participant O as Object Storage",
+            "  participant P as Media Processor",
+            "  participant CDN as CDN",
+            "  C->>M: request upload URL",
+            "  M->>O: create pre-signed PUT",
+            "  O-->>M: upload URL",
+            "  M-->>C: mediaId + uploadUrl",
+            "  C->>O: PUT media bytes",
+            "  O-)P: processing job",
+            "  P->>O: write resized / transcoded variants",
+            "  P-)CDN: make variants cacheable"
+          ]
+        },
+        {
+          "name": "Publish with media reference",
+          "note": "The post references media metadata instead of embedding media bytes.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant P as Post Service",
+            "  participant M as Media Service",
+            "  participant DB as Post DB",
+            "  C->>P: POST /v1/me/feed { mediaIds }",
+            "  P->>M: validate media ownership + status",
+            "  alt media ready or allowed pending",
+            "    M-->>P: ok",
+            "    P->>DB: INSERT post with media refs",
+            "    DB-->>P: committed",
+            "    P-->>C: 201 { postId }",
+            "  else invalid media",
+            "    M-->>P: reject",
+            "    P-->>C: 400 invalid media",
+            "  end"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "hydration-and-cache-layers",
+      "title": "9. Cache Layers and Interaction State",
+      "description": "The feed path depends on multiple caches: feed IDs, post content, user profiles, social graph, viewer actions, and counters. Make each cache explicit so latency and consistency tradeoffs are visible.",
+      "decisionPrompt": "Assign ownership and freshness to each cache layer: decide what can be stale, what must be personalized, and how writes invalidate derived views.",
+      "concepts": [
+        {
+          "term": "Cache-aside",
+          "definition": "Application code reads from cache first, reads the source store on miss, then backfills the cache.",
+          "whyItMatters": "It keeps ownership explicit: each service decides how to cache and invalidate its own data."
+        },
+        {
+          "term": "Eventual consistency",
+          "definition": "Replicas or derived views may be briefly stale, but converge after asynchronous updates finish.",
+          "whyItMatters": "Counters and profile metadata can tolerate short staleness more easily than privacy decisions."
+        }
+      ],
+      "whyNow": [
+        "After hydration is introduced, cache ownership and consistency become the main performance controls.",
+        "Viewer actions and counters change more frequently than post bodies and profiles, so they need different strategies."
+      ],
+      "recap": {
+        "before": "The read path knows which dependencies it needs, but not how to keep latency predictable.",
+        "after": "Feed IDs, post bodies, profiles, graph data, viewer actions, and counters have separate cache policies.",
+        "newRisk": "Different freshness windows can make the same feed page show mixed consistency."
+      },
+      "failureDrills": [
+        {
+          "scenario": "Like counters are delayed while the viewer's own like action must appear immediately.",
+          "expectedBehavior": "The viewer sees their own action reflected even if aggregate counters are eventually consistent.",
+          "mitigation": "Read viewer action state from an authoritative or write-through path, and allow counters to update asynchronously."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Assigns different TTLs and invalidation strategies to different data types.",
+          "Separates personalized viewer state from aggregate counters."
+        ],
+        "weak": [
+          "Uses one cache policy for everything in the feed card.",
+          "Requires strong consistency for all counters and metadata without explaining cost."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  FeedSvc[Feed Service]",
+        "  FeedCache[(News Feed IDs)]",
+        "  PostCache[(Post Content)]",
+        "  UserCache[(User Profiles)]",
+        "  GraphCache[(Social Graph)]",
+        "  ActionCache[(Liked / Replied State)]",
+        "  CounterCache[(Counters)]",
+        "  Stores[(Source Databases)]",
+        "  FeedSvc -->|read IDs| FeedCache",
+        "  FeedSvc -->|hydrate posts| PostCache",
+        "  FeedSvc -->|hydrate users| UserCache",
+        "  FeedSvc -->|read| GraphCache",
+        "  FeedSvc -->|viewer state| ActionCache",
+        "  FeedSvc --> CounterCache",
+        "  FeedCache --> Stores",
+        "  PostCache --> Stores",
+        "  UserCache --> Stores"
+      ],
+      "highlight": [
+        "ActionCache",
+        "CounterCache",
+        "GraphCache"
+      ],
+      "options": [
+        {
+          "name": "Cache-aside layers (default)",
+          "pros": [
+            "Simple and service-owned",
+            "Each service can tune TTL and invalidation for its data",
+            "Source databases remain the authority"
+          ],
+          "cons": [
+            "First read after miss is slower",
+            "Many layers can create inconsistent snapshots",
+            "Invalidation discipline is required on writes"
+          ],
+          "diagram": [
+            "graph TB",
+            "  FeedSvc[Feed Service]",
+            "  FeedCache[(News Feed IDs)]",
+            "  PostCache[(Post Content)]",
+            "  UserCache[(User Profiles)]",
+            "  ActionCache[(Action State)]",
+            "  CounterCache[(Counters)]",
+            "  Stores[(Source Databases)]",
+            "  FeedSvc -->|read IDs| FeedCache",
+            "  FeedSvc -->|hydrate posts| PostCache",
+            "  FeedSvc -->|hydrate users| UserCache",
+            "  FeedSvc -->|viewer state| ActionCache",
+            "  FeedSvc -->|counters| CounterCache",
+            "  PostCache --> Stores",
+            "  UserCache --> Stores"
+          ],
+          "highlight": [
+            "FeedCache",
+            "PostCache",
+            "UserCache",
+            "ActionCache",
+            "CounterCache"
+          ]
+        },
+        {
+          "name": "Materialized feed cards",
+          "pros": [
+            "Very fast reads because cards are preassembled",
+            "Lower hydration fanout at request time",
+            "Useful for push notifications or email digests"
+          ],
+          "cons": [
+            "Memory use is much higher",
+            "Profile updates and counter changes make cards stale",
+            "Harder to personalize viewer-specific action state"
+          ],
+          "diagram": [
+            "graph TB",
+            "  FanoutWorker[Fanout Worker]",
+            "  CardBuilder[Card Builder]",
+            "  CardCache[(Materialized Feed Cards)]",
+            "  FeedSvc[Feed Service]",
+            "  Stores[(Post / User / Counter Stores)]",
+            "  FanoutWorker -->|post event| CardBuilder",
+            "  CardBuilder -->|hydrate| Stores",
+            "  CardBuilder -->|write cards| CardCache",
+            "  FeedSvc -->|read cards| CardCache"
+          ],
+          "highlight": [
+            "CardBuilder",
+            "CardCache"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Cache ownership",
+          "points": [
+            "Post Service owns post cache invalidation.",
+            "User Service owns profile cache invalidation.",
+            "Feed Service owns feed ID cache and can rebuild it from durable sources."
+          ]
+        },
+        {
+          "title": "Counters and actions",
+          "points": [
+            "Counters such as likes and replies can be eventually consistent.",
+            "Viewer-specific action state must be correct for the current viewer, so it is fetched separately.",
+            "Missing counters should not block feed rendering."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "A single feed request can touch too many caches.",
+          "mitigation": "Batch multi-get per cache, limit page size, and degrade noncritical fields."
+        },
+        {
+          "issue": "Materialized cards go stale when users edit profiles or counters change.",
+          "mitigation": "Prefer ID-only feed entries plus hydration for the main product feed."
+        }
+      ],
+      "talkingPoints": [
+        "Cache layers are not interchangeable; each stores a different kind of data.",
+        "State that counters are eventually consistent but deletes/privacy filters must be enforced before rendering."
+      ],
+      "flows": [
+        {
+          "name": "Batch hydrate cache layers",
+          "note": "The Feed Service fans out to caches in controlled batches, not one lookup per card.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant F as Feed Service",
+            "  participant P as Post Cache",
+            "  participant U as User Cache",
+            "  participant A as Action Cache",
+            "  participant C as Counter Cache",
+            "  F->>P: MGET post IDs",
+            "  P-->>F: posts",
+            "  F->>U: MGET author IDs",
+            "  U-->>F: profiles",
+            "  F->>A: MGET viewer action states",
+            "  A-->>F: liked/replied flags",
+            "  F->>C: MGET counters",
+            "  C-->>F: counts"
+          ]
+        },
+        {
+          "name": "Profile update invalidation",
+          "note": "Because cards hydrate author profiles on read, a profile update only invalidates user cache.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant U as User Service",
+            "  participant DB as User DB",
+            "  participant K as User Cache",
+            "  C->>U: update profile photo",
+            "  U->>DB: UPDATE user profile",
+            "  DB-->>U: committed",
+            "  U->>K: DEL user_id",
+            "  U-->>C: 200 updated"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "multi-region-and-observability",
+      "title": "10. Multi-Region and Observability",
+      "description": "At scale, the feed system needs regional redundancy and operational controls. Reads can be served near users, while writes are replicated. Metrics track publish latency, fanout lag, feed read latency, cache hit rates, queue depth, and media processing lag.",
+      "decisionPrompt": "Design the operating model: define regional read/write ownership, lag indicators, failover behavior, and the metrics that prove feeds are healthy.",
+      "concepts": [
+        {
+          "term": "SLO",
+          "definition": "A measurable target for user-visible reliability or latency, such as feed read p99 under 300 ms.",
+          "whyItMatters": "It turns architecture goals into operational thresholds and alerts."
+        },
+        {
+          "term": "Replication lag",
+          "definition": "The delay between a write in one region or store and its visibility in another replica or derived system.",
+          "whyItMatters": "Lag determines how stale feeds can become during failover or regional reads."
+        }
+      ],
+      "whyNow": [
+        "Once the architecture has asynchronous queues, caches, and hybrid reads, correctness depends on observability as much as component choice.",
+        "Multi-region design forces explicit choices about write ownership, replication lag, and degraded modes."
+      ],
+      "recap": {
+        "before": "The single-region design can serve the product path but has limited failure isolation and operational visibility.",
+        "after": "The system has regional read serving, replicated writes, lag metrics, alerts, and operational levers.",
+        "newRisk": "Cross-region replication and failover can reorder events or expose stale feeds."
+      },
+      "failureDrills": [
+        {
+          "scenario": "The primary write region is unavailable for 10 minutes.",
+          "expectedBehavior": "Reads continue from healthy regions, publishing is either failed closed or routed to a controlled secondary write path.",
+          "mitigation": "Define RPO/RTO, use durable replication, expose degraded-mode UI states, and alert on fanout lag and replication lag."
+        }
+      ],
+      "interviewerSignals": {
+        "strong": [
+          "Defines product-facing SLOs and maps them to concrete metrics.",
+          "Explains regional read locality, write ownership, failover, and queue-lag visibility."
+        ],
+        "weak": [
+          "Adds regions without discussing consistency, failover, or data ownership.",
+          "Mentions monitoring only as a generic final checkbox."
+        ]
+      },
+      "diagram": [
+        "graph TB",
+        "  Client[Client]",
+        "  Geo[GeoDNS / Anycast]",
+        "  RegionA[Region A\\nweb + feed + fanout]",
+        "  RegionB[Region B\\nweb + feed + fanout]",
+        "  PostA[(Post DB A)]",
+        "  PostB[(Post DB B)]",
+        "  FeedA[(Feed Cache A)]",
+        "  FeedB[(Feed Cache B)]",
+        "  Rep[[Replication / Event Streams]]",
+        "  Metrics[/Metrics + Alerts/]",
+        "  Client -->|nearest region| Geo",
+        "  Geo -->|route| RegionA",
+        "  Geo --> RegionB",
+        "  RegionA -->|local read/write| PostA",
+        "  RegionB --> PostB",
+        "  RegionA -->|local read/write| FeedA",
+        "  RegionB --> FeedB",
+        "  PostA --> Rep",
+        "  Rep -->|replicate| PostB",
+        "  PostB --> Rep",
+        "  Rep --> PostA",
+        "  RegionA --> Metrics",
+        "  RegionB --> Metrics"
+      ],
+      "highlight": [
+        "Geo",
+        "RegionA",
+        "RegionB",
+        "Rep",
+        "Metrics"
+      ],
+      "options": [
+        {
+          "name": "Home-region writes (default)",
+          "pros": [
+            "Each user has one write home for posts and graph changes",
+            "Simpler conflict handling for post IDs and relationship updates",
+            "Other regions can serve reads from replicated posts plus local feed caches"
+          ],
+          "cons": [
+            "Users far from home region pay higher publish latency",
+            "Failover needs careful home-region promotion",
+            "Feed freshness in other regions depends on replication lag"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  Geo[GeoDNS / Anycast]",
+            "  Home[Home Region Writes]",
+            "  ReadRegion[Nearest Read Region]",
+            "  PostHome[(Home Post DB)]",
+            "  PostReplica[(Replica Post DB)]",
+            "  Rep[[Replication Stream]]",
+            "  FeedCache[(Regional Feed Cache)]",
+            "  Client -->|nearest region| Geo",
+            "  Geo -->|route| Home",
+            "  Geo -->|route| ReadRegion",
+            "  Home --> PostHome",
+            "  PostHome --> Rep",
+            "  Rep -->|replicate| PostReplica",
+            "  ReadRegion --> PostReplica",
+            "  ReadRegion -->|cache| FeedCache"
+          ],
+          "highlight": [
+            "Home",
+            "ReadRegion",
+            "Rep"
+          ]
+        },
+        {
+          "name": "Active-active writes",
+          "pros": [
+            "Lowest regional publish latency",
+            "Better availability during regional write outages",
+            "Pairs well with globally unique time-sortable IDs"
+          ],
+          "cons": [
+            "Graph changes, deletes, and privacy updates have conflict cases",
+            "Fanout can duplicate or reorder entries if events replay differently",
+            "Operationally much harder for an interview baseline"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  Geo[GeoDNS / Anycast]",
+            "  RegionA[Region A Writes]",
+            "  RegionB[Region B Writes]",
+            "  EventsA[[Event Stream A]]",
+            "  EventsB[[Event Stream B]]",
+            "  Merge[Global Event Merge]",
+            "  FeedA[(Feed Cache A)]",
+            "  FeedB[(Feed Cache B)]",
+            "  Client -->|nearest region| Geo",
+            "  Geo -->|route| RegionA",
+            "  Geo --> RegionB",
+            "  RegionA -->|events| EventsA",
+            "  RegionB --> EventsB",
+            "  EventsA -->|replicate| Merge",
+            "  EventsB --> Merge",
+            "  Merge -->|hydrate| FeedA",
+            "  Merge --> FeedB"
+          ],
+          "highlight": [
+            "EventsA",
+            "EventsB",
+            "Merge"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Regional model",
+          "points": [
+            "Reads can be served close to the viewer because feed caches and post replicas exist regionally.",
+            "Writes can go to a user's home region to avoid conflict-heavy graph and privacy updates.",
+            "Cross-region replication delay is acceptable because the feed is already eventually consistent."
+          ]
+        },
+        {
+          "title": "Operational metrics",
+          "points": [
+            "Publish p99, feed read p99, fanout queue depth, fanout lag, cache hit rate, media processing lag, and error rates should be dashboards.",
+            "Alert on fanout lag before users notice stale feeds.",
+            "Track feed freshness: time from post commit to visible in eligible active viewers' feeds."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Regional outage leaves feed caches cold in the failover region.",
+          "mitigation": "Replicate hot feed entries, keep spare cache capacity, and rebuild active users first."
+        },
+        {
+          "issue": "Replication lag makes feeds stale across regions.",
+          "mitigation": "Expose freshness metrics and fall back to read-time merge from replicated author timelines."
+        }
+      ],
+      "talkingPoints": [
+        "Do not promise strong global consistency for a social feed unless the product truly needs it.",
+        "Observability is part of the design because fanout lag and cache misses are user-visible."
+      ],
+      "flows": [
+        {
+          "name": "Home-region publish replicated globally",
+          "note": "The publish is durable in the home region first; other regions catch up through event streams.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant G as Geo Router",
+            "  participant H as Home Region Post Service",
+            "  participant DB as Home Post DB",
+            "  participant E as Event Stream",
+            "  participant R as Remote Region",
+            "  C->>G: POST /v1/me/feed",
+            "  G->>H: route to user's home region",
+            "  H->>DB: INSERT post",
+            "  DB-->>H: committed",
+            "  H-)E: publish post event",
+            "  E-)R: replicate post + fanout event",
+            "  H-->>C: 201 { postId }"
+          ]
+        },
+        {
+          "name": "Failover feed read",
+          "note": "A viewer can read from another region while caches warm from replicated data.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant G as Geo Router",
+            "  participant A as Region A Feed",
+            "  participant B as Region B Feed",
+            "  participant K as Region B Feed Cache",
+            "  participant P as Region B Post Replica",
+            "  C->>G: GET /v1/me/feed",
+            "  G->>A: nearest region",
+            "  A-->>G: unhealthy",
+            "  G->>B: fail over",
+            "  B->>K: read viewer feed",
+            "  alt warm cache",
+            "    K-->>B: post IDs",
+            "  else cold cache",
+            "    K-->>B: miss",
+            "    B->>P: rebuild from recent posts",
+            "    P-->>B: candidate posts",
+            "  end",
+            "  B-->>C: 200 feed page"
+          ]
+        }
+      ]
+    }
+  ],
+  "finalDesign": {
+    "title": "Final Design",
+    "description": "End-to-end news feed architecture: stateless APIs, durable post store, graph and privacy rules, asynchronous fanout, feed ID cache, hybrid celebrity pull, hydration caches, media pipeline, multi-region serving, and observability.",
+    "diagram": [
+      "graph TB",
+      "  Client[Web / Mobile Client]",
+      "  LB[Load Balancer]",
+      "  Web[Stateless Web Tier]",
+      "  Auth[(Auth / Rate Limit)]",
+      "  PostSvc[Post Service]",
+      "  PostDB[(Post DB)]",
+      "  PostCache([Post Cache])",
+      "  MediaSvc[Media Service]",
+      "  ObjectStore[(Object Storage)]",
+      "  CDN[Media CDN]",
+      "  GraphSvc[Graph Service]",
+      "  GraphDB[(Graph DB)]",
+      "  Privacy[Privacy / Eligibility]",
+      "  FanoutQ[[Fanout Queue]]",
+      "  FanoutWorkers[Fanout Workers]",
+      "  FeedCache([News Feed ID Cache])",
+      "  AuthorOutbox[(Celebrity Author Outbox)]",
+      "  FeedSvc[Feed Service]",
+      "  UserCache([User Cache])",
+      "  ActionCache([Viewer Action Cache])",
+      "  CounterCache([Counter Cache])",
+      "  EventBus[[Event / Analytics Bus]]",
+      "  Metrics[Metrics / Alerts]",
+      "  Client -->|API calls| LB",
+      "  LB -->|route| Web",
+      "  Web -->|auth/check| Auth",
+      "  Web -->|publish| PostSvc",
+      "  Web -->|read feed| FeedSvc",
+      "  PostSvc -->|write post| PostDB",
+      "  PostSvc -->|warm cache| PostCache",
+      "  PostSvc -->|media refs| MediaSvc",
+      "  MediaSvc -->|store bytes| ObjectStore",
+      "  ObjectStore -->|variants| CDN",
+      "  PostSvc -->|enqueue normal author| FanoutQ",
+      "  FanoutQ -->|consume| FanoutWorkers",
+      "  FanoutWorkers -->|recipient query| GraphSvc",
+      "  GraphSvc -->|edges| GraphDB",
+      "  GraphSvc -->|filter| Privacy",
+      "  FanoutWorkers -->|append IDs| FeedCache",
+      "  PostSvc -->|celebrity post| AuthorOutbox",
+      "  FeedSvc -->|read IDs| FeedCache",
+      "  FeedSvc -->|pull candidates| AuthorOutbox",
+      "  FeedSvc -->|hydrate posts| PostCache",
+      "  FeedSvc -->|hydrate users| UserCache",
+      "  FeedSvc -->|viewer state| ActionCache",
+      "  FeedSvc -->|counters| CounterCache",
+      "  FeedSvc -->|media URLs| CDN",
+      "  PostSvc -->|events| EventBus",
+      "  FeedSvc -->|latency + cache metrics| Metrics"
+    ],
+    "highlight": [],
+    "options": [
+      {
+        "name": "Hybrid fanout feed design",
+        "pros": [
+          "Fast reads for normal users through materialized feed IDs",
+          "Avoids celebrity write amplification with pull candidates",
+          "Keeps post, graph, media, and hydration ownership separate",
+          "Observability covers fanout lag and read latency"
+        ],
+        "cons": [
+          "Read path must merge pushed and pulled candidates",
+          "Feed cache is derived state and needs rebuild strategy",
+          "Privacy rules must be checked even for precomputed entries"
+        ],
+        "diagram": [
+          "graph TB",
+          "  Client[Web / Mobile Client]",
+          "  LB[Load Balancer]",
+          "  Web[Stateless Web Tier]",
+          "  Auth[(Auth / Rate Limit)]",
+          "  PostSvc[Post Service]",
+          "  PostDB[(Post DB)]",
+          "  PostCache([Post Cache])",
+          "  MediaSvc[Media Service]",
+          "  ObjectStore[(Object Storage)]",
+          "  CDN[Media CDN]",
+          "  GraphSvc[Graph Service]",
+          "  GraphDB[(Graph DB)]",
+          "  Privacy[Privacy / Eligibility]",
+          "  FanoutQ[[Fanout Queue]]",
+          "  FanoutWorkers[Fanout Workers]",
+          "  FeedCache([News Feed ID Cache])",
+          "  AuthorOutbox[(Celebrity Author Outbox)]",
+          "  FeedSvc[Feed Service]",
+          "  UserCache([User Cache])",
+          "  ActionCache([Viewer Action Cache])",
+          "  CounterCache([Counter Cache])",
+          "  EventBus[[Event / Analytics Bus]]",
+          "  Metrics[Metrics / Alerts]",
+          "  Client -->|API calls| LB",
+          "  LB -->|route| Web",
+          "  Web -->|auth/check| Auth",
+          "  Web -->|publish| PostSvc",
+          "  Web -->|read feed| FeedSvc",
+          "  PostSvc -->|write post| PostDB",
+          "  PostSvc -->|warm cache| PostCache",
+          "  PostSvc -->|media refs| MediaSvc",
+          "  MediaSvc -->|store bytes| ObjectStore",
+          "  ObjectStore -->|variants| CDN",
+          "  PostSvc -->|enqueue normal author| FanoutQ",
+          "  FanoutQ -->|consume| FanoutWorkers",
+          "  FanoutWorkers -->|recipient query| GraphSvc",
+          "  GraphSvc -->|edges| GraphDB",
+          "  GraphSvc -->|filter| Privacy",
+          "  FanoutWorkers -->|append IDs| FeedCache",
+          "  PostSvc -->|celebrity post| AuthorOutbox",
+          "  FeedSvc -->|read IDs| FeedCache",
+          "  FeedSvc -->|pull candidates| AuthorOutbox",
+          "  FeedSvc -->|hydrate posts| PostCache",
+          "  FeedSvc -->|hydrate users| UserCache",
+          "  FeedSvc -->|viewer state| ActionCache",
+          "  FeedSvc -->|counters| CounterCache",
+          "  FeedSvc -->|media URLs| CDN",
+          "  PostSvc -->|events| EventBus",
+          "  FeedSvc -->|latency + cache metrics| Metrics"
+        ],
+        "highlight": []
+      },
+      {
+        "name": "Pull-on-read feed design",
+        "pros": [
+          "Simpler write path and no large fanout queue",
+          "Fresh graph and privacy changes are naturally reflected",
+          "Good for smaller networks or low read volume"
+        ],
+        "cons": [
+          "Feed reads become expensive for users who follow many authors",
+          "Harder to hit low latency without aggressive caching",
+          "Every read can touch many author timelines"
+        ],
+        "diagram": [
+          "graph TB",
+          "  Client[Client]",
+          "  Web[Web Tier]",
+          "  PostSvc[Post Service]",
+          "  AuthorTimeline[(Author Timelines)]",
+          "  GraphSvc[Graph Service]",
+          "  FeedSvc[Feed Service]",
+          "  Merge[Read-Time Merge]",
+          "  PostCache([Post Cache])",
+          "  UserCache([User Cache])",
+          "  Client -->|publish/read| Web",
+          "  Web -->|publish| PostSvc",
+          "  PostSvc -->|append author timeline| AuthorTimeline",
+          "  Web -->|read feed| FeedSvc",
+          "  FeedSvc -->|followees| GraphSvc",
+          "  FeedSvc -->|recent posts| AuthorTimeline",
+          "  AuthorTimeline -->|candidates| Merge",
+          "  Merge -->|hydrate| PostCache",
+          "  Merge -->|profiles| UserCache",
+          "  Merge -->|feed page| Client"
+        ],
+        "highlight": []
+      }
+    ]
+  }
+}

@@ -1,0 +1,2214 @@
+{
+  "title": "URL Shortener — System Design",
+  "description": "A step-by-step walkthrough of designing a URL shortener, starting from requirements and capacity, then evolving the architecture from a minimal client/server toward a sharded, edge-accelerated, multi-region system.",
+  "patterns": [
+    {
+      "name": "Cache-aside",
+      "what": "Read from cache first; on a miss, read the source of truth and backfill the cache.",
+      "whenToUse": "Read-heavy workloads with a hot subset of keys, where a slightly stale read is acceptable.",
+      "steps": ["cache"]
+    },
+    {
+      "name": "Sharding (horizontal partitioning)",
+      "what": "Split data across nodes by a partition key so no single node holds the whole dataset.",
+      "whenToUse": "When data or write volume exceeds what one node can hold or serve.",
+      "steps": ["sharded-mapping-store"]
+    },
+    {
+      "name": "Edge caching (CDN)",
+      "what": "Serve cacheable responses from points of presence close to users.",
+      "whenToUse": "Geographically distributed read traffic for cacheable content.",
+      "steps": ["cdn-and-analytics", "multi-region"]
+    }
+  ],
+  "interviewScript": [
+    {
+      "phase": "Scope & requirements",
+      "time": "first 5 min",
+      "say": [
+        "Restate the problem: a service that maps long URLs to short codes and redirects.",
+        "List functional needs (create, redirect, optional analytics) and the read:write ratio.",
+        "Name the non-functional priorities: low-latency redirects, high availability, durability."
+      ]
+    },
+    {
+      "phase": "Estimate & API",
+      "time": "5–15 min",
+      "say": [
+        "Do a back-of-envelope: writes/sec, reads/sec, storage growth over 5 years.",
+        "Sketch the API: POST /shorten, GET /{code}. Note redirects are the hot path."
+      ]
+    },
+    {
+      "phase": "High-level design & deep dives",
+      "time": "15–40 min",
+      "say": [
+        "Draw client → LB → app → cache → DB, then justify each addition against the numbers.",
+        "Go deep where prompted: ID generation, cache strategy, sharding the mapping store."
+      ]
+    },
+    {
+      "phase": "Wrap up",
+      "time": "final 5 min",
+      "say": [
+        "Summarize how the design meets each requirement.",
+        "Call out the top bottleneck and one thing you'd do next with more time."
+      ]
+    }
+  ],
+  "levelVariants": [
+    {
+      "level": "Junior",
+      "expectations": [
+        "Produces a working single-region design: app servers, a database, a cache.",
+        "Can explain why a cache helps a read-heavy workload."
+      ]
+    },
+    {
+      "level": "Senior",
+      "expectations": [
+        "Drives the capacity math and lets it justify each component.",
+        "Reasons about ID-generation collisions and sharding the mapping store.",
+        "Discusses cache invalidation, TTLs, and stale-read tradeoffs."
+      ]
+    },
+    {
+      "level": "Staff+",
+      "expectations": [
+        "Frames the design around multi-region availability and failure domains.",
+        "Weighs consistency vs. latency for cross-region writes and analytics.",
+        "Quantifies tradeoffs and names the operational cost of each choice."
+      ]
+    }
+  ],
+  "requirementsDiagram": [
+    "graph TB",
+    "  User((User))",
+    "  Owner((Link Owner))",
+    "  Browser[Browser / Mobile App]",
+    "  System[[URL Shortener]]",
+    "  Analytics[/Analytics Dashboards/]",
+    "  User --> Browser",
+    "  Browser -->|Shorten / Resolve| System",
+    "  Owner -->|Manage links| System",
+    "  System --> Analytics"
+  ],
+  "capacityDiagram": [
+    "graph TB",
+    "  Clients[~100k redirects/sec\\n~1k creates/sec]",
+    "  Edge[Edge / CDN\\nserves hot redirects]",
+    "  App[App Tier\\nstateless, autoscaling]",
+    "  Cache[(Cache\\n~50-200 GB hot set)]",
+    "  DB[(Mapping Store\\n~75 TB raw / 200+ TB replicated)]",
+    "  Queue[[Event Queue\\n~100k click events/sec]]",
+    "  Analytics[(Analytics Store)]",
+    "  Clients --> Edge",
+    "  Edge -->|miss| App",
+    "  Edge -->|edge click logs| Queue",
+    "  App --> Cache",
+    "  Cache -->|miss| DB",
+    "  App --> Queue",
+    "  Queue --> Analytics"
+  ],
+  "requirements": {
+    "functional": [
+      "Shorten a long URL to a unique short code (e.g. sho.rt/aZ8q1).",
+      "Redirect a short code back to its original long URL with low latency.",
+      "Optional custom alias (vanity URL) chosen by the user.",
+      "Optional expiration time for a short URL.",
+      "Click analytics: total clicks, recent clicks, basic referrer/geo breakdown."
+    ],
+    "nonFunctional": [
+      "High availability for redirects (target ≥ 99.99%); creates can be slightly less available.",
+      "Low p99 redirect latency (target ≤ 50 ms at the edge for hot links; ≤ 150 ms on origin miss).",
+      "Read-heavy: ~100:1 read/write ratio is typical.",
+      "Scalable to billions of stored URLs and tens of thousands of redirects/sec.",
+      "Durable storage — a shortened URL must not be lost.",
+      "Analytics are eventually consistent and approximate when redirects are cached at the edge or browser; the mapping write must be strongly consistent."
+    ]
+  },
+  "capacity": [
+    {
+      "label": "New URLs per second",
+      "value": "~1,000",
+      "note": "≈ 86M/day; peak ~3× average"
+    },
+    {
+      "label": "Redirects per second",
+      "value": "~100,000",
+      "note": "100:1 read/write ratio"
+    },
+    {
+      "label": "Storage (5 years)",
+      "value": "~75 TB raw",
+      "note": "~150B URLs x ~500 bytes/row; plan for 200+ TB with indexes, replicas, and backups"
+    },
+    {
+      "label": "Cache working set",
+      "value": "~50-200 GB",
+      "note": "Enough for tens or hundreds of millions of hot mappings; not the full top 10% of all URLs"
+    },
+    {
+      "label": "Short code length",
+      "value": "7 chars (base62)",
+      "note": "62^7 ≈ 3.5 trillion codes"
+    },
+    {
+      "label": "Bandwidth (egress)",
+      "value": "~1 Gbps",
+      "note": "Mostly 302 redirects and edge responses, very small payloads"
+    }
+  ],
+  "api": [
+    {
+      "method": "POST",
+      "path": "/api/v1/shorten",
+      "description": "Create a short URL from a long URL. Optional custom alias and TTL.",
+      "request": "{ \"longUrl\": \"https://...\", \"alias\"?: \"string\", \"ttlSeconds\"?: number }",
+      "response": "{ \"shortUrl\": \"https://sho.rt/aZ8q1\", \"code\": \"aZ8q1\", \"expiresAt\"?: \"ISO-8601\" }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Client",
+        "  participant LB as Load Balancer",
+        "  participant A as App Server",
+        "  participant ID as ID Generator",
+        "  participant R as Shard Router",
+        "  participant DB as DB Shard",
+        "  participant K as Cache",
+        "  C->>LB: POST /api/v1/shorten",
+        "  LB->>A: forward",
+        "  A->>ID: next id",
+        "  ID-->>A: base62 code",
+        "  A->>R: route hash(code)",
+        "  R-->>A: shard address",
+        "  A->>DB: INSERT (code, long_url)",
+        "  DB-->>A: ok",
+        "  A->>K: SET code -> long_url",
+        "  A-->>C: 200 { shortUrl }"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/{code}",
+      "description": "Resolve a short code and redirect to the long URL. Use 302 by default when click tracking matters; 301 can be offered for permanent, less-trackable links.",
+      "request": "—",
+      "response": "HTTP 302 with Location: <longUrl> by default, or 404 if unknown/expired/deleted.",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Client",
+        "  participant E as CDN Edge",
+        "  participant LB as Load Balancer",
+        "  participant A as App Server",
+        "  participant K as Cache",
+        "  participant R as Shard Router",
+        "  participant DB as DB Shard",
+        "  participant Q as Click Queue",
+        "  C->>E: GET /:code",
+        "  alt hot at edge",
+        "    E-->>C: 302 Location: long_url",
+        "    E-)Q: emit edge click log",
+        "  else miss",
+        "    E->>LB: forward",
+        "    LB->>A: forward",
+        "    A->>K: GET code",
+        "    alt cache hit",
+        "      K-->>A: long_url",
+        "    else cache miss",
+        "      A->>R: route hash(code)",
+        "      R-->>A: shard address",
+        "      A->>DB: SELECT active mapping WHERE code=?",
+        "      DB-->>A: long_url",
+        "      A->>K: SET code -> long_url (TTL <= expiry)",
+        "    end",
+        "    A-->>C: 302 Location: long_url",
+        "    A-)Q: emit origin click event",
+        "  end"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/links/{code}",
+      "description": "Fetch metadata for a short link (owner, createdAt, expiry, click counters).",
+      "request": "—",
+      "response": "{ \"code\": \"...\", \"longUrl\": \"...\", \"createdAt\": \"...\", \"clickCount\": number }",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Client (link owner)",
+        "  participant LB as Load Balancer",
+        "  participant A as App Server",
+        "  participant R as Shard Router",
+        "  participant DB as DB Shard",
+        "  participant K as Cache",
+        "  participant AN as Analytics Store",
+        "  C->>LB: GET /api/v1/links/:code",
+        "  LB->>A: forward (auth required)",
+        "  A->>A: authorize owner",
+        "  A->>R: route hash(code)",
+        "  R-->>A: shard address",
+        "  A->>DB: SELECT urls WHERE code=?",
+        "  alt not found",
+        "    DB-->>A: 0 rows",
+        "    A-->>C: 404",
+        "  else found",
+        "    DB-->>A: link row",
+        "    A->>K: GET counter:code",
+        "    K-->>A: near-real-time clickCount",
+        "    opt deeper history requested",
+        "      A->>AN: aggregate clicks WHERE code=?",
+        "      AN-->>A: counters",
+        "    end",
+        "    A-->>C: 200 { code, longUrl, createdAt, clickCount }",
+        "  end"
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/links/{code}",
+      "description": "Soft-delete a short link (owner-only). Future redirects return 404.",
+      "request": "—",
+      "response": "HTTP 204",
+      "diagram": [
+        "sequenceDiagram",
+        "  participant C as Client (link owner)",
+        "  participant LB as Load Balancer",
+        "  participant A as App Server",
+        "  participant R as Shard Router",
+        "  participant DB as DB Shard",
+        "  participant K as Cache",
+        "  participant E as CDN Edge",
+        "  C->>LB: DELETE /api/v1/links/:code",
+        "  LB->>A: forward (auth required)",
+        "  A->>A: authorize owner",
+        "  A->>R: route hash(code)",
+        "  R-->>A: shard address",
+        "  A->>DB: UPDATE urls SET deleted_at=now(), status='deleted' WHERE code=?",
+        "  alt not found / not owner",
+        "    DB-->>A: 0 rows",
+        "    A-->>C: 404",
+        "  else soft-deleted",
+        "    DB-->>A: ok",
+        "    A->>K: DEL code",
+        "    A-)E: purge /:code",
+        "    A-->>C: 204 No Content",
+        "  end"
+      ]
+    }
+  ],
+  "dataModelDiagram": [
+    "erDiagram",
+    "  users ||--o{ urls : owns",
+    "  users ||--o{ owner_links : lists",
+    "  urls ||--o{ click_events : generates",
+    "  urls {",
+    "    varchar short_code PK",
+    "    text long_url",
+    "    bigint user_id FK",
+    "    varchar status",
+    "    timestamp created_at",
+    "    timestamp updated_at",
+    "    timestamp expires_at",
+    "    timestamp deleted_at",
+    "  }",
+    "  owner_links {",
+    "    bigint user_id FK",
+    "    varchar short_code FK",
+    "    timestamp created_at",
+    "  }",
+    "  click_events {",
+    "    uuid event_id PK",
+    "    varchar short_code FK",
+    "    timestamp ts",
+    "    varchar ip_hash",
+    "    text referrer",
+    "    char country",
+    "  }",
+    "  users {",
+    "    bigint user_id PK",
+    "    varchar email",
+    "    varchar plan",
+    "  }"
+  ],
+  "dataModel": [
+    {
+      "name": "urls",
+      "note": "Primary mapping table. Sharded by short_code hash at scale.",
+      "fields": [
+        {
+          "name": "short_code",
+          "type": "varchar(10) PK",
+          "note": "Base62; primary lookup key"
+        },
+        {
+          "name": "long_url",
+          "type": "text NOT NULL"
+        },
+        {
+          "name": "user_id",
+          "type": "bigint NULL",
+          "note": "Owner; NULL for anonymous"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp"
+        },
+        {
+          "name": "status",
+          "type": "varchar(16)",
+          "note": "active | expired | deleted"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamp NULL"
+        },
+        {
+          "name": "deleted_at",
+          "type": "timestamp NULL",
+          "note": "Soft delete"
+        }
+      ]
+    },
+    {
+      "name": "owner_links",
+      "note": "Secondary index for management pages. It avoids querying every short_code shard when an owner lists their links.",
+      "fields": [
+        {
+          "name": "user_id",
+          "type": "bigint"
+        },
+        {
+          "name": "short_code",
+          "type": "varchar(10)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "click_events (analytics store)",
+      "note": "Append-only; written via the click queue, not the hot redirect path.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "short_code",
+          "type": "varchar(10)",
+          "note": "FK-style; not enforced"
+        },
+        {
+          "name": "ts",
+          "type": "timestamp"
+        },
+        {
+          "name": "ip_hash",
+          "type": "varchar(64)"
+        },
+        {
+          "name": "referrer",
+          "type": "text"
+        },
+        {
+          "name": "country",
+          "type": "char(2)"
+        },
+        {
+          "name": "user_agent",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "name": "users",
+      "fields": [
+        {
+          "name": "user_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "email",
+          "type": "varchar(255) UNIQUE"
+        },
+        {
+          "name": "plan",
+          "type": "varchar(32)"
+        }
+      ]
+    }
+  ],
+  "satisfies": {
+    "functional": [
+      {
+        "requirement": "Shorten a long URL to a unique short code.",
+        "how": "App servers call the ID Generator to mint a base62 code, route the code to the correct mapping shard, then write (short_code -> long_url) with conditional uniqueness. The cache is populated on write so the first redirect is a hit.",
+        "steps": [
+          "add-database",
+          "id-generator",
+          "cache",
+          "sharded-mapping-store"
+        ]
+      },
+      {
+        "requirement": "Redirect a short code back to the original URL with low latency.",
+        "how": "Redirects are served from the CDN edge for hot codes; cold codes fall through to the regional Redis cache, then to one mapping shard. Geo routing sends users to the nearest healthy region.",
+        "steps": [
+          "cache",
+          "sharded-mapping-store",
+          "cdn-and-analytics",
+          "multi-region"
+        ]
+      },
+      {
+        "requirement": "Custom alias (vanity URL) chosen by the user.",
+        "how": "Vanity aliases share the mapping store and go through the same conditional uniqueness check on short_code. In multi-region active-active mode, aliases need home-region routing or a global reservation service.",
+        "steps": [
+          "id-generator",
+          "sharded-mapping-store",
+          "multi-region"
+        ]
+      },
+      {
+        "requirement": "Optional expiration for a short URL.",
+        "how": "expires_at is stored on the row; cache and edge TTLs are set to the lesser of cache policy and remaining lifetime, delete/expiry publishes purge events, and the app returns 404 for expired codes.",
+        "steps": [
+          "add-database",
+          "cache",
+          "cdn-and-analytics"
+        ]
+      },
+      {
+        "requirement": "Click analytics: totals, recent activity, basic breakdowns.",
+        "how": "Edge functions and origin app servers emit click events to the message queue when they observe redirects. A stream processor aggregates per-code counters into Redis and writes events to the analytics store. If a link uses permanent browser-cached 301 redirects, analytics are explicitly approximate.",
+        "steps": [
+          "cdn-and-analytics"
+        ]
+      }
+    ],
+    "nonFunctional": [
+      {
+        "requirement": "High availability for redirects (≥ 99.99%).",
+        "how": "Stateless app servers behind an HA load balancer, multi-AZ Redis with replicas, replicated mapping shards, a CDN that serves hot redirects when origin is degraded, and geo failover across regions.",
+        "steps": [
+          "load-balancer",
+          "cache",
+          "sharded-mapping-store",
+          "cdn-and-analytics",
+          "multi-region"
+        ]
+      },
+      {
+        "requirement": "Low p99 redirect latency (≤ 50 ms at edge; ≤ 150 ms on origin miss).",
+        "how": "Edge resolution at the CDN for hot codes; regional Redis cache for the long tail; single-shard primary-key lookup as last resort. Redirects are usually GET -> 302 so expiration/delete and analytics remain practical.",
+        "steps": [
+          "cache",
+          "sharded-mapping-store",
+          "cdn-and-analytics",
+          "multi-region"
+        ]
+      },
+      {
+        "requirement": "Read-heavy workload (~100:1 read/write).",
+        "how": "Reads are absorbed by the CDN and Redis hot set; misses route to a single shard. Writes go through a dedicated ID generator and shard router, decoupling write throughput from one DB sequence or one database node.",
+        "steps": [
+          "cache",
+          "id-generator",
+          "sharded-mapping-store",
+          "cdn-and-analytics"
+        ]
+      },
+      {
+        "requirement": "Scale to billions of URLs and tens of thousands of redirects/sec.",
+        "how": "App tier scales horizontally behind the load balancer. Cache scales via Redis Cluster sharding. The mapping store shards by short_code hash. ID generation avoids a central DB sequence, and multi-region routing distributes read load globally.",
+        "steps": [
+          "load-balancer",
+          "cache",
+          "id-generator",
+          "sharded-mapping-store",
+          "multi-region"
+        ]
+      },
+      {
+        "requirement": "Durability — a shortened URL must not be lost.",
+        "how": "The mapping is committed to the owning shard before the API returns success. Each shard has replicas, backups, and PITR. Multi-region replication extends durability and availability, while cache and edge entries are treated as rebuildable.",
+        "steps": [
+          "add-database",
+          "sharded-mapping-store",
+          "multi-region"
+        ]
+      },
+      {
+        "requirement": "Eventually consistent analytics; strong consistency for the mapping write.",
+        "how": "Mapping writes are synchronous to the owning shard in the write region; global visibility can be eventual across regions. Analytics are produced from an async event stream and the hot read path never blocks on the analytics pipeline.",
+        "steps": [
+          "add-database",
+          "sharded-mapping-store",
+          "cdn-and-analytics",
+          "multi-region"
+        ]
+      }
+    ]
+  },
+  "followUps": [
+    "How would you support custom (vanity) aliases without collisions?",
+    "How would you prevent abuse (phishing, malware-hosting URLs)?",
+    "How would the system behave during a database failover?",
+    "When would you choose 301 vs 302 redirects, and what does that do to analytics and expiration?",
+    "How would you reshard the mapping store without downtime?",
+    "How would you make redirects work across regions with low latency?",
+    "How would you make custom aliases globally unique in an active-active multi-region design?",
+    "How would you change the design for a 10× growth in QPS?",
+    "How would you support per-user analytics dashboards in near real time?",
+    "How would you implement rate limiting at the edge?"
+  ],
+  "steps": [
+    {
+      "id": "client-server",
+      "title": "1. Client and Server",
+      "description": "Start with the simplest possible architecture: a client (browser or mobile app) talks directly to a single application server. The server handles two operations: creating a short URL from a long URL, and redirecting a short URL back to the long URL.",
+      "decisionPrompt": "Design the smallest API boundary for create and redirect: what data enters each request, what response proves success, and which concerns stay out of this first step?",
+      "concepts": [
+        {
+          "term": "API contract",
+          "definition": "The agreed request and response shape between client and service.",
+          "whyItMatters": "The rest of the design must preserve the create and redirect behavior defined here."
+        },
+        {
+          "term": "HTTP redirect",
+          "definition": "A response such as 301 or 302 that tells the browser to request another URL.",
+          "whyItMatters": "Redirect latency is the main user-visible path for a URL shortener."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client]",
+        "  Server[App Server]",
+        "  Client -->|POST /shorten, GET /:code| Server"
+      ],
+      "highlight": [
+        "Client",
+        "Server"
+      ],
+      "options": [
+        {
+          "name": "In-memory map (prototype)",
+          "pros": [
+            "Fastest way to explain the product behavior",
+            "No database or distributed systems concepts yet",
+            "Good first step for clarifying API semantics"
+          ],
+          "cons": [
+            "All mappings disappear on restart",
+            "Cannot run more than one server safely",
+            "No durability, ownership, expiration, or analytics history"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  Server[App Server\\nin-memory map]",
+            "  Client -->|POST /shorten, GET /:code| Server"
+          ],
+          "highlight": [
+            "Client",
+            "Server"
+          ]
+        },
+        {
+          "name": "Embedded local store",
+          "pros": [
+            "Survives process restart during a prototype demo",
+            "Introduces durable writes without operating a separate DB tier",
+            "Keeps the first architecture visually simple"
+          ],
+          "cons": [
+            "Still a single machine and single failure domain",
+            "Hard to scale horizontally because state is local",
+            "Migration to a real database is unavoidable"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  Server[App Server]",
+            "  LocalDB[(Local Store)]",
+            "  Client -->|POST /shorten, GET /:code| Server",
+            "  Server --> LocalDB"
+          ],
+          "highlight": [
+            "LocalDB"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Short code generation (initial approach)",
+          "points": [
+            "Random 7-char base62 string; reject on collision and retry.",
+            "Alternative: hash(longUrl) and take a prefix — but collisions are likely and identical inputs always map to the same code, which may be undesirable.",
+            "Defer a 'real' ID strategy until DB write throughput becomes a bottleneck."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "All state lives in process memory; restart loses everything.",
+          "mitigation": "Add persistence (next step)."
+        },
+        {
+          "issue": "Single server is a SPOF and caps throughput.",
+          "mitigation": "Add a load balancer + multiple stateless app servers (step 3)."
+        }
+      ],
+      "talkingPoints": [
+        "Clarify HTTP 301 vs 302 — 301 is cacheable by browsers and makes click tracking less accurate. 302 keeps redirect traffic observable but costs more origin/edge work.",
+        "Mention CAP only when persistence enters — right now there is no replication to reason about."
+      ],
+      "flows": [
+        {
+          "name": "Shorten in memory",
+          "note": "The first version proves the API shape but stores the mapping only inside one process.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant A as App Server",
+            "  C->>A: POST /shorten { longUrl }",
+            "  A->>A: generate random code",
+            "  A->>A: store code -> longUrl in memory",
+            "  A-->>C: 200 { shortUrl }"
+          ]
+        },
+        {
+          "name": "Redirect in memory",
+          "note": "Redirects are simple lookups, but restart or multi-server scaling breaks this design.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant A as App Server",
+            "  C->>A: GET /:code",
+            "  A->>A: lookup code in memory",
+            "  alt found",
+            "    A-->>C: 302 Location: long_url",
+            "  else unknown",
+            "    A-->>C: 404",
+            "  end"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "add-database",
+      "title": "2. Add a Database",
+      "description": "The server cannot keep mappings in memory — they must survive restarts. Introduce a database (e.g. PostgreSQL or MySQL) to persist the (short_code → long_url) mapping. Each shorten request inserts a row; each redirect performs a lookup by primary key.",
+      "decisionPrompt": "Choose the durable mapping record and write semantics: what must be committed before returning a short URL, and how do duplicate or retried creates behave?",
+      "concepts": [
+        {
+          "term": "Durable mapping",
+          "definition": "A persistent short_code to long_url record that survives process and machine restarts.",
+          "whyItMatters": "A generated short URL is useless if the mapping can disappear after success is returned."
+        },
+        {
+          "term": "Unique constraint",
+          "definition": "A database rule that prevents two rows from using the same short code.",
+          "whyItMatters": "It is the final guard against code collisions even if application retries race."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client]",
+        "  Server[App Server]",
+        "  DB[(Database)]",
+        "  Client -->|request| Server",
+        "  Server -->|lookup/write| DB"
+      ],
+      "highlight": [
+        "DB"
+      ],
+      "options": [
+        {
+          "name": "SQL database (default)",
+          "pros": [
+            "UNIQUE constraint gives a clean custom-alias collision story",
+            "Transactions keep mapping creation simple and correct",
+            "Operationally familiar for the first durable version"
+          ],
+          "cons": [
+            "A single primary becomes a write bottleneck later",
+            "Manual sharding is needed at very large cardinality",
+            "Cross-region active/active writes are harder"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  Server[App Server]",
+            "  DB[(SQL Database\\nunique short_code)]",
+            "  Client -->|request| Server",
+            "  Server -->|lookup/write| DB"
+          ],
+          "highlight": [
+            "DB"
+          ]
+        },
+        {
+          "name": "Managed key-value store",
+          "pros": [
+            "Horizontal scale and partitioning are built in",
+            "Primary-key lookups match the redirect workload",
+            "Conditional put can enforce no-overwrite semantics"
+          ],
+          "cons": [
+            "Secondary queries and owner dashboards need extra indexes",
+            "Transactional alias flows can be less ergonomic",
+            "Cost and hot-partition behavior need careful modeling"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  Server[App Server]",
+            "  KV[(Managed KV Store\\ncode -> URL)]",
+            "  OwnerIndex[(Owner Index)]",
+            "  Client -->|request| Server",
+            "  Server -->|lookup/write| KV",
+            "  Server -->|owner query| OwnerIndex"
+          ],
+          "highlight": [
+            "KV",
+            "OwnerIndex"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "SQL vs NoSQL",
+          "points": [
+            "Workload is keyed lookups by short_code — both can serve it.",
+            "SQL gives transactions for 'insert if not exists' on custom aliases and simpler operational tooling.",
+            "NoSQL (e.g. DynamoDB, Cassandra) scales horizontally out of the box; consider when single-node DB limits are visible."
+          ]
+        },
+        {
+          "title": "Write path",
+          "points": [
+            "Insert (short_code, long_url, created_at, user_id?). UNIQUE on short_code guarantees no overwrite.",
+            "On collision (race or random duplicate), retry with a new code."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Single DB instance caps writes and reads.",
+          "mitigation": "Add read replicas; later shard by short_code hash."
+        },
+        {
+          "issue": "Every redirect is a DB read.",
+          "mitigation": "Add a cache (step 4)."
+        }
+      ],
+      "talkingPoints": [
+        "Mention an index strategy: primary key on short_code is enough for the hot path; created_at index helps analytics queries.",
+        "Soft delete (deleted_at) vs hard delete — soft delete is safer if links are shared externally."
+      ],
+      "flows": [
+        {
+          "name": "Shorten — minimal write path",
+          "note": "Server generates a code, inserts it; UNIQUE constraint catches collisions and we retry.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant A as App Server",
+            "  participant DB as Database",
+            "  C->>A: POST /shorten { longUrl }",
+            "  loop until success",
+            "    A->>A: generate code",
+            "    A->>DB: INSERT (code, long_url)",
+            "    alt UNIQUE conflict",
+            "      DB-->>A: error",
+            "    else inserted",
+            "      DB-->>A: ok",
+            "    end",
+            "  end",
+            "  A-->>C: 200 { shortUrl }"
+          ]
+        },
+        {
+          "name": "Redirect — minimal read path",
+          "note": "Every redirect is a DB lookup by primary key. Latency = network + index seek.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant A as App Server",
+            "  participant DB as Database",
+            "  C->>A: GET /:code",
+            "  A->>DB: SELECT long_url WHERE code=?",
+            "  alt found and active",
+            "    DB-->>A: long_url",
+            "    A-->>C: 302 Location: long_url",
+            "  else not found, expired, or deleted",
+            "    DB-->>A: 0 active rows",
+            "    A-->>C: 404",
+            "  end"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "load-balancer",
+      "title": "3. Scale Out with a Load Balancer",
+      "description": "A single app server is a single point of failure and a bottleneck. Place a load balancer in front and run multiple stateless app servers behind it. Sessions and state must live in the database (or cache), not in the app process.",
+      "decisionPrompt": "Decide how to scale stateless create and redirect traffic behind a load balancer while keeping redirects correct during server failure.",
+      "concepts": [
+        {
+          "term": "Horizontal scaling",
+          "definition": "Increase capacity by adding more stateless service instances behind a routing layer.",
+          "whyItMatters": "Redirect traffic can grow by adding app servers instead of making one server larger."
+        },
+        {
+          "term": "Health check",
+          "definition": "A periodic probe used by the load balancer to remove unhealthy servers from rotation.",
+          "whyItMatters": "Users should not be routed to a server that cannot resolve or create links."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client]",
+        "  LB[Load Balancer]",
+        "  S1[App Server 1]",
+        "  S2[App Server 2]",
+        "  S3[App Server 3]",
+        "  DB[(Database)]",
+        "  Client -->|create/redirect| LB",
+        "  LB --> S1",
+        "  LB --> S2",
+        "  LB --> S3",
+        "  S1 -->|lookup/write| DB",
+        "  S2 --> DB",
+        "  S3 --> DB"
+      ],
+      "highlight": [
+        "LB",
+        "S1",
+        "S2",
+        "S3"
+      ],
+      "options": [
+        {
+          "name": "Managed HA load balancer (default)",
+          "pros": [
+            "Health checks and failover are built in",
+            "Supports TLS termination, connection reuse, and autoscaling targets",
+            "Keeps app servers stateless and interchangeable"
+          ],
+          "cons": [
+            "Adds one more managed dependency",
+            "Regional LB failure still needs a broader failover plan",
+            "Misconfigured health checks can drain healthy capacity"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  LB[Managed HA Load Balancer]",
+            "  S1[App Server 1]",
+            "  S2[App Server 2]",
+            "  S3[App Server 3]",
+            "  DB[(Database)]",
+            "  Client -->|create/redirect| LB",
+            "  LB --> S1",
+            "  LB --> S2",
+            "  LB --> S3",
+            "  S1 -->|lookup/write| DB",
+            "  S2 --> DB",
+            "  S3 --> DB"
+          ],
+          "highlight": [
+            "LB",
+            "S1",
+            "S2",
+            "S3"
+          ]
+        },
+        {
+          "name": "DNS round-robin",
+          "pros": [
+            "Very simple and cheap",
+            "Removes a dedicated LB from the request path",
+            "Can work for early low-risk deployments"
+          ],
+          "cons": [
+            "Slow client-side failover because DNS is cached",
+            "No request-level health checks or connection balancing",
+            "Harder to do autoscaling and deployments safely"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  DNS[DNS Round Robin]",
+            "  S1[App Server 1]",
+            "  S2[App Server 2]",
+            "  S3[App Server 3]",
+            "  DB[(Database)]",
+            "  Client -->|request| DNS",
+            "  DNS --> S1",
+            "  DNS --> S2",
+            "  DNS --> S3",
+            "  S1 -->|lookup/write| DB",
+            "  S2 --> DB",
+            "  S3 --> DB"
+          ],
+          "highlight": [
+            "DNS",
+            "S1",
+            "S2",
+            "S3"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Load balancing algorithm",
+          "points": [
+            "Round-robin or least-connections is fine — app servers are stateless.",
+            "Avoid IP-hash unless you need stickiness; it complicates capacity changes."
+          ]
+        },
+        {
+          "title": "Health checks",
+          "points": [
+            "LB needs a cheap /healthz that checks process liveness, not DB connectivity (so DB blips don't drain the fleet).",
+            "Deeper /readyz that checks DB can drive deployment readiness gates."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "LB itself becomes the SPOF.",
+          "mitigation": "Use a managed/HA load balancer (ALB/NLB, GCLB) or two LBs behind DNS/anycast."
+        },
+        {
+          "issue": "All servers still hit the same DB.",
+          "mitigation": "Read replicas for redirects; cache for hot keys (next step)."
+        },
+        {
+          "issue": "Cold-start spikes when adding servers under high QPS.",
+          "mitigation": "Pre-warm connection pools; ramp traffic via weighted target groups."
+        }
+      ],
+      "talkingPoints": [
+        "Stateless app servers are a prerequisite for autoscaling — no sticky sessions, no in-memory caches that diverge.",
+        "Mention TLS termination at the LB and HTTP/2 to the backend."
+      ],
+      "flows": [
+        {
+          "name": "Redirect — through the load balancer",
+          "note": "Any app server can serve any redirect because they are stateless. LB picks one via round-robin / least-connections.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant LB as Load Balancer",
+            "  participant A as App Server (one of N)",
+            "  participant DB as Database",
+            "  C->>LB: GET /:code",
+            "  LB->>A: forward (round-robin)",
+            "  A->>DB: SELECT long_url WHERE code=?",
+            "  DB-->>A: long_url",
+            "  A-->>LB: 302 Location: long_url",
+            "  LB-->>C: 302 Location: long_url"
+          ]
+        },
+        {
+          "name": "Health check and drain",
+          "note": "The load balancer must stop sending traffic to a bad process without requiring sticky sessions.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant LB as Load Balancer",
+            "  participant A1 as App Server 1",
+            "  participant A2 as App Server 2",
+            "  participant DB as Database",
+            "  LB->>A1: GET /healthz",
+            "  A1-->>LB: 200 alive",
+            "  LB->>A2: GET /healthz",
+            "  A2-->>LB: timeout",
+            "  LB->>LB: remove A2 from rotation",
+            "  LB->>A1: forward new requests",
+            "  A1->>DB: normal reads/writes"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cache",
+      "title": "4. Add a Cache for Hot URLs",
+      "description": "Redirects vastly outnumber creations, and a small fraction of URLs receive most of the traffic. Add an in-memory cache in front of the database. On a redirect, check the cache first; on a miss, fall back to the database and populate the cache.",
+      "patterns": ["Cache-aside", "TTL expiry"],
+      "traps": [
+        {
+          "trap": "Caching every lookup, including one-off long-tail codes",
+          "why": "Cold codes evict hot ones and inflate memory for keys that are never read again.",
+          "instead": "Cache on read (cache-aside) so only codes that are actually requested populate the cache."
+        },
+        {
+          "trap": "No TTL or invalidation, so deleted/expired links keep redirecting",
+          "why": "The cache serves stale mappings long after the source of truth changed.",
+          "instead": "Set a TTL and invalidate on update/delete; accept a bounded staleness window."
+        }
+      ],
+      "decisionPrompt": "Decide which redirect lookups deserve cache-aside treatment, how misses fall back to the mapping store, and how stale or deleted links are handled.",
+      "concepts": [
+        {
+          "term": "Cache-aside",
+          "definition": "Application code checks cache first, reads the database on miss, then backfills the cache.",
+          "whyItMatters": "Hot redirects avoid database reads while correctness still falls back to the mapping store."
+        },
+        {
+          "term": "TTL",
+          "definition": "A time-to-live after which a cached value expires automatically.",
+          "whyItMatters": "TTL limits stale redirects and bounds cache memory without requiring perfect invalidation."
+        }
+      ],
+      "options": [
+        {
+          "name": "Redis (default)",
+          "pros": [
+            "Rich data types (sorted sets, hashes) help with counters and rate limiting",
+            "Optional persistence (AOF/RDB) avoids cold caches on restart",
+            "Built-in replication and Cluster mode for HA and sharding"
+          ],
+          "cons": [
+            "Single-threaded per shard — large values or slow commands block the loop",
+            "Slightly higher operational complexity than Memcached"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  LB[Load Balancer]",
+            "  S1[App Server 1]",
+            "  S2[App Server 2]",
+            "  S3[App Server 3]",
+            "  Cache[(Redis Cache)]",
+            "  DB[(Database)]",
+            "  Client -->|create/redirect| LB",
+            "  LB --> S1",
+            "  LB --> S2",
+            "  LB --> S3",
+            "  S1 -->|cache lookup| Cache",
+            "  S2 --> Cache",
+            "  S3 --> Cache",
+            "  Cache -->|miss| DB",
+            "  S1 -->|lookup/write| DB",
+            "  S2 --> DB",
+            "  S3 --> DB"
+          ],
+          "highlight": [
+            "Cache"
+          ]
+        },
+        {
+          "name": "Memcached",
+          "pros": [
+            "Multithreaded — handles high concurrent throughput on a single node",
+            "Simple, predictable LRU semantics",
+            "Lower memory overhead per key"
+          ],
+          "cons": [
+            "Key/value only — no data structures, no atomic counters beyond incr",
+            "No persistence — restart wipes the cache (thundering herd risk)",
+            "No native replication; clients shard via consistent hashing"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  LB[Load Balancer]",
+            "  S1[App Server 1]",
+            "  S2[App Server 2]",
+            "  S3[App Server 3]",
+            "  Cache[(Memcached)]",
+            "  DB[(Database)]",
+            "  Client -->|create/redirect| LB",
+            "  LB --> S1",
+            "  LB --> S2",
+            "  LB --> S3",
+            "  S1 -->|cache lookup| Cache",
+            "  S2 --> Cache",
+            "  S3 --> Cache",
+            "  Cache -->|miss| DB",
+            "  S1 -->|lookup/write| DB",
+            "  S2 --> DB",
+            "  S3 --> DB"
+          ],
+          "highlight": [
+            "Cache"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Caching policy",
+          "points": [
+            "Read-through with TTL (e.g. 24h) is the simplest; popular keys auto-refresh.",
+            "Write-through on create populates the cache so the first redirect is a hit.",
+            "Negative caching (404s) prevents the DB from being hammered by scanners."
+          ],
+          "diagram": [
+            "graph TB",
+            "  Req[Lookup short_code]",
+            "  Cache{In cache?}",
+            "  Hit[Return long_url]",
+            "  DB{In database?}",
+            "  Fill[Backfill cache then return]",
+            "  Neg[Cache negative 404 then return 404]",
+            "  Req --> Cache",
+            "  Cache -->|hit| Hit",
+            "  Cache -->|miss| DB",
+            "  DB -->|found| Fill",
+            "  DB -->|not found| Neg"
+          ]
+        },
+        {
+          "title": "Eviction",
+          "points": [
+            "LRU by default; size the cache to fit the measured hot set, not an arbitrary percentage of all keys.",
+            "Avoid 'allkeys-random' unless memory pressure is unavoidable."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Cache stampede on a popular key expiry.",
+          "mitigation": "Probabilistic early expiration or single-flight refresh per app server."
+        },
+        {
+          "issue": "Cache cluster failure causes DB overload.",
+          "mitigation": "Multi-AZ replicas; circuit breaker that falls back to DB with strict rate limits."
+        },
+        {
+          "issue": "Cache/DB staleness after writes.",
+          "mitigation": "Update or invalidate on write; short TTLs as a backstop."
+        }
+      ],
+      "talkingPoints": [
+        "Distinguish read-through, write-through, write-behind, and cache-aside; we use cache-aside + write-through here.",
+        "Memory cost vs hit-rate is a knob — quantify it from capacity numbers, not vibes."
+      ],
+      "flows": [
+        {
+          "name": "Redirect — cache-aside read",
+          "note": "Hot codes are served from the cache; the DB is touched only on misses, and we backfill the cache on the way out.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant LB as Load Balancer",
+            "  participant A as App Server",
+            "  participant K as Cache",
+            "  participant DB as Database",
+            "  C->>LB: GET /:code",
+            "  LB->>A: forward",
+            "  A->>K: GET code",
+            "  alt cache hit",
+            "    K-->>A: long_url",
+            "  else cache miss",
+            "    A->>DB: SELECT long_url WHERE code=? AND active",
+            "    DB-->>A: long_url",
+            "    A->>K: SET code -> long_url (TTL <= expiry)",
+            "  end",
+            "  A-->>C: 302 Location: long_url"
+          ]
+        },
+        {
+          "name": "Shorten — write-through populate",
+          "note": "Inserting into the cache on create means the first redirect is already a hit, avoiding a cold lookup.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant A as App Server",
+            "  participant DB as Database",
+            "  participant K as Cache",
+            "  C->>A: POST /shorten { longUrl }",
+            "  A->>A: generate code",
+            "  A->>DB: INSERT (code, long_url)",
+            "  DB-->>A: ok",
+            "  A->>K: SET code -> long_url (TTL)",
+            "  A-->>C: 200 { shortUrl }"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "id-generator",
+      "title": "5. Dedicated ID Generation Service",
+      "description": "Generating short codes by inserting and reading back an auto-increment ID couples write throughput to the database. Introduce a separate ID generation service (e.g. a counter service, Snowflake-style IDs, or a pre-allocated ID range) so that app servers can mint short codes without contending on a single DB sequence.",
+      "decisionPrompt": "Choose a short-code generation strategy that avoids collisions at high write volume without putting every create request through one bottleneck.",
+      "concepts": [
+        {
+          "term": "Collision avoidance",
+          "definition": "A strategy that prevents two create requests from receiving the same short code.",
+          "whyItMatters": "A collision would send one short URL to the wrong destination."
+        },
+        {
+          "term": "Base62 encoding",
+          "definition": "Represent an integer using digits, lowercase letters, and uppercase letters.",
+          "whyItMatters": "It creates compact, URL-safe codes from numeric IDs."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client]",
+        "  LB[Load Balancer]",
+        "  S1[App Server 1]",
+        "  S2[App Server 2]",
+        "  S3[App Server 3]",
+        "  IDGen[ID Generator]",
+        "  Cache[(Redis Cache)]",
+        "  DB[(Database)]",
+        "  Client -->|create/redirect| LB",
+        "  LB --> S1",
+        "  LB --> S2",
+        "  LB --> S3",
+        "  S1 -->|allocate code| IDGen",
+        "  S2 --> IDGen",
+        "  S3 --> IDGen",
+        "  S1 -->|cache lookup| Cache",
+        "  S2 --> Cache",
+        "  S3 --> Cache",
+        "  Cache -->|miss| DB",
+        "  S1 -->|lookup/write| DB",
+        "  S2 --> DB",
+        "  S3 --> DB"
+      ],
+      "highlight": [
+        "IDGen"
+      ],
+      "options": [
+        {
+          "name": "Range allocation (default)",
+          "pros": [
+            "App servers can mint IDs locally after claiming a block",
+            "Short ID-generator outages do not stop creates immediately",
+            "Produces compact monotonic integers that encode cleanly to base62"
+          ],
+          "cons": [
+            "Some IDs are wasted when an app server dies with an unused block",
+            "The range allocator is still a coordination dependency",
+            "Predictable codes may need scrambling if enumeration is a concern"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  LB[Load Balancer]",
+            "  S1[App Server 1\\nlocal ID range]",
+            "  S2[App Server 2\\nlocal ID range]",
+            "  S3[App Server 3\\nlocal ID range]",
+            "  IDGen[Range Allocator]",
+            "  Cache[(Redis Cache)]",
+            "  DB[(Database)]",
+            "  Client -->|create/redirect| LB",
+            "  LB --> S1",
+            "  LB --> S2",
+            "  LB --> S3",
+            "  S1 -->|allocate code| IDGen",
+            "  S2 --> IDGen",
+            "  S3 --> IDGen",
+            "  S1 -->|cache lookup| Cache",
+            "  S2 --> Cache",
+            "  S3 --> Cache",
+            "  S1 -->|lookup/write| DB",
+            "  S2 --> DB",
+            "  S3 --> DB"
+          ],
+          "highlight": [
+            "IDGen"
+          ]
+        },
+        {
+          "name": "Snowflake-style IDs",
+          "pros": [
+            "No central counter on the hot path",
+            "Works naturally across many app servers and regions",
+            "IDs carry time and node information for debugging"
+          ],
+          "cons": [
+            "Clock rollback must stop ID issuance or use a fallback sequence",
+            "IDs are longer than a simple counter if encoded directly",
+            "Machine-id assignment becomes operationally important"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  LB[Load Balancer]",
+            "  S1[App Server 1\\nSnowflake worker]",
+            "  S2[App Server 2\\nSnowflake worker]",
+            "  S3[App Server 3\\nSnowflake worker]",
+            "  Clock[(Clock Sync)]",
+            "  Cache[(Redis Cache)]",
+            "  DB[(Database)]",
+            "  Client -->|create/redirect| LB",
+            "  LB --> S1",
+            "  LB --> S2",
+            "  LB --> S3",
+            "  S1 -->|allocate code| Clock",
+            "  S2 --> Clock",
+            "  S3 --> Clock",
+            "  S1 -->|cache lookup| Cache",
+            "  S2 --> Cache",
+            "  S3 --> Cache",
+            "  S1 -->|lookup/write| DB",
+            "  S2 --> DB",
+            "  S3 --> DB"
+          ],
+          "highlight": [
+            "Clock"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "ID strategies",
+          "points": [
+            "Range allocation: each app server claims a block of IDs (e.g. 10,000) from a central counter. Encodes to base62. Coordination is cheap.",
+            "Snowflake-style: 41-bit timestamp + 10-bit machine id + 12-bit sequence. No central counter; clocks must be reasonably synced.",
+            "UUID + truncate: simplest, but collisions become non-trivial as cardinality grows."
+          ]
+        },
+        {
+          "title": "Custom aliases coexisting with generated codes",
+          "points": [
+            "Use the same urls table; vanity aliases go through a UNIQUE check.",
+            "Reserve a separate namespace prefix to avoid collision with generated codes (e.g. all generated codes start with a lowercase letter)."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "ID generator itself becomes a SPOF.",
+          "mitigation": "Run replicas; for range allocation, app servers can survive short outages from their reserved block."
+        },
+        {
+          "issue": "Clock skew on Snowflake-style nodes can produce duplicates.",
+          "mitigation": "NTP discipline; refuse to issue IDs when clock moves backwards."
+        }
+      ],
+      "talkingPoints": [
+        "Choosing base62 over base64 — base62 is URL-safe without escaping.",
+        "Discuss code length vs collision probability vs guessability (security)."
+      ],
+      "flows": [
+        {
+          "name": "Shorten — mint code via ID Generator",
+          "note": "The DB no longer owns ID generation; app servers ask the generator for the next code, decoupling write throughput from a single DB sequence.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant LB as Load Balancer",
+            "  participant A as App Server",
+            "  participant ID as ID Generator",
+            "  participant DB as Database",
+            "  participant K as Cache",
+            "  C->>LB: POST /shorten { longUrl }",
+            "  LB->>A: forward",
+            "  A->>ID: next id",
+            "  ID-->>A: base62 code",
+            "  A->>DB: INSERT (code, long_url)",
+            "  DB-->>A: ok",
+            "  A->>K: SET code -> long_url",
+            "  A-->>C: 200 { shortUrl }"
+          ]
+        },
+        {
+          "name": "Reserve an ID range",
+          "note": "With range allocation the generator is not called for every create; app servers refill only when their local block is almost empty.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant A as App Server",
+            "  participant ID as Range Allocator",
+            "  participant DB as Allocator Store",
+            "  A->>ID: reserve 10,000 IDs",
+            "  ID->>DB: atomic increment counter by 10,000",
+            "  DB-->>ID: start/end range",
+            "  ID-->>A: range [n, n+9999]",
+            "  loop per create",
+            "    A->>A: take next local ID and base62 encode",
+            "  end"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sharded-mapping-store",
+      "title": "6. Shard the Mapping Store",
+      "description": "At the target scale, the mapping store cannot be treated as one database. With roughly 150B URLs over 5 years, the raw mapping data alone is about 75 TB before indexes and replicas. Shard by short_code hash so redirects and creates distribute across many storage partitions.",
+      "decisionPrompt": "Pick the shard key and routing model for the mapping store: optimize for redirect lookup first, then explain the cost for analytics and admin queries.",
+      "concepts": [
+        {
+          "term": "Sharding",
+          "definition": "Split one logical table across multiple database partitions.",
+          "whyItMatters": "The mapping store can grow beyond the capacity of one database node."
+        },
+        {
+          "term": "Shard key",
+          "definition": "The value used to choose which shard owns a record.",
+          "whyItMatters": "For redirects, short_code is the natural key because every lookup starts with it."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client]",
+        "  LB[Load Balancer]",
+        "  App[App Server]",
+        "  IDGen[ID Generator]",
+        "  Cache[(Redis Cluster)]",
+        "  Router[Shard Router]",
+        "  DB1[(DB Shard 1)]",
+        "  DB2[(DB Shard 2)]",
+        "  DB3[(DB Shard 3)]",
+        "  Client -->|create/redirect| LB",
+        "  LB --> App",
+        "  App -->|allocate code| IDGen",
+        "  App -->|cache lookup| Cache",
+        "  Cache -->|miss| Router",
+        "  App -->|route code| Router",
+        "  Router -->|shard key| DB1",
+        "  Router --> DB2",
+        "  Router --> DB3"
+      ],
+      "highlight": [
+        "Router",
+        "DB1",
+        "DB2",
+        "DB3"
+      ],
+      "options": [
+        {
+          "name": "Hash-sharded SQL (default)",
+          "pros": [
+            "Preserves SQL constraints and transactional alias creation within a shard",
+            "Primary-key redirect lookups route to exactly one shard",
+            "Can start from the earlier SQL design and split gradually"
+          ],
+          "cons": [
+            "Operationally heavy: resharding, backups, schema changes, and failover are harder",
+            "Owner dashboards need a separate owner index or fanout query",
+            "Cross-region active/active writes need extra conflict planning"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  LB[Load Balancer]",
+            "  App[App Server]",
+            "  IDGen[ID Generator]",
+            "  Cache[(Redis Cluster)]",
+            "  Router[Shard Router\\nhash short_code]",
+            "  DB1[(SQL Shard 1)]",
+            "  DB2[(SQL Shard 2)]",
+            "  DB3[(SQL Shard 3)]",
+            "  Client -->|create/redirect| LB",
+            "  LB --> App",
+            "  App -->|allocate code| IDGen",
+            "  App -->|cache lookup| Cache",
+            "  Cache -->|miss| Router",
+            "  App -->|route code| Router",
+            "  Router -->|shard key| DB1",
+            "  Router --> DB2",
+            "  Router --> DB3"
+          ],
+          "highlight": [
+            "Router",
+            "DB1",
+            "DB2",
+            "DB3"
+          ]
+        },
+        {
+          "name": "Managed partitioned KV",
+          "pros": [
+            "Partitioning, replication, and elastic throughput are built into the storage service",
+            "Redirects are simple code-key lookups",
+            "Conditional writes can protect custom aliases"
+          ],
+          "cons": [
+            "Cost can be high at 100k+ reads/sec and large retention",
+            "Hot keys and hot partitions still need cache and edge offload",
+            "Relational owner queries require secondary indexes or separate stores"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  LB[Load Balancer]",
+            "  App[App Server]",
+            "  IDGen[ID Generator]",
+            "  Cache[(Redis Cluster)]",
+            "  KV[(Managed Partitioned KV Store)]",
+            "  OwnerIndex[(Owner / Metadata Index)]",
+            "  Client -->|create/redirect| LB",
+            "  LB --> App",
+            "  App -->|allocate code| IDGen",
+            "  App -->|cache lookup| Cache",
+            "  Cache -->|miss| KV",
+            "  App -->|lookup/write| KV",
+            "  App -->|owner query| OwnerIndex"
+          ],
+          "highlight": [
+            "KV",
+            "OwnerIndex"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Shard key",
+          "points": [
+            "Use hash(short_code) for even distribution because the redirect path always has the code.",
+            "Do not shard by user_id for the mapping table; celebrity users can become hot and redirects do not know owner_id before lookup.",
+            "Keep a separate owner index for management pages such as listing a user's links."
+          ]
+        },
+        {
+          "title": "Resharding",
+          "points": [
+            "Use virtual buckets so moving capacity means remapping buckets, not every individual key.",
+            "During migration, route reads to old and new locations until the bucket is fully copied.",
+            "Writes for a moving bucket must be serialized or dual-written with a clear cutover marker."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "One hot short code can overload a cache shard even if DB shards are balanced.",
+          "mitigation": "Serve the hottest codes at the edge and replicate hot cache keys."
+        },
+        {
+          "issue": "Shard-router mistakes can create lost writes or split-brain reads.",
+          "mitigation": "Version the routing table and roll it out through a controlled config service."
+        },
+        {
+          "issue": "Owner dashboards need queries that do not match the redirect shard key.",
+          "mitigation": "Maintain an owner_id -> short_code index populated on create."
+        }
+      ],
+      "talkingPoints": [
+        "A 7-character base62 namespace has about 3.5T possible codes, enough for the stated 150B mappings with room, but 8 characters buys a much longer runway.",
+        "Sharding is required by storage size and operational limits, not by redirect QPS alone, because cache and edge absorb many reads."
+      ],
+      "flows": [
+        {
+          "name": "Redirect through shard router",
+          "note": "Cache misses route to exactly one database shard by short_code hash.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant A as App Server",
+            "  participant K as Cache",
+            "  participant R as Shard Router",
+            "  participant DB as DB Shard",
+            "  C->>A: GET /:code",
+            "  A->>K: GET code",
+            "  alt cache hit",
+            "    K-->>A: long_url",
+            "  else cache miss",
+            "    A->>R: route hash(code)",
+            "    R-->>A: shard address",
+            "    A->>DB: SELECT active mapping WHERE code=?",
+            "    DB-->>A: long_url",
+            "    A->>K: SET code -> long_url",
+            "  end",
+            "  A-->>C: 302 Location: long_url"
+          ]
+        },
+        {
+          "name": "Create mapping on one shard",
+          "note": "The generated code determines the write shard; custom aliases use the same conditional insert path.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant A as App Server",
+            "  participant ID as ID Generator",
+            "  participant R as Shard Router",
+            "  participant DB as DB Shard",
+            "  participant O as Owner Index",
+            "  C->>A: POST /shorten",
+            "  A->>ID: next code",
+            "  ID-->>A: base62 code",
+            "  A->>R: route hash(code)",
+            "  R-->>A: shard address",
+            "  A->>DB: INSERT IF NOT EXISTS code -> URL",
+            "  DB-->>A: committed",
+            "  A->>O: add owner_id -> code",
+            "  A-->>C: 200 { shortUrl }"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cdn-and-analytics",
+      "title": "7. CDN, Analytics, and Async Pipeline",
+      "description": "Push redirects to the edge using a CDN that can resolve hot codes without round-tripping to the origin. Capture every redirect as a click event and send it through a message queue (e.g. Kafka) to an analytics store, decoupling the hot read path from analytics ingestion and aggregation.",
+      "decisionPrompt": "Draw the synchronous redirect path and the asynchronous analytics path: what must complete before the 301 or 302 response, and what can be delayed or dropped?",
+      "concepts": [
+        {
+          "term": "Asynchronous analytics",
+          "definition": "Record click events through a queue or stream after the redirect response is served.",
+          "whyItMatters": "Analytics should not add latency or reduce availability of the redirect path."
+        },
+        {
+          "term": "Edge caching",
+          "definition": "Serve frequently requested redirect data from infrastructure close to users.",
+          "whyItMatters": "It reduces origin load and improves latency for popular links."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client]",
+        "  CDN[CDN / Edge]",
+        "  LB[Load Balancer]",
+        "  App[App Servers]",
+        "  IDGen[ID Generator]",
+        "  Cache[(Redis Cluster)]",
+        "  Router[Shard Router]",
+        "  Shards[(DB Shards)]",
+        "  Queue[[Click Event Queue]]",
+        "  Analytics[(Analytics Store)]",
+        "  Client -->|redirect| CDN",
+        "  CDN -->|miss| LB",
+        "  CDN -->|edge logs| Queue",
+        "  LB --> App",
+        "  App -->|allocate code| IDGen",
+        "  App -->|cache lookup| Cache",
+        "  Cache -->|miss| Router",
+        "  App -->|route code| Router",
+        "  Router -->|shard key| Shards",
+        "  App --> Queue",
+        "  Queue --> Analytics"
+      ],
+      "highlight": [
+        "CDN",
+        "Queue",
+        "Analytics"
+      ],
+      "options": [
+        {
+          "name": "302 + edge logs (default)",
+          "pros": [
+            "Keeps click analytics reasonably accurate even when hot redirects terminate at the edge",
+            "Avoids long-lived browser caching for links that may expire or be deleted",
+            "Still offloads origin for hot codes"
+          ],
+          "cons": [
+            "More repeat traffic than permanent browser-cached 301 redirects",
+            "Requires CDN/edge logging integration with the analytics pipeline",
+            "Analytics remain eventually consistent and can drop during queue outages"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  CDN[CDN / Edge\\n302 + click log]",
+            "  LB[Load Balancer]",
+            "  App[App Servers]",
+            "  Cache[(Redis Cluster)]",
+            "  Router[Shard Router]",
+            "  Shards[(DB Shards)]",
+            "  Queue[[Click Event Queue]]",
+            "  Analytics[(Analytics Store)]",
+            "  Client -->|redirect| CDN",
+            "  CDN -->|edge hit| Client",
+            "  CDN -->|miss| LB",
+            "  CDN -->|log click| Queue",
+            "  LB --> App",
+            "  App -->|cache lookup| Cache",
+            "  Cache -->|miss| Router",
+            "  Router -->|shard key| Shards",
+            "  App --> Queue",
+            "  Queue -->|events| Analytics"
+          ],
+          "highlight": [
+            "CDN",
+            "Queue",
+            "Analytics"
+          ]
+        },
+        {
+          "name": "301 for permanent links",
+          "pros": [
+            "Lowest repeat traffic because browsers and intermediaries cache aggressively",
+            "Good for links that never expire and do not need exact click counts",
+            "Reduces cost for extremely hot links"
+          ],
+          "cons": [
+            "Click counts become approximate because many repeat clicks never reach edge or origin",
+            "Deletes and expiration are hard to enforce once clients cache permanently",
+            "Bad fit for vanity links that owners may edit"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  BrowserCache[(Browser Cache)]",
+            "  CDN[CDN / Edge\\n301 permanent]",
+            "  App[App Servers]",
+            "  Queue[[Best-effort Click Logs]]",
+            "  Analytics[(Analytics Store)]",
+            "  Client -->|cached redirect| BrowserCache",
+            "  BrowserCache -->|miss| CDN",
+            "  CDN -->|301| BrowserCache",
+            "  CDN -->|origin miss| App",
+            "  CDN -->|log click| Queue",
+            "  Queue -->|events| Analytics"
+          ],
+          "highlight": [
+            "BrowserCache"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Edge resolution",
+          "points": [
+            "CDN can do the redirect itself for hot codes via edge functions (Cloudflare Workers, Lambda@Edge).",
+            "Origin still owns invalidation: on update/delete/expiry, publish a purge event and keep edge TTL bounded.",
+            "Long-tail (cold) codes fall through to origin; cache them in the regional Redis cluster."
+          ]
+        },
+        {
+          "title": "Analytics pipeline",
+          "points": [
+            "Edge functions and app servers emit click events to Kafka (or Kinesis/Pub-Sub). Hot path doesn't wait on the write.",
+            "Stream processor (Flink/Spark) aggregates per-code counters and writes to OLAP (ClickHouse, BigQuery, Redshift).",
+            "Per-code counter in Redis gives near-real-time totals; OLAP gives historical/dimensional queries."
+          ]
+        },
+        {
+          "title": "Caching contract",
+          "points": [
+            "Use 302 as the default if links can expire, be deleted, or need click analytics.",
+            "Offer 301 only as an explicit permanent-link mode with approximate analytics.",
+            "Set edge TTL to the lesser of cache policy and remaining link lifetime."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Queue backpressure stalls app servers.",
+          "mitigation": "Async send with a small in-process buffer; drop oldest analytics on sustained outage (analytics is best-effort)."
+        },
+        {
+          "issue": "Edge cache poisoning (wrong/expired URL cached).",
+          "mitigation": "Signed cache keys; purge-on-write; short TTLs at the edge for mutable items."
+        },
+        {
+          "issue": "Hot-key concentration overloads one cache shard.",
+          "mitigation": "Per-shard request coalescing; promote to multiple replicas; serve from the LB layer via in-memory micro-cache."
+        }
+      ],
+      "talkingPoints": [
+        "Make the analytics tradeoff explicit: edge and browser caching reduce cost but make click counts eventually consistent and sometimes approximate.",
+        "Discuss the consistency contract: a freshly-created link may take a few hundred ms to be visible at every edge, but origin reads should work immediately."
+      ],
+      "flows": [
+        {
+          "name": "Redirect — edge-resolved (hot path)",
+          "note": "Hot codes are served entirely from the CDN, never reaching the origin. The bulk of redirect traffic terminates here.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant E as Edge / CDN",
+            "  participant Q as Event Queue",
+            "  C->>E: GET /:code",
+            "  E-->>C: 302 Location: long_url",
+            "  E-)Q: emit edge click log"
+          ]
+        },
+        {
+          "name": "Redirect — edge miss, origin + click event",
+          "note": "On a CDN miss the request falls through to the origin, which resolves via cache/DB and emits a click event asynchronously. The hot read path never waits on the queue.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant E as Edge / CDN",
+            "  participant LB as Load Balancer",
+            "  participant A as App Server",
+            "  participant K as Cache",
+            "  participant R as Shard Router",
+            "  participant DB as DB Shard",
+            "  participant Q as Event Queue",
+            "  C->>E: GET /:code",
+            "  E->>LB: miss, forward",
+            "  LB->>A: forward",
+            "  A->>K: GET code",
+            "  alt cache hit",
+            "    K-->>A: long_url",
+            "  else cache miss",
+            "    A->>R: route hash(code)",
+            "    R-->>A: shard address",
+            "    A->>DB: SELECT active mapping WHERE code=?",
+            "    DB-->>A: long_url",
+            "    A->>K: SET code -> long_url (TTL <= expiry)",
+            "  end",
+            "  A-->>C: 302 Location: long_url",
+            "  A-)Q: emit origin click event"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "multi-region",
+      "title": "8. Multi-Region Redirects and Replication",
+      "description": "Redirect traffic should stay available and low-latency even during a regional outage. Run the edge, app tier, cache, and mapping shards in multiple regions. Choose an explicit write model: active-passive is simpler; active-active gives lower create latency but needs conflict-free ID allocation and replication lag handling.",
+      "decisionPrompt": "Choose a multi-region read/write model for redirects: keep global reads fast while making link creation, replication lag, and regional failover explicit.",
+      "concepts": [
+        {
+          "term": "Replication lag",
+          "definition": "The delay between a write in one region and visibility in another region.",
+          "whyItMatters": "A newly created link may not resolve everywhere immediately unless the design handles lag."
+        },
+        {
+          "term": "Active-active",
+          "definition": "Multiple regions accept traffic, and often writes, at the same time.",
+          "whyItMatters": "It improves global latency and availability but makes conflict handling more explicit."
+        }
+      ],
+      "diagram": [
+        "graph TB",
+        "  Client[Client]",
+        "  Geo[GeoDNS / Anycast]",
+        "  EdgeA[Region A Edge]",
+        "  EdgeB[Region B Edge]",
+        "  AppA[Region A Apps]",
+        "  AppB[Region B Apps]",
+        "  CacheA[(Region A Cache)]",
+        "  CacheB[(Region B Cache)]",
+        "  DBA[(Region A DB Shards)]",
+        "  DBB[(Region B DB Shards)]",
+        "  Rep[[Replication Stream]]",
+        "  Queue[[Regional Click Queues]]",
+        "  Analytics[(Global Analytics)]",
+        "  Client -->|nearest region| Geo",
+        "  Geo --> EdgeA",
+        "  Geo --> EdgeB",
+        "  EdgeA --> AppA",
+        "  EdgeB --> AppB",
+        "  AppA -->|cache lookup| CacheA",
+        "  AppB --> CacheB",
+        "  CacheA -->|miss| DBA",
+        "  CacheB --> DBB",
+        "  DBA -->|replicate| Rep",
+        "  Rep -->|replicate| DBB",
+        "  DBB --> Rep",
+        "  Rep --> DBA",
+        "  EdgeA --> Queue",
+        "  EdgeB --> Queue",
+        "  Queue --> Analytics"
+      ],
+      "highlight": [
+        "Geo",
+        "EdgeA",
+        "EdgeB",
+        "AppA",
+        "AppB",
+        "Rep"
+      ],
+      "options": [
+        {
+          "name": "Active-passive writes",
+          "pros": [
+            "Simplest correctness model for creates and custom aliases",
+            "One primary region owns mapping writes, so no cross-region conflict resolution",
+            "Read replicas in other regions still improve redirect latency"
+          ],
+          "cons": [
+            "Create requests from far regions pay cross-region latency",
+            "Failover requires promoting a standby region safely",
+            "Regional write outage can pause new link creation"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  Geo[GeoDNS / Anycast]",
+            "  EdgeA[Primary Region Edge]",
+            "  EdgeB[Standby Region Edge]",
+            "  AppA[Primary Apps]",
+            "  AppB[Standby Apps]",
+            "  Primary[(Primary DB Shards)]",
+            "  Replica[(Replica DB Shards)]",
+            "  Rep[[Async Replication]]",
+            "  Client -->|nearest region| Geo",
+            "  Geo --> EdgeA",
+            "  Geo --> EdgeB",
+            "  EdgeA --> AppA",
+            "  EdgeB --> AppB",
+            "  AppA -->|lookup/write| Primary",
+            "  AppB -->|lookup/write| Replica",
+            "  Primary -->|replicate| Rep",
+            "  Rep -->|replicate| Replica"
+          ],
+          "highlight": [
+            "Geo",
+            "EdgeA",
+            "EdgeB",
+            "Rep"
+          ]
+        },
+        {
+          "name": "Active-active writes",
+          "pros": [
+            "Low create latency in every region",
+            "Regional write outage affects only local capacity if traffic can fail over",
+            "Pairs well with region-scoped ID prefixes or Snowflake worker bits"
+          ],
+          "cons": [
+            "Custom aliases need global uniqueness checks or home-region routing",
+            "Replication lag means a brand-new link may miss in another region briefly",
+            "Conflict handling, replay, and observability are much harder"
+          ],
+          "diagram": [
+            "graph TB",
+            "  Client[Client]",
+            "  Geo[GeoDNS / Anycast]",
+            "  AppA[Region A Apps]",
+            "  AppB[Region B Apps]",
+            "  IDA[Region A ID Prefix]",
+            "  IDB[Region B ID Prefix]",
+            "  DBA[(Region A DB Shards)]",
+            "  DBB[(Region B DB Shards)]",
+            "  Rep[[Bi-directional Replication]]",
+            "  Client -->|nearest region| Geo",
+            "  Geo --> AppA",
+            "  Geo --> AppB",
+            "  AppA -->|allocate code| IDA",
+            "  AppB --> IDB",
+            "  AppA -->|lookup/write| DBA",
+            "  AppB --> DBB",
+            "  DBA -->|replicate| Rep",
+            "  DBB --> Rep",
+            "  Rep -->|replicate| DBA",
+            "  Rep --> DBB"
+          ],
+          "highlight": [
+            "IDA",
+            "IDB",
+            "Rep"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Read path",
+          "points": [
+            "GeoDNS or anycast routes users to the nearest healthy edge.",
+            "Hot links are served at the edge; regional cache and DB shards cover misses.",
+            "If a region is unhealthy, traffic shifts to another region with warm enough cache capacity."
+          ]
+        },
+        {
+          "title": "Write path",
+          "points": [
+            "Generated codes can be made conflict-free with region-scoped ID ranges or Snowflake worker bits.",
+            "Custom aliases are harder: either route each alias to a home region or use a globally consistent uniqueness check.",
+            "A new link may not be visible in every region until replication catches up; origin can route misses to the write home region during that window."
+          ]
+        }
+      ],
+      "bottlenecks": [
+        {
+          "issue": "Replication lag causes a freshly-created link to 404 in another region.",
+          "mitigation": "Return the home region in metadata and route early misses there; keep edge TTLs short during the first minutes."
+        },
+        {
+          "issue": "Custom alias conflicts across regions.",
+          "mitigation": "Use home-region routing or a global strongly consistent alias reservation service."
+        },
+        {
+          "issue": "Failover can overload the surviving region.",
+          "mitigation": "Keep spare capacity, shed low-priority analytics, and pre-warm caches for globally hot links."
+        }
+      ],
+      "talkingPoints": [
+        "Do not say active-active casually; explain how IDs, aliases, replication lag, and deletes behave.",
+        "The system can promise immediate consistency in the write region and eventual global visibility."
+      ],
+      "flows": [
+        {
+          "name": "Create in home region",
+          "note": "Generated codes avoid conflicts by using region-scoped allocation; replication makes the mapping visible globally.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant G as Geo Router",
+            "  participant A as Region A App",
+            "  participant ID as Region A ID Generator",
+            "  participant DB as Region A DB Shard",
+            "  participant R as Replication Stream",
+            "  participant B as Region B DB Shard",
+            "  C->>G: POST /shorten",
+            "  G->>A: route to nearest healthy region",
+            "  A->>ID: next region-scoped code",
+            "  ID-->>A: code",
+            "  A->>DB: INSERT code -> long_url",
+            "  DB-->>A: committed",
+            "  DB-)R: publish mapping change",
+            "  R-)B: replicate mapping",
+            "  A-->>C: 200 { shortUrl, homeRegion: A }"
+          ]
+        },
+        {
+          "name": "Regional failover redirect",
+          "note": "Reads fail over through the edge/geo layer; cold misses may route to the replicated shard in the surviving region.",
+          "diagram": [
+            "sequenceDiagram",
+            "  participant C as Client",
+            "  participant G as Geo Router",
+            "  participant EA as Region A Edge",
+            "  participant EB as Region B Edge",
+            "  participant B as Region B App",
+            "  participant K as Region B Cache",
+            "  participant DB as Region B DB Shard",
+            "  C->>G: GET /:code",
+            "  G->>EA: try nearest region",
+            "  EA-->>G: unhealthy",
+            "  G->>EB: route to healthy region",
+            "  EB->>B: edge miss",
+            "  B->>K: GET code",
+            "  alt cache hit",
+            "    K-->>B: long_url",
+            "  else cache miss",
+            "    B->>DB: SELECT active mapping WHERE code=?",
+            "    DB-->>B: long_url",
+            "    B->>K: SET code -> long_url",
+            "  end",
+            "  B-->>C: 302 Location: long_url"
+          ]
+        }
+      ]
+    }
+  ],
+  "finalDesign": {
+    "title": "Final Design",
+    "description": "End-to-end URL shortener architecture: public create and redirect APIs, stateless app servers, cache-aside hot redirects, dedicated ID generation, sharded mapping storage, CDN-assisted redirects, asynchronous analytics, replication, and observability.",
+    "diagram": [
+      "graph TB",
+      "  Client[Client / Browser]",
+      "  Geo[GeoDNS / Traffic Manager]",
+      "  CDN[CDN / Edge Redirect Cache]",
+      "  LB[Load Balancer]",
+      "  App[Stateless App Servers]",
+      "  IDGen[ID Generator]",
+      "  Cache([Redirect Cache])",
+      "  Router[Shard Router by short_code]",
+      "  DB1[(Mapping Shard 1)]",
+      "  DB2[(Mapping Shard 2)]",
+      "  DB3[(Mapping Shard N)]",
+      "  OwnerIndex[(Owner / Admin Index)]",
+      "  Queue[[Click Event Queue]]",
+      "  Analytics[(Analytics Store)]",
+      "  Rep[Cross-Region Replication]",
+      "  Metrics[Metrics / Alerts]",
+      "  Client -->|nearest edge| Geo",
+      "  Geo -->|redirect reads| CDN",
+      "  CDN -->|miss or create| LB",
+      "  LB -->|route| App",
+      "  App -->|allocate code| IDGen",
+      "  App -->|cache lookup| Cache",
+      "  Cache -->|miss| Router",
+      "  App -->|route code| Router",
+      "  Router -->|shard key| DB1",
+      "  Router -->|shard key| DB2",
+      "  Router -->|shard key| DB3",
+      "  App -->|owner queries| OwnerIndex",
+      "  CDN -->|log click| Queue",
+      "  App -->|log click| Queue",
+      "  Queue -->|events| Analytics",
+      "  DB1 -->|replicate| Rep",
+      "  Rep -->|regional copy| DB2",
+      "  App -->|health + latency| Metrics"
+    ],
+    "highlight": [],
+    "options": [
+      {
+        "name": "Recommended multi-region redirect design",
+        "pros": [
+          "Redirect reads are fast through CDN and cache layers",
+          "Create path remains strongly owned by app + mapping store",
+          "Click analytics are off the critical redirect path",
+          "Sharding by short_code keeps lookups direct"
+        ],
+        "cons": [
+          "Requires cache invalidation and replication-lag handling",
+          "Owner/admin queries need a secondary index",
+          "Multi-region writes add conflict and ID-space planning"
+        ],
+        "diagram": [
+          "graph TB",
+          "  Client[Client / Browser]",
+          "  Geo[GeoDNS / Traffic Manager]",
+          "  CDN[CDN / Edge Redirect Cache]",
+          "  LB[Load Balancer]",
+          "  App[Stateless App Servers]",
+          "  IDGen[ID Generator]",
+          "  Cache([Redirect Cache])",
+          "  Router[Shard Router by short_code]",
+          "  DB1[(Mapping Shard 1)]",
+          "  DB2[(Mapping Shard 2)]",
+          "  DB3[(Mapping Shard N)]",
+          "  OwnerIndex[(Owner / Admin Index)]",
+          "  Queue[[Click Event Queue]]",
+          "  Analytics[(Analytics Store)]",
+          "  Rep[Cross-Region Replication]",
+          "  Metrics[Metrics / Alerts]",
+          "  Client -->|nearest edge| Geo",
+          "  Geo -->|redirect reads| CDN",
+          "  CDN -->|miss or create| LB",
+          "  LB -->|route| App",
+          "  App -->|allocate code| IDGen",
+          "  App -->|cache lookup| Cache",
+          "  Cache -->|miss| Router",
+          "  App -->|route code| Router",
+          "  Router -->|shard key| DB1",
+          "  Router -->|shard key| DB2",
+          "  Router -->|shard key| DB3",
+          "  App -->|owner queries| OwnerIndex",
+          "  CDN -->|log click| Queue",
+          "  App -->|log click| Queue",
+          "  Queue -->|events| Analytics",
+          "  DB1 -->|replicate| Rep",
+          "  Rep -->|regional copy| DB2",
+          "  App -->|health + latency| Metrics"
+        ],
+        "highlight": []
+      },
+      {
+        "name": "Simpler single-region design",
+        "pros": [
+          "Much easier to operate for moderate scale",
+          "Clear consistency story for create and redirect",
+          "Can still add cache and analytics without multi-region complexity"
+        ],
+        "cons": [
+          "Higher global latency",
+          "Region outage affects writes and cache misses",
+          "Scaling ceiling is lower before sharding/replication are added"
+        ],
+        "diagram": [
+          "graph TB",
+          "  Client[Client / Browser]",
+          "  CDN[CDN for hot redirects]",
+          "  LB[Load Balancer]",
+          "  App[Stateless App Servers]",
+          "  IDGen[ID Generator]",
+          "  Cache([Redirect Cache])",
+          "  DB[(Primary Mapping DB)]",
+          "  Replica[(Read Replica)]",
+          "  Queue[[Click Event Queue]]",
+          "  Analytics[(Analytics Store)]",
+          "  Client -->|redirect| CDN",
+          "  CDN -->|miss/create| LB",
+          "  LB -->|route| App",
+          "  App -->|allocate code| IDGen",
+          "  App -->|cache lookup| Cache",
+          "  Cache -->|miss| DB",
+          "  App -->|write mapping| DB",
+          "  DB -->|replicate| Replica",
+          "  App -->|log click| Queue",
+          "  Queue -->|events| Analytics"
+        ],
+        "highlight": []
+      }
+    ]
+  }
+}

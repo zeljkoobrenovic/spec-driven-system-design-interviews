@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""Builder for the Ad-Click / Analytics Pipeline book case."""
+import json, os
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+NODES = {
+    "Client":    ("Ad Client / Browser", "client", "boundary", [], "Emits impression and click events as users interact with ads."),
+    "Collector": ("Event Collector (Edge)", "service", "compute", ["stateless"], "Lightweight endpoint that validates, enriches, and accepts events fast."),
+    "Log":       ("Event Log (Kafka)", "stream", "async", ["stateful"], "Durable, partitioned, ordered event log buffering all ingested events."),
+    "Stream":    ("Stream Processor", "service", "compute", ["stateful"], "Real-time consumer: dedup, windowed aggregation, attribution."),
+    "Batch":     ("Batch Processor", "worker", "async", ["stateless"], "Periodic reprocessing of raw events for accurate, corrected metrics."),
+    "RawStore":  ("Raw Event Store (Data Lake)", "object-storage", "state", ["stateful"], "Immutable archive of every raw event for replay and batch recompute."),
+    "DedupStore": ("Dedup Store", "cache", "state", ["stateful"], "Seen-event-id set / Bloom filter for exactly-once-ish counting."),
+    "OLAP":      ("OLAP / Metrics Store", "database", "state", ["stateful"], "Pre-aggregated, queryable metrics (time-series / columnar)."),
+    "ServeAPI":  ("Query / Dashboard API", "service", "compute", ["stateless"], "Serves aggregated metrics to dashboards and advertisers."),
+    "Dashboard": ("Dashboard / Advertiser", "client", "boundary", [], "Views near-real-time and historical campaign metrics."),
+    "AttrSvc":   ("Attribution Service", "service", "compute", ["stateless"], "Joins clicks to conversions within a window to credit campaigns."),
+}
+
+LINKS = {
+    "client-collector":  ("Client", "Collector", "emit event"),
+    "collector-log":     ("Collector", "Log", "append"),
+    "log-stream":        ("Log", "Stream", "consume (real-time)"),
+    "log-raw":           ("Log", "RawStore", "archive raw"),
+    "log-batch":         ("RawStore", "Batch", "replay for recompute"),
+    "stream-dedup":      ("Stream", "DedupStore", "seen this event id?"),
+    "stream-attr":       ("Stream", "AttrSvc", "click->conversion join"),
+    "stream-olap":       ("Stream", "OLAP", "write real-time aggregates"),
+    "batch-olap":        ("Batch", "OLAP", "overwrite corrected aggregates"),
+    "serve-olap":        ("ServeAPI", "OLAP", "query metrics"),
+    "dashboard-serve":   ("Dashboard", "ServeAPI", "GET metrics"),
+    "attr-raw":          ("AttrSvc", "RawStore", "lookup click events"),
+}
+
+
+def view(nodes, links, highlight=None, groups=None):
+    v = {"nodes": list(nodes), "links": list(links)}
+    if highlight: v["highlight"] = list(highlight)
+    if groups: v["groups"] = list(groups)
+    return v
+
+
+def hla():
+    nodes = [{"id": n, "label": l, "type": t, "category": c, "traits": tr, "description": d}
+             for n, (l, t, c, tr, d) in NODES.items()]
+    links = [{"id": i, "from": f, "to": to, "label": lb} for i, (f, to, lb) in LINKS.items()]
+    types = [
+        {"id": "ingest", "label": "Ingestion", "nodes": ["Collector", "Log", "RawStore"]},
+        {"id": "speed-layer", "label": "Speed Layer (Stream)", "nodes": ["Stream", "DedupStore", "AttrSvc"]},
+        {"id": "batch-layer", "label": "Batch Layer", "nodes": ["Batch", "OLAP"]},
+    ]
+    return {"nodes": nodes, "links": links, "types": types}
+
+
+def seq(parts, msgs, highlight=None):
+    out = {"sequence": {"participants": parts, "messages": msgs}}
+    if highlight: out["highlight"] = highlight
+    return out
+
+
+data = {
+    "title": "Ad-Click / Analytics Pipeline — System Design",
+    "description": "Design a pipeline that ingests billions of ad impression and click events per day and turns them into accurate, queryable campaign metrics. The themes are high-throughput ingestion, stream vs batch processing, deduplication for correct counts, attribution, and the freshness-vs-accuracy tradeoff.",
+    "highLevelArchitecture": hla(),
+
+    "requirementsDiagram": [
+        "graph LR",
+        "  Ad[Ad event]",
+        "  Ingest[Ingest at scale]",
+        "  RT[Real-time metrics]",
+        "  Acc[Accurate counts]",
+        "  Query[Query dashboards]",
+        "  Ad --> Ingest",
+        "  Ingest --> RT",
+        "  Ingest --> Acc",
+        "  RT --> Query",
+        "  Acc --> Query",
+    ],
+    "capacityDiagram": [
+        "graph LR",
+        "  Ev[~1M events/s]",
+        "  Day[Billions/day]",
+        "  Dedup[Exactly-once counts]",
+        "  Ev --> Day",
+        "  Day --> Dedup",
+    ],
+
+    "requirements": {
+        "functional": [
+            "Ingest impression and click events at very high throughput.",
+            "Produce near-real-time metrics (clicks, CTR) within seconds.",
+            "Produce accurate, corrected daily metrics (the billing source of truth).",
+            "Attribute conversions to the click/campaign that drove them.",
+            "Let advertisers query metrics sliced by campaign, time, geo, etc.",
+        ],
+        "nonFunctional": [
+            "High throughput: ~1M events/sec sustained, bursty.",
+            "Durable ingestion: never lose an accepted event (billing depends on it).",
+            "Correct counts: dedup retried/duplicate events (no over-counting).",
+            "Low query latency on aggregated metrics.",
+            "Reprocessable: fix a bug and recompute history from raw events.",
+        ],
+    },
+
+    "capacity": [
+        {"label": "Events per second", "value": "~1,000,000", "note": "Impressions dominate; clicks are a fraction."},
+        {"label": "Events per day", "value": "billions", "note": "Drives raw-store and log sizing."},
+        {"label": "Event size", "value": "~hundreds of bytes", "note": "Ad id, user/session, timestamp, context."},
+        {"label": "Real-time freshness", "value": "seconds", "note": "Speed-layer target."},
+        {"label": "Batch correction", "value": "hourly / daily", "note": "Accurate, billing-grade recompute."},
+    ],
+
+    "api": [
+        {"method": "POST", "path": "/v1/events",
+         "description": "Ingest a batch of ad events. Accepted fast and durably; processed downstream.",
+         "request": "{ \"events\": [ { \"type\": \"click\", \"adId\": \"a_9\", \"eventId\": \"e_77\", \"ts\": ... } ] }",
+         "response": "{ \"accepted\": 1 }",
+         **seq(
+             [{"id": "Client"}, {"id": "Collector", "label": "Collector"}, {"id": "Log", "label": "Event Log"}],
+             [
+                 {"from": "Client", "to": "Collector", "arrow": "->>", "label": "POST /events"},
+                 {"from": "Collector", "to": "Collector", "arrow": "->>", "label": "validate + enrich"},
+                 {"from": "Collector", "to": "Log", "arrow": "->>", "label": "append (partition by adId)"},
+                 {"from": "Collector", "to": "Client", "arrow": "-->>", "label": "202 accepted"},
+             ])},
+        {"method": "GET", "path": "/v1/metrics",
+         "description": "Query aggregated metrics for a campaign over a time range.",
+         "request": "?campaign=c_3&from=...&to=...&groupBy=hour",
+         "response": "{ \"series\": [ { \"t\": ..., \"impressions\": 1200, \"clicks\": 34, \"ctr\": 0.028 } ] }",
+         **seq(
+             [{"id": "Dashboard"}, {"id": "ServeAPI", "label": "Query API"}, {"id": "OLAP", "label": "Metrics Store"}],
+             [
+                 {"from": "Dashboard", "to": "ServeAPI", "arrow": "->>", "label": "GET /metrics"},
+                 {"from": "ServeAPI", "to": "OLAP", "arrow": "->>", "label": "read pre-aggregates"},
+                 {"from": "ServeAPI", "to": "Dashboard", "arrow": "-->>", "label": "200 series"},
+             ])},
+    ],
+
+    "dataModel": [
+        {"name": "raw_event", "note": "Immutable record of one ad event (in the log and data lake).",
+         "fields": [
+             {"name": "event_id", "type": "uuid (idempotency key for dedup)"},
+             {"name": "type", "type": "enum(impression, click, conversion)"},
+             {"name": "ad_id", "type": "string (partition key)"},
+             {"name": "campaign_id", "type": "string"},
+             {"name": "user_id", "type": "string"},
+             {"name": "ts", "type": "event timestamp"},
+             {"name": "context", "type": "geo, device, etc."},
+         ]},
+        {"name": "metric_rollup", "note": "Pre-aggregated metrics in the OLAP store.",
+         "fields": [
+             {"name": "campaign_id", "type": "string"},
+             {"name": "window", "type": "time bucket (e.g. minute/hour)"},
+             {"name": "dimensions", "type": "geo, device, ..."},
+             {"name": "impressions", "type": "bigint"}, {"name": "clicks", "type": "bigint"},
+             {"name": "source", "type": "enum(speed, batch) (batch overwrites speed)"},
+         ]},
+    ],
+
+    "patterns": [
+        {"name": "Durable event log (Kafka)", "what": "Append events to a partitioned, replayable log that decouples ingestion from processing.",
+         "whenToUse": "High-throughput ingestion where producers and consumers scale independently.", "steps": ["ingest"]},
+        {"name": "Stream processing (speed layer)", "what": "Consume the log continuously to produce low-latency, approximate metrics.",
+         "whenToUse": "When seconds-fresh numbers matter.", "steps": ["speed"]},
+        {"name": "Batch reprocessing (batch layer)", "what": "Recompute metrics from immutable raw events for accuracy and bug fixes.",
+         "whenToUse": "When billing-grade correctness and replayability are required.", "steps": ["batch"]},
+        {"name": "Idempotent dedup", "what": "Use an event id + a seen-set/Bloom filter so retries don't over-count.",
+         "whenToUse": "At-least-once delivery where counts must be correct.", "steps": ["dedup"]},
+        {"name": "Windowed attribution", "what": "Join clicks to later conversions within a time window to credit campaigns.",
+         "whenToUse": "Conversion/ROI metrics that span multiple events.", "steps": ["attribution"]},
+        {"name": "Pre-aggregation / rollups", "what": "Materialize metrics by time bucket and dimension so queries are cheap.",
+         "whenToUse": "Dashboards over huge event volumes.", "steps": ["serve"]},
+    ],
+
+    "steps": [
+        {
+            "id": "ingest",
+            "title": "1. Durable High-Throughput Ingestion",
+            "description": [
+                "A lightweight edge collector validates and enriches each event and appends it to a durable, partitioned event log (Kafka-style). The collector does almost no work so it can absorb ~1M events/sec.",
+                "The log decouples producers from consumers: ingestion never blocks on downstream processing, and many consumers can read independently at their own pace. Partition by a key (e.g. ad/campaign id) for parallelism and ordering within a partition.",
+                "Also tee the raw events into an immutable data lake — the system of record that makes later reprocessing possible.",
+            ],
+            "view": view(["Client", "Collector", "Log", "RawStore"],
+                         ["client-collector", "collector-log", "log-raw"],
+                         highlight=["Collector", "Log"], groups=["ingest"]),
+            "decisionPrompt": "Why put a log between the collector and the processors instead of processing events inline?",
+            "concepts": [
+                {"term": "Durable event log", "definition": "An append-only, partitioned, replicated, replayable stream of events.",
+                 "whyItMatters": "Decouples ingestion from processing and enables replay — the backbone of the pipeline.",
+                 "example": "Kafka topic partitioned by ad_id, retained for days, consumed by stream + archived to a lake."},
+            ],
+            "patterns": ["Durable event log (Kafka)"],
+            "whyNow": ["The log is the architectural backbone; everything (real-time, batch, replay) hangs off durable, decoupled ingestion."],
+            "recap": {"before": "Nothing.", "after": "Events durably accepted and buffered, decoupled from processing.",
+                      "newRisk": "Raw events aren't metrics yet — need processing, and counts must handle duplicates."},
+            "traps": [
+                {"trap": "Doing aggregation synchronously in the collector.", "why": "Ties ingestion throughput/availability to processing; a slow consumer drops events.",
+                 "instead": "Accept fast to a durable log; process asynchronously."},
+            ],
+        },
+        {
+            "id": "speed",
+            "title": "2. Speed Layer: Real-Time Metrics",
+            "description": [
+                "A stream processor consumes the log continuously and maintains windowed aggregates (clicks/impressions per campaign per minute), writing them to the OLAP store within seconds.",
+                "This is the speed layer: fast and fresh, but approximate — it may miss late-arriving events or contain duplicates not yet reconciled.",
+                "Use tumbling/sliding time windows keyed by campaign+dimensions; emit incremental updates so dashboards move in near-real-time.",
+            ],
+            "view": view(["Log", "Stream", "OLAP", "ServeAPI"],
+                         ["log-stream", "stream-olap", "serve-olap"],
+                         highlight=["Stream"], groups=["speed-layer", "batch-layer"]),
+            "decisionPrompt": "What does the speed layer get wrong that you'll need to correct later?",
+            "concepts": [
+                {"term": "Windowed aggregation", "definition": "Grouping streaming events into time windows to compute running metrics.",
+                 "whyItMatters": "Turns an unbounded stream into bounded, queryable rollups.",
+                 "example": "Per-minute click counts per campaign, updated as events arrive."},
+            ],
+            "patterns": ["Stream processing (speed layer)"],
+            "whyNow": ["Real-time freshness is a hard requirement; the stream layer delivers it, while explicitly being the approximate half of the design."],
+            "recap": {"before": "Only raw events.", "after": "Seconds-fresh approximate metrics queryable now.",
+                      "newRisk": "Retries/duplicates over-count; late events are missed — correctness needs more."},
+        },
+        {
+            "id": "dedup",
+            "title": "3. Deduplicate for Correct Counts",
+            "description": [
+                "Ingestion is at-least-once: network retries and client re-fires mean the same event can appear multiple times. Counting naively over-counts clicks — and clicks are billed.",
+                "Give each event a stable event id. The stream processor checks a dedup store (a seen-id set, often a Bloom filter or RocksDB-backed keyed state) and ignores ids it has already counted — effectively-once counting.",
+                "Bound the dedup window (you can't remember every id forever); the batch layer provides the exact, full-history dedup as the backstop.",
+            ],
+            "view": view(["Log", "Stream", "DedupStore", "OLAP"],
+                         ["log-stream", "stream-dedup", "stream-olap"],
+                         highlight=["DedupStore"], groups=["speed-layer"]),
+            "decisionPrompt": "A click event is delivered twice. How do you make sure the advertiser is billed once?",
+            "concepts": [
+                {"term": "Idempotent dedup", "definition": "Skip events whose id has already been processed.",
+                 "whyItMatters": "Converts at-least-once delivery into correct, exactly-once counts.",
+                 "example": "Bloom filter of seen event ids per window; a repeat id is dropped."},
+            ],
+            "patterns": ["Idempotent dedup"],
+            "whyNow": ["Correct counts are non-negotiable for billing; dedup is the mechanism and the at-least-once reality is the reason."],
+            "recap": {"before": "Counts inflated by duplicates.", "after": "Effectively-once counts in real time.",
+                      "newRisk": "Approximate dedup over a window isn't perfect; conversions span events — need attribution and an exact backstop."},
+            "traps": [
+                {"trap": "Assuming the message bus gives exactly-once for free.", "why": "Most pipelines are at-least-once at the edges; producers retry.",
+                 "instead": "Make counting idempotent on a stable event id; reconcile exactly in batch."},
+            ],
+        },
+        {
+            "id": "attribution",
+            "title": "4. Attribution: Credit Clicks for Conversions",
+            "description": [
+                "Advertisers care about conversions (a purchase), which happen later than and separately from the click. Attribution joins a conversion back to the click/campaign that drove it, within an attribution window (e.g. 7 days).",
+                "This is a stateful, time-windowed join across event types and time — heavier than counting. The stream layer can do near-real-time attribution for recent windows; longer windows and corrections are done in batch over raw events.",
+                "Define the model explicitly (last-click, first-click, multi-touch) — it changes who gets credit and the numbers advertisers see.",
+            ],
+            "view": view(["Stream", "AttrSvc", "RawStore", "OLAP"],
+                         ["stream-attr", "attr-raw", "stream-olap"],
+                         highlight=["AttrSvc"], groups=["speed-layer"]),
+            "decisionPrompt": "A user clicks an ad Monday and buys Thursday. How do you credit the campaign, and what's the state cost?",
+            "concepts": [
+                {"term": "Windowed attribution join", "definition": "Joining a conversion to a prior click within a bounded time window.",
+                 "whyItMatters": "Produces ROI/conversion metrics that span multiple events and days.",
+                 "example": "Last-click within 7 days credits the most recent click's campaign."},
+            ],
+            "patterns": ["Windowed attribution"],
+            "whyNow": ["Attribution is the ad-specific depth that separates this from a generic counter; the windowed join and model choice are the senior signals."],
+            "recap": {"before": "Independent event counts.", "after": "Conversions attributed to campaigns within a window.",
+                      "newRisk": "Long windows + corrections exceed what the speed layer can hold accurately — batch must reconcile."},
+        },
+        {
+            "id": "batch",
+            "title": "5. Batch Layer: Accurate, Reprocessable Metrics",
+            "description": [
+                "Periodically reprocess the immutable raw events end-to-end to produce billing-grade metrics: full dedup, complete attribution windows, and late-arriving events all included.",
+                "Batch results overwrite the speed layer's approximate numbers for the same windows (lambda-architecture reconciliation): real-time numbers are provisional, batch numbers are authoritative.",
+                "Because the raw events are immutable and replayable, a processing bug is fixed by re-running batch over history — no data loss, just recompute.",
+            ],
+            "view": view(["RawStore", "Batch", "OLAP", "ServeAPI"],
+                         ["log-batch", "batch-olap", "serve-olap"],
+                         highlight=["Batch"], groups=["batch-layer"]),
+            "decisionPrompt": "You discover the click counter double-counted a class of events for a week. How do you fix history?",
+            "concepts": [
+                {"term": "Lambda / kappa reconciliation", "definition": "Pair a fast approximate stream layer with an accurate batch (or replay) layer that corrects it.",
+                 "whyItMatters": "Delivers both freshness and correctness, and makes bugs recoverable.",
+                 "example": "Batch overwrites today's hourly rollups once the day is complete."},
+            ],
+            "patterns": ["Batch reprocessing (batch layer)"],
+            "whyNow": ["The accuracy + reprocessability requirements demand a batch/replay layer; framing speed-vs-batch is the core architectural tradeoff of the case."],
+            "recap": {"before": "Only approximate real-time numbers.", "after": "Authoritative batch metrics; history is recomputable.",
+                      "newRisk": "Two sources for the same metric — queries must know which to trust; serving must hide the seam."},
+            "failureDrills": [
+                {"scenario": "The stream processor crashes and loses in-memory windows.",
+                 "expectedBehavior": "It resumes from the log offset (checkpointed state); batch later corrects any gap.",
+                 "mitigation": "Replayable log + checkpointed stream state + authoritative batch recompute."},
+            ],
+        },
+        {
+            "id": "serve",
+            "title": "6. Serve: Pre-Aggregation and Query",
+            "description": [
+                "Dashboards can't scan billions of raw events per query. Store pre-aggregated rollups by time bucket and dimension in an OLAP/columnar store; queries read materialized aggregates and are fast.",
+                "The query API merges the two sources cleanly: serve batch (authoritative) numbers for closed windows and speed-layer (provisional) numbers for the current, still-open window — so users see fresh data that later settles to exact.",
+                "Roll up at multiple granularities (minute -> hour -> day) and pre-compute common dimension slices to keep queries cheap.",
+            ],
+            "view": view(["Dashboard", "ServeAPI", "OLAP", "Stream", "Batch"],
+                         ["dashboard-serve", "serve-olap", "stream-olap", "batch-olap"],
+                         highlight=["ServeAPI", "OLAP"], groups=["batch-layer", "speed-layer"]),
+            "decisionPrompt": "How does the query API give a user fresh numbers now and exact numbers later without contradicting itself?",
+            "concepts": [
+                {"term": "Pre-aggregation (rollups)", "definition": "Materializing metrics by window+dimension ahead of query time.",
+                 "whyItMatters": "Turns an O(events) scan into an O(buckets) lookup.",
+                 "example": "Per-hour campaign rollups answer a month-long query from ~720 rows."},
+            ],
+            "patterns": ["Pre-aggregation / rollups"],
+            "whyNow": ["Serving ties it together: it's where the freshness/accuracy split becomes a single coherent answer for the user."],
+            "recap": {"before": "Metrics computed but not efficiently queryable.", "after": "Fast dashboards over rollups; provisional-then-exact merge.",
+                      "newRisk": "Rollup cardinality explosion across many dimensions — bounded by limiting pre-computed slices."},
+            "bottlenecks": [
+                {"issue": "High-cardinality dimension combinations blow up rollup storage.", "mitigation": "Pre-compute only common slices; compute rare ones on demand from raw."},
+                {"issue": "A hot partition (huge campaign) lags the stream.", "mitigation": "Repartition / scale consumers; the log absorbs the backlog."},
+            ],
+        },
+    ],
+
+    "finalDesign": {
+        "title": "Final Design — Lambda Analytics Pipeline",
+        "description": "A thin collector accepts events fast into a durable partitioned log, which is both consumed by a stream processor (dedup via event-id seen-set, windowed aggregation and near-real-time attribution -> OLAP) and archived raw to a data lake. A batch layer periodically reprocesses the immutable raw events for exact, fully-attributed, billing-grade metrics that overwrite the provisional speed-layer rollups. A query API serves pre-aggregated rollups, merging authoritative batch numbers for closed windows with provisional stream numbers for the open window. Replayable raw events make any bug recoverable by recompute.",
+        "view": view(
+            ["Client", "Collector", "Log", "RawStore", "Stream", "DedupStore", "AttrSvc",
+             "Batch", "OLAP", "ServeAPI", "Dashboard"],
+            ["client-collector", "collector-log", "log-raw", "log-stream", "stream-dedup",
+             "stream-attr", "attr-raw", "stream-olap", "log-batch", "batch-olap", "serve-olap",
+             "dashboard-serve"],
+            groups=["ingest", "speed-layer", "batch-layer"]),
+    },
+
+    "satisfies": {
+        "functional": [
+            {"requirement": "Ingest at high throughput", "how": "Thin collector + durable partitioned log.", "steps": ["ingest"]},
+            {"requirement": "Near-real-time metrics", "how": "Stream processor windowed aggregation.", "steps": ["speed"]},
+            {"requirement": "Accurate daily metrics", "how": "Batch reprocess of raw events overwrites provisional numbers.", "steps": ["batch"]},
+            {"requirement": "Conversion attribution", "how": "Windowed click->conversion join.", "steps": ["attribution"]},
+            {"requirement": "Query by dimensions", "how": "Pre-aggregated OLAP rollups via query API.", "steps": ["serve"]},
+        ],
+        "nonFunctional": [
+            {"requirement": "~1M events/sec", "how": "Log partitioning + horizontally scaled consumers.", "steps": ["ingest", "speed"]},
+            {"requirement": "Never lose events", "how": "Durable replicated log + immutable data lake.", "steps": ["ingest"]},
+            {"requirement": "Correct counts", "how": "Idempotent dedup in stream + exact dedup in batch.", "steps": ["dedup", "batch"]},
+            {"requirement": "Low query latency", "how": "Pre-aggregation; queries read rollups not raw.", "steps": ["serve"]},
+            {"requirement": "Reprocessable", "how": "Immutable raw events replayed through batch.", "steps": ["batch"]},
+        ],
+    },
+
+    "interviewScript": [
+        {"phase": "Scope & requirements", "time": "first 5 min",
+         "say": ["Confirm both real-time freshness AND billing-grade accuracy are required.",
+                 "Pin ~1M events/sec, durability, and correct (dedup'd) counts.",
+                 "Establish attribution and reprocessability as first-class."]},
+        {"phase": "High-level design", "time": "next 10 min",
+         "say": ["Thin collector into a durable partitioned log; archive raw.",
+                 "Stream layer for real-time windowed metrics.",
+                 "Batch layer for accurate recompute."]},
+        {"phase": "Deep dive", "time": "next 15 min",
+         "say": ["Dedup with event ids for correct counts.",
+                 "Windowed attribution and the model choice.",
+                 "Lambda reconciliation; pre-aggregation and the provisional-then-exact serving merge."]},
+        {"phase": "Wrap-up", "time": "final 5 min",
+         "say": ["Map requirements to mechanisms.",
+                 "Tradeoffs: speed vs accuracy, dedup window size, rollup cardinality.",
+                 "Mention kappa (replay-only) as a simpler alternative to lambda."]},
+    ],
+
+    "levelVariants": [
+        {"level": "Junior", "expectations": ["Ingests to a log and aggregates.", "Produces real-time counts.", "May miss dedup, attribution, and accuracy correction."]},
+        {"level": "Senior", "expectations": ["Designs speed + batch layers.", "Handles dedup and windowed attribution.", "Pre-aggregates for serving."]},
+        {"level": "Staff", "expectations": ["Reasons about exactly-once vs at-least-once precisely.", "Designs reprocessability and lambda/kappa reconciliation.", "Discusses rollup cardinality, hot partitions, and serving-seam consistency."]},
+    ],
+
+    "followUps": [
+        "Lambda vs kappa (replay-only) architecture — when would you drop the batch layer?",
+        "How do you handle very late-arriving events (days late)?",
+        "How would you support exactly-once end to end, and what does it cost?",
+        "How do you bound rollup storage as advertisers slice by many dimensions?",
+        "How would you detect and handle click fraud in this pipeline?",
+    ],
+}
+
+if __name__ == "__main__":
+    out = os.path.join(HERE, "interview.json")
+    with open(out, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"WROTE {out}: {os.path.getsize(out)} bytes, {len(data['steps'])} steps")

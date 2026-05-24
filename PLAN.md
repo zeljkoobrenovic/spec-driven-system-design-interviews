@@ -100,6 +100,9 @@ All fields below are optional except `highLevelArchitecture` and either
 {
   "title": "URL Shortener — System Design",
   "description": "Short blurb shown under the title.",
+  "assets": {
+    "icon": "icon.png"                                      // optional; dataset overview icon
+  },
 
   // Explicit high-level architecture metadata used for generated views,
   // node captions, sequence participant annotations, and styling.
@@ -193,7 +196,8 @@ All fields below are optional except `highLevelArchitecture` and either
   // Reusable design patterns this case teaches. Renders as an Overview entry
   // ("Patterns"); `steps` cross-links each pattern to where it appears.
   "patterns": [
-    { "name": "Cache-aside", "what": "...", "whenToUse": "...", "steps": ["cache"] }
+    { "name": "Cache-aside", "what": "...", "whenToUse": "...", "steps": ["cache"],
+      "icon": "assets/icons/patterns/cache-aside.png" }
   ],
 
   // Standalone pattern reference. Renders as a "Pattern Catalog" entry, grouped
@@ -202,7 +206,8 @@ All fields below are optional except `highLevelArchitecture` and either
   // are free-text case names (they may live in other datasets).
   "patternCatalog": [
     { "name": "Idempotency key", "category": "Reliability & correctness",
-      "what": "...", "whenToUse": "...", "tradeoffs": "...", "usedBy": ["Payment System"] }
+      "what": "...", "whenToUse": "...", "tradeoffs": "...", "usedBy": ["Payment System"],
+      "icon": "assets/icons/patterns/idempotency-key.png" }
   ],
 
   // ---- Architecture steps ---- (optional when patternCatalog is present)
@@ -244,7 +249,8 @@ All fields below are optional except `highLevelArchitecture` and either
           "term": "Cache-aside",
           "definition": "The application checks cache first, reads the database on a miss, then backfills the cache.",
           "whyItMatters": "The candidate sees the concept before using it in the design.",
-          "example": "GET /short-code reads Redis, then the URL table on cache miss."
+          "example": "GET /short-code reads Redis, then the URL table on cache miss.",
+          "icon": "assets/icons/concepts/cache-aside.png"
         }
       ],
       "whyNow": ["Why this step belongs here in the build order."],
@@ -311,6 +317,7 @@ All fields below are optional except `highLevelArchitecture` and either
   "finalDesign": {                              // optional; if omitted, no Final Design wrap-up entry is shown
     "title":       "Final Design",
     "description": "End-to-end architecture summary.",
+    "image":       "assets/images/final-design.png", // optional; rendered at bottom under "Generated Image"
     "view":        { "nodes": ["Client", "App", "Cache", "DB"], "links": ["client-app", "app-cache", "cache-db"] },
     "options": [                               // optional; same shape/renderer as step.options
       {
@@ -343,11 +350,13 @@ All fields below are optional except `highLevelArchitecture` and either
 }
 ```
 
-The fields above (`patterns`, `step.patterns`, `step.traps`,
+The fields above (`patterns`, `patternCatalog`, `step.patterns`, `step.traps`,
 `interviewScript`, `levelVariants`) are the **book differentiators** — all
 optional, so the 17 example datasets render unchanged. `patterns` and
 `step.traps` are exercised in the canonical `url-shortener` example;
 `data/book/payment-system` uses all of them.
+Generated visual assets are optional too: absent `assets`, `icon`, or `image`
+fields simply render nothing.
 
 `highLevelArchitecture` is required for every dataset and always contains
 `nodes`, `links`, and `types` arrays; catalog datasets may keep all three empty.
@@ -446,6 +455,9 @@ Sources (edit these):
 - `data/<group>/index.json`              — One site's manifest (`groups[]`).
 - `data/<group>/<id>/interview.json`     — One dataset per directory.
 - `data/<group>/<id>/icon.png`           — Optional per-interview icon.
+- `data/<group>/<id>/assets/icons/...`   — Optional generated pattern/concept icons linked from JSON.
+- `data/<group>/<id>/assets/images/final-design.png` — Optional generated final-design image linked from JSON.
+- `_scripts/generate_interview_assets.py` — Generates interview assets and writes JSON links.
 - `build.py`               — Copy step: `_templates/` + `data/<group>/` →
                              `docs/<group>/`.
 
@@ -471,6 +483,9 @@ populated URL shortener walkthrough used as the worked example.
   final design must have a `view` or options with views. Step/final/deep-dive
   graph diagrams must use structured `view` objects; flow diagrams must use
   structured `sequence` objects.
+- Generated asset paths are relative to the dataset directory. Pattern and
+  concept icons live on the object they describe (`icon`); the only generated
+  walkthrough image is `finalDesign.image`.
 - Sentence-splitting of `description` strings tolerates common abbreviations
   (`e.g.`, `i.e.`, `etc.`, etc.) so they don't break into separate bullets.
 

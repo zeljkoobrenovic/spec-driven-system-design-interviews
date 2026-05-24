@@ -39,6 +39,8 @@ Two pages, sharing `styles.css`:
 | `data/<group>/index.json`           | One site's manifest (`groups[]` of categories)           |
 | `data/<group>/<id>/interview.json`  | One dataset per subdirectory                             |
 | `data/<group>/<id>/icon.png`        | Optional per-interview icon (else falls back)            |
+| `data/<group>/<id>/assets/`         | Optional generated icons/images linked from JSON         |
+| `_scripts/generate_interview_assets.py` | Generates interview assets and writes JSON links     |
 
 Datasets are organized into **groups** (each a directory under `data/`).
 `data/examples/` is the canonical group of worked examples; `data/book/` is the
@@ -325,6 +327,10 @@ when absent, so the `examples` datasets are unaffected):
   `category`. Each `{ name, category?, what, whenToUse?, tradeoffs?, usedBy? }`.
   **A dataset with `patternCatalog` and no `steps` is valid** (a catalog, not a
   walkthrough) — `validateDataset` requires `steps[]` *or* `patternCatalog[]`.
+- Generated visual assets are optional and path-based. Top-level `assets`
+  stores `icon`; pattern/concept objects use `icon`; `finalDesign` uses
+  `image`. Generated images are only rendered for the final design. Paths are
+  relative to the dataset directory and render only when present.
 
 `data/book/payment-system` is the reference dataset using the per-step/wrap-up
 fields; `data/book/notification-system` is a second full case;

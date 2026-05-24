@@ -42,6 +42,7 @@
         datasets: [],           // flat list, each with groupId/groupName
         groups: [],             // [{ id, name, datasets }, ...]
         currentDatasetId: null,
+        currentDatasetPath: null,
         data: null,
         nodeTypeConfig: null,
         nodeIndex: null,
@@ -101,6 +102,54 @@
         } catch (e) {
             throw new Error(`Invalid JSON in ${path}: ${e.message}`);
         }
+    }
+
+    function assetUrl(path) {
+        if (!path || typeof path !== "string") return "";
+        if (/^(?:https?:|data:|\/)/.test(path)) return path;
+        const basePath = state.currentDatasetPath || "";
+        const base = basePath.includes("/") ? basePath.replace(/\/[^/]*$/, "/") : "";
+        return base + path.replace(/^\.\//, "");
+    }
+
+    function makeAssetIcon(path, alt) {
+        const src = assetUrl(path);
+        if (!src) return null;
+        const img = document.createElement("img");
+        img.className = "asset-icon";
+        img.src = src;
+        img.alt = alt || "";
+        img.loading = "lazy";
+        img.decoding = "async";
+        img.addEventListener("error", () => {
+            img.remove();
+        });
+        return img;
+    }
+
+    function renderGeneratedImage(path, alt) {
+        const src = assetUrl(path);
+        if (!src) return null;
+        const figure = document.createElement("figure");
+        figure.className = "generated-image-card";
+        const link = document.createElement("a");
+        link.className = "generated-image-link";
+        link.href = src;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        const img = document.createElement("img");
+        img.className = "generated-image";
+        img.src = src;
+        img.alt = alt || "Generated image";
+        img.loading = "lazy";
+        img.decoding = "async";
+        link.appendChild(img);
+        figure.appendChild(link);
+        const section = makeSection("Generated Image", figure, "generated-image-section");
+        img.addEventListener("error", () => {
+            section.remove();
+        });
+        return section;
     }
 
     async function loadNodeTypeConfig() {
@@ -693,10 +742,24 @@
 
     // ---------- Rendering: description ----------
 
-    function renderTopDecisionPrompt(prompt) {
-        const content = renderTextOrBullets(prompt, "education-card decision-prompt top-decision-prompt");
+    function renderStepTextSection(title, value, className) {
+        const content = renderTextOrBullets(value, "step-text-body");
         if (!content) return null;
-        return content;
+        const section = document.createElement("section");
+        section.className = `step-text-section${className ? " " + className : ""}`;
+        const h = document.createElement("h3");
+        h.textContent = title;
+        section.appendChild(h);
+        section.appendChild(content);
+        return section;
+    }
+
+    function renderDesignMove(description) {
+        return renderStepTextSection("Design Move", description, "education-card design-move");
+    }
+
+    function renderDecisionPoint(prompt) {
+        return renderStepTextSection("Decision Point", prompt, "education-card decision-prompt top-decision-prompt");
     }
 
     function appendConceptLine(card, label, value) {
@@ -722,9 +785,14 @@
                 card.appendChild(p);
             } else if (concept && typeof concept === "object") {
                 const term = concept.term || concept.name || concept.title || "Concept";
+                const head = document.createElement("div");
+                head.className = "asset-heading";
+                const icon = makeAssetIcon(concept.icon, `${term} icon`);
+                if (icon) head.appendChild(icon);
                 const h = document.createElement("h4");
                 h.textContent = term;
-                card.appendChild(h);
+                head.appendChild(h);
+                card.appendChild(head);
                 if (concept.definition || concept.description) {
                     const p = document.createElement("p");
                     p.className = "concept-definition";
@@ -750,15 +818,12 @@
         return wrap;
     }
 
-    function renderDescription(description, decisionPrompt, concepts) {
+    function renderDescription(description, decisionPrompt) {
         els.stepDescription.innerHTML = "";
-        const prompt = renderTopDecisionPrompt(decisionPrompt);
-        if (prompt) els.stepDescription.appendChild(prompt);
-        const conceptBlock = renderTopConcepts(concepts);
-        if (conceptBlock) els.stepDescription.appendChild(conceptBlock);
-        const items = bulletsFrom(description);
-        if (items.length === 0) return;
-        els.stepDescription.appendChild(makeBulletList(items, "bullets"));
+        const designMove = renderDesignMove(description);
+        if (designMove) els.stepDescription.appendChild(designMove);
+        const decisionPoint = renderDecisionPoint(decisionPrompt);
+        if (decisionPoint) els.stepDescription.appendChild(decisionPoint);
     }
 
     // ---------- Rendering: architecture step diagram + options ----------
@@ -794,22 +859,25 @@
     }
 
     function graphShapeLine(id, label, shape) {
+        // Quote the label so parentheses/brackets in the text aren't parsed as
+        // additional Mermaid shape tokens. mermaidNodeLabel already escapes ".
+        const q = `"${label}"`;
         if (shape === "database") {
-            return `  ${id}[(${label})]`;
+            return `  ${id}[(${q})]`;
         }
         if (shape === "queue" || shape === "subroutine") {
-            return `  ${id}[[${label}]]`;
+            return `  ${id}[[${q}]]`;
         }
         if (shape === "cache" || shape === "stadium") {
-            return `  ${id}([${label}])`;
+            return `  ${id}([${q}])`;
         }
         if (shape === "external" || shape === "actor" || shape === "parallelogram") {
-            return `  ${id}[/${label}/]`;
+            return `  ${id}[/${q}/]`;
         }
-        if (shape === "diamond") return `  ${id}{${label}}`;
-        if (shape === "circle") return `  ${id}((${label}))`;
-        if (shape === "asymmetric") return `  ${id}>${label}]`;
-        return `  ${id}[${label}]`;
+        if (shape === "diamond") return `  ${id}{${q}}`;
+        if (shape === "circle") return `  ${id}((${q}))`;
+        if (shape === "asymmetric") return `  ${id}>${q}]`;
+        return `  ${id}[${q}]`;
     }
 
     function graphNodeLine(node, render) {
@@ -827,8 +895,10 @@
         const render = link.render && typeof link.render === "object" ? link.render : {};
         const arrow = String(render.arrow || (render.style === "dashed" ? "-.->" : "-->"));
         const label = String(link.label || "").trim();
-        const escaped = label.replace(/\|/g, "/");
-        return label ? `  ${from} ${arrow}|${escaped}| ${to}` : `  ${from} ${arrow} ${to}`;
+        // Quote the edge label so parentheses/brackets/pipes in the text aren't
+        // parsed as Mermaid node-shape or label-delimiter tokens.
+        const escaped = label.replace(/"/g, "&quot;").replace(/\|/g, "/");
+        return label ? `  ${from} ${arrow}|"${escaped}"| ${to}` : `  ${from} ${arrow} ${to}`;
     }
 
     function graphViewRefs(view, key) {
@@ -1520,19 +1590,80 @@
         return wrap.children.length > 0 ? makeSection("Common traps", wrap, "traps") : null;
     }
 
-    // Per-step pattern tags: string IDs/names rendered as chips. Surfaces the
-    // reusable patterns (see Overview > Patterns) exercised by this step.
-    function renderStepPatternTags(patterns) {
-        if (!Array.isArray(patterns) || patterns.length === 0) return null;
-        const wrap = document.createElement("div");
-        wrap.className = "pattern-tags";
-        for (const p of patterns) {
-            const chip = document.createElement("span");
-            chip.className = "pattern-tag";
-            chip.textContent = String(p);
-            wrap.appendChild(chip);
+    function normalizedPatternKey(value) {
+        return String(value || "")
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, " ")
+            .trim();
+    }
+
+    function datasetPatternIndex() {
+        const index = new Map();
+        const collections = [
+            state.data && state.data.patterns,
+            state.data && state.data.patternCatalog,
+        ];
+        for (const collection of collections) {
+            for (const item of Array.isArray(collection) ? collection : []) {
+                if (!item || typeof item !== "object") continue;
+                for (const key of [item.name, item.id, item.title]) {
+                    const normalized = normalizedPatternKey(key);
+                    if (normalized && !index.has(normalized)) index.set(normalized, item);
+                }
+            }
         }
-        return makeSection("Patterns", wrap, "step-patterns");
+        return index;
+    }
+
+    // Per-step patterns use the same visual treatment as concepts. Step arrays
+    // usually contain names; details/icons resolve from dataset-level patterns.
+    function renderStepPatterns(patterns) {
+        if (!Array.isArray(patterns) || patterns.length === 0) return null;
+        const index = datasetPatternIndex();
+        const cards = [];
+        for (const item of patterns) {
+            const inline = item && typeof item === "object" ? item : null;
+            const name = inline
+                ? (inline.name || inline.title || inline.id || "Pattern")
+                : String(item || "");
+            const meta = Object.assign({}, index.get(normalizedPatternKey(name)) || {}, inline || {});
+            const title = meta.name || meta.title || name;
+            if (!title) continue;
+
+            const card = document.createElement("article");
+            card.className = "concept-card pattern-concept-card";
+
+            const head = document.createElement("div");
+            head.className = "asset-heading";
+            const icon = makeAssetIcon(meta.icon, `${title} icon`);
+            if (icon) head.appendChild(icon);
+            const h = document.createElement("h4");
+            h.textContent = title;
+            head.appendChild(h);
+            card.appendChild(head);
+
+            if (meta.what || meta.description) {
+                const p = document.createElement("p");
+                p.className = "concept-definition";
+                p.textContent = meta.what || meta.description;
+                card.appendChild(p);
+            }
+            appendConceptLine(card, "When to use", meta.whenToUse);
+            appendConceptLine(card, "Trade-off", meta.tradeoffs || meta.tradeoff);
+            cards.push(card);
+        }
+        if (cards.length === 0) return null;
+
+        const wrap = document.createElement("div");
+        wrap.className = "step-concepts step-pattern-cards";
+        const h = document.createElement("h3");
+        h.textContent = "Used Patterns";
+        wrap.appendChild(h);
+        const grid = document.createElement("div");
+        grid.className = "concept-grid";
+        cards.forEach((card) => grid.appendChild(card));
+        wrap.appendChild(grid);
+        return wrap;
     }
 
     function renderInterviewerSignals(signals) {
@@ -1570,8 +1701,6 @@
 
     function renderStepExtras(step) {
         els.stepExtras.innerHTML = "";
-
-        appendStepExtra(renderStepPatternTags(step.patterns));
 
         if (Array.isArray(step.flows) && step.flows.length > 0) {
             // Only render valid flows (must have a non-empty diagram source).
@@ -1629,6 +1758,9 @@
                 els.stepExtras.appendChild(makeSection("Flows", wrap, "flows"));
             }
         }
+
+        appendStepExtra(renderTopConcepts(step.concepts));
+        appendStepExtra(renderStepPatterns(step.patterns));
 
         appendStepExtra(renderWhyNow(step.whyNow));
         appendStepExtra(renderRecap(step.recap));
@@ -2238,10 +2370,15 @@
             const card = document.createElement("div");
             card.className = "pattern-card";
 
+            const head = document.createElement("div");
+            head.className = "asset-heading pattern-heading";
+            const icon = makeAssetIcon(p.icon, `${p.name || "Pattern"} icon`);
+            if (icon) head.appendChild(icon);
             const name = document.createElement("div");
             name.className = "pattern-name";
             name.textContent = p.name || "";
-            card.appendChild(name);
+            head.appendChild(name);
+            card.appendChild(head);
 
             if (p.what) {
                 const what = document.createElement("p");
@@ -2295,10 +2432,15 @@
                 const card = document.createElement("div");
                 card.className = "pattern-card";
 
+                const head = document.createElement("div");
+                head.className = "asset-heading pattern-heading";
+                const icon = makeAssetIcon(p.icon, `${p.name || "Pattern"} icon`);
+                if (icon) head.appendChild(icon);
                 const name = document.createElement("div");
                 name.className = "pattern-name";
                 name.textContent = p.name || "";
-                card.appendChild(name);
+                head.appendChild(name);
+                card.appendChild(head);
 
                 if (p.what) {
                     const what = document.createElement("p");
@@ -2436,7 +2578,7 @@
 
     async function renderStepLikeEntry(entry, prevStep) {
         const step = entry.payload;
-        renderDescription(step.description, step.decisionPrompt, step.concepts);
+        renderDescription(step.description, step.decisionPrompt);
 
         if (Array.isArray(step.options) && step.options.length > 0) {
             if (state.currentOptionIndex >= step.options.length) state.currentOptionIndex = 0;
@@ -2464,6 +2606,9 @@
         await renderDiagram(diagram, highlight, diagramPrevStep);
 
         renderStepExtras(step);
+        if (entry.id === INTRO_SLUGS.finalDesign) {
+            appendStepExtra(renderGeneratedImage(step.image, `${step.title || "Final Design"} generated image`));
+        }
     }
 
     async function renderCurrentEntry() {
@@ -2567,12 +2712,36 @@
                 throw new Error(`${label}: Mermaid diagram fields must be arrays of source lines`);
             }
         }
+        function validateAssetPath(value, label) {
+            if (value !== undefined && typeof value !== "string") {
+                throw new Error(`${label}: asset path must be a string`);
+            }
+        }
         validateDiagramArray(d.requirementsDiagram, `Dataset ${path} requirementsDiagram`);
         validateDiagramArray(d.capacityDiagram, `Dataset ${path} capacityDiagram`);
         validateDiagramArray(d.dataModelDiagram, `Dataset ${path} dataModelDiagram`);
+        if (d.assets !== undefined) {
+            if (!d.assets || typeof d.assets !== "object" || Array.isArray(d.assets)) {
+                throw new Error(`Dataset ${path}: "assets" must be an object if present`);
+            }
+            for (const key of ["icon"]) {
+                validateAssetPath(d.assets[key], `Dataset ${path} assets.${key}`);
+            }
+            for (const key of ["requirements", "capacityEstimation", "apiDesign"]) {
+                if (d.assets[key] !== undefined) {
+                    throw new Error(`Dataset ${path}: assets.${key} is not supported; generated images are only rendered for finalDesign.image`);
+                }
+            }
+        }
         (d.steps || []).forEach((step, i) => {
             if (!step || typeof step !== "object") throw new Error(`Step ${i} is not an object`);
             if (step.diagram !== undefined) throw new Error(`Step ${i} ("${step.title || step.id || ""}") must use "view", not "diagram"`);
+            if (step.image !== undefined) {
+                throw new Error(`Step ${i} ("${step.title || step.id || ""}"): generated images are only supported for finalDesign.image`);
+            }
+            (Array.isArray(step.concepts) ? step.concepts : []).forEach((concept, j) => {
+                if (concept && typeof concept === "object") validateAssetPath(concept.icon, `Step ${i} concept ${j} icon`);
+            });
             (step.options || []).forEach((opt, j) => {
                 if (opt.diagram !== undefined) throw new Error(`Step ${i} option ${j} ("${opt.name || ""}") must use "view", not "diagram"`);
             });
@@ -2587,6 +2756,7 @@
         });
         if (d.finalDesign) {
             if (d.finalDesign.diagram !== undefined) throw new Error(`Dataset ${path}: finalDesign must use "view", not "diagram"`);
+            validateAssetPath(d.finalDesign.image, `Dataset ${path}: finalDesign.image`);
             (d.finalDesign.options || []).forEach((opt, j) => {
                 if (opt.diagram !== undefined) throw new Error(`Dataset ${path}: finalDesign option ${j} must use "view", not "diagram"`);
             });
@@ -2602,6 +2772,12 @@
                 throw new Error(`Dataset ${path}: "${key}" must be an array if present`);
             }
         }
+        (d.patterns || []).forEach((pattern, i) => {
+            if (pattern && typeof pattern === "object") validateAssetPath(pattern.icon, `Dataset ${path}: patterns[${i}].icon`);
+        });
+        (d.patternCatalog || []).forEach((pattern, i) => {
+            if (pattern && typeof pattern === "object") validateAssetPath(pattern.icon, `Dataset ${path}: patternCatalog[${i}].icon`);
+        });
         const architecture = d.highLevelArchitecture;
         if (!architecture || typeof architecture !== "object") {
             throw new Error(`Dataset ${path}: "highLevelArchitecture" must be an object`);
@@ -2720,6 +2896,7 @@
             const data = await fetchJson(meta.path);
             validateDataset(data, meta.path);
             state.currentDatasetId = datasetId;
+            state.currentDatasetPath = meta.path;
             state.data = data;
             state.nodeIndex = buildNodeIndex(data);
             state.linkIndex = buildLinkIndex(data);

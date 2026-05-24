@@ -850,8 +850,26 @@
         return safe;
     }
 
+    // Encode characters the Mermaid flowchart parser treats as structural
+    // tokens (shape brackets, label pipes, quotes) as HTML entities. Mermaid
+    // decodes these back to the real glyphs when rendering, so the displayed
+    // text is unchanged while the source stays parseable. Used for both node
+    // and edge labels in generated flowcharts.
+    function mermaidLabelEscape(label) {
+        return String(label || "")
+            .replace(/&/g, "&amp;")
+            .replace(/"/g, "&quot;")
+            .replace(/\(/g, "#40;")
+            .replace(/\)/g, "#41;")
+            .replace(/\[/g, "#91;")
+            .replace(/\]/g, "#93;")
+            .replace(/\{/g, "#123;")
+            .replace(/\}/g, "#125;")
+            .replace(/\|/g, "#124;");
+    }
+
     function mermaidNodeLabel(label) {
-        return String(label || "").replace(/"/g, "&quot;");
+        return mermaidLabelEscape(label);
     }
 
     function mermaidSequenceText(text) {
@@ -859,25 +877,24 @@
     }
 
     function graphShapeLine(id, label, shape) {
-        // Quote the label so parentheses/brackets in the text aren't parsed as
-        // additional Mermaid shape tokens. mermaidNodeLabel already escapes ".
-        const q = `"${label}"`;
+        // label is already entity-escaped by mermaidNodeLabel, so special
+        // characters in the text won't be parsed as extra shape tokens.
         if (shape === "database") {
-            return `  ${id}[(${q})]`;
+            return `  ${id}[(${label})]`;
         }
         if (shape === "queue" || shape === "subroutine") {
-            return `  ${id}[[${q}]]`;
+            return `  ${id}[[${label}]]`;
         }
         if (shape === "cache" || shape === "stadium") {
-            return `  ${id}([${q}])`;
+            return `  ${id}([${label}])`;
         }
         if (shape === "external" || shape === "actor" || shape === "parallelogram") {
-            return `  ${id}[/${q}/]`;
+            return `  ${id}[/${label}/]`;
         }
-        if (shape === "diamond") return `  ${id}{${q}}`;
-        if (shape === "circle") return `  ${id}((${q}))`;
-        if (shape === "asymmetric") return `  ${id}>${q}]`;
-        return `  ${id}[${q}]`;
+        if (shape === "diamond") return `  ${id}{${label}}`;
+        if (shape === "circle") return `  ${id}((${label}))`;
+        if (shape === "asymmetric") return `  ${id}>${label}]`;
+        return `  ${id}[${label}]`;
     }
 
     function graphNodeLine(node, render) {
@@ -895,10 +912,11 @@
         const render = link.render && typeof link.render === "object" ? link.render : {};
         const arrow = String(render.arrow || (render.style === "dashed" ? "-.->" : "-->"));
         const label = String(link.label || "").trim();
-        // Quote the edge label so parentheses/brackets/pipes in the text aren't
-        // parsed as Mermaid node-shape or label-delimiter tokens.
-        const escaped = label.replace(/"/g, "&quot;").replace(/\|/g, "/");
-        return label ? `  ${from} ${arrow}|"${escaped}"| ${to}` : `  ${from} ${arrow} ${to}`;
+        // Entity-escape so parentheses/brackets/pipes in the text aren't parsed
+        // as Mermaid node-shape or label-delimiter tokens; Mermaid decodes the
+        // entities back to the real glyphs when rendering.
+        const escaped = mermaidLabelEscape(label);
+        return label ? `  ${from} ${arrow}|${escaped}| ${to}` : `  ${from} ${arrow} ${to}`;
     }
 
     function graphViewRefs(view, key) {

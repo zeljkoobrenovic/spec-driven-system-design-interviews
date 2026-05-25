@@ -551,8 +551,52 @@
   ],
   "steps": [
     {
+      "id": "naive",
+      "title": "1. Naive: Vote Counter + Sort-on-Read (the baseline)",
+      "description": [
+        "Start with the simplest thing that works. Posts and comments live in one store; a vote just increments a count column on the post; the listing is produced by sorting all posts by (votes / age) at read time.",
+        "This is correct and trivial \u2014 and it exposes two problems the rest of the design exists to solve. First, sorting every post by a recomputed score on every page load is far too slow once there are millions of posts and heavy read traffic. Second, a naked counter increment double-counts on retries and is wide open to vote manipulation.",
+        "So the baseline motivates everything that follows: make voting correct (idempotent), move ranking off the read path, and precompute the listing."
+      ],
+      "view": {
+        "nodes": [
+          "Client",
+          "LB",
+          "PostSvc",
+          "VoteSvc",
+          "PostDB"
+        ],
+        "links": [
+          "client-lb",
+          "lb-post",
+          "lb-vote",
+          "post-db"
+        ],
+        "highlight": [
+          "PostSvc",
+          "PostDB"
+        ]
+      },
+      "decisionPrompt": "If you sort all posts by score on every listing read, what happens at a million posts and tens of thousands of reads per second?",
+      "whyNow": [
+        "Establishing the naive baseline first makes it obvious why ranking must be precomputed and why votes need protection \u2014 every later step removes a specific pain from here."
+      ],
+      "recap": {
+        "before": "Nothing.",
+        "after": "Posts, comments, and votes stored; listing sorted on read.",
+        "newRisk": "Sort-on-read melts under load, counters double-count on retry, and votes are trivially gamed."
+      },
+      "traps": [
+        {
+          "trap": "Shipping the sort-on-read counter design as 'good enough'.",
+          "why": "Re-sorting millions of posts per request is infeasible at scale, and a bare counter is neither idempotent nor abuse-resistant.",
+          "instead": "Treat it as the baseline; make voting idempotent, score asynchronously, and precompute listings."
+        }
+      ]
+    },
+    {
       "id": "voting",
-      "title": "1. Idempotent Voting",
+      "title": "2. Idempotent Voting",
       "description": [
         "A vote must be one-per-user-per-item: store a row keyed by (user, item) so a repeat vote upserts (up -> down, or remove) rather than incrementing twice. This makes votes idempotent and safe to retry.",
         "Record the vote fast and return an optimistic score; the authoritative tally and ranking update happen asynchronously. Emit a vote event onto a queue for downstream scoring and fraud checks.",
@@ -607,11 +651,83 @@
           "why": "Retries and re-votes corrupt the tally and allow double-voting.",
           "instead": "Upsert one (user,item) vote row; derive the tally from it."
         }
+      ],
+      "flows": [
+        {
+          "name": "Vote -> dedup -> async score",
+          "note": "A vote is deduped per (user,item), acked optimistically, and queued for scoring.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Client"
+              },
+              {
+                "id": "VoteSvc",
+                "label": "Vote Service"
+              },
+              {
+                "id": "VoteStore",
+                "label": "Vote Store"
+              },
+              {
+                "id": "EventQ",
+                "label": "Event Queue"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Client",
+                "to": "VoteSvc",
+                "arrow": "->>",
+                "label": "upvote post"
+              },
+              {
+                "from": "VoteSvc",
+                "to": "VoteStore",
+                "arrow": "->>",
+                "label": "upsert (user,item) vote"
+              },
+              {
+                "type": "alt",
+                "label": "new or changed vote",
+                "messages": [
+                  {
+                    "from": "VoteSvc",
+                    "to": "EventQ",
+                    "arrow": "->>",
+                    "label": "emit vote event"
+                  },
+                  {
+                    "from": "VoteSvc",
+                    "to": "Client",
+                    "arrow": "-->>",
+                    "label": "ok (optimistic score)"
+                  }
+                ],
+                "else": {
+                  "label": "duplicate vote",
+                  "messages": [
+                    {
+                      "from": "VoteSvc",
+                      "to": "Client",
+                      "arrow": "-->>",
+                      "label": "ok (no-op)"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "VoteSvc",
+            "VoteStore"
+          ]
+        }
       ]
     },
     {
       "id": "ranking",
-      "title": "2. The Hot-Ranking Score",
+      "title": "3. The Hot-Ranking Score",
       "description": [
         "Ordering by raw upvotes would freeze old viral posts at the top forever. Use a time-decay 'hot' score that blends vote signal with age \u2014 e.g. log(votes) plus a term that decreases as the post gets older \u2014 so fresh, well-received content rises and everything sinks over time.",
         "Recompute scores asynchronously from vote events (the score worker reads tally + age and writes hot_score). This decouples the cheap vote write from the heavier ranking math.",
@@ -656,11 +772,66 @@
         "before": "Raw vote ordering.",
         "after": "Time-decayed hot scores recomputed continuously.",
         "newRisk": "Sorting millions of posts by score per request is too slow \u2014 precompute the listing."
-      }
+      },
+      "flows": [
+        {
+          "name": "Async hot-score recompute",
+          "note": "The score worker consumes vote events and updates the precomputed listing.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "EventQ",
+                "label": "Event Queue"
+              },
+              {
+                "id": "Ranker",
+                "label": "Score Worker"
+              },
+              {
+                "id": "PostDB",
+                "label": "Post Store"
+              },
+              {
+                "id": "RankCache",
+                "label": "Listing Cache"
+              }
+            ],
+            "messages": [
+              {
+                "from": "EventQ",
+                "to": "Ranker",
+                "arrow": "->>",
+                "label": "vote event"
+              },
+              {
+                "from": "Ranker",
+                "to": "PostDB",
+                "arrow": "->>",
+                "label": "read tally + age"
+              },
+              {
+                "from": "Ranker",
+                "to": "Ranker",
+                "arrow": "->>",
+                "label": "hot = f(votes, age)"
+              },
+              {
+                "from": "Ranker",
+                "to": "RankCache",
+                "arrow": "->>",
+                "label": "update sorted listing"
+              }
+            ]
+          },
+          "highlight": [
+            "Ranker"
+          ]
+        }
+      ]
     },
     {
       "id": "listings",
-      "title": "3. Precomputed Ranked Listings",
+      "title": "4. Precomputed Ranked Listings",
       "description": [
         "Sorting a community's posts by hot score on every read won't meet the latency target. Maintain a precomputed listing per (community, sort) \u2014 a sorted set of post ids the score worker updates as scores change.",
         "Reads become an O(1) cache read of the top-N ids, hydrated with post metadata and paginated by cursor. The front page is the same idea over an aggregate of communities.",
@@ -709,7 +880,7 @@
     },
     {
       "id": "comments",
-      "title": "4. Threaded Comments",
+      "title": "5. Threaded Comments",
       "description": [
         "Comments are nested arbitrarily deep. Storing only parent_id forces recursive queries to read a thread. Instead store a materialized path (the chain of ancestor ids) so any subtree is a prefix query and the whole thread sorts naturally.",
         "Shard comments by post id so a thread lives together; sort siblings by their own (smaller) score. Cache hot threads' rendered/sorted trees since popular posts are read far more than written.",
@@ -757,7 +928,7 @@
     },
     {
       "id": "fraud",
-      "title": "5. Vote-Fraud and Abuse Prevention",
+      "title": "6. Vote-Fraud and Abuse Prevention",
       "description": [
         "Open voting attracts ballot stuffing (sockpuppet accounts), brigading (coordinated external voting), and bots. The vote store's per-user records are the signal: detect anomalous patterns (many new accounts voting one post, correlated IPs/timing).",
         "Don't block synchronously \u2014 record the vote, then let the fraud service discount or strip illegitimate votes when scores recompute. Suspicious votes can be 'counted' to the voter but excluded from the real score (vote fuzzing / shadow handling).",
@@ -805,7 +976,7 @@
     },
     {
       "id": "scale-mod",
-      "title": "6. Scaling, Hot Posts, and Moderation",
+      "title": "7. Scaling, Hot Posts, and Moderation",
       "description": [
         "Viral posts get extreme read and vote concurrency. Reads are already served from the listing/comment caches; for vote write bursts, the queue absorbs them and the score worker batches recompute (you don't need per-vote reordering).",
         "Moderation (removals, spam, shadow bans) must reflect in listings: removing a post evicts it from the ranked cache and hides its comments. Run a spam check on submit and let mods act asynchronously, with listings updated by the same worker that maintains them.",

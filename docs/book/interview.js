@@ -120,6 +120,10 @@
         concept: "icons/concept.png",
         pattern: "icons/pattern.png",
         trap: "icons/trap.png",
+        before: "icons/before.png",
+        after: "icons/after.png",
+        risk: "icons/risk.png",
+        failureDrill: "icons/failure-drill.png",
     };
 
     // `fallback` is a site-root-relative path (e.g. ICON_FALLBACK.concept) used
@@ -1722,12 +1726,23 @@
         return wrap;
     }
 
-    function makeLabeledText(label, value) {
+    // `icon` is a site-root fallback path (e.g. ICON_FALLBACK.before); when set,
+    // the label heading is shown with that icon (same treatment as concepts).
+    function makeLabeledText(label, value, icon) {
         const wrap = document.createElement("div");
         wrap.className = "labeled-text";
         const h = document.createElement("h4");
         h.textContent = label;
-        wrap.appendChild(h);
+        const iconEl = icon ? makeAssetIcon(null, label, icon) : null;
+        if (iconEl) {
+            const head = document.createElement("div");
+            head.className = "asset-heading";
+            head.appendChild(iconEl);
+            head.appendChild(h);
+            wrap.appendChild(head);
+        } else {
+            wrap.appendChild(h);
+        }
         const p = document.createElement("p");
         p.textContent = String(value || "");
         wrap.appendChild(p);
@@ -1761,16 +1776,16 @@
         }
 
         const fields = [
-            ["Before", recap.before],
-            ["After", recap.after],
-            ["New risk", recap.newRisk],
+            ["Before", recap.before, ICON_FALLBACK.before],
+            ["After", recap.after, ICON_FALLBACK.after],
+            ["New risk", recap.newRisk, ICON_FALLBACK.risk],
         ].filter((pair) => pair[1]);
         if (fields.length === 0) return null;
 
         const wrap = document.createElement("div");
         wrap.className = "recap-grid";
-        fields.forEach(([label, value]) => {
-            wrap.appendChild(makeLabeledText(label, value));
+        fields.forEach(([label, value, icon]) => {
+            wrap.appendChild(makeLabeledText(label, value, icon));
         });
         return makeSection("Recap", wrap, "recap");
     }
@@ -1784,9 +1799,14 @@
             const card = document.createElement("div");
             card.className = "failure-drill-card";
             const scenario = drill.scenario || drill.title || "Failure scenario";
+            const head = document.createElement("div");
+            head.className = "asset-heading";
+            const icon = makeAssetIcon(null, "Failure drill", ICON_FALLBACK.failureDrill);
+            if (icon) head.appendChild(icon);
             const h = document.createElement("h4");
             h.textContent = scenario;
-            card.appendChild(h);
+            head.appendChild(h);
+            card.appendChild(head);
             if (drill.expectedBehavior || drill.expected) {
                 card.appendChild(makeLabeledText("Expected behavior", drill.expectedBehavior || drill.expected));
             }

@@ -232,7 +232,7 @@
         const safe = highlightIds.filter((id) => /^[A-Za-z_][A-Za-z0-9_-]*$/.test(id));
         if (safe.length === 0) return diagramSrc;
         return diagramSrc + "\n" +
-            "classDef newNode stroke:#f59e0b,stroke-width:2.8px;\n" +
+            "classDef newNode stroke:crimson,stroke-width:3.6px;\n" +
             `class ${safe.join(",")} newNode;`;
     }
 

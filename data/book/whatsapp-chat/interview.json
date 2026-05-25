@@ -580,8 +580,49 @@
   ],
   "steps": [
     {
+      "id": "naive",
+      "title": "1. Naive: Poll the Server for New Messages",
+      "description": [
+        "Start with the simplest thing that works. The client sends a message with an ordinary HTTP POST; the server writes it to a messages table. To receive, each client polls the server every few seconds (GET /messages?since=...) and the server returns any new rows.",
+        "This is correct and trivial to build \u2014 and it exposes the two problems the rest of the design exists to solve. First, latency: a message sits unseen until the recipient's next poll, so 'real-time' is really 'every few seconds', and shortening the interval only makes it worse. Second, load: hundreds of millions of clients polling a database every few seconds is mostly empty responses \u2014 a crushing, wasteful read load whether or not anyone sent anything.",
+        "So the baseline motivates everything that follows: replace polling with a persistent connection the server can push down, so delivery is instant and the server only does work when there's an actual message."
+      ],
+      "view": {
+        "nodes": [
+          "Client",
+          "LB",
+          "ChatSvc",
+          "MsgDB"
+        ],
+        "links": [
+          "client-lb",
+          "chat-msgdb"
+        ],
+        "highlight": [
+          "ChatSvc",
+          "MsgDB"
+        ]
+      },
+      "decisionPrompt": "If every client polls the server every 3 seconds for new messages, what does that cost at hundreds of millions of users \u2014 and how 'real-time' is it?",
+      "whyNow": [
+        "Establishing the polling baseline first makes it obvious why a persistent connection is needed \u2014 it removes both the latency and the wasted-poll load in one move."
+      ],
+      "recap": {
+        "before": "Nothing.",
+        "after": "Messages POSTed and stored; recipients poll the DB for new rows.",
+        "newRisk": "Polling is high-latency and floods the database with mostly-empty reads; the server can't push, so delivery is never truly real-time."
+      },
+      "traps": [
+        {
+          "trap": "Shipping HTTP polling as 'good enough' for chat.",
+          "why": "Short poll intervals multiply database load across hundreds of millions of clients while still delivering messages seconds late.",
+          "instead": "Hold a persistent connection per device so the server pushes messages the instant they arrive."
+        }
+      ]
+    },
+    {
       "id": "connections",
-      "title": "1. Persistent Connections via WebSocket Gateways",
+      "title": "2. Persistent Connections via WebSocket Gateways",
       "description": [
         "Polling can't deliver in real time at this scale. Each device opens a long-lived WebSocket to a gateway node that holds the connection open and can push messages down instantly.",
         "A gateway holds ~1M connections; a connection load balancer spreads new connections across the fleet. The connection is stateful, so it's sticky to one gateway for its lifetime.",
@@ -636,7 +677,7 @@
     },
     {
       "id": "routing",
-      "title": "2. Route a Message to the Recipient's Connection",
+      "title": "3. Route a Message to the Recipient's Connection",
       "description": [
         "When a message arrives, the chat service looks up the recipient in the session registry: which gateway (if any) currently holds their device's socket.",
         "If online, the chat service tells that gateway to push the frame down the recipient's socket. The registry is the live device -> gateway map, updated on connect/disconnect.",
@@ -688,7 +729,7 @@
     },
     {
       "id": "delivery",
-      "title": "3. Reliable, Ordered, Idempotent Delivery",
+      "title": "4. Reliable, Ordered, Idempotent Delivery",
       "description": [
         "Persist the message durably before acking the sender \u2014 that's what makes 'never lost' true across crashes. The store assigns a per-conversation sequence number for ordering.",
         "The client attaches a clientMsgId; the server dedups on it so a retry over a flaky network doesn't create a duplicate (at-least-once + idempotency = effectively-once).",
@@ -747,11 +788,83 @@
           "expectedBehavior": "Client retries with the same clientMsgId; server recognizes it and re-acks without duplicating.",
           "mitigation": "Persist-before-ack + idempotent dedup on clientMsgId."
         }
+      ],
+      "flows": [
+        {
+          "name": "Persist-before-ack with idempotent dedup",
+          "note": "The message is durably stored and ordered before the sender is acked; a retry with the same clientMsgId returns the original id instead of duplicating.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Client"
+              },
+              {
+                "id": "Gateway",
+                "label": "WS Gateway"
+              },
+              {
+                "id": "ChatSvc",
+                "label": "Chat Service"
+              },
+              {
+                "id": "MsgDB",
+                "label": "Message Store"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Client",
+                "to": "Gateway",
+                "arrow": "->>",
+                "label": "send {clientMsgId}"
+              },
+              {
+                "from": "Gateway",
+                "to": "ChatSvc",
+                "arrow": "->>",
+                "label": "route message"
+              },
+              {
+                "type": "alt",
+                "label": "clientMsgId not seen before",
+                "messages": [
+                  {
+                    "from": "ChatSvc",
+                    "to": "MsgDB",
+                    "arrow": "->>",
+                    "label": "persist + assign sequence"
+                  },
+                  {
+                    "from": "ChatSvc",
+                    "to": "Client",
+                    "arrow": "-->>",
+                    "label": "ack(sent, serverMsgId)"
+                  }
+                ],
+                "else": {
+                  "label": "duplicate retry",
+                  "messages": [
+                    {
+                      "from": "ChatSvc",
+                      "to": "Client",
+                      "arrow": "-->>",
+                      "label": "ack(original serverMsgId)"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "ChatSvc",
+            "MsgDB"
+          ]
+        }
       ]
     },
     {
       "id": "offline",
-      "title": "4. Offline Delivery and History Sync",
+      "title": "5. Offline Delivery and History Sync",
       "description": [
         "If the recipient is offline (no session in the registry), enqueue the message in their per-user message queue. On reconnect, the gateway drains the queue down the new socket before live traffic.",
         "Wake the device with a push notification (APNs/FCM) so it reconnects and pulls. Push is a hint, not the delivery channel \u2014 the durable queue is.",
@@ -872,7 +985,7 @@
     },
     {
       "id": "groups",
-      "title": "5. Group Messaging and Fanout",
+      "title": "6. Group Messaging and Fanout",
       "description": [
         "A group message must reach every current member. The fanout service reads the group membership, then for each member does the same online/offline decision: push to their gateway or enqueue.",
         "Per-recipient delivery state means receipts work in groups too (delivered/read counts). Bound group size so fanout stays cheap; very large 'broadcast' groups may switch to a pull model.",
@@ -921,11 +1034,82 @@
           "issue": "Presence/typing updates amplify across large groups.",
           "mitigation": "Throttle and batch presence; don't fan out typing to huge groups."
         }
+      ],
+      "flows": [
+        {
+          "name": "Group message fanout to members",
+          "note": "One canonical message is fanned out to each member; per member the online/offline decision is made independently.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "ChatSvc",
+                "label": "Chat Service"
+              },
+              {
+                "id": "Fanout",
+                "label": "Fanout Service"
+              },
+              {
+                "id": "GroupDB",
+                "label": "Group Store"
+              },
+              {
+                "id": "MsgQ",
+                "label": "Message Queue"
+              },
+              {
+                "id": "Gateway",
+                "label": "WS Gateway"
+              }
+            ],
+            "messages": [
+              {
+                "from": "ChatSvc",
+                "to": "Fanout",
+                "arrow": "->>",
+                "label": "group message"
+              },
+              {
+                "from": "Fanout",
+                "to": "GroupDB",
+                "arrow": "->>",
+                "label": "list members"
+              },
+              {
+                "type": "alt",
+                "label": "member online",
+                "messages": [
+                  {
+                    "from": "Fanout",
+                    "to": "Gateway",
+                    "arrow": "->>",
+                    "label": "push to device"
+                  }
+                ],
+                "else": {
+                  "label": "member offline",
+                  "messages": [
+                    {
+                      "from": "Fanout",
+                      "to": "MsgQ",
+                      "arrow": "->>",
+                      "label": "enqueue per member"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Fanout",
+            "GroupDB"
+          ]
+        }
       ]
     },
     {
       "id": "scale-presence",
-      "title": "6. Presence, Media, and Gateway Resilience",
+      "title": "7. Presence, Media, and Gateway Resilience",
       "description": [
         "Presence (online / last-seen) derives from session registry entries and heartbeats; broadcast presence changes only to a user's contacts, not everyone, and rate-limit typing indicators.",
         "Media never travels the message path: the client uploads to the media/blob service and the message carries a media id; recipients download from the blob store/CDN.",

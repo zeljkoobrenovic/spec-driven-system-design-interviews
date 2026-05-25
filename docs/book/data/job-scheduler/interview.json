@@ -485,8 +485,50 @@
   ],
   "steps": [
     {
+      "id": "naive",
+      "title": "1. Naive: One Cron Process on a Single Box",
+      "description": [
+        "Start with the simplest scheduler that works: a single process on one machine runs a loop, wakes up every second, scans its in-memory list of jobs for any whose time has come, and fires them. This is essentially `cron` \u2014 and for a handful of jobs on one box it's perfectly fine.",
+        "It exposes the problems the rest of the design exists to solve. If the box crashes, every in-memory schedule is gone and any job due during the outage simply never runs \u2014 the cardinal sin for a scheduler. If you run a second instance for availability, both loops see the same due job and fire it twice. And scanning every job each tick doesn't scale past one machine's memory and CPU.",
+        "So the naive loop motivates everything that follows: persist schedules durably, index them for cheap due-lookup, elect a single leader so jobs fire exactly once, and execute reliably with retries."
+      ],
+      "view": {
+        "nodes": [
+          "Client",
+          "API",
+          "JobDB"
+        ],
+        "links": [
+          "client-api",
+          "api-jobdb"
+        ],
+        "highlight": [
+          "API"
+        ],
+        "groups": [
+          "control"
+        ]
+      },
+      "decisionPrompt": "Your single cron box reboots for 5 minutes. What happens to the jobs that were due during those 5 minutes?",
+      "whyNow": [
+        "Establishing the single-box cron loop first makes every later step's purpose concrete \u2014 durability fixes the crash, leader election fixes the double-fire, the due index fixes the full scan."
+      ],
+      "recap": {
+        "before": "Nothing.",
+        "after": "A single process loops, scans jobs in memory, and fires the ones that are due.",
+        "newRisk": "A crash loses every schedule and silently drops due jobs; a second instance double-fires; scanning all jobs every tick won't scale."
+      },
+      "traps": [
+        {
+          "trap": "Shipping the single-box cron loop as the design.",
+          "why": "In-memory schedules vanish on crash, a second instance for HA double-fires every job, and the full scan caps you at one machine.",
+          "instead": "Persist schedules durably, index them by next-fire time, elect one dispatcher, and execute via an idempotent queue."
+        }
+      ]
+    },
+    {
       "id": "store",
-      "title": "1. Durable Schedules",
+      "title": "2. Durable Schedules",
       "description": [
         "First, never forget a job. Persist each job definition and its schedule (cron expression or one-off time) in a durable store, along with a computed next_fire_at timestamp.",
         "The store is the source of truth: a full restart of the whole scheduler can reconstruct exactly what should run and when. Recurring jobs recompute next_fire_at after each fire from the cron expression.",
@@ -533,7 +575,7 @@
     },
     {
       "id": "due",
-      "title": "2. Finding Due Jobs Efficiently",
+      "title": "3. Finding Due Jobs Efficiently",
       "description": [
         "You can't scan millions of jobs each second to find which are due. Maintain a time-ordered index keyed by next_fire_at so 'what's due in the next window' is a cheap range query (a time wheel / sorted index).",
         "The scheduler ticks periodically, pulls the small set of jobs due now (or imminently), and dispatches them. Round-time bursts (everything at 02:00) are handled by reading the due range and fanning out.",
@@ -581,7 +623,7 @@
     },
     {
       "id": "election",
-      "title": "3. Leader Election to Avoid Duplicate Triggers",
+      "title": "4. Leader Election to Avoid Duplicate Triggers",
       "description": [
         "For availability you run multiple scheduler instances \u2014 but if they all read the due index and dispatch, every job fires multiple times. Elect a single active dispatcher (per shard) via a lease in a coordination store.",
         "The lease has a TTL and a fencing token; only the lease holder dispatches. If the leader dies, its lease expires and another instance takes over \u2014 brief gap, no duplicate leaders. The fencing token guards against a paused-then-resumed old leader acting late.",
@@ -635,7 +677,7 @@
     },
     {
       "id": "dispatch",
-      "title": "4. Exactly-Once Triggering",
+      "title": "5. Exactly-Once Triggering",
       "description": [
         "Even with one leader, a dispatcher can crash after reading a due job but before recording it, then re-dispatch on restart. Make triggering idempotent: each fire has a natural key (job_id, scheduled_fire_time). Atomically mark that key as dispatched (advance last_fired/next_fire) and enqueue the run in one step.",
         "A second attempt to fire the same (job_id, scheduled_fire) is a no-op because the key already exists. This turns at-least-once dispatch into exactly-once triggering \u2014 one run per scheduled fire.",
@@ -679,11 +721,84 @@
         "before": "Crash-then-restart could re-fire.",
         "after": "Each scheduled fire produces exactly one run.",
         "newRisk": "The run still has to execute reliably on a worker that may itself fail."
-      }
+      },
+      "flows": [
+        {
+          "name": "Poll due -> dedup -> enqueue",
+          "note": "The leader pulls due jobs, atomically dedups each fire on (job_id, scheduled_fire), and enqueues exactly one run; a re-dispatch after a crash is a no-op.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Dispatcher",
+                "label": "Dispatcher (Leader)"
+              },
+              {
+                "id": "TimeWheel",
+                "label": "Due-Job Index"
+              },
+              {
+                "id": "JobDB",
+                "label": "Job Store"
+              },
+              {
+                "id": "RunQ",
+                "label": "Run Queue"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Dispatcher",
+                "to": "TimeWheel",
+                "arrow": "->>",
+                "label": "poll due jobs (<= now)"
+              },
+              {
+                "from": "Dispatcher",
+                "to": "JobDB",
+                "arrow": "->>",
+                "label": "mark fired (job_id, scheduled_fire)"
+              },
+              {
+                "type": "alt",
+                "label": "first dispatch of this fire",
+                "messages": [
+                  {
+                    "from": "Dispatcher",
+                    "to": "RunQ",
+                    "arrow": "->>",
+                    "label": "enqueue run + advance next_fire"
+                  },
+                  {
+                    "from": "RunQ",
+                    "to": "Dispatcher",
+                    "arrow": "-->>",
+                    "label": "enqueued"
+                  }
+                ],
+                "else": {
+                  "label": "fire already marked (re-dispatch)",
+                  "messages": [
+                    {
+                      "from": "JobDB",
+                      "to": "Dispatcher",
+                      "arrow": "-->>",
+                      "label": "duplicate -> no-op"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Dispatcher",
+            "RunQ"
+          ]
+        }
+      ]
     },
     {
       "id": "execute",
-      "title": "5. At-Least-Once Execution with Idempotency",
+      "title": "6. At-Least-Once Execution with Idempotency",
       "description": [
         "Dispatched runs go onto an at-least-once queue consumed by stateless workers. A worker picks up a run, executes the job, and records the outcome. At-least-once means a run can be delivered twice (worker crash before ack), so execution must be idempotent.",
         "Use the run's idempotency key (job_id, scheduled_fire): a worker checks/records it in the run store before executing, so a redelivered run is recognized and not run twice (or the job itself is designed to be safe to re-run).",
@@ -728,11 +843,80 @@
         "before": "A worker crash could lose or duplicate execution.",
         "after": "Runs execute at-least-once, idempotently \u2014 effectively once.",
         "newRisk": "Jobs fail for transient reasons and must be retried sensibly, not forever."
-      }
+      },
+      "flows": [
+        {
+          "name": "At-least-once run with idempotency",
+          "note": "A worker claims a run, dedups on the run key, executes, and acks; a redelivered copy is recognized and skipped.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "RunQ",
+                "label": "Run Queue"
+              },
+              {
+                "id": "Workers",
+                "label": "Job Worker"
+              },
+              {
+                "id": "RunStore",
+                "label": "Run Store"
+              }
+            ],
+            "messages": [
+              {
+                "from": "RunQ",
+                "to": "Workers",
+                "arrow": "->>",
+                "label": "deliver run"
+              },
+              {
+                "from": "Workers",
+                "to": "RunStore",
+                "arrow": "->>",
+                "label": "claim (job_id, scheduled_fire)"
+              },
+              {
+                "type": "alt",
+                "label": "first attempt",
+                "messages": [
+                  {
+                    "from": "Workers",
+                    "to": "Workers",
+                    "arrow": "->>",
+                    "label": "execute job"
+                  },
+                  {
+                    "from": "Workers",
+                    "to": "RunStore",
+                    "arrow": "->>",
+                    "label": "record success + ack"
+                  }
+                ],
+                "else": {
+                  "label": "redelivered run",
+                  "messages": [
+                    {
+                      "from": "RunStore",
+                      "to": "Workers",
+                      "arrow": "-->>",
+                      "label": "already done -> skip + ack"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Workers",
+            "RunStore"
+          ]
+        }
+      ]
     },
     {
       "id": "retry",
-      "title": "6. Retries, Backoff, and Dead-Lettering",
+      "title": "7. Retries, Backoff, and Dead-Lettering",
       "description": [
         "Transient failures (a downstream blip) should self-heal: on failure, the retry controller re-enqueues the run with exponential backoff (and jitter), incrementing the attempt count in the run store.",
         "After a max number of attempts, stop retrying and move the run to a dead-letter store for inspection/alerting \u2014 so a permanently-broken job doesn't retry forever or block others.",

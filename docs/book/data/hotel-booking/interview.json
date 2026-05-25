@@ -569,8 +569,55 @@
   ],
   "steps": [
     {
+      "id": "naive",
+      "title": "1. Naive: Check Availability, Then Write a Booking (the baseline)",
+      "description": [
+        "Start with the simplest booking flow: when a guest books, read the availability for the dates, and if it looks free, write a booking row. Search is a query over the same availability/property tables.",
+        "It reads naturally and is wrong under concurrency. Between the check and the write, a second guest can run the same check, see the same dates free, and also write a booking \u2014 a classic read-then-write race that double-books the room for overlapping dates. Separately, searching the authoritative availability tables on every browse doesn't scale to millions of properties and browse-heavy traffic.",
+        "So the baseline motivates the design: model per-night date-range inventory, reserve a range atomically (so exactly one booking wins), and serve browse from a fast approximate index/cache while the book step verifies the truth."
+      ],
+      "view": {
+        "nodes": [
+          "Client",
+          "LB",
+          "BookingSvc",
+          "AvailSvc",
+          "AvailDB"
+        ],
+        "links": [
+          "client-lb",
+          "lb-booking",
+          "booking-avail",
+          "avail-db"
+        ],
+        "highlight": [
+          "BookingSvc",
+          "AvailDB"
+        ],
+        "groups": [
+          "booking-core"
+        ]
+      },
+      "decisionPrompt": "Two guests check the same room for the same dates at the same moment, both see it free, and both write a booking. What did you just do?",
+      "whyNow": [
+        "Check-then-write is the intuitive booking flow; watching it double-book under a concurrent race is exactly what motivates atomic range reservation and the approximate-browse / exact-book split."
+      ],
+      "recap": {
+        "before": "Nothing.",
+        "after": "Bookings work by checking availability then writing a booking row; search hits the same tables.",
+        "newRisk": "The check-then-write gap double-books under concurrency, and searching the truth store on every browse doesn't scale."
+      },
+      "traps": [
+        {
+          "trap": "Checking availability and then writing the booking in two separate steps.",
+          "why": "Two concurrent requests both pass the check before either writes, double-booking the room for overlapping dates.",
+          "instead": "Reserve the whole date range in one atomic conditional operation so exactly one booking wins."
+        }
+      ]
+    },
+    {
       "id": "inventory",
-      "title": "1. Model Inventory as Date-Range Availability",
+      "title": "2. Model Inventory as Date-Range Availability",
       "description": [
         "Lodging inventory is per-night: a property/room is available or not for each date. A stay is a contiguous range of nights, and booking it means every night in the range is open.",
         "Store availability per (property, date) with a state (open/held/booked). This per-night model is what makes overlapping-range conflict detection precise \u2014 two stays conflict iff they share any night.",
@@ -610,14 +657,14 @@
         "The per-night inventory model is the foundation; search, holds, and double-book prevention all reason about date ranges over it."
       ],
       "recap": {
-        "before": "Nothing.",
+        "before": "Check-then-write bookings on shared tables.",
         "after": "Per-night availability is the source of truth.",
         "newRisk": "Searching this directly across millions of properties on every browse is too slow."
       }
     },
     {
       "id": "search",
-      "title": "2. Search: Approximate Browse",
+      "title": "3. Search: Approximate Browse",
       "description": [
         "Browse is read-heavy and tolerant of slight staleness. Build a search index over properties (geo + attributes) and an availability read cache; search returns properties that appear available for the dates, fast.",
         "Search availability is approximate by design \u2014 a property shown as available might get booked by someone else a second later. That's acceptable for browse; the booking step is where exactness is enforced.",
@@ -670,7 +717,7 @@
     },
     {
       "id": "hold",
-      "title": "3. Hold-Then-Confirm Checkout",
+      "title": "4. Hold-Then-Confirm Checkout",
       "description": [
         "Booking is multi-step (review, pay), during which someone else mustn't grab the room. When checkout starts, place a hold on the date range: mark those nights 'held' with a short TTL and authorize payment.",
         "The hold gives the guest a window to complete payment without the dates being sold from under them. If they confirm, the hold becomes a booking; if they abandon, the hold expires.",
@@ -729,7 +776,7 @@
     },
     {
       "id": "consistency",
-      "title": "4. Preventing Double-Booking",
+      "title": "5. Preventing Double-Booking",
       "description": [
         "The core correctness requirement: never sell the same room twice for overlapping dates. The hold acquisition must be atomic \u2014 check that every night in the range is open and mark them held in one operation, so two concurrent requests can't both pass the check.",
         "Use a conditional/transactional update over the date range (or optimistic concurrency with the version column): the first request wins the range; the second sees a conflict and is rejected. The availability store, sharded by property, serializes writes per property.",
@@ -779,11 +826,86 @@
           "why": "Two requests both read 'open' before either marks held -> double-booking.",
           "instead": "Atomic conditional update over the whole range."
         }
+      ],
+      "flows": [
+        {
+          "name": "Atomic range reservation: exactly one hold wins",
+          "note": "Two concurrent holds hit the same range; the conditional update over all nights succeeds for exactly one, the other sees a conflict.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "BookingSvc",
+                "label": "Booking Service"
+              },
+              {
+                "id": "AvailSvc",
+                "label": "Availability"
+              },
+              {
+                "id": "AvailDB",
+                "label": "Availability Store"
+              }
+            ],
+            "messages": [
+              {
+                "from": "BookingSvc",
+                "to": "AvailSvc",
+                "arrow": "->>",
+                "label": "reserve nights [Jun1..Jun4)"
+              },
+              {
+                "from": "AvailSvc",
+                "to": "AvailDB",
+                "arrow": "->>",
+                "label": "UPDATE state='held' WHERE all nights='open'"
+              },
+              {
+                "type": "alt",
+                "label": "all nights matched (won the range)",
+                "messages": [
+                  {
+                    "from": "AvailDB",
+                    "to": "AvailSvc",
+                    "arrow": "-->>",
+                    "label": "rows updated"
+                  },
+                  {
+                    "from": "AvailSvc",
+                    "to": "BookingSvc",
+                    "arrow": "-->>",
+                    "label": "reserved"
+                  }
+                ],
+                "else": {
+                  "label": "a night already held/booked",
+                  "messages": [
+                    {
+                      "from": "AvailDB",
+                      "to": "AvailSvc",
+                      "arrow": "-->>",
+                      "label": "0 rows (conflict)"
+                    },
+                    {
+                      "from": "AvailSvc",
+                      "to": "BookingSvc",
+                      "arrow": "-->>",
+                      "label": "409 unavailable"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "AvailSvc",
+            "AvailDB"
+          ]
+        }
       ]
     },
     {
       "id": "confirm",
-      "title": "5. Confirm, Idempotency, and Expiry",
+      "title": "6. Confirm, Idempotency, and Expiry",
       "description": [
         "On confirm, capture the authorized payment and transition the hold to a confirmed booking atomically (held nights -> booked). Use an idempotency key so a retried confirm (network blip) doesn't create two bookings or double-charge.",
         "If the guest abandons checkout, the hold reaper expires it past its TTL and releases the nights back to 'open' \u2014 inventory self-heals without manual cleanup.",
@@ -839,11 +961,93 @@
           "expectedBehavior": "Retry with the idempotency key recognizes the captured payment and finalizes one booking.",
           "mitigation": "Idempotent confirm keyed to the hold/payment."
         }
+      ],
+      "flows": [
+        {
+          "name": "Idempotent confirm: capture payment, finalize once",
+          "note": "Confirm captures the authorized payment and transitions held nights to booked under an idempotency key; a retried confirm returns the same booking.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Client"
+              },
+              {
+                "id": "BookingSvc",
+                "label": "Booking Service"
+              },
+              {
+                "id": "PaySvc",
+                "label": "Payment"
+              },
+              {
+                "id": "AvailDB",
+                "label": "Availability Store"
+              },
+              {
+                "id": "BookingDB",
+                "label": "Booking Store"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Client",
+                "to": "BookingSvc",
+                "arrow": "->>",
+                "label": "confirm hold {idemKey}"
+              },
+              {
+                "type": "alt",
+                "label": "first confirm for this key",
+                "messages": [
+                  {
+                    "from": "BookingSvc",
+                    "to": "PaySvc",
+                    "arrow": "->>",
+                    "label": "capture authorized payment"
+                  },
+                  {
+                    "from": "BookingSvc",
+                    "to": "AvailDB",
+                    "arrow": "->>",
+                    "label": "held nights -> booked"
+                  },
+                  {
+                    "from": "BookingSvc",
+                    "to": "BookingDB",
+                    "arrow": "->>",
+                    "label": "persist booking (confirmed)"
+                  },
+                  {
+                    "from": "BookingSvc",
+                    "to": "Client",
+                    "arrow": "-->>",
+                    "label": "confirmed"
+                  }
+                ],
+                "else": {
+                  "label": "retry of same key",
+                  "messages": [
+                    {
+                      "from": "BookingSvc",
+                      "to": "Client",
+                      "arrow": "-->>",
+                      "label": "confirmed (original booking)"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "BookingSvc",
+            "PaySvc"
+          ]
+        }
       ]
     },
     {
       "id": "scale",
-      "title": "6. Scaling Search, Hot Properties, and Freshness",
+      "title": "7. Scaling Search, Hot Properties, and Freshness",
       "description": [
         "Shard the availability and booking stores by property id so per-property writes serialize locally and load spreads. Search scales separately: the index + availability cache are derived and replicated for browse volume.",
         "Hot dates/properties (a festival weekend, a famous listing) concentrate booking contention on one property's rows; this is bounded \u2014 contention is per-property, and the atomic range reservation keeps it correct, just serialized.",

@@ -191,6 +191,12 @@
         "from": "Inventory",
         "to": "OrderDB",
         "label": "reconcile to ledger"
+      },
+      {
+        "id": "buy-db",
+        "from": "BuySvc",
+        "to": "OrderDB",
+        "label": "read + decrement stock row"
       }
     ],
     "types": [
@@ -553,8 +559,51 @@
   ],
   "steps": [
     {
+      "id": "naive",
+      "title": "1. Naive: Everyone Hits Buy, Decrement Stock in the DB",
+      "description": [
+        "Start with the obvious design: expose a buy endpoint, let every user call it, and on each call read the stock row from the database, check it's above zero, and decrement it. One transaction per purchase, the DB as the single source of truth. For a normal store this is exactly right.",
+        "Under a flash sale it melts. Millions of users arrive in the same second for a few thousand units, so the buy endpoint and the database take the full flood \u2014 far past what the DB can serve. Worse, 'read then check then decrement' as separate steps lets concurrent buyers all read the same positive count and oversell. Even a single row with `UPDATE ... WHERE qty > 0` becomes a row-lock hotspot that collapses throughput, and most of the traffic is doomed to fail anyway but still costs a full request.",
+        "So the naive path motivates the whole design: offload reads at the edge, admit only a survivable, fair rate, and reserve stock with one atomic counter instead of a contended DB row."
+      ],
+      "view": {
+        "nodes": [
+          "Client",
+          "BuySvc",
+          "OrderDB"
+        ],
+        "links": [
+          "client-buy",
+          "buy-db"
+        ],
+        "highlight": [
+          "BuySvc",
+          "OrderDB"
+        ],
+        "groups": [
+          "purchase"
+        ]
+      },
+      "decisionPrompt": "10 million users hit the buy endpoint in the same second for 10,000 units, each doing a read-check-decrement on one stock row. What breaks first?",
+      "whyNow": [
+        "Letting everyone hit the DB makes the two failures concrete \u2014 the spike that melts the database and the race that oversells \u2014 which is exactly what edge offload, admission control, and the atomic counter remove."
+      ],
+      "recap": {
+        "before": "Nothing.",
+        "after": "Every buyer calls the endpoint and read-check-decrements the stock row in the DB.",
+        "newRisk": "The spike overwhelms the DB, separate read/check/decrement steps oversell, and a single hot row becomes a lock bottleneck."
+      },
+      "traps": [
+        {
+          "trap": "Letting the full crowd transact directly against the database.",
+          "why": "The spike is orders of magnitude over capacity, and naive read-then-decrement oversells while a hot row serializes throughput.",
+          "instead": "Offload reads to the edge, admit a fair capped rate, and reserve with a single atomic decrement-if-positive counter."
+        }
+      ]
+    },
+    {
       "id": "offload",
-      "title": "1. Offload Reads to the Edge",
+      "title": "2. Offload Reads to the Edge",
       "description": [
         "Most of the flood is people loading the page and refreshing for availability \u2014 not actually transacting. Serve the sale page as static assets from a CDN, and expose availability/sold-out as a cacheable, frequently-updated value the page polls.",
         "This keeps the overwhelming majority of traffic off the backend entirely. The backend should only ever see admission and buy attempts.",
@@ -607,7 +656,7 @@
     },
     {
       "id": "admission",
-      "title": "2. Admission Control at the Edge",
+      "title": "3. Admission Control at the Edge",
       "description": [
         "Demand is 100-1000x stock, so most requests cannot succeed. Reject early and cheaply: rate-limit per user/IP, filter bots, and shed excess load at the edge with a fast, clear 'try later' instead of letting it reach the core.",
         "The goal is to protect the purchase core so it only ever receives a survivable request rate \u2014 admitting somewhat more than `stock` (to cover non-completers) but nowhere near the full flood.",
@@ -653,7 +702,7 @@
     },
     {
       "id": "waitroom",
-      "title": "3. Fairness: Virtual Waiting Room",
+      "title": "4. Fairness: Virtual Waiting Room",
       "description": [
         "Pure load-shedding is a lottery on network timing and favors bots with fast connections. A virtual waiting room makes admission fair: users join a queue and are admitted at a controlled rate.",
         "Admission grants a signed, time-boxed token that the buy endpoint requires. The token caps how many users can be in the purchase path at once and ties a buy attempt to an admitted identity (anti-abuse).",
@@ -708,7 +757,7 @@
     },
     {
       "id": "reserve",
-      "title": "4. Oversell-Proof Reservation",
+      "title": "5. Oversell-Proof Reservation",
       "description": [
         "Admitted buyers contend for limited stock. The whole correctness requirement reduces to: at most `stock` reservations succeed. Use a single atomic counter (e.g. Redis DECR) \u2014 decrement-if-positive returns success only while units remain.",
         "An atomic counter is the contention point but is extremely fast and trivially oversell-proof: the (stock+1)th decrement returns 'sold out'. No locking, no race.",
@@ -765,11 +814,94 @@
           "why": "Row-lock contention on one row collapses throughput.",
           "instead": "An in-memory atomic counter as the hot reservation gate; reconcile to durable storage off the hot path."
         }
+      ],
+      "flows": [
+        {
+          "name": "Token-gated atomic reservation",
+          "note": "An admitted buyer presents a token; the purchase service verifies it, then a single atomic decrement-if-positive either reserves a unit or returns sold-out \u2014 oversell-proof and lock-free.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Client",
+                "label": "Buyer"
+              },
+              {
+                "id": "BuySvc",
+                "label": "Purchase Service"
+              },
+              {
+                "id": "Token",
+                "label": "Token Service"
+              },
+              {
+                "id": "Inventory",
+                "label": "Inventory Counter"
+              },
+              {
+                "id": "OrderQ",
+                "label": "Order Queue"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Client",
+                "to": "BuySvc",
+                "arrow": "->>",
+                "label": "POST /buy {token, idempotencyKey}"
+              },
+              {
+                "from": "BuySvc",
+                "to": "Token",
+                "arrow": "->>",
+                "label": "verify signed token"
+              },
+              {
+                "from": "BuySvc",
+                "to": "Inventory",
+                "arrow": "->>",
+                "label": "DECR if > 0"
+              },
+              {
+                "type": "alt",
+                "label": "got a unit",
+                "messages": [
+                  {
+                    "from": "BuySvc",
+                    "to": "OrderQ",
+                    "arrow": "->>",
+                    "label": "enqueue reservation"
+                  },
+                  {
+                    "from": "BuySvc",
+                    "to": "Client",
+                    "arrow": "-->>",
+                    "label": "reserved"
+                  }
+                ],
+                "else": {
+                  "label": "counter at 0",
+                  "messages": [
+                    {
+                      "from": "BuySvc",
+                      "to": "Client",
+                      "arrow": "-->>",
+                      "label": "sold_out"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "BuySvc",
+            "Inventory"
+          ]
+        }
       ]
     },
     {
       "id": "async",
-      "title": "5. Async Order Creation and Payment",
+      "title": "6. Async Order Creation and Payment",
       "description": [
         "Keep the contended buy path tiny: a successful counter decrement returns 'reserved' immediately and enqueues the reservation. Order creation, persistence, and payment happen asynchronously off the hot path.",
         "A worker creates the durable order, decrements the durable stock ledger, and charges the buyer within a reservation hold window. The slow/durable work is now decoupled from the spike.",
@@ -823,11 +955,84 @@
           "expectedBehavior": "The reservation expires after the hold window; the unit is released (counter incremented, ledger adjusted) and can resell.",
           "mitigation": "Reaper job on reservation TTL + counter/ledger reconciliation."
         }
+      ],
+      "flows": [
+        {
+          "name": "Async order creation + payment",
+          "note": "A successful reservation is processed off the hot path: a worker creates the durable order, decrements the ledger, and charges the buyer within the hold window; failure releases the unit.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "OrderQ",
+                "label": "Order Queue"
+              },
+              {
+                "id": "OrderSvc",
+                "label": "Order Service"
+              },
+              {
+                "id": "OrderDB",
+                "label": "Order Store"
+              },
+              {
+                "id": "PaySvc",
+                "label": "Payment Service"
+              }
+            ],
+            "messages": [
+              {
+                "from": "OrderQ",
+                "to": "OrderSvc",
+                "arrow": "->>",
+                "label": "deliver reservation"
+              },
+              {
+                "from": "OrderSvc",
+                "to": "OrderDB",
+                "arrow": "->>",
+                "label": "persist order + decrement ledger"
+              },
+              {
+                "from": "OrderSvc",
+                "to": "PaySvc",
+                "arrow": "->>",
+                "label": "charge buyer (within hold)"
+              },
+              {
+                "type": "alt",
+                "label": "payment succeeds",
+                "messages": [
+                  {
+                    "from": "PaySvc",
+                    "to": "OrderSvc",
+                    "arrow": "-->>",
+                    "label": "paid -> confirm order"
+                  }
+                ],
+                "else": {
+                  "label": "fails / times out",
+                  "messages": [
+                    {
+                      "from": "OrderSvc",
+                      "to": "OrderDB",
+                      "arrow": "->>",
+                      "label": "expire order, release unit"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "OrderQ",
+            "OrderSvc"
+          ]
+        }
       ]
     },
     {
       "id": "consistency",
-      "title": "6. Consistency, Reconciliation, and Degradation",
+      "title": "7. Consistency, Reconciliation, and Degradation",
       "description": [
         "The in-memory counter is fast but not durable; the order store/ledger is the source of truth. Reconcile them: confirmed orders + live reservations must equal units allocated, and the counter is rebuilt from the ledger after a restart.",
         "Released (expired) reservations increment the counter back. A reaper enforces hold-window TTLs. Periodic reconciliation catches any drift, with the durable ledger authoritative.",

@@ -127,6 +127,9 @@
         deepDive: "icons/deep-dive.png",
         talkingPoints: "icons/talking-points.png",
         mitigations: "icons/mitigations.png",
+        designMove: "icons/design-move.png",
+        whyNow: "icons/why-now.png",
+        decisionPoint: "icons/decision-point.png",
     };
 
     // `fallback` is a site-root-relative path (e.g. ICON_FALLBACK.concept) used
@@ -900,24 +903,35 @@
 
     // ---------- Rendering: description ----------
 
-    function renderStepTextSection(title, value, className) {
+    // `icon` is an optional site-root fallback path; when set, the section's
+    // <h3> title is shown alongside that icon (same .asset-heading treatment).
+    function renderStepTextSection(title, value, className, icon) {
         const content = renderTextOrBullets(value, "step-text-body");
         if (!content) return null;
         const section = document.createElement("section");
         section.className = `step-text-section${className ? " " + className : ""}`;
         const h = document.createElement("h3");
         h.textContent = title;
-        section.appendChild(h);
+        const iconEl = icon ? makeAssetIcon(null, title, icon) : null;
+        if (iconEl) {
+            const head = document.createElement("div");
+            head.className = "asset-heading section-heading";
+            head.appendChild(iconEl);
+            head.appendChild(h);
+            section.appendChild(head);
+        } else {
+            section.appendChild(h);
+        }
         section.appendChild(content);
         return section;
     }
 
     function renderDesignMove(description) {
-        return renderStepTextSection("Design Move", description, "education-card design-move");
+        return renderStepTextSection("Design Move", description, "education-card design-move", ICON_FALLBACK.designMove);
     }
 
     function renderDecisionPoint(prompt) {
-        return renderStepTextSection("Decision Point", prompt, "education-card decision-prompt top-decision-prompt");
+        return renderStepTextSection("Decision Point", prompt, "education-card decision-prompt top-decision-prompt", ICON_FALLBACK.decisionPoint);
     }
 
     function appendConceptLine(card, label, value) {
@@ -1779,7 +1793,7 @@
     }
 
     function renderWhyNow(whyNow) {
-        return renderStepTextSection("Why Now", whyNow, "education-card why-now");
+        return renderStepTextSection("Why Now", whyNow, "education-card why-now", ICON_FALLBACK.whyNow);
     }
 
     function renderRecap(recap) {

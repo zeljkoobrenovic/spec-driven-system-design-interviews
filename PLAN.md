@@ -47,7 +47,7 @@ The page is a two-column layout:
   - **Architecture**: the sequence of design steps (sub-steps with a
     `parent` field render indented under their parent — useful for focused
     deep-dives on one aspect of a step, like an algorithm choice)
-  - **Wrap-up**: API Flows · Design vs. Requirements · Follow-up Questions
+  - **Wrap-up**: API Flows · Design vs. Requirements · By Level · Follow-up Questions · To Probe Further
 
   Each item is clickable. The selected item drives the right pane.
 
@@ -255,6 +255,7 @@ All fields below are optional except `highLevelArchitecture` and either
       ],
       "whyNow": ["Why this step belongs here in the build order."],
       "patterns": ["Cache-aside", "TTL expiry"],   // optional; reusable-pattern tags (chips), names from dataset-level patterns[]
+      "probeLinks": ["youtube-dnn"],                // optional; IDs from toProbeFurther.links[], rendered at step end
       "traps": [                                    // optional; common mistakes at this step
         { "trap": "The mistake", "why": "Why it's wrong", "instead": "The better move" }
       ],
@@ -314,7 +315,7 @@ All fields below are optional except `highLevelArchitecture` and either
   ],
 
   // ---- Wrap-up ----
-  "finalDesign": {                              // optional; if omitted, no Final Design wrap-up entry is shown
+  "finalDesign": {                              // optional; if omitted, no Final Design architecture entry is shown
     "title":       "Final Design",
     "description": "End-to-end architecture summary.",
     "image":       "assets/images/final-design.png", // optional; rendered at bottom under "Generated Image"
@@ -336,7 +337,7 @@ All fields below are optional except `highLevelArchitecture` and either
     "nonFunctional": [ /* same shape */ ]
   },
 
-  // What to say across the interview's phases. Wrap-up entry ("Interview Script").
+  // What to say across the interview's phases. Overview entry ("Interview Script").
   "interviewScript": [
     { "phase": "Scope & requirements", "time": "first 5 min", "say": ["...", "..."] }
   ],
@@ -346,12 +347,30 @@ All fields below are optional except `highLevelArchitecture` and either
     { "level": "Senior", "expectations": ["...", "..."] }
   ],
 
-  "followUps": ["Dataset-wide follow-up questions..."]
+  "followUps": ["Dataset-wide follow-up questions..."],
+
+  // Canonical external reading list. Wrap-up entry ("To Probe Further").
+  // Steps reference these by id via step.probeLinks[].
+  "toProbeFurther": {
+    "links": [
+      {
+        "id": "youtube-dnn",
+        "group": "Production systems",
+        "groupDescription": "Primary sources and realistic references for readers who want to go deeper.",
+        "title": "Deep Neural Networks for YouTube Recommendations",
+        "url": "https://research.google/pubs/deep-neural-networks-for-youtube-recommendations/",
+        "source": "Google Research",
+        "type": "Paper",
+        "year": "2016",
+        "why": "Shows the classic candidate-generation plus ranking split at large scale."
+      }
+    ]
+  }
 }
 ```
 
 The fields above (`patterns`, `patternCatalog`, `step.patterns`, `step.traps`,
-`interviewScript`, `levelVariants`) are the **book differentiators** — all
+`step.probeLinks`, `interviewScript`, `levelVariants`, `toProbeFurther`) are the **book differentiators** — all
 optional, so the 17 example datasets render unchanged. `patterns` and
 `step.traps` are exercised in the canonical `url-shortener` example;
 `data/book/payment-system` uses all of them.

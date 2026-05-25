@@ -126,6 +126,7 @@
         failureDrill: "icons/failure-drill.png",
         deepDive: "icons/deep-dive.png",
         talkingPoints: "icons/talking-points.png",
+        mitigations: "icons/mitigations.png",
     };
 
     // `fallback` is a site-root-relative path (e.g. ICON_FALLBACK.concept) used
@@ -2065,6 +2066,8 @@
             for (const b of step.bottlenecks) {
                 const row = document.createElement("div");
                 row.className = "bottleneck-row";
+                const icon = makeAssetIcon(null, "Bottleneck / mitigation", ICON_FALLBACK.mitigations);
+                if (icon) row.appendChild(icon);
                 const issue = document.createElement("div");
                 issue.className = "bottleneck-issue";
                 issue.textContent = b.issue || "";

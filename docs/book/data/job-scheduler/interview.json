@@ -1,0 +1,1295 @@
+{
+  "title": "Distributed Job Scheduler / Cron — System Design",
+  "description": "Design a reliable distributed scheduler: run jobs at a scheduled time (one-off or recurring/cron) across a fleet, exactly-once triggered and at-least-once executed, surviving node failures. The themes are durable schedules, efficient due-job lookup, leader election to avoid duplicate triggers, and retries/idempotency.",
+  "highLevelArchitecture": {
+    "nodes": [
+      {
+        "id": "Client",
+        "label": "Client / Service",
+        "type": "client",
+        "category": "boundary",
+        "traits": [],
+        "description": "Registers scheduled or one-off jobs and reads status."
+      },
+      {
+        "id": "API",
+        "label": "Scheduler API",
+        "type": "service",
+        "category": "compute",
+        "traits": [
+          "stateless"
+        ],
+        "description": "CRUD for job definitions and schedules; persists durably."
+      },
+      {
+        "id": "JobDB",
+        "label": "Job / Schedule Store",
+        "type": "database",
+        "category": "state",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Authoritative job definitions, schedules, and run state."
+      },
+      {
+        "id": "TimeWheel",
+        "label": "Due-Job Index",
+        "type": "index",
+        "category": "state",
+        "traits": [
+          "stateful",
+          "derived"
+        ],
+        "description": "Time-ordered index of next-fire times so 'what's due now' is cheap."
+      },
+      {
+        "id": "Dispatcher",
+        "label": "Dispatcher (Leader)",
+        "type": "orchestrator",
+        "category": "compute",
+        "traits": [
+          "stateful"
+        ],
+        "description": "The elected leader that finds due jobs and enqueues runs exactly once."
+      },
+      {
+        "id": "Lease",
+        "label": "Lease / Election Store",
+        "type": "cache",
+        "category": "state",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Holds the leader lease (fencing token) for the active dispatcher."
+      },
+      {
+        "id": "RunQ",
+        "label": "Run Queue",
+        "type": "queue",
+        "category": "async",
+        "traits": [
+          "stateful"
+        ],
+        "description": "At-least-once queue of job runs handed to workers."
+      },
+      {
+        "id": "Workers",
+        "label": "Job Workers",
+        "type": "worker",
+        "category": "compute",
+        "traits": [
+          "stateless"
+        ],
+        "description": "Execute the job, report success/failure, honor idempotency."
+      },
+      {
+        "id": "RunStore",
+        "label": "Run / Execution Store",
+        "type": "database",
+        "category": "state",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Per-run records: status, attempts, idempotency key, result."
+      },
+      {
+        "id": "Retry",
+        "label": "Retry / Backoff Controller",
+        "type": "service",
+        "category": "compute",
+        "traits": [
+          "stateless"
+        ],
+        "description": "Reschedules failed runs with backoff; dead-letters after max attempts."
+      },
+      {
+        "id": "DLQ",
+        "label": "Dead-Letter Store",
+        "type": "queue",
+        "category": "async",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Runs that exhausted retries, for inspection."
+      }
+    ],
+    "links": [
+      {
+        "id": "client-api",
+        "from": "Client",
+        "to": "API",
+        "label": "register job"
+      },
+      {
+        "id": "api-jobdb",
+        "from": "API",
+        "to": "JobDB",
+        "label": "persist definition"
+      },
+      {
+        "id": "api-timewheel",
+        "from": "API",
+        "to": "TimeWheel",
+        "label": "index next-fire"
+      },
+      {
+        "id": "dispatcher-lease",
+        "from": "Dispatcher",
+        "to": "Lease",
+        "label": "acquire leader lease"
+      },
+      {
+        "id": "dispatcher-timewheel",
+        "from": "Dispatcher",
+        "to": "TimeWheel",
+        "label": "poll due jobs"
+      },
+      {
+        "id": "dispatcher-jobdb",
+        "from": "Dispatcher",
+        "to": "JobDB",
+        "label": "mark fired (dedup)"
+      },
+      {
+        "id": "dispatcher-runq",
+        "from": "Dispatcher",
+        "to": "RunQ",
+        "label": "enqueue run"
+      },
+      {
+        "id": "runq-workers",
+        "from": "RunQ",
+        "to": "Workers",
+        "label": "deliver run"
+      },
+      {
+        "id": "workers-runstore",
+        "from": "Workers",
+        "to": "RunStore",
+        "label": "record attempt + result"
+      },
+      {
+        "id": "workers-retry",
+        "from": "Workers",
+        "to": "Retry",
+        "label": "report failure"
+      },
+      {
+        "id": "retry-runq",
+        "from": "Retry",
+        "to": "RunQ",
+        "label": "re-enqueue (backoff)"
+      },
+      {
+        "id": "retry-dlq",
+        "from": "Retry",
+        "to": "DLQ",
+        "label": "give up -> dead-letter"
+      },
+      {
+        "id": "workers-jobdb",
+        "from": "Workers",
+        "to": "JobDB",
+        "label": "compute next-fire (recurring)"
+      }
+    ],
+    "types": [
+      {
+        "id": "control",
+        "label": "Scheduling Control",
+        "nodes": [
+          "API",
+          "JobDB",
+          "TimeWheel",
+          "Dispatcher",
+          "Lease"
+        ]
+      },
+      {
+        "id": "execution",
+        "label": "Execution",
+        "nodes": [
+          "RunQ",
+          "Workers",
+          "RunStore",
+          "Retry",
+          "DLQ"
+        ]
+      }
+    ]
+  },
+  "requirementsDiagram": [
+    "graph LR",
+    "  User[User]",
+    "  Define[Define job + schedule]",
+    "  Fire[Fire at the right time]",
+    "  Run[Run on a worker]",
+    "  Reliable[Survive failures]",
+    "  User --> Define",
+    "  Define --> Fire",
+    "  Fire --> Run",
+    "  Run --> Reliable"
+  ],
+  "capacityDiagram": [
+    "graph LR",
+    "  Jobs[Millions of schedules]",
+    "  Due[Spikes at round times]",
+    "  Once[Trigger once each]",
+    "  Jobs --> Due",
+    "  Due --> Once"
+  ],
+  "requirements": {
+    "functional": [
+      "Register one-off jobs (run at time T) and recurring jobs (cron expression).",
+      "Trigger each due job at (approximately) its scheduled time.",
+      "Execute the job on a worker; report success/failure and status.",
+      "Retry failed runs with backoff; give up after a limit.",
+      "Cancel/update schedules."
+    ],
+    "nonFunctional": [
+      "Exactly-once triggering: a scheduled fire produces exactly one run (no duplicates from multiple schedulers).",
+      "At-least-once execution with idempotency: a run is retried until it succeeds, and jobs are safe to re-run.",
+      "Durable: a registered schedule is never lost; the system survives node crashes.",
+      "Scale to millions of schedules and bursts at round times (top of the hour).",
+      "Reasonable timing accuracy (seconds), not hard real-time."
+    ]
+  },
+  "capacity": [
+    {
+      "label": "Schedules",
+      "value": "millions",
+      "note": "One-off + recurring; stored durably."
+    },
+    {
+      "label": "Fire bursts",
+      "value": "spiky",
+      "note": "Many jobs share round times (0 * * * *)."
+    },
+    {
+      "label": "Timing accuracy",
+      "value": "~seconds",
+      "note": "Not hard real-time."
+    },
+    {
+      "label": "Trigger semantics",
+      "value": "exactly-once",
+      "note": "Per scheduled fire."
+    },
+    {
+      "label": "Execution semantics",
+      "value": "at-least-once",
+      "note": "Retried; jobs must be idempotent."
+    }
+  ],
+  "api": [
+    {
+      "method": "POST",
+      "path": "/v1/jobs",
+      "description": "Register a job with a schedule (one-off time or cron).",
+      "request": "{ \"name\": \"nightly-report\", \"schedule\": \"0 2 * * *\", \"target\": \"...\" }",
+      "response": "{ \"jobId\": \"j_9\", \"nextFire\": \"...\" }",
+      "sequence": {
+        "participants": [
+          {
+            "id": "Client"
+          },
+          {
+            "id": "API",
+            "label": "Scheduler API"
+          },
+          {
+            "id": "JobDB",
+            "label": "Job Store"
+          },
+          {
+            "id": "TimeWheel",
+            "label": "Due-Job Index"
+          }
+        ],
+        "messages": [
+          {
+            "from": "Client",
+            "to": "API",
+            "arrow": "->>",
+            "label": "POST job + cron"
+          },
+          {
+            "from": "API",
+            "to": "JobDB",
+            "arrow": "->>",
+            "label": "persist definition"
+          },
+          {
+            "from": "API",
+            "to": "TimeWheel",
+            "arrow": "->>",
+            "label": "index next-fire time"
+          },
+          {
+            "from": "API",
+            "to": "Client",
+            "arrow": "-->>",
+            "label": "201 jobId + nextFire"
+          }
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/jobs/{id}/runs",
+      "description": "List recent runs and their status for a job.",
+      "request": "(id in path)",
+      "response": "{ \"runs\": [ { \"runId\": \"r_1\", \"status\": \"succeeded\", \"attempts\": 1 } ] }"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/jobs/{id}",
+      "description": "Cancel/unschedule a job.",
+      "request": "(id in path)",
+      "response": "{ \"cancelled\": true }"
+    }
+  ],
+  "dataModel": [
+    {
+      "name": "jobs",
+      "note": "Authoritative job definition + schedule + next-fire marker.",
+      "fields": [
+        {
+          "name": "job_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "schedule",
+          "type": "cron expr | one-off ts"
+        },
+        {
+          "name": "next_fire_at",
+          "type": "timestamp (drives due lookup)"
+        },
+        {
+          "name": "last_fired_at",
+          "type": "timestamp (dedup window)"
+        },
+        {
+          "name": "target",
+          "type": "what to run (endpoint/handler)"
+        },
+        {
+          "name": "state",
+          "type": "enum(active, paused, cancelled)"
+        }
+      ]
+    },
+    {
+      "name": "runs",
+      "note": "Per-execution record; idempotency key = (job_id, scheduled_fire).",
+      "fields": [
+        {
+          "name": "run_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "job_id",
+          "type": "uuid"
+        },
+        {
+          "name": "scheduled_fire",
+          "type": "timestamp (the fire this run is for)"
+        },
+        {
+          "name": "idempotency_key",
+          "type": "(job_id, scheduled_fire) — unique"
+        },
+        {
+          "name": "status",
+          "type": "enum(queued, running, succeeded, failed, dead)"
+        },
+        {
+          "name": "attempts",
+          "type": "int"
+        }
+      ]
+    },
+    {
+      "name": "leader_lease",
+      "note": "Election state for the active dispatcher.",
+      "fields": [
+        {
+          "name": "role",
+          "type": "string PK (e.g. dispatcher-shard-3)"
+        },
+        {
+          "name": "holder",
+          "type": "node id"
+        },
+        {
+          "name": "fencing_token",
+          "type": "monotonic int"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamp (TTL)"
+        }
+      ]
+    }
+  ],
+  "patterns": [
+    {
+      "name": "Durable schedule store",
+      "what": "Persist job definitions + next-fire so schedules survive restarts.",
+      "whenToUse": "Any scheduler that must not forget jobs after a crash.",
+      "steps": [
+        "store"
+      ],
+      "group": "Durable Schedules"
+    },
+    {
+      "name": "Time-ordered due index",
+      "what": "Index jobs by next-fire time so 'what's due now' is a cheap range scan, not a full scan.",
+      "whenToUse": "Many schedules where polling all of them would be too slow.",
+      "steps": [
+        "due"
+      ],
+      "group": "Finding Due Jobs Efficiently"
+    },
+    {
+      "name": "Leader election + fencing",
+      "what": "Elect one dispatcher via a lease with a fencing token so only one triggers each fire.",
+      "whenToUse": "Avoiding duplicate triggers from multiple scheduler instances.",
+      "steps": [
+        "election"
+      ],
+      "group": "Leader Election to Avoid Duplicate Triggers"
+    },
+    {
+      "name": "Exactly-once trigger via dedup",
+      "what": "Mark a fire as dispatched (job_id, scheduled_fire) so a re-run of the dispatcher can't double-fire.",
+      "whenToUse": "Turning at-least-once dispatch into exactly-once triggering.",
+      "steps": [
+        "dispatch"
+      ],
+      "group": "Exactly-Once Triggering"
+    },
+    {
+      "name": "At-least-once execution + idempotency",
+      "what": "Queue runs at-least-once; workers dedup on a run key so re-delivery is safe.",
+      "whenToUse": "Reliable execution where workers can crash mid-run.",
+      "steps": [
+        "execute"
+      ],
+      "group": "At-Least-Once Execution with Idempotency"
+    },
+    {
+      "name": "Retry with backoff + DLQ",
+      "what": "Re-run failures with exponential backoff; dead-letter after a max.",
+      "whenToUse": "Transient failures that should self-heal without infinite loops.",
+      "steps": [
+        "retry"
+      ],
+      "group": "Retries, Backoff, and Dead-Lettering"
+    }
+  ],
+  "steps": [
+    {
+      "id": "naive",
+      "title": "1. Naive: One Cron Process on a Single Box",
+      "description": [
+        "Start with the simplest scheduler that works: a single process on one machine runs a loop, wakes up every second, scans its in-memory list of jobs for any whose time has come, and fires them. This is essentially `cron` — and for a handful of jobs on one box it's perfectly fine.",
+        "It exposes the problems the rest of the design exists to solve. If the box crashes, every in-memory schedule is gone and any job due during the outage simply never runs — the cardinal sin for a scheduler. If you run a second instance for availability, both loops see the same due job and fire it twice. And scanning every job each tick doesn't scale past one machine's memory and CPU.",
+        "So the naive loop motivates everything that follows: persist schedules durably, index them for cheap due-lookup, elect a single leader so jobs fire exactly once, and execute reliably with retries."
+      ],
+      "view": {
+        "nodes": [
+          "Client",
+          "API",
+          "JobDB"
+        ],
+        "links": [
+          "client-api",
+          "api-jobdb"
+        ],
+        "highlight": [
+          "API"
+        ],
+        "groups": [
+          "control"
+        ]
+      },
+      "decisionPrompt": "Your single cron box reboots for 5 minutes. What happens to the jobs that were due during those 5 minutes?",
+      "whyNow": [
+        "Establishing the single-box cron loop first makes every later step's purpose concrete — durability fixes the crash, leader election fixes the double-fire, the due index fixes the full scan."
+      ],
+      "probeLinks": [
+        "borg-paper",
+        "kueue-docs",
+        "volcano-docs"
+      ],
+      "recap": {
+        "before": "Nothing.",
+        "after": "A single process loops, scans jobs in memory, and fires the ones that are due.",
+        "newRisk": "A crash loses every schedule and silently drops due jobs; a second instance double-fires; scanning all jobs every tick won't scale."
+      },
+      "traps": [
+        {
+          "trap": "Shipping the single-box cron loop as the design.",
+          "why": "In-memory schedules vanish on crash, a second instance for HA double-fires every job, and the full scan caps you at one machine.",
+          "instead": "Persist schedules durably, index them by next-fire time, elect one dispatcher, and execute via an idempotent queue."
+        }
+      ]
+    },
+    {
+      "id": "store",
+      "title": "2. Durable Schedules",
+      "description": [
+        "First, never forget a job. Persist each job definition and its schedule (cron expression or one-off time) in a durable store, along with a computed next_fire_at timestamp.",
+        "The store is the source of truth: a full restart of the whole scheduler can reconstruct exactly what should run and when. Recurring jobs recompute next_fire_at after each fire from the cron expression.",
+        "Everything else (the due index, the dispatcher's in-memory view) is derived from and rebuildable from this store."
+      ],
+      "view": {
+        "nodes": [
+          "Client",
+          "API",
+          "JobDB"
+        ],
+        "links": [
+          "client-api",
+          "api-jobdb"
+        ],
+        "highlight": [
+          "API",
+          "JobDB"
+        ],
+        "groups": [
+          "control"
+        ]
+      },
+      "decisionPrompt": "What's the source of truth, and how does the system know what to run after a total restart?",
+      "concepts": [
+        {
+          "term": "Durable schedule + next-fire",
+          "definition": "Persisted job definition with a computed next fire time.",
+          "whyItMatters": "Schedules survive crashes; recurring fires are recomputed deterministically.",
+          "example": "Cron '0 2 * * *' -> next_fire_at = tomorrow 02:00.",
+          "group": "Durable Schedules"
+        }
+      ],
+      "probeLinks": [
+        "borg-paper",
+        "kueue-docs",
+        "volcano-docs"
+      ],
+      "patterns": [
+        "Durable schedule store"
+      ],
+      "whyNow": [
+        "Durability of schedules is the foundation; without it a crash silently drops jobs, which is the cardinal sin for a scheduler."
+      ],
+      "recap": {
+        "before": "Nothing.",
+        "after": "All schedules durably persisted with next-fire times.",
+        "newRisk": "Scanning millions of jobs every tick to find due ones is too slow."
+      }
+    },
+    {
+      "id": "due",
+      "title": "3. Finding Due Jobs Efficiently",
+      "description": [
+        "You can't scan millions of jobs each second to find which are due. Maintain a time-ordered index keyed by next_fire_at so 'what's due in the next window' is a cheap range query (a time wheel / sorted index).",
+        "The scheduler ticks periodically, pulls the small set of jobs due now (or imminently), and dispatches them. Round-time bursts (everything at 02:00) are handled by reading the due range and fanning out.",
+        "The index is derived from the job store and rebuildable; the store's next_fire_at is authoritative."
+      ],
+      "view": {
+        "nodes": [
+          "API",
+          "TimeWheel",
+          "Dispatcher",
+          "JobDB"
+        ],
+        "links": [
+          "api-timewheel",
+          "dispatcher-timewheel",
+          "dispatcher-jobdb"
+        ],
+        "highlight": [
+          "TimeWheel"
+        ],
+        "groups": [
+          "control"
+        ]
+      },
+      "decisionPrompt": "With millions of schedules, how do you find the ones due this second without scanning them all?",
+      "concepts": [
+        {
+          "term": "Time-ordered due index",
+          "definition": "Jobs indexed by next-fire time for cheap range lookup of what's due.",
+          "whyItMatters": "Turns 'find due jobs' into a small range scan instead of a full table scan each tick.",
+          "example": "Sorted set keyed by next_fire_at; pop entries <= now.",
+          "group": "Finding Due Jobs Efficiently"
+        }
+      ],
+      "probeLinks": [
+        "borg-paper",
+        "kueue-docs",
+        "volcano-docs"
+      ],
+      "patterns": [
+        "Time-ordered due index"
+      ],
+      "whyNow": [
+        "Efficient due lookup is what makes the scheduler scale; the time-ordered index is the standard mechanism and sets up dispatch."
+      ],
+      "recap": {
+        "before": "Full scan to find due jobs.",
+        "after": "Cheap range lookup of due jobs each tick.",
+        "newRisk": "If multiple scheduler instances run, each could fire the same due job — duplicates."
+      }
+    },
+    {
+      "id": "election",
+      "title": "4. Leader Election to Avoid Duplicate Triggers",
+      "description": [
+        "For availability you run multiple scheduler instances — but if they all read the due index and dispatch, every job fires multiple times. Elect a single active dispatcher (per shard) via a lease in a coordination store.",
+        "The lease has a TTL and a fencing token; only the lease holder dispatches. If the leader dies, its lease expires and another instance takes over — brief gap, no duplicate leaders. The fencing token guards against a paused-then-resumed old leader acting late.",
+        "Shard the schedule space (by job id hash) across several leader leases so dispatch scales horizontally while each shard still has exactly one active dispatcher."
+      ],
+      "view": {
+        "nodes": [
+          "Dispatcher",
+          "Lease",
+          "TimeWheel"
+        ],
+        "links": [
+          "dispatcher-lease",
+          "dispatcher-timewheel"
+        ],
+        "highlight": [
+          "Lease",
+          "Dispatcher"
+        ],
+        "groups": [
+          "control"
+        ]
+      },
+      "decisionPrompt": "You run 3 scheduler instances for HA. How do you stop a job from firing 3 times?",
+      "concepts": [
+        {
+          "term": "Leader election (lease + fencing)",
+          "definition": "One holder of a TTL lease acts; a fencing token rejects stale ex-leaders.",
+          "whyItMatters": "Guarantees a single dispatcher per shard, preventing duplicate triggers, with automatic failover.",
+          "example": "Instance A holds lease (token 7); A pauses, B takes over (token 8); A's late write with token 7 is rejected.",
+          "group": "Leader Election to Avoid Duplicate Triggers"
+        }
+      ],
+      "probeLinks": [
+        "borg-paper",
+        "kueue-docs",
+        "volcano-docs",
+        "kafka-design"
+      ],
+      "patterns": [
+        "Leader election + fencing"
+      ],
+      "whyNow": [
+        "Single-dispatcher election is the classic distributed-cron problem; fencing tokens are the senior detail that makes it actually safe."
+      ],
+      "recap": {
+        "before": "Many dispatchers could double-fire.",
+        "after": "One leader per shard dispatches; failover without duplicate leaders.",
+        "newRisk": "Even one leader can crash mid-dispatch and re-dispatch on restart — need fire-level dedup."
+      },
+      "traps": [
+        {
+          "trap": "Relying on 'only one instance running' by convention.",
+          "why": "Deploys, network partitions, and restarts inevitably produce two live instances.",
+          "instead": "Explicit lease-based election with a fencing token."
+        }
+      ]
+    },
+    {
+      "id": "dispatch",
+      "title": "5. Exactly-Once Triggering",
+      "description": [
+        "Even with one leader, a dispatcher can crash after reading a due job but before recording it, then re-dispatch on restart. Make triggering idempotent: each fire has a natural key (job_id, scheduled_fire_time). Atomically mark that key as dispatched (advance last_fired/next_fire) and enqueue the run in one step.",
+        "A second attempt to fire the same (job_id, scheduled_fire) is a no-op because the key already exists. This turns at-least-once dispatch into exactly-once triggering — one run per scheduled fire.",
+        "For recurring jobs, computing the next next_fire_at as part of this atomic step ensures each occurrence fires exactly once."
+      ],
+      "view": {
+        "nodes": [
+          "Dispatcher",
+          "JobDB",
+          "RunQ"
+        ],
+        "links": [
+          "dispatcher-jobdb",
+          "dispatcher-runq"
+        ],
+        "highlight": [
+          "Dispatcher",
+          "RunQ"
+        ],
+        "groups": [
+          "control",
+          "execution"
+        ]
+      },
+      "decisionPrompt": "The dispatcher enqueues a run, then crashes before recording it fired. On restart it sees the job still due. What stops a double-fire?",
+      "concepts": [
+        {
+          "term": "Exactly-once trigger key",
+          "definition": "Dedup a fire on (job_id, scheduled_fire) so re-dispatch can't duplicate it.",
+          "whyItMatters": "Combines with leader election to guarantee one run per scheduled occurrence.",
+          "example": "Unique constraint on (job_id, scheduled_fire); a repeat insert is ignored.",
+          "group": "Exactly-Once Triggering"
+        }
+      ],
+      "probeLinks": [
+        "sqs-visibility",
+        "kueue-docs",
+        "volcano-docs",
+        "kafka-design"
+      ],
+      "patterns": [
+        "Exactly-once trigger via dedup"
+      ],
+      "whyNow": [
+        "Fire-level dedup is what actually delivers exactly-once triggering; election alone isn't enough, and naming this is the senior signal."
+      ],
+      "recap": {
+        "before": "Crash-then-restart could re-fire.",
+        "after": "Each scheduled fire produces exactly one run.",
+        "newRisk": "The run still has to execute reliably on a worker that may itself fail."
+      },
+      "flows": [
+        {
+          "name": "Poll due -> dedup -> enqueue",
+          "note": "The leader pulls due jobs, atomically dedups each fire on (job_id, scheduled_fire), and enqueues exactly one run; a re-dispatch after a crash is a no-op.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Dispatcher",
+                "label": "Dispatcher (Leader)"
+              },
+              {
+                "id": "TimeWheel",
+                "label": "Due-Job Index"
+              },
+              {
+                "id": "JobDB",
+                "label": "Job Store"
+              },
+              {
+                "id": "RunQ",
+                "label": "Run Queue"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Dispatcher",
+                "to": "TimeWheel",
+                "arrow": "->>",
+                "label": "poll due jobs (<= now)"
+              },
+              {
+                "from": "Dispatcher",
+                "to": "JobDB",
+                "arrow": "->>",
+                "label": "mark fired (job_id, scheduled_fire)"
+              },
+              {
+                "type": "alt",
+                "label": "first dispatch of this fire",
+                "messages": [
+                  {
+                    "from": "Dispatcher",
+                    "to": "RunQ",
+                    "arrow": "->>",
+                    "label": "enqueue run + advance next_fire"
+                  },
+                  {
+                    "from": "RunQ",
+                    "to": "Dispatcher",
+                    "arrow": "-->>",
+                    "label": "enqueued"
+                  }
+                ],
+                "else": {
+                  "label": "fire already marked (re-dispatch)",
+                  "messages": [
+                    {
+                      "from": "JobDB",
+                      "to": "Dispatcher",
+                      "arrow": "-->>",
+                      "label": "duplicate -> no-op"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Dispatcher",
+            "RunQ"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "execute",
+      "title": "6. At-Least-Once Execution with Idempotency",
+      "description": [
+        "Dispatched runs go onto an at-least-once queue consumed by stateless workers. A worker picks up a run, executes the job, and records the outcome. At-least-once means a run can be delivered twice (worker crash before ack), so execution must be idempotent.",
+        "Use the run's idempotency key (job_id, scheduled_fire): a worker checks/records it in the run store before executing, so a redelivered run is recognized and not run twice (or the job itself is designed to be safe to re-run).",
+        "Visibility timeouts return un-acked runs to the queue; the run store tracks attempts and status for observability."
+      ],
+      "view": {
+        "nodes": [
+          "RunQ",
+          "Workers",
+          "RunStore",
+          "JobDB"
+        ],
+        "links": [
+          "runq-workers",
+          "workers-runstore",
+          "workers-jobdb"
+        ],
+        "highlight": [
+          "Workers",
+          "RunStore"
+        ],
+        "groups": [
+          "execution"
+        ]
+      },
+      "decisionPrompt": "A worker runs the job, then crashes before acking. The run redelivers. How do you avoid running it twice?",
+      "concepts": [
+        {
+          "term": "At-least-once + idempotency",
+          "definition": "Reliable delivery that may duplicate, made safe by an idempotency key.",
+          "whyItMatters": "Guarantees the job runs without relying on impossible exactly-once delivery.",
+          "example": "Run keyed (j_9, 02:00); a redelivered copy is recognized and skipped.",
+          "group": "At-Least-Once Execution with Idempotency"
+        }
+      ],
+      "probeLinks": [
+        "sqs-visibility",
+        "kueue-docs",
+        "volcano-docs",
+        "kafka-design"
+      ],
+      "patterns": [
+        "At-least-once execution + idempotency"
+      ],
+      "whyNow": [
+        "Reliable execution is the other half of correctness; pairing at-least-once delivery with idempotency is the standard, honest answer (exactly-once delivery is a myth)."
+      ],
+      "recap": {
+        "before": "A worker crash could lose or duplicate execution.",
+        "after": "Runs execute at-least-once, idempotently — effectively once.",
+        "newRisk": "Jobs fail for transient reasons and must be retried sensibly, not forever."
+      },
+      "flows": [
+        {
+          "name": "At-least-once run with idempotency",
+          "note": "A worker claims a run, dedups on the run key, executes, and acks; a redelivered copy is recognized and skipped.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "RunQ",
+                "label": "Run Queue"
+              },
+              {
+                "id": "Workers",
+                "label": "Job Worker"
+              },
+              {
+                "id": "RunStore",
+                "label": "Run Store"
+              }
+            ],
+            "messages": [
+              {
+                "from": "RunQ",
+                "to": "Workers",
+                "arrow": "->>",
+                "label": "deliver run"
+              },
+              {
+                "from": "Workers",
+                "to": "RunStore",
+                "arrow": "->>",
+                "label": "claim (job_id, scheduled_fire)"
+              },
+              {
+                "type": "alt",
+                "label": "first attempt",
+                "messages": [
+                  {
+                    "from": "Workers",
+                    "to": "Workers",
+                    "arrow": "->>",
+                    "label": "execute job"
+                  },
+                  {
+                    "from": "Workers",
+                    "to": "RunStore",
+                    "arrow": "->>",
+                    "label": "record success + ack"
+                  }
+                ],
+                "else": {
+                  "label": "redelivered run",
+                  "messages": [
+                    {
+                      "from": "RunStore",
+                      "to": "Workers",
+                      "arrow": "-->>",
+                      "label": "already done -> skip + ack"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Workers",
+            "RunStore"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "retry",
+      "title": "7. Retries, Backoff, and Dead-Lettering",
+      "description": [
+        "Transient failures (a downstream blip) should self-heal: on failure, the retry controller re-enqueues the run with exponential backoff (and jitter), incrementing the attempt count in the run store.",
+        "After a max number of attempts, stop retrying and move the run to a dead-letter store for inspection/alerting — so a permanently-broken job doesn't retry forever or block others.",
+        "Combined with the earlier guarantees: each occurrence triggers once, executes at-least-once with idempotency, retries with backoff, and dead-letters on give-up — a complete reliable-execution lifecycle."
+      ],
+      "view": {
+        "nodes": [
+          "Workers",
+          "Retry",
+          "RunQ",
+          "DLQ"
+        ],
+        "links": [
+          "workers-retry",
+          "retry-runq",
+          "retry-dlq"
+        ],
+        "highlight": [
+          "Retry",
+          "DLQ"
+        ],
+        "groups": [
+          "execution"
+        ]
+      },
+      "decisionPrompt": "A job keeps failing. How do you retry transient errors without retrying a broken job forever?",
+      "concepts": [
+        {
+          "term": "Backoff + dead-letter",
+          "definition": "Exponential-backoff retries up to a limit, then route to a DLQ.",
+          "whyItMatters": "Self-heals transient failures while bounding effort on permanent ones.",
+          "example": "Retry at 1m, 2m, 4m...; after 6 attempts -> dead-letter + alert.",
+          "group": "Retries, Backoff, and Dead-Lettering"
+        }
+      ],
+      "probeLinks": [
+        "kafka-design",
+        "kueue-docs",
+        "volcano-docs",
+        "sqs-visibility"
+      ],
+      "patterns": [
+        "Retry with backoff + DLQ"
+      ],
+      "whyNow": [
+        "Closing on retry/backoff/DLQ completes the reliable-execution story and shows you handle permanent failure gracefully."
+      ],
+      "recap": {
+        "before": "Failures lost or retried blindly.",
+        "after": "Backoff retries + dead-letter; full reliable lifecycle.",
+        "newRisk": "Round-time fire bursts and leader failover gaps stress the system — bounded by sharding and short lease TTLs."
+      },
+      "bottlenecks": [
+        {
+          "issue": "Thundering herd of jobs at the top of the hour.",
+          "mitigation": "Spread/jitter fire times; the run queue + worker autoscale absorb the burst."
+        },
+        {
+          "issue": "Leader failover leaves a brief dispatch gap.",
+          "mitigation": "Short lease TTL; due index means a slightly-late leader still finds and fires overdue jobs (caught up, deduped)."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The leader dispatcher crashes at 02:00 during a fire burst.",
+          "expectedBehavior": "A new leader takes the lease, reads still-due jobs from the index, and fires them (dedup prevents doubles); jobs fire slightly late, not never.",
+          "mitigation": "Lease failover + durable due index + exactly-once trigger keys."
+        }
+      ]
+    }
+  ],
+  "finalDesign": {
+    "title": "Final Design — Distributed Scheduler",
+    "description": "Jobs and schedules persist durably with a computed next-fire time and are indexed by time for cheap due-job lookup. Per shard, a single dispatcher is elected via a TTL lease with a fencing token; it polls the due index and, for each fire, atomically dedups on (job_id, scheduled_fire) and enqueues a run — giving exactly-once triggering even across crashes/failover. Runs go onto an at-least-once queue; idempotent workers execute and record outcomes. A retry controller re-enqueues failures with exponential backoff and dead-letters after a max. Round-time bursts are smoothed by jitter and absorbed by the queue + autoscaled workers.",
+    "view": {
+      "nodes": [
+        "Client",
+        "API",
+        "JobDB",
+        "TimeWheel",
+        "Dispatcher",
+        "Lease",
+        "RunQ",
+        "Workers",
+        "RunStore",
+        "Retry",
+        "DLQ"
+      ],
+      "links": [
+        "client-api",
+        "api-jobdb",
+        "api-timewheel",
+        "dispatcher-lease",
+        "dispatcher-timewheel",
+        "dispatcher-jobdb",
+        "dispatcher-runq",
+        "runq-workers",
+        "workers-runstore",
+        "workers-retry",
+        "retry-runq",
+        "retry-dlq",
+        "workers-jobdb"
+      ],
+      "groups": [
+        "control",
+        "execution"
+      ]
+    }
+  },
+  "satisfies": {
+    "functional": [
+      {
+        "requirement": "One-off + recurring jobs",
+        "how": "Durable schedule with cron/one-off + recomputed next-fire.",
+        "steps": [
+          "store"
+        ]
+      },
+      {
+        "requirement": "Trigger at scheduled time",
+        "how": "Time-ordered due index polled by the leader.",
+        "steps": [
+          "due",
+          "dispatch"
+        ]
+      },
+      {
+        "requirement": "Execute + report status",
+        "how": "Run queue + idempotent workers + run store.",
+        "steps": [
+          "execute"
+        ]
+      },
+      {
+        "requirement": "Retry with backoff",
+        "how": "Retry controller + DLQ.",
+        "steps": [
+          "retry"
+        ]
+      },
+      {
+        "requirement": "Cancel/update",
+        "how": "Update the durable definition + due index.",
+        "steps": [
+          "store"
+        ]
+      }
+    ],
+    "nonFunctional": [
+      {
+        "requirement": "Exactly-once trigger",
+        "how": "Leader election + (job_id, scheduled_fire) dedup.",
+        "steps": [
+          "election",
+          "dispatch"
+        ]
+      },
+      {
+        "requirement": "At-least-once execution",
+        "how": "At-least-once queue + idempotency key.",
+        "steps": [
+          "execute"
+        ]
+      },
+      {
+        "requirement": "Durable / crash-safe",
+        "how": "Durable schedules + rebuildable due index + lease failover.",
+        "steps": [
+          "store",
+          "election"
+        ]
+      },
+      {
+        "requirement": "Scale to millions",
+        "how": "Sharded dispatch + time-ordered due lookup.",
+        "steps": [
+          "due",
+          "election"
+        ]
+      }
+    ]
+  },
+  "interviewScript": [
+    {
+      "phase": "Scope & requirements",
+      "time": "first 5 min",
+      "say": [
+        "Confirm one-off + cron, ~seconds accuracy (not hard real-time).",
+        "Pin exactly-once triggering and at-least-once-with-idempotency execution.",
+        "Establish durability and crash-survival as hard requirements."
+      ]
+    },
+    {
+      "phase": "High-level design",
+      "time": "next 10 min",
+      "say": [
+        "Durable schedule store with next-fire.",
+        "Time-ordered due index for cheap lookup.",
+        "A leader dispatcher enqueues runs to workers."
+      ]
+    },
+    {
+      "phase": "Deep dive",
+      "time": "next 15 min",
+      "say": [
+        "Leader election + fencing to avoid duplicate triggers.",
+        "Exactly-once trigger via (job, fire) dedup.",
+        "At-least-once execution + idempotency; retries/backoff/DLQ."
+      ]
+    },
+    {
+      "phase": "Wrap-up",
+      "time": "final 5 min",
+      "say": [
+        "Map requirements to mechanisms.",
+        "Tradeoffs: lease TTL vs failover gap, exactly-once trigger vs at-least-once execute, round-time bursts.",
+        "Mention job dependencies/DAGs and priorities as extensions."
+      ]
+    }
+  ],
+  "levelVariants": [
+    {
+      "level": "Junior",
+      "expectations": [
+        "Persists schedules and polls for due jobs.",
+        "Runs jobs on workers with retries.",
+        "May miss leader election and exactly-once triggering."
+      ]
+    },
+    {
+      "level": "Senior",
+      "expectations": [
+        "Designs leader election + fencing.",
+        "Exactly-once trigger dedup + at-least-once idempotent execution.",
+        "Time-ordered due index; backoff/DLQ."
+      ]
+    },
+    {
+      "level": "Staff",
+      "expectations": [
+        "Reasons about failover gaps, fencing correctness, and round-time bursts.",
+        "Shards dispatch with per-shard leaders.",
+        "Distinguishes exactly-once trigger from at-least-once execute precisely."
+      ]
+    }
+  ],
+  "followUps": [
+    "Why is exactly-once delivery impossible, and how do you get effectively-once execution anyway?",
+    "How short should the leader lease TTL be, and what's the failover tradeoff?",
+    "How would you handle job dependencies / DAGs (run B after A)?",
+    "How do you smooth a thundering herd of jobs all scheduled for the top of the hour?",
+    "How would you add per-job priorities or rate limits?"
+  ],
+  "toProbeFurther": {
+    "links": [
+      {
+        "id": "borg-paper",
+        "group": "AI and ML Systems",
+        "groupDescription": "Feature stores, model serving, RAG, recommendation, and ML operations references.",
+        "title": "Large-scale Cluster Management at Google with Borg",
+        "url": "https://research.google/pubs/large-scale-cluster-management-at-google-with-borg/",
+        "source": "Google Research",
+        "type": "Paper",
+        "why": "Production cluster scheduler reference for placement, quotas, priorities, and reliability.",
+        "year": "2015"
+      },
+      {
+        "id": "airflow-docs",
+        "group": "Data and Observability",
+        "groupDescription": "Metrics, tracing, logs, analytics, data pipelines, warehouses, and orchestration references.",
+        "title": "Apache Airflow Documentation",
+        "url": "https://airflow.apache.org/docs/apache-airflow/stable/",
+        "source": "Apache Airflow",
+        "type": "Docs",
+        "why": "Workflow orchestration reference for scheduled pipelines, DAGs, retries, and backfills."
+      },
+      {
+        "id": "kueue-docs",
+        "group": "AI and ML Systems",
+        "groupDescription": "Feature stores, model serving, RAG, recommendation, and ML operations references.",
+        "title": "Kueue Overview",
+        "url": "https://kueue.sigs.k8s.io/docs/overview/",
+        "source": "Kueue",
+        "type": "Docs",
+        "why": "Kubernetes-native queueing and quota-management reference for batch workloads."
+      },
+      {
+        "id": "volcano-docs",
+        "group": "AI and ML Systems",
+        "groupDescription": "Feature stores, model serving, RAG, recommendation, and ML operations references.",
+        "title": "Volcano Documentation",
+        "url": "https://volcano.sh/en/docs/",
+        "source": "Volcano",
+        "type": "Docs",
+        "why": "Batch and AI scheduling reference with queues, gang scheduling, and priorities."
+      },
+      {
+        "id": "kafka-design",
+        "group": "Queues and Streams",
+        "groupDescription": "Messaging, event streaming, delivery semantics, and async processing references.",
+        "title": "Apache Kafka Design",
+        "url": "https://kafka.apache.org/documentation/#design",
+        "source": "Apache Kafka",
+        "type": "Docs",
+        "why": "Explains Kafka's log, partitions, consumer groups, replication, and operational model."
+      },
+      {
+        "id": "sqs-visibility",
+        "group": "Queues and Streams",
+        "groupDescription": "Messaging, event streaming, delivery semantics, and async processing references.",
+        "title": "Amazon SQS Visibility Timeout",
+        "url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html",
+        "source": "AWS",
+        "type": "Docs",
+        "why": "Concrete reference for ack/visibility-timeout delivery in work queues."
+      },
+      {
+        "id": "sre-monitoring",
+        "group": "Foundations",
+        "groupDescription": "Core system design references for scalability, reliability, and operating distributed services.",
+        "title": "Monitoring Distributed Systems",
+        "url": "https://sre.google/sre-book/monitoring-distributed-systems/",
+        "source": "Google SRE",
+        "type": "Book chapter",
+        "why": "Grounds monitoring and alerting decisions in user-visible reliability signals."
+      }
+    ]
+  },
+  "assets": {
+    "icon": "icon.png"
+  }
+}

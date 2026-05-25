@@ -1,0 +1,1286 @@
+{
+  "title": "Distributed Lock Service — System Design",
+  "description": "Design a service that grants mutual exclusion across a fleet: only one client at a time holds a lock on a key, even as clients and nodes fail. The themes are consensus-backed durable lock state, leases with TTL (so a dead holder doesn't block forever), fencing tokens (to defeat the lock's fundamental safety gap), and leader election.",
+  "highLevelArchitecture": {
+    "nodes": [
+      {
+        "id": "Client",
+        "label": "Client (Worker)",
+        "type": "client",
+        "category": "boundary",
+        "traits": [],
+        "description": "Acquires a lock to do exclusive work; renews and releases it."
+      },
+      {
+        "id": "LockAPI",
+        "label": "Lock Service API",
+        "type": "service",
+        "category": "compute",
+        "traits": [
+          "stateless"
+        ],
+        "description": "Acquire/renew/release; issues fencing tokens; routes to the consensus group."
+      },
+      {
+        "id": "Leader",
+        "label": "Consensus Leader",
+        "type": "service",
+        "category": "state",
+        "traits": [
+          "stateful"
+        ],
+        "description": "The elected leader of the replica group that serializes lock writes."
+      },
+      {
+        "id": "Followers",
+        "label": "Consensus Followers",
+        "type": "service",
+        "category": "state",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Replicate the log; one becomes leader on failure (Raft/Paxos)."
+      },
+      {
+        "id": "Log",
+        "label": "Replicated Log",
+        "type": "database",
+        "category": "state",
+        "traits": [
+          "stateful"
+        ],
+        "description": "The agreed, durable sequence of lock operations (source of truth)."
+      },
+      {
+        "id": "LockState",
+        "label": "Lock State (Replicated)",
+        "type": "database",
+        "category": "state",
+        "traits": [
+          "stateful",
+          "derived"
+        ],
+        "description": "Current lock holders + lease expiry, applied from the log."
+      },
+      {
+        "id": "Sweeper",
+        "label": "Lease Sweeper",
+        "type": "worker",
+        "category": "compute",
+        "traits": [
+          "stateless"
+        ],
+        "description": "Expires leases whose holder didn't renew in time."
+      },
+      {
+        "id": "Resource",
+        "label": "Protected Resource",
+        "type": "external",
+        "category": "boundary",
+        "traits": [],
+        "description": "The thing being guarded (a file, a DB write, a job) that checks the token."
+      }
+    ],
+    "links": [
+      {
+        "id": "client-api",
+        "from": "Client",
+        "to": "LockAPI",
+        "label": "acquire(key)"
+      },
+      {
+        "id": "api-leader",
+        "from": "LockAPI",
+        "to": "Leader",
+        "label": "propose lock op"
+      },
+      {
+        "id": "leader-log",
+        "from": "Leader",
+        "to": "Log",
+        "label": "append op"
+      },
+      {
+        "id": "leader-followers",
+        "from": "Leader",
+        "to": "Followers",
+        "label": "replicate (quorum)"
+      },
+      {
+        "id": "followers-log",
+        "from": "Followers",
+        "to": "Log",
+        "label": "ack replicate"
+      },
+      {
+        "id": "log-lockstate",
+        "from": "Log",
+        "to": "LockState",
+        "label": "apply committed ops"
+      },
+      {
+        "id": "api-lockstate",
+        "from": "LockAPI",
+        "to": "LockState",
+        "label": "read holder/lease"
+      },
+      {
+        "id": "client-renew",
+        "from": "Client",
+        "to": "LockAPI",
+        "label": "renew lease (heartbeat)"
+      },
+      {
+        "id": "sweeper-lockstate",
+        "from": "Sweeper",
+        "to": "LockState",
+        "label": "expire stale leases"
+      },
+      {
+        "id": "api-client",
+        "from": "LockAPI",
+        "to": "Client",
+        "label": "grant + fencing token"
+      },
+      {
+        "id": "client-resource",
+        "from": "Client",
+        "to": "Resource",
+        "label": "act with fencing token"
+      },
+      {
+        "id": "resource-check",
+        "from": "Resource",
+        "to": "Resource",
+        "label": "reject stale token"
+      }
+    ],
+    "types": [
+      {
+        "id": "api-tier",
+        "label": "API Tier",
+        "nodes": [
+          "LockAPI",
+          "Sweeper"
+        ]
+      },
+      {
+        "id": "consensus",
+        "label": "Consensus Group",
+        "nodes": [
+          "Leader",
+          "Followers",
+          "Log",
+          "LockState"
+        ]
+      }
+    ]
+  },
+  "requirementsDiagram": [
+    "graph LR",
+    "  Worker[Worker]",
+    "  Acquire[Acquire lock]",
+    "  Exclusive[Exclusive access]",
+    "  Fail[Holder may die]",
+    "  Safe[Still safe]",
+    "  Worker --> Acquire",
+    "  Acquire --> Exclusive",
+    "  Exclusive --> Fail",
+    "  Fail --> Safe"
+  ],
+  "capacityDiagram": [
+    "graph LR",
+    "  Keys[Many lock keys]",
+    "  Safety[At most one holder]",
+    "  Live[No deadlock on death]",
+    "  Keys --> Safety",
+    "  Safety --> Live"
+  ],
+  "requirements": {
+    "functional": [
+      "Acquire an exclusive lock on a key; block/fail-fast if held.",
+      "Renew (extend) a held lock; release it explicitly.",
+      "Automatically release a lock if the holder dies (no permanent deadlock).",
+      "Provide a way to make protected actions safe even if a lock is wrongly believed held.",
+      "Serve as a primitive for leader election (one holder = the leader)."
+    ],
+    "nonFunctional": [
+      "Safety: at most one client holds a given lock at any time (mutual exclusion).",
+      "Liveness: a crashed holder's lock is eventually released (via lease expiry).",
+      "Durable + highly available: survive node failures without losing lock state or granting two holders.",
+      "Correctness under the worst case: process pauses (GC), clock skew, and network partitions.",
+      "Low latency for acquire/renew on the common path."
+    ]
+  },
+  "capacity": [
+    {
+      "label": "Lock keys",
+      "value": "many",
+      "note": "Each independently lockable."
+    },
+    {
+      "label": "Replication",
+      "value": "consensus group (3/5)",
+      "note": "Quorum for durability + availability."
+    },
+    {
+      "label": "Lease TTL",
+      "value": "seconds",
+      "note": "Short enough to recover fast, long enough to renew."
+    },
+    {
+      "label": "Safety",
+      "value": "at most one holder",
+      "note": "The whole point."
+    },
+    {
+      "label": "Consistency",
+      "value": "linearizable (CP)",
+      "note": "Correctness over availability for lock grants."
+    }
+  ],
+  "api": [
+    {
+      "method": "POST",
+      "path": "/v1/locks/{key}/acquire",
+      "description": "Acquire the lock with a lease TTL; returns a fencing token if granted.",
+      "request": "{ \"clientId\": \"w_3\", \"ttlSec\": 15 }",
+      "response": "{ \"granted\": true, \"fencingToken\": 42, \"expiresAt\": \"...\" }",
+      "sequence": {
+        "participants": [
+          {
+            "id": "Client"
+          },
+          {
+            "id": "LockAPI",
+            "label": "Lock API"
+          },
+          {
+            "id": "Leader",
+            "label": "Consensus Leader"
+          },
+          {
+            "id": "Followers",
+            "label": "Followers"
+          },
+          {
+            "id": "LockState",
+            "label": "Lock State"
+          }
+        ],
+        "messages": [
+          {
+            "from": "Client",
+            "to": "LockAPI",
+            "arrow": "->>",
+            "label": "acquire(key)"
+          },
+          {
+            "from": "LockAPI",
+            "to": "Leader",
+            "arrow": "->>",
+            "label": "propose acquire"
+          },
+          {
+            "from": "Leader",
+            "to": "Followers",
+            "arrow": "->>",
+            "label": "replicate (quorum)"
+          },
+          {
+            "from": "Leader",
+            "to": "LockState",
+            "arrow": "->>",
+            "label": "apply: holder=w_3, token++"
+          },
+          {
+            "from": "LockAPI",
+            "to": "Client",
+            "arrow": "-->>",
+            "label": "granted + fencing token 42"
+          }
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/v1/locks/{key}/renew",
+      "description": "Extend the lease before it expires (heartbeat).",
+      "request": "{ \"clientId\": \"w_3\", \"fencingToken\": 42 }",
+      "response": "{ \"ok\": true, \"expiresAt\": \"...\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/locks/{key}/release",
+      "description": "Explicitly release a held lock.",
+      "request": "{ \"clientId\": \"w_3\", \"fencingToken\": 42 }",
+      "response": "{ \"released\": true }"
+    }
+  ],
+  "dataModel": [
+    {
+      "name": "lock",
+      "note": "Current lock state, applied from the replicated log.",
+      "fields": [
+        {
+          "name": "key",
+          "type": "string PK"
+        },
+        {
+          "name": "holder",
+          "type": "client_id | null"
+        },
+        {
+          "name": "fencing_token",
+          "type": "monotonic int (incremented each grant)"
+        },
+        {
+          "name": "expires_at",
+          "type": "lease expiry"
+        }
+      ]
+    },
+    {
+      "name": "replicated_log",
+      "note": "Agreed, durable sequence of lock ops (the source of truth).",
+      "fields": [
+        {
+          "name": "index",
+          "type": "log position (monotonic)"
+        },
+        {
+          "name": "term",
+          "type": "consensus term"
+        },
+        {
+          "name": "op",
+          "type": "acquire/renew/release(key, client)"
+        }
+      ]
+    }
+  ],
+  "patterns": [
+    {
+      "name": "Consensus-replicated state",
+      "what": "Replicate lock operations via Raft/Paxos so a quorum agrees; survive node loss without divergence.",
+      "whenToUse": "Lock/config state that must be durable, consistent, and highly available.",
+      "steps": [
+        "consensus"
+      ],
+      "group": "Consensus-Backed Lock State"
+    },
+    {
+      "name": "Lease with TTL",
+      "what": "Grant a lock for a bounded time; the holder renews, or it auto-expires.",
+      "whenToUse": "Avoiding permanent deadlock when a holder dies.",
+      "steps": [
+        "lease"
+      ],
+      "group": "Leases with TTL (No Permanent Deadlock)"
+    },
+    {
+      "name": "Fencing token",
+      "what": "Issue a monotonically increasing token with each grant; resources reject stale tokens.",
+      "whenToUse": "Defeating the lock's fundamental gap (a paused holder acting after expiry).",
+      "steps": [
+        "fencing"
+      ],
+      "group": "Fencing Tokens (The Fundamental Gap)"
+    },
+    {
+      "name": "Leader election (lock as primitive)",
+      "what": "Holding a well-known lock = being the leader; lease loss = stepping down.",
+      "whenToUse": "Single-active-instance coordination.",
+      "steps": [
+        "election"
+      ],
+      "group": "Leader Election as a Lock"
+    },
+    {
+      "name": "Lease sweeping / failure detection",
+      "what": "Expire leases whose holder stopped renewing within the TTL + grace.",
+      "whenToUse": "Detecting dead holders and reclaiming locks.",
+      "steps": [
+        "lease"
+      ],
+      "group": "Leases with TTL (No Permanent Deadlock)"
+    },
+    {
+      "name": "Linearizable (CP) operations",
+      "what": "Lock grants go through the leader/quorum so there's a single, total order.",
+      "whenToUse": "When two holders would be catastrophic (choose CP over availability).",
+      "steps": [
+        "consensus"
+      ],
+      "group": "Consensus-Backed Lock State"
+    }
+  ],
+  "steps": [
+    {
+      "id": "naive",
+      "title": "1. Naive: A Lock Row in a Single Database",
+      "description": [
+        "Start with the simplest thing that works: one row per key in a single database, acquired with a conditional write (SET key IF NOT EXISTS, or INSERT ... an UPDATE ... WHERE holder IS NULL). The atomic conditional means only one client wins the row, so in the happy path you really do get mutual exclusion.",
+        "It fails on the two hard requirements. Liveness: if the holder dies after acquiring, the row stays set forever — a permanent deadlock, because nothing ever releases it. Safety + availability: the single database is a single point of failure; if it dies the whole fleet loses locking, and if you make it highly available with async-replicated failover, a failover or partition can promote a replica that doesn't know about the latest grant — split-brain, two holders.",
+        "So the baseline motivates the design. To avoid permanent deadlock the grant must be time-bounded and auto-expire (leases). To avoid split-brain the state must be agreed by a quorum, not a single node or a lossy failover (consensus). And to stay safe even when a holder pauses past expiry you need fencing tokens. The steps that follow add exactly these."
+      ],
+      "view": {
+        "nodes": [
+          "Client",
+          "LockAPI",
+          "LockState"
+        ],
+        "links": [
+          "client-api",
+          "api-lockstate"
+        ],
+        "highlight": [
+          "LockState"
+        ]
+      },
+      "decisionPrompt": "A single-row 'SET key IF NOT EXISTS' gives mutual exclusion in the happy path. What happens when the holder dies, and what happens when the database fails over?",
+      "whyNow": [
+        "The single-DB lock row is the obvious first answer; its two failures — permanent deadlock on holder death and split-brain on failover — are exactly what leases and consensus exist to fix."
+      ],
+      "probeLinks": [
+        "redis-locks",
+        "chubby-paper",
+        "zookeeper-paper",
+        "raft-paper"
+      ],
+      "recap": {
+        "before": "Nothing.",
+        "after": "Mutual exclusion via an atomic conditional write to one lock row.",
+        "newRisk": "A dead holder deadlocks the key forever, and the single DB is a SPOF that can split-brain on failover — motivating leases + consensus + fencing."
+      },
+      "traps": [
+        {
+          "trap": "Shipping 'SET key IF NOT EXISTS' on a single (or async-replicated) database as the lock service.",
+          "why": "A crashed holder never releases the row (permanent deadlock), and a single DB is a SPOF whose failover can promote a stale replica and grant two holders.",
+          "instead": "Bound the grant with a lease that auto-expires, back the state with consensus, and hand out fencing tokens."
+        }
+      ]
+    },
+    {
+      "id": "consensus",
+      "title": "2. Consensus-Backed Lock State",
+      "description": [
+        "A lock service's one job is mutual exclusion, so its state must never diverge — two nodes can't each think a different client holds the lock. Replicate the lock state across a small group (3 or 5 nodes) via a consensus protocol (Raft/Paxos): one leader proposes each lock operation, a quorum agrees and appends it to a replicated log, and that committed log is the source of truth.",
+        "This makes operations linearizable (a single total order) and durable (survives a minority of nodes failing) — deliberately choosing CP (consistency over availability): if quorum is lost, the service refuses grants rather than risk two holders.",
+        "Lock state (holder, expiry, token per key) is a deterministic application of the committed log, so all replicas agree."
+      ],
+      "view": {
+        "nodes": [
+          "Client",
+          "LockAPI",
+          "Leader",
+          "Followers",
+          "Log",
+          "LockState"
+        ],
+        "links": [
+          "client-api",
+          "api-leader",
+          "leader-log",
+          "leader-followers",
+          "followers-log",
+          "log-lockstate"
+        ],
+        "highlight": [
+          "Leader",
+          "Log"
+        ],
+        "groups": [
+          "api-tier",
+          "consensus"
+        ]
+      },
+      "decisionPrompt": "Why must lock state go through consensus rather than a single fast database?",
+      "concepts": [
+        {
+          "term": "Consensus replication (Raft/Paxos)",
+          "definition": "A leader + quorum agree on a replicated log of operations; committed entries are durable and ordered.",
+          "whyItMatters": "Guarantees a single, consistent view of who holds a lock even through node failures.",
+          "example": "Acquire is committed only after a quorum replicates it.",
+          "group": "Consensus-Backed Lock State"
+        }
+      ],
+      "probeLinks": [
+        "raft-paper",
+        "redis-locks",
+        "chubby-paper",
+        "zookeeper-paper"
+      ],
+      "patterns": [
+        "Consensus-replicated state",
+        "Linearizable (CP) operations"
+      ],
+      "whyNow": [
+        "Consensus is the foundation — mutual exclusion demands a single agreed source of truth; everything else (leases, fencing) sits on top."
+      ],
+      "recap": {
+        "before": "Nothing.",
+        "after": "Durable, linearizable lock state via consensus.",
+        "newRisk": "A client can acquire a lock and then die holding it — locking everyone out forever."
+      },
+      "traps": [
+        {
+          "trap": "Storing lock state in a single (or async-replicated) database.",
+          "why": "A failover/partition can produce two nodes that each grant the lock -> two holders.",
+          "instead": "Consensus-replicated, linearizable lock state (CP)."
+        }
+      ]
+    },
+    {
+      "id": "lease",
+      "title": "3. Leases with TTL (No Permanent Deadlock)",
+      "description": [
+        "If a lock were held until explicitly released, a client that crashes while holding it would block the resource forever. Grant locks as leases with a TTL: the holder must periodically renew (heartbeat) to keep it; if it stops (crash, hang, partition), the lease expires and the lock is reclaimed.",
+        "A lease sweeper (or the leader) expires leases past their TTL and frees the key. This gives liveness — a dead holder's lock is automatically released — at the cost of choosing a TTL: too short risks expiring a slow-but-alive holder; too long delays recovery.",
+        "Renew goes through consensus too (it extends committed state), but is the common, cheap path."
+      ],
+      "view": {
+        "nodes": [
+          "Client",
+          "LockAPI",
+          "LockState",
+          "Sweeper"
+        ],
+        "links": [
+          "client-renew",
+          "api-lockstate",
+          "sweeper-lockstate"
+        ],
+        "highlight": [
+          "Sweeper",
+          "LockState"
+        ],
+        "groups": [
+          "api-tier",
+          "consensus"
+        ]
+      },
+      "decisionPrompt": "A worker acquires a lock and then crashes. How do you avoid locking the resource forever?",
+      "concepts": [
+        {
+          "term": "Lease with TTL + renewal",
+          "definition": "A lock granted for a bounded time, kept alive by heartbeats, auto-expiring otherwise.",
+          "whyItMatters": "Provides liveness — a dead holder's lock is reclaimed without manual intervention.",
+          "example": "15s lease; renew every 5s; miss renewals -> expire and free.",
+          "group": "Leases with TTL (No Permanent Deadlock)"
+        }
+      ],
+      "probeLinks": [
+        "redis-locks",
+        "chubby-paper",
+        "zookeeper-paper",
+        "raft-paper"
+      ],
+      "patterns": [
+        "Lease with TTL",
+        "Lease sweeping / failure detection"
+      ],
+      "whyNow": [
+        "Leases are the standard fix for the dead-holder deadlock; the TTL tradeoff is the practical decision."
+      ],
+      "recap": {
+        "before": "Locks held until release (deadlock on crash).",
+        "after": "TTL leases auto-release dead holders.",
+        "newRisk": "A holder can be PAUSED (GC) past expiry, lose the lock, then resume and act — thinking it still holds it."
+      },
+      "flows": [
+        {
+          "name": "Renew heartbeat, or sweeper expires a dead holder",
+          "note": "A live holder keeps the lease by renewing; if renewals stop, the sweeper expires the lease and frees the key for liveness.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Client"
+              },
+              {
+                "id": "LockAPI",
+                "label": "Lock API"
+              },
+              {
+                "id": "LockState",
+                "label": "Lock State"
+              },
+              {
+                "id": "Sweeper",
+                "label": "Lease Sweeper"
+              }
+            ],
+            "messages": [
+              {
+                "type": "alt",
+                "label": "holder alive (renews in time)",
+                "messages": [
+                  {
+                    "from": "Client",
+                    "to": "LockAPI",
+                    "arrow": "->>",
+                    "label": "renew(key, token)"
+                  },
+                  {
+                    "from": "LockAPI",
+                    "to": "LockState",
+                    "arrow": "->>",
+                    "label": "extend expires_at"
+                  },
+                  {
+                    "from": "LockAPI",
+                    "to": "Client",
+                    "arrow": "-->>",
+                    "label": "ok (lease extended)"
+                  }
+                ],
+                "else": {
+                  "label": "holder dead (misses renewals)",
+                  "messages": [
+                    {
+                      "from": "Sweeper",
+                      "to": "LockState",
+                      "arrow": "->>",
+                      "label": "expire stale lease"
+                    },
+                    {
+                      "from": "LockState",
+                      "to": "Sweeper",
+                      "arrow": "-->>",
+                      "label": "key freed (holder=null)"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Sweeper",
+            "LockState"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "fencing",
+      "title": "4. Fencing Tokens (The Fundamental Gap)",
+      "description": [
+        "Leases introduce the classic distributed-lock hazard: a holder pauses (a long GC, a slow disk) past its lease expiry; the service grants the lock to someone else; the paused holder wakes up still believing it holds the lock and acts on the resource — now two clients act. No lock service alone can prevent this.",
+        "The fix is fencing tokens: each grant returns a monotonically increasing token. The holder includes its token in every operation on the protected resource, and the resource rejects any token lower than the highest it has seen. The paused holder's stale (lower) token is refused.",
+        "This is the key correctness insight: the lock provides mutual exclusion in the common case, but the fencing token is what makes the protected action actually safe under pauses/skew. The resource must check the token."
+      ],
+      "view": {
+        "nodes": [
+          "Client",
+          "LockAPI",
+          "Resource"
+        ],
+        "links": [
+          "api-client",
+          "client-resource",
+          "resource-check"
+        ],
+        "highlight": [
+          "Resource"
+        ],
+        "groups": [
+          "api-tier"
+        ]
+      },
+      "decisionPrompt": "A holder pauses for a GC, its lease expires, another client gets the lock, then the first wakes up and writes. How do you prevent corruption?",
+      "concepts": [
+        {
+          "term": "Fencing token",
+          "definition": "A monotonic token issued per grant; the protected resource rejects any token older than the latest it has accepted.",
+          "whyItMatters": "Defeats the paused-holder problem that leases alone can't — the real safety mechanism.",
+          "example": "Holder writes with token 42; after expiry the new holder gets 43; the resource refuses a later write with 42.",
+          "group": "Fencing Tokens (The Fundamental Gap)"
+        }
+      ],
+      "probeLinks": [
+        "redis-locks",
+        "chubby-paper",
+        "zookeeper-paper",
+        "raft-paper"
+      ],
+      "patterns": [
+        "Fencing token"
+      ],
+      "whyNow": [
+        "Fencing tokens are THE senior insight of distributed locking — naming the pause/expiry gap and that the resource must check tokens is the differentiator."
+      ],
+      "recap": {
+        "before": "Lease alone (unsafe under pauses).",
+        "after": "Fencing tokens make protected actions safe.",
+        "newRisk": "The service itself must stay available and elect a new leader if one fails."
+      },
+      "traps": [
+        {
+          "trap": "Trusting the lock alone for safety (no fencing).",
+          "why": "A paused/partitioned holder can act after losing the lock, corrupting the resource.",
+          "instead": "Issue fencing tokens; the resource rejects stale ones."
+        }
+      ],
+      "flows": [
+        {
+          "name": "Paused holder fenced out by token",
+          "note": "After a pause past expiry the lock is regranted with a higher token; the resource rejects the old holder's stale (lower) token.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Client"
+              },
+              {
+                "id": "LockAPI",
+                "label": "Lock API"
+              },
+              {
+                "id": "Resource",
+                "label": "Protected Resource"
+              }
+            ],
+            "messages": [
+              {
+                "from": "LockAPI",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "grant + token 42"
+              },
+              {
+                "from": "Client",
+                "to": "Resource",
+                "arrow": "->>",
+                "label": "write (token 42)  [then GC pause]"
+              },
+              {
+                "from": "LockAPI",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "(after expiry) new holder gets token 43"
+              },
+              {
+                "from": "Client",
+                "to": "Resource",
+                "arrow": "->>",
+                "label": "paused holder resumes: write (token 42)"
+              },
+              {
+                "type": "alt",
+                "label": "token < highest seen (43)",
+                "messages": [
+                  {
+                    "from": "Resource",
+                    "to": "Client",
+                    "arrow": "-->>",
+                    "label": "reject stale token 42"
+                  }
+                ],
+                "else": {
+                  "label": "token >= highest seen",
+                  "messages": [
+                    {
+                      "from": "Resource",
+                      "to": "Client",
+                      "arrow": "-->>",
+                      "label": "accept write"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Resource"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "election",
+      "title": "5. Leader Election as a Lock",
+      "description": [
+        "A distributed lock is the primitive for leader election: whoever holds a well-known lock (e.g. 'scheduler-leader') is the active leader; losing the lease means stepping down. This is exactly how systems pick a single active instance.",
+        "The same mechanics apply: the leader renews its lease to stay leader; if it crashes/pauses, the lease expires and another instance acquires the lock and takes over. The fencing token becomes the leader's epoch — downstream systems reject actions from a stale (lower-epoch) ex-leader.",
+        "So the lock service both is internally leader-elected (its consensus group) and provides leader election to its clients — the same idea at two levels."
+      ],
+      "view": {
+        "nodes": [
+          "Client",
+          "LockAPI",
+          "LockState",
+          "Resource"
+        ],
+        "links": [
+          "client-api",
+          "api-lockstate",
+          "client-resource"
+        ],
+        "highlight": [
+          "LockAPI"
+        ],
+        "groups": [
+          "api-tier",
+          "consensus"
+        ]
+      },
+      "decisionPrompt": "How would a job scheduler use this lock service to guarantee exactly one active scheduler?",
+      "concepts": [
+        {
+          "term": "Lock-based leader election",
+          "definition": "Holding a designated lock = being leader; lease loss = stepping down; the token = the leader epoch.",
+          "whyItMatters": "A single, reusable primitive for single-active-instance coordination.",
+          "example": "Scheduler acquires 'scheduler-leader'; ex-leader's lower epoch is fenced out.",
+          "group": "Leader Election as a Lock"
+        }
+      ],
+      "probeLinks": [
+        "redis-locks",
+        "chubby-paper",
+        "zookeeper-paper",
+        "raft-paper"
+      ],
+      "patterns": [
+        "Leader election (lock as primitive)",
+        "Fencing token"
+      ],
+      "whyNow": [
+        "Showing the lock is the building block for leader election connects it to the broader systems (job scheduler, etc.) and reuses fencing as the epoch."
+      ],
+      "recap": {
+        "before": "Locks for mutual exclusion.",
+        "after": "Locks as a leader-election primitive with fenced epochs.",
+        "newRisk": "The lock service's own leader can fail or partition — it must recover safely."
+      }
+    },
+    {
+      "id": "availability",
+      "title": "6. Failure, Partitions, and the Worst Cases",
+      "description": [
+        "The consensus group handles its own leader failure: if the leader dies, the followers elect a new one (a higher term); in-flight uncommitted ops are resolved by the protocol, and committed lock state is preserved — no two holders.",
+        "Network partitions are handled by quorum: only the side with a majority can commit grants; the minority side refuses to grant or renew (it can't reach quorum), so it can never independently hand out a lock. This is the CP choice — under partition the lock service sacrifices availability on the minority side to preserve safety.",
+        "Clock skew is why you don't trust local clocks for expiry decisions: lease expiry is judged relative to the consensus group's committed timeline (and fencing tokens backstop any timing error). The combination — quorum + fencing — is what makes it correct even in the nasty cases."
+      ],
+      "view": {
+        "nodes": [
+          "Leader",
+          "Followers",
+          "Log",
+          "LockState"
+        ],
+        "links": [
+          "leader-followers",
+          "followers-log",
+          "leader-log",
+          "log-lockstate"
+        ],
+        "highlight": [
+          "Leader",
+          "Followers"
+        ],
+        "groups": [
+          "consensus"
+        ]
+      },
+      "decisionPrompt": "The network partitions the consensus group 2-vs-3. Which side can grant locks, and why is that safe?",
+      "concepts": [
+        {
+          "term": "Quorum under partition",
+          "definition": "Only a majority partition can commit; the minority refuses grants, preserving single-holder safety.",
+          "whyItMatters": "Prevents two partitions from independently granting the same lock (split-brain).",
+          "example": "2-node side can't reach quorum -> refuses; 3-node side continues safely.",
+          "group": "Failure, Partitions, and the Worst Cases"
+        }
+      ],
+      "probeLinks": [
+        "redis-locks",
+        "chubby-paper",
+        "zookeeper-paper",
+        "raft-paper"
+      ],
+      "patterns": [
+        "Consensus-replicated state",
+        "Linearizable (CP) operations"
+      ],
+      "whyNow": [
+        "Partition/failure behavior is where lock correctness is truly tested; quorum + fencing + not trusting clocks is the staff-level answer."
+      ],
+      "recap": {
+        "before": "Single-leader assumption.",
+        "after": "Safe through leader failure, partitions, and clock skew.",
+        "newRisk": "Many keys and high acquire/renew volume must scale without a single group bottlenecking."
+      },
+      "failureDrills": [
+        {
+          "scenario": "The consensus leader crashes.",
+          "expectedBehavior": "Followers elect a new leader (new term); committed lock state survives; no lock is granted twice.",
+          "mitigation": "Raft/Paxos leader election + committed-log durability."
+        },
+        {
+          "scenario": "A client is partitioned from the service while holding a lock.",
+          "expectedBehavior": "It can't renew -> its lease expires -> the lock is reclaimed; its stale fencing token is rejected if it later acts.",
+          "mitigation": "Lease expiry + fencing tokens."
+        }
+      ],
+      "flows": [
+        {
+          "name": "Leader failure: re-elect, committed state survives",
+          "note": "If the leader dies the followers elect a new one in a higher term; committed lock grants are preserved, so no key is ever granted twice.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Leader",
+                "label": "Old Leader (crashes)"
+              },
+              {
+                "id": "Followers",
+                "label": "Followers"
+              },
+              {
+                "id": "Log",
+                "label": "Replicated Log"
+              },
+              {
+                "id": "LockState",
+                "label": "Lock State"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Followers",
+                "to": "Followers",
+                "arrow": "->>",
+                "label": "election timeout -> new term"
+              },
+              {
+                "from": "Followers",
+                "to": "Log",
+                "arrow": "->>",
+                "label": "new leader takes committed log"
+              },
+              {
+                "from": "Log",
+                "to": "LockState",
+                "arrow": "->>",
+                "label": "apply committed grants"
+              },
+              {
+                "from": "Followers",
+                "to": "LockState",
+                "arrow": "-->>",
+                "label": "single consistent holder preserved"
+              }
+            ]
+          },
+          "highlight": [
+            "Followers",
+            "Log"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "scale",
+      "title": "7. Scaling and Operating the Lock Service",
+      "description": [
+        "A single consensus group has limited throughput (every write is a quorum round-trip). Scale by sharding the key space across multiple independent consensus groups, each owning a subset of keys — locks on different keys don't contend, so throughput scales horizontally while each group stays small and fast.",
+        "Keep leases short enough for timely recovery but long enough that renewals aren't excessive; clients renew well before expiry to tolerate a missed heartbeat. The API tier is stateless and routes a key to its group's current leader.",
+        "Operationally: the replicated log is the durable truth (snapshot + compact it so it doesn't grow forever); lock state is rebuildable from the log. Expose lock-held metrics and detect stuck/long-held locks. The whole design's value is correctness, so favor refusing service (CP) over ever granting two holders."
+      ],
+      "view": {
+        "nodes": [
+          "LockAPI",
+          "Leader",
+          "Log",
+          "LockState",
+          "Followers"
+        ],
+        "links": [
+          "api-leader",
+          "leader-log",
+          "log-lockstate",
+          "leader-followers"
+        ],
+        "highlight": [
+          "LockAPI"
+        ],
+        "groups": [
+          "api-tier",
+          "consensus"
+        ]
+      },
+      "decisionPrompt": "One consensus group can't handle the lock throughput. How do you scale without risking safety?",
+      "whyNow": [
+        "Closing on key-space sharding + log compaction + CP operating stance shows the service scales while never compromising the single-holder guarantee."
+      ],
+      "probeLinks": [
+        "redis-locks",
+        "chubby-paper",
+        "zookeeper-paper",
+        "raft-paper"
+      ],
+      "recap": {
+        "before": "Single group.",
+        "after": "Key-sharded consensus groups; compacted logs; CP operating posture.",
+        "newRisk": "Cross-key transactions (locking multiple keys atomically) — bounded by ordering/avoiding or a higher-level protocol."
+      },
+      "bottlenecks": [
+        {
+          "issue": "Single consensus group write throughput.",
+          "mitigation": "Shard keys across independent groups; locks on distinct keys don't contend."
+        },
+        {
+          "issue": "Replicated log grows unbounded.",
+          "mitigation": "Snapshot + compact; rebuild state from snapshot + tail."
+        }
+      ]
+    }
+  ],
+  "finalDesign": {
+    "title": "Final Design — Distributed Lock Service",
+    "description": "Lock operations go through a consensus group (Raft/Paxos): a leader proposes, a quorum replicates to a durable log, and lock state (holder, expiry, fencing token per key) is the committed log applied deterministically — linearizable and CP, so it never grants two holders. Locks are leases with a TTL that holders renew; a sweeper expires dead holders' leases for liveness. Each grant returns a monotonically increasing fencing token, and protected resources reject stale tokens — defeating the paused-holder gap leases can't. The service is internally leader-elected and offers leader election to clients (lock = leader, token = epoch). Under partition only the majority grants locks; the key space shards across independent groups to scale, with compacted logs and a correctness-first (CP) posture.",
+    "view": {
+      "nodes": [
+        "Client",
+        "LockAPI",
+        "Leader",
+        "Followers",
+        "Log",
+        "LockState",
+        "Sweeper",
+        "Resource"
+      ],
+      "links": [
+        "client-api",
+        "api-leader",
+        "leader-log",
+        "leader-followers",
+        "followers-log",
+        "log-lockstate",
+        "api-lockstate",
+        "client-renew",
+        "sweeper-lockstate",
+        "api-client",
+        "client-resource",
+        "resource-check"
+      ],
+      "groups": [
+        "api-tier",
+        "consensus"
+      ]
+    }
+  },
+  "satisfies": {
+    "functional": [
+      {
+        "requirement": "Acquire / renew / release",
+        "how": "Consensus-committed lock ops via the API.",
+        "steps": [
+          "consensus",
+          "lease"
+        ]
+      },
+      {
+        "requirement": "Auto-release on holder death",
+        "how": "Lease TTL + sweeper.",
+        "steps": [
+          "lease"
+        ]
+      },
+      {
+        "requirement": "Safe protected actions",
+        "how": "Fencing tokens checked by the resource.",
+        "steps": [
+          "fencing"
+        ]
+      },
+      {
+        "requirement": "Leader election primitive",
+        "how": "Lock-as-leader with token epoch.",
+        "steps": [
+          "election"
+        ]
+      }
+    ],
+    "nonFunctional": [
+      {
+        "requirement": "Mutual exclusion (safety)",
+        "how": "Linearizable consensus + quorum under partition.",
+        "steps": [
+          "consensus",
+          "availability"
+        ]
+      },
+      {
+        "requirement": "Liveness (no deadlock)",
+        "how": "TTL leases auto-expire dead holders.",
+        "steps": [
+          "lease"
+        ]
+      },
+      {
+        "requirement": "Correct under pauses/skew",
+        "how": "Fencing tokens + quorum-relative expiry.",
+        "steps": [
+          "fencing",
+          "availability"
+        ]
+      },
+      {
+        "requirement": "Durable + HA",
+        "how": "Consensus-replicated, survives minority loss.",
+        "steps": [
+          "consensus",
+          "availability"
+        ]
+      },
+      {
+        "requirement": "Scale throughput",
+        "how": "Key-space sharding across consensus groups.",
+        "steps": [
+          "scale"
+        ]
+      }
+    ]
+  },
+  "interviewScript": [
+    {
+      "phase": "Scope & requirements",
+      "time": "first 5 min",
+      "say": [
+        "Confirm the hard guarantee: at most one holder, ever (safety > availability).",
+        "Pin liveness (no deadlock on crash) and correctness under pauses/partitions.",
+        "Note it's a CP system by design."
+      ]
+    },
+    {
+      "phase": "High-level design",
+      "time": "next 10 min",
+      "say": [
+        "Consensus-backed (Raft/Paxos) linearizable lock state.",
+        "Leases with TTL + renewal for liveness.",
+        "Fencing tokens for actual safety."
+      ]
+    },
+    {
+      "phase": "Deep dive",
+      "time": "next 15 min",
+      "say": [
+        "The paused-holder gap and why fencing is required.",
+        "Lock as a leader-election primitive (token = epoch).",
+        "Partition/quorum behavior, clock skew, scaling by key sharding."
+      ]
+    },
+    {
+      "phase": "Wrap-up",
+      "time": "final 5 min",
+      "say": [
+        "Map requirements to mechanisms.",
+        "Tradeoffs: lease TTL length, CP availability sacrifice, sharding for throughput.",
+        "Mention multi-key locking and read/shared locks as extensions."
+      ]
+    }
+  ],
+  "levelVariants": [
+    {
+      "level": "Junior",
+      "expectations": [
+        "Uses a lock with a TTL lease.",
+        "May store state in one DB and miss fencing/consensus."
+      ]
+    },
+    {
+      "level": "Senior",
+      "expectations": [
+        "Consensus-backed lock state + leases.",
+        "Knows fencing tokens defeat the pause gap.",
+        "Handles leader failure."
+      ]
+    },
+    {
+      "level": "Staff",
+      "expectations": [
+        "Reasons about the paused-holder problem and clock skew precisely.",
+        "Explains partition/quorum (CP) behavior.",
+        "Designs key-sharded scaling + log compaction; lock as election primitive."
+      ]
+    }
+  ],
+  "followUps": [
+    "Why can't a lease alone guarantee safety, and exactly how does a fencing token fix it?",
+    "How do you choose the lease TTL, and what breaks if it's too short or too long?",
+    "Under a network partition, which side can grant locks and why?",
+    "How would you support locking multiple keys atomically?",
+    "Why is this a CP system, and when would a weaker (AP) lock be acceptable?"
+  ],
+  "toProbeFurther": {
+    "links": [
+      {
+        "id": "chubby-paper",
+        "group": "Distributed Data",
+        "groupDescription": "Primary papers and docs for storage, replication, partitioning, consistency, and caching.",
+        "title": "The Chubby Lock Service for Loosely-Coupled Distributed Systems",
+        "url": "https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/",
+        "source": "Google Research",
+        "type": "Paper",
+        "why": "Production lock-service design with leases, sessions, and failure semantics.",
+        "year": "2006"
+      },
+      {
+        "id": "zookeeper-paper",
+        "group": "Distributed Data",
+        "groupDescription": "Primary papers and docs for storage, replication, partitioning, consistency, and caching.",
+        "title": "ZooKeeper: Wait-free Coordination for Internet-scale Systems",
+        "url": "https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf",
+        "source": "Yahoo / USENIX",
+        "type": "Paper",
+        "why": "Reference for coordination services, watches, ephemeral nodes, and distributed primitives.",
+        "year": "2010"
+      },
+      {
+        "id": "raft-paper",
+        "group": "Distributed Data",
+        "groupDescription": "Primary papers and docs for storage, replication, partitioning, consistency, and caching.",
+        "title": "In Search of an Understandable Consensus Algorithm",
+        "url": "https://raft.github.io/raft.pdf",
+        "source": "Raft",
+        "type": "Paper",
+        "why": "Readable consensus reference for leader election, log replication, membership changes, and safety.",
+        "year": "2014"
+      },
+      {
+        "id": "redis-locks",
+        "group": "Booking and Contention",
+        "groupDescription": "Inventory reservation, waiting rooms, locks, leases, and contention-management references.",
+        "title": "Distributed Locks with Redis",
+        "url": "https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/",
+        "source": "Redis",
+        "type": "Docs",
+        "why": "Clarifies when Redis locks are acceptable and why leases/fencing matter."
+      },
+      {
+        "id": "spanner-paper",
+        "group": "Distributed Data",
+        "groupDescription": "Primary papers and docs for storage, replication, partitioning, consistency, and caching.",
+        "title": "Spanner: Google's Globally Distributed Database",
+        "url": "https://research.google/pubs/spanner-googles-globally-distributed-database/",
+        "source": "Google Research",
+        "type": "Paper",
+        "why": "Reference for globally replicated transactions, external consistency, and geographically distributed state.",
+        "year": "2012"
+      },
+      {
+        "id": "sre-monitoring",
+        "group": "Foundations",
+        "groupDescription": "Core system design references for scalability, reliability, and operating distributed services.",
+        "title": "Monitoring Distributed Systems",
+        "url": "https://sre.google/sre-book/monitoring-distributed-systems/",
+        "source": "Google SRE",
+        "type": "Book chapter",
+        "why": "Grounds monitoring and alerting decisions in user-visible reliability signals."
+      }
+    ]
+  },
+  "assets": {
+    "icon": "icon.png"
+  }
+}

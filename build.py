@@ -45,6 +45,22 @@ REQUIRED_TEMPLATE_FILES = (
 )
 
 
+# File extensions that are authoring/review notes or build helpers — kept in
+# the repo next to datasets but never copied into the deployed docs/ output.
+NON_DATA_SUFFIXES = (".md", ".markdown", ".py", ".mjs")
+
+
+def _ignore_non_data(dirpath, names):
+    """copytree ignore callback: skip Markdown notes and build helpers."""
+    return [n for n in names if n.lower().endswith(NON_DATA_SUFFIXES)]
+
+
+def _ignore_template_docs(dirpath, names):
+    """copytree ignore callback for _templates/: skip developer docs (README,
+    other Markdown) so they don't ship into the deployed docs/<group>/ sites."""
+    return [n for n in names if n.lower().endswith((".md", ".markdown"))]
+
+
 def fail(msg):
     print(f"error: {msg}", file=sys.stderr)
     sys.exit(1)
@@ -75,17 +91,20 @@ def build_group(group):
         shutil.rmtree(out)
 
     # 1. Shared template shell — the whole _templates/ tree (both pages, their
-    #    JS, styles.css, plus icons/ and any other assets).
-    shutil.copytree(TEMPLATES, out)
+    #    JS, styles.css, plus icons/ and any other assets). Developer docs
+    #    (README.md) are skipped — they belong in the repo, not the site.
+    shutil.copytree(TEMPLATES, out, ignore=_ignore_template_docs)
     out_data.mkdir(parents=True)
 
-    # 2. The group's data (manifest + every dataset subdir). We copy the whole
-    #    tree, so authoring notes like INPUT.md / REQUIREMENTS.md ship alongside
-    #    for reference (they're harmless static files).
+    # 2. The group's data (manifest + every dataset subdir). Authoring/review
+    #    notes (Markdown) and build helpers (.py/.mjs) live alongside the data
+    #    for reference but must NOT ship to the deployed site, so they're
+    #    skipped during the copy. Everything else (interview.json, icon.png, …)
+    #    is copied.
     shutil.copy2(src_data / "index.json", out_data / "index.json")
     for entry in sorted(src_data.iterdir()):
         if entry.is_dir():
-            shutil.copytree(entry, out_data / entry.name)
+            shutil.copytree(entry, out_data / entry.name, ignore=_ignore_non_data)
 
     dataset_count = sum(1 for e in out_data.iterdir() if e.is_dir())
     print(f"  built docs/{group}/  ({dataset_count} datasets)")

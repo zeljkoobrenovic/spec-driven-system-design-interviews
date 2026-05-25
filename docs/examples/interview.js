@@ -124,6 +124,7 @@
         after: "icons/after.png",
         risk: "icons/risk.png",
         failureDrill: "icons/failure-drill.png",
+        deepDive: "icons/deep-dive.png",
     };
 
     // `fallback` is a site-root-relative path (e.g. ICON_FALLBACK.concept) used
@@ -2029,9 +2030,14 @@
             for (const dd of step.deepDives) {
                 const card = document.createElement("div");
                 card.className = "deepdive-card";
+                const head = document.createElement("div");
+                head.className = "asset-heading";
+                const ddIcon = makeAssetIcon(null, "Deep dive", ICON_FALLBACK.deepDive);
+                if (ddIcon) head.appendChild(ddIcon);
                 const h = document.createElement("h4");
                 h.textContent = dd.title || "Deep dive";
-                card.appendChild(h);
+                head.appendChild(h);
+                card.appendChild(head);
                 card.appendChild(makeBulletList(bulletsFrom(dd.points || [])));
                 if (hasGraphView(dd.view)) {
                     card.appendChild(makeMermaidEl(graphViewToMermaid(dd.view), "deepdive-diagram"));

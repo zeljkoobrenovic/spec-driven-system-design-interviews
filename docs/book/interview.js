@@ -29,6 +29,7 @@
         diagramBlock: document.getElementById("diagram-block"),
         diagramViewTabs: document.getElementById("diagram-view-tabs"),
         diagram: document.getElementById("diagram"),
+        diagramLegend: document.getElementById("diagram-legend"),
         optionTabs: document.getElementById("option-tabs"),
         optionProsCons: document.getElementById("option-proscons"),
         introBlock: document.getElementById("intro-block"),
@@ -1573,6 +1574,23 @@
         return filtered.length > 0 ? filtered : focus;
     }
 
+    // Small legend under the diagram explaining the crimson highlight. Shown
+    // only when at least one node is highlighted; wording reflects the view.
+    function renderDiagramLegend(highlightCount) {
+        const el = els.diagramLegend;
+        if (!el) return;
+        if (!highlightCount) {
+            el.hidden = true;
+            return;
+        }
+        const text = state.currentDiagramView === "context"
+            ? "Crimson = this step’s nodes within the full design"
+            : "Crimson = node(s) in focus this step";
+        const textEl = el.querySelector(".diagram-legend-text");
+        if (textEl) textEl.textContent = text;
+        el.hidden = false;
+    }
+
     async function renderDiagram(diagramSrc, explicitHighlight, prevStep) {
         clearError();
         const tempStep = {diagram: diagramSrc, highlight: explicitHighlight};
@@ -1590,8 +1608,10 @@
             const {svg, bindFunctions} = await mermaid.render(renderId, src);
             els.diagram.innerHTML = svg;
             if (bindFunctions) bindFunctions(els.diagram);
+            renderDiagramLegend(Array.isArray(highlights) ? highlights.length : 0);
         } catch (err) {
             els.diagram.innerHTML = "";
+            renderDiagramLegend(0);
             showError(`Mermaid render error: ${err.message || err}`);
         }
     }

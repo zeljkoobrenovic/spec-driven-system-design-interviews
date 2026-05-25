@@ -1584,8 +1584,8 @@
             return;
         }
         const text = state.currentDiagramView === "context"
-            ? "Crimson = this step’s nodes within the full design"
-            : "Crimson = node(s) in focus this step";
+            ? "this step’s nodes within the full design"
+            : "in focus this step";
         const textEl = el.querySelector(".diagram-legend-text");
         if (textEl) textEl.textContent = text;
         el.hidden = false;

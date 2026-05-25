@@ -114,8 +114,19 @@
         return base + path.replace(/^\.\//, "");
     }
 
-    function makeAssetIcon(path, alt) {
-        const src = assetUrl(path);
+    // Shared fallback icons (site-root-relative, alongside index.html). Used
+    // when a concept/pattern has no per-item icon, or its icon fails to load.
+    const ICON_FALLBACK = {
+        concept: "icons/concept.png",
+        pattern: "icons/pattern.png",
+        trap: "icons/trap.png",
+    };
+
+    // `fallback` is a site-root-relative path (e.g. ICON_FALLBACK.concept) used
+    // when `path` is absent or fails to load. With a fallback, an icon is
+    // always shown; without one, a missing/broken icon yields null / is removed.
+    function makeAssetIcon(path, alt, fallback) {
+        const src = assetUrl(path) || (fallback || "");
         if (!src) return null;
         const img = document.createElement("img");
         img.className = "asset-icon";
@@ -123,7 +134,12 @@
         img.alt = alt || "";
         img.loading = "lazy";
         img.decoding = "async";
-        img.addEventListener("error", () => {
+        img.addEventListener("error", function onErr() {
+            if (fallback && !img.src.endsWith(fallback)) {
+                img.src = fallback; // dataset icon missing -> shared fallback
+                return;
+            }
+            img.removeEventListener("error", onErr);
             img.remove();
         });
         return img;
@@ -923,7 +939,7 @@
                 const term = concept.term || concept.name || concept.title || "Concept";
                 const head = document.createElement("div");
                 head.className = "asset-heading";
-                const icon = makeAssetIcon(concept.icon, `${term} icon`);
+                const icon = makeAssetIcon(concept.icon, `${term} icon`, ICON_FALLBACK.concept);
                 if (icon) head.appendChild(icon);
                 const h = document.createElement("h4");
                 h.textContent = term;
@@ -1796,9 +1812,14 @@
             if (!t) continue;
             const card = document.createElement("div");
             card.className = "trap-card";
+            const head = document.createElement("div");
+            head.className = "asset-heading";
+            const icon = makeAssetIcon(null, "Trap", ICON_FALLBACK.trap);
+            if (icon) head.appendChild(icon);
             const h = document.createElement("h4");
             h.textContent = t.trap || t.title || "Trap";
-            card.appendChild(h);
+            head.appendChild(h);
+            card.appendChild(head);
             if (t.why) card.appendChild(makeLabeledText("Why it's wrong", t.why));
             if (t.instead || t.better) card.appendChild(makeLabeledText("Do instead", t.instead || t.better));
             wrap.appendChild(card);
@@ -1851,7 +1872,7 @@
 
             const head = document.createElement("div");
             head.className = "asset-heading";
-            const icon = makeAssetIcon(meta.icon, `${title} icon`);
+            const icon = makeAssetIcon(meta.icon, `${title} icon`, ICON_FALLBACK.pattern);
             if (icon) head.appendChild(icon);
             const h = document.createElement("h4");
             h.textContent = title;
@@ -2687,7 +2708,7 @@
 
             const head = document.createElement("div");
             head.className = "asset-heading pattern-heading";
-            const icon = makeAssetIcon(p.icon, `${p.name || "Pattern"} icon`);
+            const icon = makeAssetIcon(p.icon, `${p.name || "Pattern"} icon`, ICON_FALLBACK.pattern);
             if (icon) head.appendChild(icon);
             const name = document.createElement("div");
             name.className = "pattern-name";

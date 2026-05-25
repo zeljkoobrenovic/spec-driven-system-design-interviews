@@ -69,17 +69,19 @@
         interviewScript: "interview-script",
         levelVariants: "by-level",
         followUps: "follow-ups",
+        toProbeFurther: "to-probe-further",
     };
 
     // Slugs that belong in the bottom "Wrap-up" sidebar group, in order.
     const WRAPUP_ORDER = [
-        INTRO_SLUGS.finalDesign,
         INTRO_SLUGS.apiFlows,
         INTRO_SLUGS.satisfies,
         INTRO_SLUGS.levelVariants,
         INTRO_SLUGS.followUps,
+        INTRO_SLUGS.toProbeFurther,
     ];
     const WRAPUP_SLUGS = new Set(WRAPUP_ORDER);
+    const ARCHITECTURE_INTRO_SLUGS = new Set([INTRO_SLUGS.finalDesign]);
 
     // ---------- Utilities ----------
 
@@ -240,6 +242,20 @@
             .replace(/</g, "&lt;")
             .replace(/>/g, "&gt;")
             .replace(/"/g, "&quot;");
+    }
+
+    function decodeMermaidLabel(text) {
+        return String(text || "")
+            .replace(/&quot;/g, "\"")
+            .replace(/&amp;/g, "&")
+            .replace(/#38;/g, "&")
+            .replace(/#40;/g, "(")
+            .replace(/#41;/g, ")")
+            .replace(/#91;/g, "[")
+            .replace(/#93;/g, "]")
+            .replace(/#123;/g, "{")
+            .replace(/#125;/g, "}")
+            .replace(/#124;/g, "|");
     }
 
     function compactTypeText(text) {
@@ -461,7 +477,7 @@
             {shape: "diamond", re: /^(\s*)([A-Za-z_][A-Za-z0-9_-]*)\{(.+)\}(\s*)$/},
             {shape: "parallelogram", re: /^(\s*)([A-Za-z_][A-Za-z0-9_-]*)\[\/(.+)\/\](\s*)$/},
             {shape: "asymmetric", re: /^(\s*)([A-Za-z_][A-Za-z0-9_-]*)>(.+)\](\s*)$/},
-            {shape: "rect", re: /^(\s*)([A-Za-z_][A-Za-z0-9_-]*)\[(.+)\](\s*)$/},
+            {shape: "rect", re: /^(\s*)([A-Za-z_][A-Za-z0-9_-]*)\[(.+)\](\s*)$/}
         ];
 
         const typeClasses = new Map();
@@ -474,34 +490,41 @@
         }
 
         function rebuild(shape, id, label) {
-            const meta = nodeMetadataFor(id, label);
+            const decodedLabel = decodeMermaidLabel(label);
+            const meta = nodeMetadataFor(id, decodedLabel);
             const type = meta ? meta.type : "";
             if (/node-type-caption/.test(label)) return null;
             // Rebuild when the node has a known type OR carries an inline annotation
             // (a `\n` in the label), so annotation styling reaches typeless nodes too.
-            const hasAnnotation = /\\n/.test(label);
+            const hasAnnotation = /\\n/.test(decodedLabel);
             if (!type && !hasAnnotation) return null;
             if (type) rememberTypeClass(id, type);
-            const annotated = typeAnnotatedLabel(type, label);
+            const annotated = typeAnnotatedLabel(type, decodedLabel);
             const typeStyle = nodeTypeStyle(type);
             const renderedShape = typeStyle && typeStyle.shape ? typeStyle.shape : shape;
+            // The annotated label is an HTML <span> (parens, semicolons, angle
+            // brackets, slashes). Mermaid only accepts an HTML node label when it
+            // is double-quoted inside the shape brackets; unquoted, the parser
+            // breaks on the first ( / ; / etc. The span uses only single-quoted
+            // attributes, so wrapping in " is safe (escape any stray " defensively).
+            const q = `"${String(annotated).replace(/"/g, "&quot;")}"`;
             switch (renderedShape) {
                 case "subroutine":
-                    return `${id}[[${annotated}]]`;
+                    return `${id}[[${q}]]`;
                 case "database":
-                    return `${id}[(${annotated})]`;
+                    return `${id}[(${q})]`;
                 case "stadium":
-                    return `${id}([${annotated}])`;
+                    return `${id}([${q}])`;
                 case "circle":
-                    return `${id}((${annotated}))`;
+                    return `${id}((${q}))`;
                 case "diamond":
-                    return `${id}{${annotated}}`;
+                    return `${id}{${q}}`;
                 case "parallelogram":
-                    return `${id}[/${annotated}/]`;
+                    return `${id}[/${q}/]`;
                 case "asymmetric":
-                    return `${id}>${annotated}]`;
+                    return `${id}>${q}]`;
                 default:
-                    return `${id}[${annotated}]`;
+                    return `${id}[${q}]`;
             }
         }
 
@@ -622,6 +645,79 @@
         return ul;
     }
 
+    function probeFurtherLinks(payload) {
+        if (!payload) return [];
+        if (Array.isArray(payload)) {
+            if (payload.some((item) => item && typeof item === "object" && Array.isArray(item.links))) {
+                const out = [];
+                for (const group of payload) {
+                    if (!group || typeof group !== "object" || !Array.isArray(group.links)) continue;
+                    for (const link of group.links) {
+                        if (!link || typeof link !== "object") continue;
+                        out.push(Object.assign({
+                            group: group.group || group.title || "",
+                            groupDescription: group.description || "",
+                        }, link));
+                    }
+                }
+                return out;
+            }
+            return payload.filter((item) => item && typeof item === "object");
+        }
+        if (payload && typeof payload === "object" && Array.isArray(payload.links)) {
+            return payload.links.filter((item) => item && typeof item === "object");
+        }
+        return [];
+    }
+
+    function probeFurtherGroups(payload, linksOverride) {
+        const links = linksOverride || probeFurtherLinks(payload);
+        const groupDefs = payload && typeof payload === "object" && !Array.isArray(payload) && Array.isArray(payload.groups)
+            ? payload.groups
+            : [];
+        const order = [];
+        const byGroup = new Map();
+
+        for (const group of groupDefs) {
+            if (!group || typeof group !== "object") continue;
+            const name = group.group || group.title || group.id || "Further reading";
+            if (!byGroup.has(name)) {
+                byGroup.set(name, {
+                    group: name,
+                    description: group.description || "",
+                    links: [],
+                });
+                order.push(name);
+            }
+        }
+
+        for (const link of links) {
+            const name = link.group || "Further reading";
+            if (!byGroup.has(name)) {
+                byGroup.set(name, {
+                    group: name,
+                    description: link.groupDescription || "",
+                    links: [],
+                });
+                order.push(name);
+            }
+            const group = byGroup.get(name);
+            if (!group.description && link.groupDescription) group.description = link.groupDescription;
+            group.links.push(link);
+        }
+
+        return order.map((name) => byGroup.get(name)).filter((group) => group.links.length > 0);
+    }
+
+    function probeFurtherLinkIndex() {
+        const index = new Map();
+        for (const link of probeFurtherLinks(state.data && state.data.toProbeFurther)) {
+            const id = String(link.id || "").trim();
+            if (id && !index.has(id)) index.set(id, link);
+        }
+        return index;
+    }
+
     function conceptKey(concept) {
         const raw = typeof concept === "string"
             ? concept
@@ -682,9 +778,6 @@
         if (Array.isArray(data.interviewScript) && data.interviewScript.length > 0) {
             entries.push({kind: "intro", id: INTRO_SLUGS.interviewScript, title: "Interview Script", payload: data.interviewScript});
         }
-        if (Array.isArray(data.steps)) {
-            for (const step of data.steps) entries.push({kind: "step", id: step.id, title: step.title, payload: step});
-        }
         const finalDesign = resolveFinalDesign(data);
         if (finalDesign) {
             entries.push({
@@ -693,6 +786,9 @@
                 title: "Final Design",
                 payload: finalDesign,
             });
+        }
+        if (Array.isArray(data.steps)) {
+            for (const step of data.steps) entries.push({kind: "step", id: step.id, title: step.title, payload: step});
         }
         if (Array.isArray(data.api) && data.api.length > 0) {
             entries.push({kind: "intro", id: INTRO_SLUGS.apiFlows, title: "API Flows", payload: data.api});
@@ -704,10 +800,13 @@
             entries.push({kind: "intro", id: INTRO_SLUGS.satisfies, title: "Design vs. Requirements", payload: data.satisfies});
         }
         if (Array.isArray(data.levelVariants) && data.levelVariants.length > 0) {
-            entries.push({kind: "intro", id: INTRO_SLUGS.levelVariants, title: "By Level", payload: data.levelVariants});
+            entries.push({kind: "intro", id: INTRO_SLUGS.levelVariants, title: "Expectations By Level", payload: data.levelVariants});
         }
         if (Array.isArray(data.followUps) && data.followUps.length > 0) {
             entries.push({kind: "intro", id: INTRO_SLUGS.followUps, title: "Follow-up Questions", payload: data.followUps});
+        }
+        if (probeFurtherLinks(data.toProbeFurther).length > 0) {
+            entries.push({kind: "intro", id: INTRO_SLUGS.toProbeFurther, title: "To Probe Further", payload: data.toProbeFurther});
         }
         return entries;
     }
@@ -724,6 +823,7 @@
 
         const introEntries = state.entries.filter((e) => e.kind === "intro");
         const stepEntries = state.entries.filter((e) => e.kind === "step");
+        const architectureEntries = state.entries.filter((e) => e.kind === "step" || ARCHITECTURE_INTRO_SLUGS.has(e.id));
 
         // Steps may declare an optional `parent: '<other-step-id>'` to mark
         // themselves as a sub-step (a smaller working of one aspect of the parent).
@@ -759,8 +859,8 @@
             els.navList.appendChild(ul);
         }
 
-        makeGroup("Overview", introEntries.filter((e) => !WRAPUP_SLUGS.has(e.id)));
-        makeGroup("High-Level Architecture", stepEntries);
+        makeGroup("Overview", introEntries.filter((e) => !WRAPUP_SLUGS.has(e.id) && !ARCHITECTURE_INTRO_SLUGS.has(e.id)));
+        makeGroup("High-Level Architecture", architectureEntries);
         const wrapupEntries = WRAPUP_ORDER
             .map((slug) => introEntries.find((e) => e.id === slug))
             .filter(Boolean);
@@ -858,10 +958,12 @@
         return wrap;
     }
 
-    function renderDescription(description, decisionPrompt) {
+    function renderDescription(description, whyNow, decisionPrompt) {
         els.stepDescription.innerHTML = "";
         const designMove = renderDesignMove(description);
         if (designMove) els.stepDescription.appendChild(designMove);
+        const whyNowSection = renderWhyNow(whyNow);
+        if (whyNowSection) els.stepDescription.appendChild(whyNowSection);
         const decisionPoint = renderDecisionPoint(decisionPrompt);
         if (decisionPoint) els.stepDescription.appendChild(decisionPoint);
     }
@@ -891,13 +993,13 @@
     }
 
     // Encode characters the Mermaid flowchart parser treats as structural
-    // tokens (shape brackets, label pipes, quotes) as HTML entities. Mermaid
+    // tokens (shape brackets, label pipes, quotes) as Mermaid entities. Mermaid
     // decodes these back to the real glyphs when rendering, so the displayed
     // text is unchanged while the source stays parseable. Used for both node
     // and edge labels in generated flowcharts.
     function mermaidLabelEscape(label) {
         return String(label || "")
-            .replace(/&/g, "&amp;")
+            .replace(/&/g, "#38;")
             .replace(/"/g, "&quot;")
             .replace(/\(/g, "#40;")
             .replace(/\)/g, "#41;")
@@ -1575,8 +1677,7 @@
     }
 
     function renderWhyNow(whyNow) {
-        const content = renderTextOrBullets(whyNow, "education-card");
-        return content ? makeSection("Why now", content, "why-now") : null;
+        return renderStepTextSection("Why Now", whyNow, "education-card why-now");
     }
 
     function renderRecap(recap) {
@@ -1820,7 +1921,6 @@
         appendStepExtra(renderTopConcepts(step.concepts));
         appendStepExtra(renderStepPatterns(step.patterns));
 
-        appendStepExtra(renderWhyNow(step.whyNow));
         appendStepExtra(renderRecap(step.recap));
         appendStepExtra(renderFailureDrills(step.failureDrills));
         appendStepExtra(renderTraps(step.traps));
@@ -1871,6 +1971,8 @@
         if (Array.isArray(step.followUps) && step.followUps.length > 0) {
             els.stepExtras.appendChild(makeSection("Follow-up questions", makeBulletList(step.followUps), "followups"));
         }
+
+        appendStepExtra(renderStepProbeLinks(step.probeLinks));
     }
 
     // ---------- Rendering: intro pages ----------
@@ -2424,6 +2526,96 @@
         return wrap;
     }
 
+    function renderProbeFurtherLinkList(links) {
+        const list = document.createElement("ul");
+        list.className = "probe-links";
+        for (const item of links) {
+            if (!item || typeof item !== "object") continue;
+            const li = document.createElement("li");
+            li.className = "probe-link-item";
+
+            const titleText = item.title || item.name || item.url || "Resource";
+            if (item.url) {
+                const a = document.createElement("a");
+                a.className = "probe-link-title";
+                a.href = item.url;
+                a.target = "_blank";
+                a.rel = "noopener noreferrer";
+                a.textContent = titleText;
+                li.appendChild(a);
+            } else {
+                const h = document.createElement("div");
+                h.className = "probe-link-title";
+                h.textContent = titleText;
+                li.appendChild(h);
+            }
+
+            const metaParts = [item.source, item.type, item.year]
+                .map((part) => String(part || "").trim())
+                .filter(Boolean);
+            if (metaParts.length > 0) {
+                const meta = document.createElement("span");
+                meta.className = "probe-link-meta mono";
+                meta.textContent = ` ${metaParts.join(" / ")}`;
+                li.appendChild(meta);
+            }
+
+            const why = item.why || item.description || item.note;
+            if (why) {
+                const p = document.createElement("p");
+                p.className = "probe-link-why";
+                p.textContent = why;
+                li.appendChild(p);
+            }
+
+            list.appendChild(li);
+        }
+        return list;
+    }
+
+    function renderStepProbeLinks(linkIds) {
+        if (!Array.isArray(linkIds) || linkIds.length === 0) return null;
+        const index = probeFurtherLinkIndex();
+        const links = linkIds
+            .map((id) => index.get(String(id || "").trim()))
+            .filter(Boolean);
+        if (links.length === 0) return null;
+        return makeSection("To Probe Further", renderProbeFurtherLinkList(links), "probe-further-step");
+    }
+
+    // Wrap-up > To Probe Further. Grouped external reading list.
+    function renderIntroToProbeFurther(payload) {
+        const outer = document.createElement("div");
+        outer.className = "probe-further";
+
+        const groups = probeFurtherGroups(payload);
+        for (const group of groups) {
+            if (!group || typeof group !== "object") continue;
+            const links = Array.isArray(group.links) ? group.links : [];
+            if (links.length === 0) continue;
+
+            const section = document.createElement("section");
+            section.className = "probe-group";
+
+            const title = document.createElement("h3");
+            title.className = "probe-group-title";
+            title.textContent = group.group || group.title || "Further reading";
+            section.appendChild(title);
+
+            if (group.description) {
+                const desc = document.createElement("p");
+                desc.className = "probe-group-description muted";
+                desc.textContent = group.description;
+                section.appendChild(desc);
+            }
+
+            section.appendChild(renderProbeFurtherLinkList(links));
+            outer.appendChild(section);
+        }
+
+        return outer;
+    }
+
     // Overview > Patterns. Each item: { name, what, whenToUse?, steps? }.
     // Names the reusable design patterns this case teaches and links them to
     // the steps where they appear.
@@ -2640,6 +2832,9 @@
             case INTRO_SLUGS.followUps:
                 node = renderIntroFollowUps(entry.payload);
                 break;
+            case INTRO_SLUGS.toProbeFurther:
+                node = renderIntroToProbeFurther(entry.payload);
+                break;
             default:
                 node = document.createElement("div");
                 node.textContent = "(no renderer for this section)";
@@ -2658,7 +2853,7 @@
 
     async function renderStepLikeEntry(entry, prevStep) {
         const step = entry.payload;
-        renderDescription(step.description, step.decisionPrompt);
+        renderDescription(step.description, step.whyNow, step.decisionPrompt);
 
         if (Array.isArray(step.options) && step.options.length > 0) {
             if (state.currentOptionIndex >= step.options.length) state.currentOptionIndex = 0;
@@ -2813,11 +3008,50 @@
                 }
             }
         }
+        const knownProbeLinks = new Set();
+        if (d.toProbeFurther !== undefined) {
+            const validContainer = Array.isArray(d.toProbeFurther) ||
+                (d.toProbeFurther && typeof d.toProbeFurther === "object");
+            if (!validContainer) {
+                throw new Error(`Dataset ${path}: "toProbeFurther" must be an object or array if present`);
+            }
+            const links = probeFurtherLinks(d.toProbeFurther);
+            links.forEach((link, i) => {
+                const id = String(link.id || "").trim();
+                if (!id) {
+                    throw new Error(`Dataset ${path}: toProbeFurther link ${i} must define a non-empty id`);
+                }
+                if (knownProbeLinks.has(id)) {
+                    throw new Error(`Dataset ${path}: duplicate toProbeFurther link id "${id}"`);
+                }
+                knownProbeLinks.add(id);
+                if (typeof link.title !== "string" || !link.title.trim()) {
+                    throw new Error(`Dataset ${path}: toProbeFurther link "${id}" title must be a non-empty string`);
+                }
+                if (typeof link.url !== "string" || !/^https?:\/\//i.test(link.url.trim())) {
+                    throw new Error(`Dataset ${path}: toProbeFurther link "${id}" url must be an http(s) URL`);
+                }
+            });
+        }
         (d.steps || []).forEach((step, i) => {
             if (!step || typeof step !== "object") throw new Error(`Step ${i} is not an object`);
             if (step.diagram !== undefined) throw new Error(`Step ${i} ("${step.title || step.id || ""}") must use "view", not "diagram"`);
             if (step.image !== undefined) {
                 throw new Error(`Step ${i} ("${step.title || step.id || ""}"): generated images are only supported for finalDesign.image`);
+            }
+            if (step.probeLinks !== undefined) {
+                if (!Array.isArray(step.probeLinks)) {
+                    throw new Error(`Step ${i} ("${step.title || step.id || ""}"): "probeLinks" must be an array`);
+                }
+                step.probeLinks.forEach((id, j) => {
+                    const normalized = String(id || "").trim();
+                    if (!normalized) {
+                        throw new Error(`Step ${i} ("${step.title || step.id || ""}"): probeLinks[${j}] must be a non-empty string`);
+                    }
+                    if (!knownProbeLinks.has(normalized)) {
+                        throw new Error(`Step ${i} ("${step.title || step.id || ""}"): probeLinks[${j}] references unknown link id "${normalized}"`);
+                    }
+                });
             }
             (Array.isArray(step.concepts) ? step.concepts : []).forEach((concept, j) => {
                 if (concept && typeof concept === "object") validateAssetPath(concept.icon, `Step ${i} concept ${j} icon`);

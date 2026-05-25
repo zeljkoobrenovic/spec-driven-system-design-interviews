@@ -125,6 +125,7 @@
         risk: "icons/risk.png",
         failureDrill: "icons/failure-drill.png",
         deepDive: "icons/deep-dive.png",
+        talkingPoints: "icons/talking-points.png",
     };
 
     // `fallback` is a site-root-relative path (e.g. ICON_FALLBACK.concept) used
@@ -1717,12 +1718,23 @@
 
     // ---------- Rendering: per-step extras ----------
 
-    function makeSection(title, contentEl, className) {
+    // `icon` is an optional site-root fallback path; when set, the section's
+    // <h3> title is shown alongside that icon (same .asset-heading treatment).
+    function makeSection(title, contentEl, className, icon) {
         const wrap = document.createElement("section");
         wrap.className = `extras-section${className ? " " + className : ""}`;
         const h = document.createElement("h3");
         h.textContent = title;
-        wrap.appendChild(h);
+        const iconEl = icon ? makeAssetIcon(null, title, icon) : null;
+        if (iconEl) {
+            const head = document.createElement("div");
+            head.className = "asset-heading section-heading";
+            head.appendChild(iconEl);
+            head.appendChild(h);
+            wrap.appendChild(head);
+        } else {
+            wrap.appendChild(h);
+        }
         wrap.appendChild(contentEl);
         return wrap;
     }
@@ -2067,7 +2079,7 @@
         }
 
         if (Array.isArray(step.talkingPoints) && step.talkingPoints.length > 0) {
-            els.stepExtras.appendChild(makeSection("Talking points", makeBulletList(step.talkingPoints), "talking"));
+            els.stepExtras.appendChild(makeSection("Talking points", makeBulletList(step.talkingPoints), "talking", ICON_FALLBACK.talkingPoints));
         }
 
         appendStepExtra(renderInterviewerSignals(step.interviewerSignals));

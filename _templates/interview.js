@@ -2347,7 +2347,7 @@
         }
         if (state.data && hasDiagram(state.data.requirementsDiagram)) {
             // Requirements diagrams lay out left-to-right.
-            outer.appendChild(makeMermaidEl(forceFlowchartDirection(state.data.requirementsDiagram, "LR"), "", {
+            outer.appendChild(makeMermaidEl(forceFlowchartDirection(state.data.requirementsDiagram, "LR"), "requirements-diagram", {
                 annotateNodeTypes: false,
             }));
         }
@@ -2383,7 +2383,7 @@
         const outer = document.createElement("div");
         if (state.data && hasDiagram(state.data.capacityDiagram)) {
             // Capacity-estimation diagrams lay out left-to-right.
-            outer.appendChild(makeMermaidEl(forceFlowchartDirection(state.data.capacityDiagram, "LR"), "", {
+            outer.appendChild(makeMermaidEl(forceFlowchartDirection(state.data.capacityDiagram, "LR"), "capacity-diagram", {
                 annotateNodeTypes: false,
             }));
         }

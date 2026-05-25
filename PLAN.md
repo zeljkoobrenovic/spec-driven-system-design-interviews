@@ -194,9 +194,10 @@ All fields below are optional except `highLevelArchitecture` and either
   ],
 
   // Reusable design patterns this case teaches. Renders as an Overview entry
-  // ("Patterns"); `steps` cross-links each pattern to where it appears.
+  // ("Patterns"), grouped by `group`; `steps` cross-links each pattern to
+  // where it appears.
   "patterns": [
-    { "name": "Cache-aside", "what": "...", "whenToUse": "...", "steps": ["cache"],
+    { "name": "Cache-aside", "group": "Caching and read path", "what": "...", "whenToUse": "...", "steps": ["cache"],
       "icon": "assets/icons/patterns/cache-aside.png" }
   ],
 
@@ -247,6 +248,7 @@ All fields below are optional except `highLevelArchitecture` and either
       "concepts": [
         {
           "term": "Cache-aside",
+          "group": "Caching and read path",
           "definition": "The application checks cache first, reads the database on a miss, then backfills the cache.",
           "whyItMatters": "The candidate sees the concept before using it in the design.",
           "example": "GET /short-code reads Redis, then the URL table on cache miss.",
@@ -369,9 +371,11 @@ All fields below are optional except `highLevelArchitecture` and either
 }
 ```
 
-The fields above (`patterns`, `patternCatalog`, `step.patterns`, `step.traps`,
+The fields above (`patterns`, `patternCatalog`, `step.concepts`, `step.patterns`, `step.traps`,
 `step.probeLinks`, `interviewScript`, `levelVariants`, `toProbeFurther`) are the **book differentiators** — all
-optional, so the 17 example datasets render unchanged. `patterns` and
+optional, so example datasets render unchanged. `patterns` and
+deduped `step.concepts` are grouped by their optional `group` on the Overview
+pages; step pages still render the local concept and pattern cards flat.
 `step.traps` are exercised in the canonical `url-shortener` example;
 `data/book/payment-system` uses all of them.
 Generated visual assets are optional too: absent `assets`, `icon`, or `image`

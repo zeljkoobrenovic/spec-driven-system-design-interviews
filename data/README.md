@@ -22,6 +22,8 @@ Current groups:
 - **`book/`** — the book group: a pattern catalog, the interview-method
   walkthrough, and ~50 flagship cases organized into categories. Also holds
   planning notes (`BOOK-STRUCTURE.md`) and a verifier (`_verify.mjs`).
+- **`real-world-systems/`** — interviews derived from public production
+  architecture case studies and engineering write-ups.
 
 A group becomes publishable once it has an `index.json`. Loose files at a group
 root that aren't dataset directories (e.g. `BOOK-STRUCTURE.md`) and, inside a

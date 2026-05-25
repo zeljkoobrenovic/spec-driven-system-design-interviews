@@ -755,25 +755,58 @@
             .trim();
     }
 
+    function cleanStepGroupTitle(step) {
+        const raw = step && (step.title || step.id);
+        return String(raw || "Design Step")
+            .replace(/^\s*\d+[a-z]?\s*[\.)-]\s*/i, "")
+            .replace(/\s+/g, " ")
+            .trim() || "Design Step";
+    }
+
     function collectDatasetConcepts(data) {
         const out = new Map();
         for (const step of data && Array.isArray(data.steps) ? data.steps : []) {
             const concepts = Array.isArray(step.concepts) ? step.concepts : [];
+            const stepGroup = cleanStepGroupTitle(step);
             for (const concept of concepts) {
                 const key = conceptKey(concept);
                 if (!key) continue;
 
                 const source = typeof concept === "string" ? {term: concept} : Object.assign({}, concept);
+                if (!source.group) source.group = stepGroup;
                 if (!out.has(key)) {
                     source.steps = Array.isArray(source.steps) ? source.steps.slice() : [];
                     out.set(key, source);
                 }
 
                 const target = out.get(key);
+                if (!target.group && source.group) target.group = source.group;
                 if (step.id && !target.steps.includes(step.id)) target.steps.push(step.id);
             }
         }
         return Array.from(out.values());
+    }
+
+    function introItemGroupName(item, fallback) {
+        if (item && typeof item === "object") {
+            const value = item.group || item.category;
+            if (String(value || "").trim()) return String(value).trim();
+        }
+        return fallback || "Other";
+    }
+
+    function groupedIntroItems(items, fallback) {
+        const order = [];
+        const byGroup = new Map();
+        for (const item of Array.isArray(items) ? items : []) {
+            const name = introItemGroupName(item, fallback);
+            if (!byGroup.has(name)) {
+                byGroup.set(name, {name, items: []});
+                order.push(name);
+            }
+            byGroup.get(name).items.push(item);
+        }
+        return order.map((name) => byGroup.get(name)).filter((group) => group.items.length > 0);
     }
 
     // ---------- Entries (sidebar model) ----------
@@ -948,8 +981,7 @@
     function renderTopConcepts(concepts, opts) {
         opts = opts || {};
         if (!Array.isArray(concepts) || concepts.length === 0) return null;
-        const cards = [];
-        for (const concept of concepts) {
+        function makeConceptCard(concept) {
             const card = document.createElement("article");
             card.className = "concept-card";
             if (typeof concept === "string") {
@@ -978,9 +1010,8 @@
                     card.appendChild(makeStepChips(concept.steps));
                 }
             }
-            if (card.children.length > 0) cards.push(card);
+            return card.children.length > 0 ? card : null;
         }
-        if (cards.length === 0) return null;
 
         const wrap = document.createElement("div");
         wrap.className = "step-concepts" + (opts.className ? ` ${opts.className}` : "");
@@ -989,6 +1020,37 @@
             h.textContent = opts.title || "Concepts introduced";
             wrap.appendChild(h);
         }
+
+        if (opts.grouped) {
+            for (const group of groupedIntroItems(concepts, opts.fallbackGroup || "Concepts")) {
+                const section = document.createElement("section");
+                section.className = "intro-item-group";
+                const title = document.createElement("h3");
+                title.className = "intro-item-group-title";
+                title.textContent = group.name;
+                section.appendChild(title);
+
+                const grid = document.createElement("div");
+                grid.className = "concept-grid";
+                for (const concept of group.items) {
+                    const card = makeConceptCard(concept);
+                    if (card) grid.appendChild(card);
+                }
+                if (grid.children.length > 0) {
+                    section.appendChild(grid);
+                    wrap.appendChild(section);
+                }
+            }
+            return wrap.children.length > (opts.showTitle === false ? 0 : 1) ? wrap : null;
+        }
+
+        const cards = [];
+        for (const concept of concepts) {
+            const card = makeConceptCard(concept);
+            if (card) cards.push(card);
+        }
+        if (cards.length === 0) return null;
+
         const grid = document.createElement("div");
         grid.className = "concept-grid";
         cards.forEach((card) => grid.appendChild(card));
@@ -2318,6 +2380,14 @@
         return wrap;
     }
 
+    // A dataModel field may be authored as an object ({ name, type?, note? })
+    // or as a bare string (just the field name). Normalize so both render.
+    function normalizeField(f) {
+        if (typeof f === "string") return {name: f};
+        if (f && typeof f === "object") return f;
+        return {name: String(f == null ? "" : f)};
+    }
+
     // Build a Mermaid `erDiagram` source from the dataModel array. Relationships
     // are not inferred — only entities + fields. Field types are sanitized: ER
     // syntax only allows simple identifiers for the type, so we strip spaces and
@@ -2339,7 +2409,8 @@
         for (const t of tables) {
             const name = safeIdent(t.name || "table");
             lines.push(`  ${name} {`);
-            for (const f of t.fields || []) {
+            for (const rawF of t.fields || []) {
+                const f = normalizeField(rawF);
                 const fname = safeIdent(f.name || "field");
                 const ftype = safeType(f.type);
                 // Mark PK heuristically: type mentions 'PK' or field name is 'id'/ends in '_id PK'
@@ -2542,10 +2613,11 @@
             const h = document.createElement("h3");
             h.textContent = t.name || "table";
             card.appendChild(h);
-            if (t.note) {
+            const tableNote = t.note || t.notes;
+            if (tableNote) {
                 const n = document.createElement("p");
                 n.className = "muted schema-note";
-                n.textContent = t.note;
+                n.textContent = tableNote;
                 card.appendChild(n);
             }
             const tbl = document.createElement("table");
@@ -2554,7 +2626,8 @@
             thead.innerHTML = "<tr><th>Field</th><th>Type</th><th>Note</th></tr>";
             tbl.appendChild(thead);
             const tbody = document.createElement("tbody");
-            for (const f of t.fields || []) {
+            for (const rawF of t.fields || []) {
+                const f = normalizeField(rawF);
                 const tr = document.createElement("tr");
                 const td1 = document.createElement("td");
                 td1.className = "mono";
@@ -2754,10 +2827,8 @@
     // the steps where they appear.
     function renderIntroPatterns(items) {
         const patterns = Array.isArray(items) ? items : [];
-        const wrap = document.createElement("div");
-        wrap.className = "patterns-list";
-
-        for (const p of patterns) {
+        function makePatternCard(p) {
+            p = p && typeof p === "object" ? p : {name: String(p || "")};
             const card = document.createElement("div");
             card.className = "pattern-card";
 
@@ -2786,10 +2857,27 @@
             if (Array.isArray(p.steps) && p.steps.length > 0) {
                 card.appendChild(makeStepChips(p.steps));
             }
-            wrap.appendChild(card);
+            return card;
         }
 
-        return wrap;
+        const outer = document.createElement("div");
+        outer.className = "intro-grouped-list";
+        for (const group of groupedIntroItems(patterns, "Patterns")) {
+            const section = document.createElement("section");
+            section.className = "intro-item-group";
+            const title = document.createElement("h3");
+            title.className = "intro-item-group-title";
+            title.textContent = group.name;
+            section.appendChild(title);
+
+            const grid = document.createElement("div");
+            grid.className = "patterns-list";
+            group.items.forEach((p) => grid.appendChild(makePatternCard(p)));
+            section.appendChild(grid);
+            outer.appendChild(section);
+        }
+
+        return outer;
     }
 
     // Overview > Concepts. Deduped from step.concepts and linked to the steps
@@ -2797,6 +2885,7 @@
     function renderIntroConcepts(items) {
         return renderTopConcepts(items, {
             className: "overview-concepts",
+            grouped: true,
             showSteps: true,
             showTitle: false,
         });
@@ -2805,15 +2894,15 @@
     // Pattern Catalog (catalog dataset). Each item: { name, category?, what,
     // whenToUse?, tradeoffs?, usedBy? }. A standalone reference of the reusable
     // patterns the book teaches; cases reference these by name. Groups cards by
-    // `category` when present.
+    // `category`/`group` when present.
     function renderIntroPatternCatalog(items) {
         const outer = document.createElement("div");
 
-        // Group items by category (preserving first-seen order); ungrouped last.
+        // Group items by category/group (preserving first-seen order); ungrouped last.
         const order = [];
         const byCat = new Map();
         for (const p of items) {
-            const cat = p.category || "";
+            const cat = p.category || p.group || "";
             if (!byCat.has(cat)) {
                 byCat.set(cat, []);
                 order.push(cat);
@@ -3124,6 +3213,11 @@
                 throw new Error(`${label}: asset path must be a string`);
             }
         }
+        function validateOptionalString(value, label) {
+            if (value !== undefined && typeof value !== "string") {
+                throw new Error(`${label}: must be a string if present`);
+            }
+        }
         validateDiagramArray(d.requirementsDiagram, `Dataset ${path} requirementsDiagram`);
         validateDiagramArray(d.capacityDiagram, `Dataset ${path} capacityDiagram`);
         validateDiagramArray(d.dataModelDiagram, `Dataset ${path} dataModelDiagram`);
@@ -3186,7 +3280,10 @@
                 });
             }
             (Array.isArray(step.concepts) ? step.concepts : []).forEach((concept, j) => {
-                if (concept && typeof concept === "object") validateAssetPath(concept.icon, `Step ${i} concept ${j} icon`);
+                if (concept && typeof concept === "object") {
+                    validateAssetPath(concept.icon, `Step ${i} concept ${j} icon`);
+                    validateOptionalString(concept.group, `Step ${i} concept ${j} group`);
+                }
             });
             (step.options || []).forEach((opt, j) => {
                 if (opt.diagram !== undefined) throw new Error(`Step ${i} option ${j} ("${opt.name || ""}") must use "view", not "diagram"`);
@@ -3219,10 +3316,16 @@
             }
         }
         (d.patterns || []).forEach((pattern, i) => {
-            if (pattern && typeof pattern === "object") validateAssetPath(pattern.icon, `Dataset ${path}: patterns[${i}].icon`);
+            if (pattern && typeof pattern === "object") {
+                validateAssetPath(pattern.icon, `Dataset ${path}: patterns[${i}].icon`);
+                validateOptionalString(pattern.group, `Dataset ${path}: patterns[${i}].group`);
+            }
         });
         (d.patternCatalog || []).forEach((pattern, i) => {
-            if (pattern && typeof pattern === "object") validateAssetPath(pattern.icon, `Dataset ${path}: patternCatalog[${i}].icon`);
+            if (pattern && typeof pattern === "object") {
+                validateAssetPath(pattern.icon, `Dataset ${path}: patternCatalog[${i}].icon`);
+                validateOptionalString(pattern.group, `Dataset ${path}: patternCatalog[${i}].group`);
+            }
         });
         const architecture = d.highLevelArchitecture;
         if (!architecture || typeof architecture !== "object") {

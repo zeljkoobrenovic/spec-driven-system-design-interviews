@@ -526,8 +526,51 @@
   ],
   "steps": [
     {
+      "id": "naive",
+      "title": "1. Naive: Write Logs Straight to a Database and Scan It (the baseline)",
+      "description": [
+        "Start with the simplest thing that works. Each service writes its log lines straight into a single shared database (or one big table), and when an engineer needs to investigate, they run a query that scans the table \u2014 effectively grep over rows.",
+        "This works for one small service and immediately exposes three problems the rest of the design exists to solve. First, synchronous writes to a database can't absorb a TB/day firehose \u2014 a burst or a slow database backs up and stalls the applications doing the logging. Second, searching means scanning the whole table, which gets unusably slow as it grows. Third, the table grows without bound; nothing ages old data out, so cost and size explode.",
+        "So the baseline motivates everything that follows: put a durable buffer in front so ingestion never blocks, build a time-bucketed index so search prunes instead of scans, and tier old data to cheap storage with a retention policy."
+      ],
+      "view": {
+        "nodes": [
+          "App",
+          "Collector",
+          "RawStore",
+          "QuerySvc",
+          "User"
+        ],
+        "links": [
+          "app-collector",
+          "query-raw",
+          "user-query"
+        ],
+        "highlight": [
+          "RawStore",
+          "QuerySvc"
+        ]
+      },
+      "decisionPrompt": "If every log line is a synchronous insert and every search is a full-table scan, what breaks first at a TB/day?",
+      "whyNow": [
+        "Establishing the write-and-scan baseline first makes it obvious why ingestion needs a durable buffer, why search needs an index, and why retention needs tiering \u2014 every later step removes a specific pain from here."
+      ],
+      "recap": {
+        "before": "Nothing.",
+        "after": "Services write log lines straight to one database; engineers scan it to search.",
+        "newRisk": "Synchronous writes can't absorb the firehose, full-table scans are too slow, and the table grows unbounded."
+      },
+      "traps": [
+        {
+          "trap": "Logging directly into a shared relational database and grepping it.",
+          "why": "Ingestion stalls applications under load, search scans everything, and storage grows without bound.",
+          "instead": "Buffer ingestion durably, index recent logs in time buckets, and tier/expire old data by retention policy."
+        }
+      ]
+    },
+    {
       "id": "ingest",
-      "title": "1. Durable High-Throughput Ingestion",
+      "title": "2. Durable High-Throughput Ingestion",
       "description": [
         "Agents on each host batch log lines and ship them to a collector that parses/enriches lightly and appends to a durable, partitioned buffer (Kafka-style). The collector does minimal work so it can absorb TBs/day.",
         "The buffer decouples ingestion from indexing: a slow or down indexer doesn't drop logs \u2014 they queue durably and consumers catch up. Partition by service/source for parallelism.",
@@ -570,11 +613,69 @@
         "before": "Nothing.",
         "after": "Logs durably accepted and buffered, decoupled from indexing.",
         "newRisk": "Raw lines aren't searchable or structured yet, and volume may exceed what's worth indexing."
-      }
+      },
+      "flows": [
+        {
+          "name": "Ship -> buffer -> ack (never block the app)",
+          "note": "The collector accepts and durably buffers a batch fast; indexing happens later off the buffer, so a slow indexer never blocks logging.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "App",
+                "label": "App / Agent"
+              },
+              {
+                "id": "Collector",
+                "label": "Collector"
+              },
+              {
+                "id": "Buffer",
+                "label": "Ingest Buffer"
+              }
+            ],
+            "messages": [
+              {
+                "from": "App",
+                "to": "Collector",
+                "arrow": "->>",
+                "label": "ship log batch"
+              },
+              {
+                "from": "Collector",
+                "to": "Collector",
+                "arrow": "->>",
+                "label": "parse + enrich (light)"
+              },
+              {
+                "from": "Collector",
+                "to": "Buffer",
+                "arrow": "->>",
+                "label": "append (partition by service)"
+              },
+              {
+                "from": "Buffer",
+                "to": "Collector",
+                "arrow": "-->>",
+                "label": "durably persisted"
+              },
+              {
+                "from": "Collector",
+                "to": "App",
+                "arrow": "-->>",
+                "label": "202 accepted"
+              }
+            ]
+          },
+          "highlight": [
+            "Collector",
+            "Buffer"
+          ]
+        }
+      ]
     },
     {
       "id": "process",
-      "title": "2. Parse, Structure, and Sample",
+      "title": "3. Parse, Structure, and Sample",
       "description": [
         "Consumers read the buffer and turn raw lines into structured events: extract level, timestamp, service, and key fields (and a trace id for correlation). Structured fields enable precise queries; the message stays full-text-searchable.",
         "Volume often outpaces value, so control cost here: sample or drop high-volume low-value logs (e.g. debug noise), enforce per-service quotas, and route different log types to different retention.",
@@ -624,7 +725,7 @@
     },
     {
       "id": "index",
-      "title": "3. Time-Bucketed Indexing for Search",
+      "title": "4. Time-Bucketed Indexing for Search",
       "description": [
         "Logs are time-ordered and queries almost always include a time range, so index in immutable time-bucketed segments (e.g. per hour). The indexer builds an inverted index over the message and structured fields per bucket.",
         "Search prunes by time first \u2014 only segments overlapping the query range are touched \u2014 then matches terms within them. Segments are immutable and independently retire-able, which is what makes tiering clean.",
@@ -675,7 +776,7 @@
     },
     {
       "id": "tiering",
-      "title": "4. Hot/Cold Storage Tiering",
+      "title": "5. Hot/Cold Storage Tiering",
       "description": [
         "Most logs are written and never read, and reads skew heavily to recent data. Keep a short hot window indexed on fast storage; age older data to cheaper tiers \u2014 warm (compressed, slower index) then cold (archive, searchable only on rehydrate).",
         "Search routes by the query's time range: recent ranges hit the hot index (fast); old ranges scan/rehydrate cold storage (slower, acceptable). The raw store backs both \u2014 you can always re-derive an index for an old window if needed.",
@@ -723,11 +824,91 @@
         "before": "Everything hot and expensive.",
         "after": "Small hot index + cheap cold retention; queries route by age.",
         "newRisk": "Some patterns need detection in real time, not via search; and lifecycle/retention must be enforced."
-      }
+      },
+      "flows": [
+        {
+          "name": "Search routes by time range (hot vs cold)",
+          "note": "Recent ranges hit the indexed hot store and return in seconds; old ranges rehydrate from cold storage and are slower but acceptable.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "User",
+                "label": "Engineer"
+              },
+              {
+                "id": "QuerySvc",
+                "label": "Query Service"
+              },
+              {
+                "id": "HotIndex",
+                "label": "Hot Index"
+              },
+              {
+                "id": "ColdStore",
+                "label": "Cold Store"
+              }
+            ],
+            "messages": [
+              {
+                "from": "User",
+                "to": "QuerySvc",
+                "arrow": "->>",
+                "label": "search q + time range"
+              },
+              {
+                "type": "alt",
+                "label": "range within hot window (recent days)",
+                "messages": [
+                  {
+                    "from": "QuerySvc",
+                    "to": "HotIndex",
+                    "arrow": "->>",
+                    "label": "time-pruned indexed search"
+                  },
+                  {
+                    "from": "HotIndex",
+                    "to": "QuerySvc",
+                    "arrow": "-->>",
+                    "label": "hits (seconds)"
+                  }
+                ],
+                "else": {
+                  "label": "old range (beyond hot window)",
+                  "messages": [
+                    {
+                      "from": "QuerySvc",
+                      "to": "ColdStore",
+                      "arrow": "->>",
+                      "label": "rehydrate + scan"
+                    },
+                    {
+                      "from": "ColdStore",
+                      "to": "QuerySvc",
+                      "arrow": "-->>",
+                      "label": "hits (slower)"
+                    }
+                  ]
+                }
+              },
+              {
+                "from": "QuerySvc",
+                "to": "User",
+                "arrow": "-->>",
+                "label": "results"
+              }
+            ]
+          },
+          "highlight": [
+            "QuerySvc",
+            "HotIndex",
+            "ColdStore"
+          ]
+        }
+      ]
     },
     {
       "id": "alert",
-      "title": "5. Streaming Alerts",
+      "title": "6. Streaming Alerts",
       "description": [
         "Alerting on logs ('error rate spiking', 'this exception appeared') shouldn't poll the index \u2014 that's slow and load-heavy. Evaluate alert rules on the ingest stream as events flow, so detection is near-real-time.",
         "Rules match patterns or compute windowed aggregates (counts/thresholds) over the stream; matches fire alerts. This reuses the same buffer the indexer consumes \u2014 alerting is just another consumer.",
@@ -772,11 +953,83 @@
         "before": "Alerting by polling search.",
         "after": "Real-time alerts evaluated on the ingest stream.",
         "newRisk": "Indexer lag under bursts and retention enforcement must be handled operationally."
-      }
+      },
+      "flows": [
+        {
+          "name": "Streaming alert evaluation (not index polling)",
+          "note": "The alert service is just another consumer of the ingest stream; it evaluates windowed rules as events flow and fires without touching the search index.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Buffer",
+                "label": "Ingest Buffer"
+              },
+              {
+                "id": "Processor",
+                "label": "Processor"
+              },
+              {
+                "id": "AlertSvc",
+                "label": "Alert Service"
+              },
+              {
+                "id": "User",
+                "label": "Engineer"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Buffer",
+                "to": "Processor",
+                "arrow": "->>",
+                "label": "consume structured events"
+              },
+              {
+                "from": "Processor",
+                "to": "AlertSvc",
+                "arrow": "->>",
+                "label": "stream for rules"
+              },
+              {
+                "from": "AlertSvc",
+                "to": "AlertSvc",
+                "arrow": "->>",
+                "label": "windowed count level:error > threshold?"
+              },
+              {
+                "type": "alt",
+                "label": "threshold crossed",
+                "messages": [
+                  {
+                    "from": "AlertSvc",
+                    "to": "User",
+                    "arrow": "->>",
+                    "label": "fire alert (dedup repeats)"
+                  }
+                ],
+                "else": {
+                  "label": "below threshold",
+                  "messages": [
+                    {
+                      "from": "AlertSvc",
+                      "to": "AlertSvc",
+                      "arrow": "->>",
+                      "label": "update window state"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "AlertSvc"
+          ]
+        }
+      ]
     },
     {
       "id": "reliability",
-      "title": "6. Retention, Backpressure, and Reliability",
+      "title": "7. Retention, Backpressure, and Reliability",
       "description": [
         "A lifecycle worker enforces retention: age hot segments to warm/cold, then delete past the policy \u2014 per service/tenant. This is what keeps storage bounded and compliant.",
         "Handle bursts and slow consumers with backpressure: the durable buffer absorbs ingestion spikes while indexers fall behind, then catch up; if truly overwhelmed, shed/sample at the collector rather than dropping silently downstream. Multi-tenant quotas stop one noisy service from starving others.",

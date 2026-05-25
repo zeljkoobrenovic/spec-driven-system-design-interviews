@@ -545,8 +545,47 @@
   ],
   "steps": [
     {
+      "id": "naive",
+      "title": "1. Naive: Store the Blob on One Fileserver (the baseline)",
+      "description": [
+        "Start with the simplest thing that works: a single fileserver with a disk. PUT writes the object's bytes to a local file named by bucket/key; GET reads that file back. For a handful of objects this is a correct, complete object store.",
+        "It fails the two headline requirements immediately. Durability: one disk holds the only copy, so a disk failure (which is routine at scale) loses the object outright \u2014 nowhere near the 11-nines target. Scale: one server's disk caps total bytes and object count, and one machine's network caps throughput, so exabytes and trillions of objects are impossible.",
+        "So the baseline motivates the design. To never lose data you need multiple copies on independent hardware (replication / erasure coding), and to scale you must separate the small, queryable mapping (which object lives where) from the bulk bytes so each scales on its own. The next two steps introduce exactly that split and that redundancy."
+      ],
+      "view": {
+        "nodes": [
+          "Client",
+          "LB",
+          "DataNodes"
+        ],
+        "links": [
+          "client-lb",
+          "client-datanodes"
+        ],
+        "highlight": [
+          "DataNodes"
+        ]
+      },
+      "decisionPrompt": "All objects live as files on one disk. Which two requirements does that violate the instant a disk fails or the server fills up?",
+      "whyNow": [
+        "Starting from one fileserver makes the two pressures concrete: a single copy isn't durable (so we add redundancy) and one box doesn't scale (so we split metadata from data) \u2014 the next two steps."
+      ],
+      "recap": {
+        "before": "Nothing.",
+        "after": "Objects stored as files on a single fileserver.",
+        "newRisk": "A single disk is neither durable (one failure loses data) nor scalable (one box caps bytes/throughput)."
+      },
+      "traps": [
+        {
+          "trap": "Treating a single fileserver (or one NAS) as 'good enough' object storage.",
+          "why": "One disk/host is a single point of data loss and a hard capacity/throughput ceiling \u2014 it can't approach 11 nines or exabyte scale.",
+          "instead": "Split metadata from data and store each object redundantly across independent failure domains."
+        }
+      ]
+    },
+    {
       "id": "split",
-      "title": "1. Split Metadata from Data",
+      "title": "2. Split Metadata from Data",
       "description": [
         "Two very different problems: a tiny, queryable mapping (bucket/key -> where the bytes live) and the bulk bytes themselves. Keep them in separate planes. The metadata service owns the key->location/version mapping in a sharded transactional store; data nodes store the actual object bytes.",
         "A request resolves metadata first (locations, version), then streams bytes to/from data nodes. This lets metadata be consistent and heavily sharded (by bucket/key hash) while raw storage scales independently and cheaply across thousands of disks.",
@@ -598,7 +637,7 @@
     },
     {
       "id": "durability",
-      "title": "2. Durability: Replication vs Erasure Coding",
+      "title": "3. Durability: Replication vs Erasure Coding",
       "description": [
         "Disks and nodes fail constantly, so a single copy loses data. Two schemes give durability. Replication: store N full copies across distinct failure domains (racks/zones); any copy serves reads, and losing up to N-1 is survivable \u2014 simple and fast but N\u00d7 storage.",
         "Erasure coding: split the object into k data + m parity fragments spread across k+m nodes; any k fragments reconstruct it. This tolerates m losses at far lower overhead (e.g. 10+4 = 1.4\u00d7 vs 3\u00d7 replication) \u2014 the standard for large/cold data, at the cost of reconstruction work on read/repair.",
@@ -662,7 +701,7 @@
     },
     {
       "id": "consistency",
-      "title": "3. Read-After-Write via Commit Ordering",
+      "title": "4. Read-After-Write via Commit Ordering",
       "description": [
         "With two planes, ordering is the consistency lever. On PUT, write the object's data durably to its nodes first (replicas/fragments acknowledged), then commit the metadata pointing to it last. The object becomes visible only once both exist.",
         "This commit-metadata-last ordering gives read-after-write: a successful PUT response means metadata is committed and data is durable, so an immediate GET resolves and serves it. A crash mid-PUT leaves orphan data (no metadata pointer) that GC later reclaims \u2014 never a dangling pointer to missing bytes.",
@@ -709,11 +748,99 @@
         "before": "Possible dangling pointers / invisible writes.",
         "after": "Read-after-write; crashes leave reclaimable orphans, not corruption.",
         "newRisk": "Very large objects can't be a single streamed PUT \u2014 they need multipart."
-      }
+      },
+      "flows": [
+        {
+          "name": "PUT: data durable first, metadata committed last",
+          "note": "Bytes are written and acknowledged durable before the metadata pointer commits, so a reader never resolves an object whose data is missing.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Client"
+              },
+              {
+                "id": "MetaSvc",
+                "label": "Metadata Service"
+              },
+              {
+                "id": "EC",
+                "label": "Erasure Coder"
+              },
+              {
+                "id": "DataNodes",
+                "label": "Data Nodes"
+              },
+              {
+                "id": "MetaDB",
+                "label": "Metadata Store"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Client",
+                "to": "MetaSvc",
+                "arrow": "->>",
+                "label": "PUT bucket/key"
+              },
+              {
+                "from": "Client",
+                "to": "EC",
+                "arrow": "->>",
+                "label": "stream bytes"
+              },
+              {
+                "from": "EC",
+                "to": "DataNodes",
+                "arrow": "->>",
+                "label": "write shards across domains"
+              },
+              {
+                "from": "DataNodes",
+                "to": "EC",
+                "arrow": "-->>",
+                "label": "durable (quorum)"
+              },
+              {
+                "type": "alt",
+                "label": "data acknowledged durable",
+                "messages": [
+                  {
+                    "from": "MetaSvc",
+                    "to": "MetaDB",
+                    "arrow": "->>",
+                    "label": "commit version + placement"
+                  },
+                  {
+                    "from": "MetaSvc",
+                    "to": "Client",
+                    "arrow": "-->>",
+                    "label": "200 versionId"
+                  }
+                ],
+                "else": {
+                  "label": "data write failed",
+                  "messages": [
+                    {
+                      "from": "MetaSvc",
+                      "to": "Client",
+                      "arrow": "-->>",
+                      "label": "5xx (no commit; bytes are orphan for GC)"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "MetaSvc",
+            "DataNodes"
+          ]
+        }
+      ]
     },
     {
       "id": "multipart",
-      "title": "4. Multipart Upload for Large Objects",
+      "title": "5. Multipart Upload for Large Objects",
       "description": [
         "A multi-GB/TB object can't be one atomic streamed request (failures waste everything, and it ties up a connection). Initiate a multipart upload, then PUT independent parts (in parallel, resumable), each durably stored and acknowledged with an etag.",
         "When all parts are in, 'complete' assembles them into the final object and commits metadata atomically \u2014 the object appears only on completion. Parts can be retried/re-uploaded independently before completion.",
@@ -759,11 +886,83 @@
         "before": "Single-shot PUT only.",
         "after": "Parallel, resumable large uploads completed atomically.",
         "newRisk": "Durability degrades over time as disks fail and deletes/abandoned uploads pile up."
-      }
+      },
+      "flows": [
+        {
+          "name": "Multipart upload: parts then atomic complete",
+          "note": "Each part is stored and acked independently (resumable); the object becomes visible only when complete commits metadata.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Client"
+              },
+              {
+                "id": "Uploader",
+                "label": "Upload Coordinator"
+              },
+              {
+                "id": "EC",
+                "label": "Erasure Coder"
+              },
+              {
+                "id": "MetaSvc",
+                "label": "Metadata Service"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Client",
+                "to": "Uploader",
+                "arrow": "->>",
+                "label": "initiate -> uploadId"
+              },
+              {
+                "from": "Client",
+                "to": "Uploader",
+                "arrow": "->>",
+                "label": "PUT part N + etag"
+              },
+              {
+                "from": "Uploader",
+                "to": "EC",
+                "arrow": "->>",
+                "label": "persist part durably"
+              },
+              {
+                "from": "Uploader",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "part N stored (retryable)"
+              },
+              {
+                "from": "Client",
+                "to": "Uploader",
+                "arrow": "->>",
+                "label": "complete (part list)"
+              },
+              {
+                "from": "Uploader",
+                "to": "MetaSvc",
+                "arrow": "->>",
+                "label": "assemble + commit metadata"
+              },
+              {
+                "from": "Uploader",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "200 object visible"
+              }
+            ]
+          },
+          "highlight": [
+            "Uploader"
+          ]
+        }
+      ]
     },
     {
       "id": "maintenance",
-      "title": "5. Scrubbing, Repair, and Garbage Collection",
+      "title": "6. Scrubbing, Repair, and Garbage Collection",
       "description": [
         "Durability isn't a one-time write property \u2014 disks rot and nodes die continuously. A background scrubber reads shards, verifies checksums, and flags lost/corrupt ones; the repair process rebuilds missing replicas/fragments (re-replicate or re-encode from surviving fragments) to restore the target redundancy.",
         "Repair speed matters: durability math assumes lost redundancy is restored before further failures accumulate, so repair is prioritized and parallelized.",
@@ -822,7 +1021,7 @@
     },
     {
       "id": "scale",
-      "title": "6. Listing, Sharding, and Availability at Scale",
+      "title": "7. Listing, Sharding, and Availability at Scale",
       "description": [
         "Metadata is the scaling pressure point: shard the metadata store by bucket/key hash across many partitions so trillions of objects and PUT/GET resolution stay fast. Replicate metadata for availability and read-after-write.",
         "Prefix listing ('list keys under foo/') is served from a derived bucket index ordered by key, kept in sync from metadata \u2014 a flat key space with delimiter-based prefix queries (S3 has no real directories).",

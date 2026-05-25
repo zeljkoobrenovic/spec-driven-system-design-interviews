@@ -411,8 +411,47 @@
   ],
   "steps": [
     {
+      "id": "naive",
+      "title": "1. Naive: A Lock Row in a Single Database",
+      "description": [
+        "Start with the simplest thing that works: one row per key in a single database, acquired with a conditional write (SET key IF NOT EXISTS, or INSERT ... an UPDATE ... WHERE holder IS NULL). The atomic conditional means only one client wins the row, so in the happy path you really do get mutual exclusion.",
+        "It fails on the two hard requirements. Liveness: if the holder dies after acquiring, the row stays set forever \u2014 a permanent deadlock, because nothing ever releases it. Safety + availability: the single database is a single point of failure; if it dies the whole fleet loses locking, and if you make it highly available with async-replicated failover, a failover or partition can promote a replica that doesn't know about the latest grant \u2014 split-brain, two holders.",
+        "So the baseline motivates the design. To avoid permanent deadlock the grant must be time-bounded and auto-expire (leases). To avoid split-brain the state must be agreed by a quorum, not a single node or a lossy failover (consensus). And to stay safe even when a holder pauses past expiry you need fencing tokens. The steps that follow add exactly these."
+      ],
+      "view": {
+        "nodes": [
+          "Client",
+          "LockAPI",
+          "LockState"
+        ],
+        "links": [
+          "client-api",
+          "api-lockstate"
+        ],
+        "highlight": [
+          "LockState"
+        ]
+      },
+      "decisionPrompt": "A single-row 'SET key IF NOT EXISTS' gives mutual exclusion in the happy path. What happens when the holder dies, and what happens when the database fails over?",
+      "whyNow": [
+        "The single-DB lock row is the obvious first answer; its two failures \u2014 permanent deadlock on holder death and split-brain on failover \u2014 are exactly what leases and consensus exist to fix."
+      ],
+      "recap": {
+        "before": "Nothing.",
+        "after": "Mutual exclusion via an atomic conditional write to one lock row.",
+        "newRisk": "A dead holder deadlocks the key forever, and the single DB is a SPOF that can split-brain on failover \u2014 motivating leases + consensus + fencing."
+      },
+      "traps": [
+        {
+          "trap": "Shipping 'SET key IF NOT EXISTS' on a single (or async-replicated) database as the lock service.",
+          "why": "A crashed holder never releases the row (permanent deadlock), and a single DB is a SPOF whose failover can promote a stale replica and grant two holders.",
+          "instead": "Bound the grant with a lease that auto-expires, back the state with consensus, and hand out fencing tokens."
+        }
+      ]
+    },
+    {
       "id": "consensus",
-      "title": "1. Consensus-Backed Lock State",
+      "title": "2. Consensus-Backed Lock State",
       "description": [
         "A lock service's one job is mutual exclusion, so its state must never diverge \u2014 two nodes can't each think a different client holds the lock. Replicate the lock state across a small group (3 or 5 nodes) via a consensus protocol (Raft/Paxos): one leader proposes each lock operation, a quorum agrees and appends it to a replicated log, and that committed log is the source of truth.",
         "This makes operations linearizable (a single total order) and durable (survives a minority of nodes failing) \u2014 deliberately choosing CP (consistency over availability): if quorum is lost, the service refuses grants rather than risk two holders.",
@@ -475,7 +514,7 @@
     },
     {
       "id": "lease",
-      "title": "2. Leases with TTL (No Permanent Deadlock)",
+      "title": "3. Leases with TTL (No Permanent Deadlock)",
       "description": [
         "If a lock were held until explicitly released, a client that crashes while holding it would block the resource forever. Grant locks as leases with a TTL: the holder must periodically renew (heartbeat) to keep it; if it stops (crash, hang, partition), the lease expires and the lock is reclaimed.",
         "A lease sweeper (or the leader) expires leases past their TTL and frees the key. This gives liveness \u2014 a dead holder's lock is automatically released \u2014 at the cost of choosing a TTL: too short risks expiring a slow-but-alive holder; too long delays recovery.",
@@ -522,11 +561,83 @@
         "before": "Locks held until release (deadlock on crash).",
         "after": "TTL leases auto-release dead holders.",
         "newRisk": "A holder can be PAUSED (GC) past expiry, lose the lock, then resume and act \u2014 thinking it still holds it."
-      }
+      },
+      "flows": [
+        {
+          "name": "Renew heartbeat, or sweeper expires a dead holder",
+          "note": "A live holder keeps the lease by renewing; if renewals stop, the sweeper expires the lease and frees the key for liveness.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Client"
+              },
+              {
+                "id": "LockAPI",
+                "label": "Lock API"
+              },
+              {
+                "id": "LockState",
+                "label": "Lock State"
+              },
+              {
+                "id": "Sweeper",
+                "label": "Lease Sweeper"
+              }
+            ],
+            "messages": [
+              {
+                "type": "alt",
+                "label": "holder alive (renews in time)",
+                "messages": [
+                  {
+                    "from": "Client",
+                    "to": "LockAPI",
+                    "arrow": "->>",
+                    "label": "renew(key, token)"
+                  },
+                  {
+                    "from": "LockAPI",
+                    "to": "LockState",
+                    "arrow": "->>",
+                    "label": "extend expires_at"
+                  },
+                  {
+                    "from": "LockAPI",
+                    "to": "Client",
+                    "arrow": "-->>",
+                    "label": "ok (lease extended)"
+                  }
+                ],
+                "else": {
+                  "label": "holder dead (misses renewals)",
+                  "messages": [
+                    {
+                      "from": "Sweeper",
+                      "to": "LockState",
+                      "arrow": "->>",
+                      "label": "expire stale lease"
+                    },
+                    {
+                      "from": "LockState",
+                      "to": "Sweeper",
+                      "arrow": "-->>",
+                      "label": "key freed (holder=null)"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Sweeper",
+            "LockState"
+          ]
+        }
+      ]
     },
     {
       "id": "fencing",
-      "title": "3. Fencing Tokens (The Fundamental Gap)",
+      "title": "4. Fencing Tokens (The Fundamental Gap)",
       "description": [
         "Leases introduce the classic distributed-lock hazard: a holder pauses (a long GC, a slow disk) past its lease expiry; the service grants the lock to someone else; the paused holder wakes up still believing it holds the lock and acts on the resource \u2014 now two clients act. No lock service alone can prevent this.",
         "The fix is fencing tokens: each grant returns a monotonically increasing token. The holder includes its token in every operation on the protected resource, and the resource rejects any token lower than the highest it has seen. The paused holder's stale (lower) token is refused.",
@@ -576,11 +687,84 @@
           "why": "A paused/partitioned holder can act after losing the lock, corrupting the resource.",
           "instead": "Issue fencing tokens; the resource rejects stale ones."
         }
+      ],
+      "flows": [
+        {
+          "name": "Paused holder fenced out by token",
+          "note": "After a pause past expiry the lock is regranted with a higher token; the resource rejects the old holder's stale (lower) token.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Client"
+              },
+              {
+                "id": "LockAPI",
+                "label": "Lock API"
+              },
+              {
+                "id": "Resource",
+                "label": "Protected Resource"
+              }
+            ],
+            "messages": [
+              {
+                "from": "LockAPI",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "grant + token 42"
+              },
+              {
+                "from": "Client",
+                "to": "Resource",
+                "arrow": "->>",
+                "label": "write (token 42)  [then GC pause]"
+              },
+              {
+                "from": "LockAPI",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "(after expiry) new holder gets token 43"
+              },
+              {
+                "from": "Client",
+                "to": "Resource",
+                "arrow": "->>",
+                "label": "paused holder resumes: write (token 42)"
+              },
+              {
+                "type": "alt",
+                "label": "token < highest seen (43)",
+                "messages": [
+                  {
+                    "from": "Resource",
+                    "to": "Client",
+                    "arrow": "-->>",
+                    "label": "reject stale token 42"
+                  }
+                ],
+                "else": {
+                  "label": "token >= highest seen",
+                  "messages": [
+                    {
+                      "from": "Resource",
+                      "to": "Client",
+                      "arrow": "-->>",
+                      "label": "accept write"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Resource"
+          ]
+        }
       ]
     },
     {
       "id": "election",
-      "title": "4. Leader Election as a Lock",
+      "title": "5. Leader Election as a Lock",
       "description": [
         "A distributed lock is the primitive for leader election: whoever holds a well-known lock (e.g. 'scheduler-leader') is the active leader; losing the lease means stepping down. This is exactly how systems pick a single active instance.",
         "The same mechanics apply: the leader renews its lease to stay leader; if it crashes/pauses, the lease expires and another instance acquires the lock and takes over. The fencing token becomes the leader's epoch \u2014 downstream systems reject actions from a stale (lower-epoch) ex-leader.",
@@ -630,7 +814,7 @@
     },
     {
       "id": "availability",
-      "title": "5. Failure, Partitions, and the Worst Cases",
+      "title": "6. Failure, Partitions, and the Worst Cases",
       "description": [
         "The consensus group handles its own leader failure: if the leader dies, the followers elect a new one (a higher term); in-flight uncommitted ops are resolved by the protocol, and committed lock state is preserved \u2014 no two holders.",
         "Network partitions are handled by quorum: only the side with a majority can commit grants; the minority side refuses to grant or renew (it can't reach quorum), so it can never independently hand out a lock. This is the CP choice \u2014 under partition the lock service sacrifices availability on the minority side to preserve safety.",
@@ -689,11 +873,67 @@
           "expectedBehavior": "It can't renew -> its lease expires -> the lock is reclaimed; its stale fencing token is rejected if it later acts.",
           "mitigation": "Lease expiry + fencing tokens."
         }
+      ],
+      "flows": [
+        {
+          "name": "Leader failure: re-elect, committed state survives",
+          "note": "If the leader dies the followers elect a new one in a higher term; committed lock grants are preserved, so no key is ever granted twice.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Leader",
+                "label": "Old Leader (crashes)"
+              },
+              {
+                "id": "Followers",
+                "label": "Followers"
+              },
+              {
+                "id": "Log",
+                "label": "Replicated Log"
+              },
+              {
+                "id": "LockState",
+                "label": "Lock State"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Followers",
+                "to": "Followers",
+                "arrow": "->>",
+                "label": "election timeout -> new term"
+              },
+              {
+                "from": "Followers",
+                "to": "Log",
+                "arrow": "->>",
+                "label": "new leader takes committed log"
+              },
+              {
+                "from": "Log",
+                "to": "LockState",
+                "arrow": "->>",
+                "label": "apply committed grants"
+              },
+              {
+                "from": "Followers",
+                "to": "LockState",
+                "arrow": "-->>",
+                "label": "single consistent holder preserved"
+              }
+            ]
+          },
+          "highlight": [
+            "Followers",
+            "Log"
+          ]
+        }
       ]
     },
     {
       "id": "scale",
-      "title": "6. Scaling and Operating the Lock Service",
+      "title": "7. Scaling and Operating the Lock Service",
       "description": [
         "A single consensus group has limited throughput (every write is a quorum round-trip). Scale by sharding the key space across multiple independent consensus groups, each owning a subset of keys \u2014 locks on different keys don't contend, so throughput scales horizontally while each group stays small and fast.",
         "Keep leases short enough for timely recovery but long enough that renewals aren't excessive; clients renew well before expiry to tolerate a missed heartbeat. The API tier is stateless and routes a key to its group's current leader.",

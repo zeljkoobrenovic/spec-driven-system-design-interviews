@@ -487,8 +487,49 @@
   ],
   "steps": [
     {
+      "id": "naive",
+      "title": "1. Naive: Increment a Counter Row Per Event (the baseline)",
+      "description": [
+        "Start with the simplest thing that works. When an event arrives, the collector synchronously does an UPDATE that increments a counter row in the metrics store (clicks++ for this campaign), and dashboards read those rows directly.",
+        "This is correct at low volume and exposes three problems the rest of the design exists to solve. First, a synchronous increment per event can't keep up with ~1M events/sec \u2014 the hot counter rows become a write bottleneck and ingestion stalls or drops events the moment processing falls behind. Second, ingestion is at-least-once: a retried or double-fired event increments the counter twice, so billed clicks are over-counted with no way to tell. Third, once a number is added into a counter the raw event is gone, so a counting bug can never be reprocessed out of history.",
+        "So the baseline motivates everything that follows: accept events into a durable, replayable log first, count asynchronously with idempotent dedup, and keep the raw events so a batch layer can recompute accurate, billing-grade numbers."
+      ],
+      "view": {
+        "nodes": [
+          "Client",
+          "Collector",
+          "OLAP",
+          "ServeAPI"
+        ],
+        "links": [
+          "client-collector",
+          "serve-olap"
+        ],
+        "highlight": [
+          "Collector",
+          "OLAP"
+        ]
+      },
+      "decisionPrompt": "If each event is a synchronous counter increment, what happens at 1M events/sec, and how do you bill correctly when an event is delivered twice?",
+      "whyNow": [
+        "Establishing the synchronous-counter baseline first makes it obvious why ingestion must be decoupled and durable, why counting needs dedup, and why raw events must be kept \u2014 every later step removes a specific pain from here."
+      ],
+      "recap": {
+        "before": "Nothing.",
+        "after": "Each event synchronously increments a counter row that dashboards read directly.",
+        "newRisk": "Synchronous counting can't absorb the firehose, retries over-count billed events, and a counting bug can't be reprocessed."
+      },
+      "traps": [
+        {
+          "trap": "Counting events with a synchronous per-event counter increment.",
+          "why": "It bottlenecks at the firehose, double-counts at-least-once retries, and discards the raw events needed to fix history.",
+          "instead": "Append events to a durable log, count asynchronously with idempotent dedup, and keep raw events for batch recompute."
+        }
+      ]
+    },
+    {
       "id": "ingest",
-      "title": "1. Durable High-Throughput Ingestion",
+      "title": "2. Durable High-Throughput Ingestion",
       "description": [
         "A lightweight edge collector validates and enriches each event and appends it to a durable, partitioned event log (Kafka-style). The collector does almost no work so it can absorb ~1M events/sec.",
         "The log decouples producers from consumers: ingestion never blocks on downstream processing, and many consumers can read independently at their own pace. Partition by a key (e.g. ad/campaign id) for parallelism and ordering within a partition.",
@@ -544,7 +585,7 @@
     },
     {
       "id": "speed",
-      "title": "2. Speed Layer: Real-Time Metrics",
+      "title": "3. Speed Layer: Real-Time Metrics",
       "description": [
         "A stream processor consumes the log continuously and maintains windowed aggregates (clicks/impressions per campaign per minute), writing them to the OLAP store within seconds.",
         "This is the speed layer: fast and fresh, but approximate \u2014 it may miss late-arriving events or contain duplicates not yet reconciled.",
@@ -593,7 +634,7 @@
     },
     {
       "id": "dedup",
-      "title": "3. Deduplicate for Correct Counts",
+      "title": "4. Deduplicate for Correct Counts",
       "description": [
         "Ingestion is at-least-once: network retries and client re-fires mean the same event can appear multiple times. Counting naively over-counts clicks \u2014 and clicks are billed.",
         "Give each event a stable event id. The stream processor checks a dedup store (a seen-id set, often a Bloom filter or RocksDB-backed keyed state) and ignores ids it has already counted \u2014 effectively-once counting.",
@@ -644,11 +685,90 @@
           "why": "Most pipelines are at-least-once at the edges; producers retry.",
           "instead": "Make counting idempotent on a stable event id; reconcile exactly in batch."
         }
+      ],
+      "flows": [
+        {
+          "name": "Effectively-once counting via dedup",
+          "note": "The stream processor checks the dedup store by event id; a first-seen event is counted, a duplicate is dropped so billed clicks aren't inflated.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Log",
+                "label": "Event Log"
+              },
+              {
+                "id": "Stream",
+                "label": "Stream Processor"
+              },
+              {
+                "id": "DedupStore",
+                "label": "Dedup Store"
+              },
+              {
+                "id": "OLAP",
+                "label": "Metrics Store"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Log",
+                "to": "Stream",
+                "arrow": "->>",
+                "label": "click event (event_id e_77)"
+              },
+              {
+                "from": "Stream",
+                "to": "DedupStore",
+                "arrow": "->>",
+                "label": "seen e_77?"
+              },
+              {
+                "type": "alt",
+                "label": "first time seen",
+                "messages": [
+                  {
+                    "from": "DedupStore",
+                    "to": "Stream",
+                    "arrow": "-->>",
+                    "label": "no -> mark seen"
+                  },
+                  {
+                    "from": "Stream",
+                    "to": "OLAP",
+                    "arrow": "->>",
+                    "label": "increment windowed count"
+                  }
+                ],
+                "else": {
+                  "label": "duplicate / retry",
+                  "messages": [
+                    {
+                      "from": "DedupStore",
+                      "to": "Stream",
+                      "arrow": "-->>",
+                      "label": "yes (already counted)"
+                    },
+                    {
+                      "from": "Stream",
+                      "to": "Stream",
+                      "arrow": "->>",
+                      "label": "drop (no over-count)"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Stream",
+            "DedupStore"
+          ]
+        }
       ]
     },
     {
       "id": "attribution",
-      "title": "4. Attribution: Credit Clicks for Conversions",
+      "title": "5. Attribution: Credit Clicks for Conversions",
       "description": [
         "Advertisers care about conversions (a purchase), which happen later than and separately from the click. Attribution joins a conversion back to the click/campaign that drove it, within an attribution window (e.g. 7 days).",
         "This is a stateful, time-windowed join across event types and time \u2014 heavier than counting. The stream layer can do near-real-time attribution for recent windows; longer windows and corrections are done in batch over raw events.",
@@ -696,7 +816,7 @@
     },
     {
       "id": "batch",
-      "title": "5. Batch Layer: Accurate, Reprocessable Metrics",
+      "title": "6. Batch Layer: Accurate, Reprocessable Metrics",
       "description": [
         "Periodically reprocess the immutable raw events end-to-end to produce billing-grade metrics: full dedup, complete attribution windows, and late-arriving events all included.",
         "Batch results overwrite the speed layer's approximate numbers for the same windows (lambda-architecture reconciliation): real-time numbers are provisional, batch numbers are authoritative.",
@@ -747,11 +867,62 @@
           "expectedBehavior": "It resumes from the log offset (checkpointed state); batch later corrects any gap.",
           "mitigation": "Replayable log + checkpointed stream state + authoritative batch recompute."
         }
+      ],
+      "flows": [
+        {
+          "name": "Batch recompute overwrites provisional metrics",
+          "note": "Batch replays immutable raw events for a closed window with full dedup and attribution, then overwrites the speed layer's approximate numbers.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "RawStore",
+                "label": "Raw Event Store"
+              },
+              {
+                "id": "Batch",
+                "label": "Batch Processor"
+              },
+              {
+                "id": "OLAP",
+                "label": "Metrics Store"
+              }
+            ],
+            "messages": [
+              {
+                "from": "RawStore",
+                "to": "Batch",
+                "arrow": "->>",
+                "label": "replay raw events for closed day"
+              },
+              {
+                "from": "Batch",
+                "to": "Batch",
+                "arrow": "->>",
+                "label": "exact dedup + full attribution"
+              },
+              {
+                "from": "Batch",
+                "to": "OLAP",
+                "arrow": "->>",
+                "label": "overwrite rollups (source=batch, authoritative)"
+              },
+              {
+                "from": "Batch",
+                "to": "OLAP",
+                "arrow": "-->>",
+                "label": "closed window settled"
+              }
+            ]
+          },
+          "highlight": [
+            "Batch"
+          ]
+        }
       ]
     },
     {
       "id": "serve",
-      "title": "6. Serve: Pre-Aggregation and Query",
+      "title": "7. Serve: Pre-Aggregation and Query",
       "description": [
         "Dashboards can't scan billions of raw events per query. Store pre-aggregated rollups by time bucket and dimension in an OLAP/columnar store; queries read materialized aggregates and are fast.",
         "The query API merges the two sources cleanly: serve batch (authoritative) numbers for closed windows and speed-layer (provisional) numbers for the current, still-open window \u2014 so users see fresh data that later settles to exact.",
@@ -808,6 +979,75 @@
         {
           "issue": "A hot partition (huge campaign) lags the stream.",
           "mitigation": "Repartition / scale consumers; the log absorbs the backlog."
+        }
+      ],
+      "flows": [
+        {
+          "name": "Provisional-then-exact query merge",
+          "note": "The query API serves authoritative batch numbers for closed windows and provisional speed-layer numbers for the still-open window, hiding the seam.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Dashboard",
+                "label": "Advertiser"
+              },
+              {
+                "id": "ServeAPI",
+                "label": "Query API"
+              },
+              {
+                "id": "OLAP",
+                "label": "Metrics Store"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Dashboard",
+                "to": "ServeAPI",
+                "arrow": "->>",
+                "label": "GET /metrics (range spans today)"
+              },
+              {
+                "from": "ServeAPI",
+                "to": "OLAP",
+                "arrow": "->>",
+                "label": "read rollups for range"
+              },
+              {
+                "type": "alt",
+                "label": "closed windows",
+                "messages": [
+                  {
+                    "from": "OLAP",
+                    "to": "ServeAPI",
+                    "arrow": "-->>",
+                    "label": "batch rows (authoritative)"
+                  }
+                ],
+                "else": {
+                  "label": "current open window",
+                  "messages": [
+                    {
+                      "from": "OLAP",
+                      "to": "ServeAPI",
+                      "arrow": "-->>",
+                      "label": "speed rows (provisional)"
+                    }
+                  ]
+                }
+              },
+              {
+                "from": "ServeAPI",
+                "to": "Dashboard",
+                "arrow": "-->>",
+                "label": "merged series (fresh now, exact later)"
+              }
+            ]
+          },
+          "highlight": [
+            "ServeAPI",
+            "OLAP"
+          ]
         }
       ]
     }

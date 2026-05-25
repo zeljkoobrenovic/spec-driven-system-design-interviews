@@ -1520,9 +1520,36 @@
         ].join("\n");
     }
 
+    // Node ids a step focuses on: the nodes its view (or current option's view)
+    // actually contains. Used to highlight the step's piece within the full
+    // (final-design) architecture in the "Full context" view.
+    function stepFocusNodeIds(step) {
+        if (!step) return [];
+        let view = step.view;
+        if (Array.isArray(step.options) && step.options.length > 0) {
+            const opt = step.options[state.currentOptionIndex] || step.options[0];
+            view = (opt && opt.view) || step.view;
+        }
+        const ids = graphViewRefs(view, "nodes").map((ref) =>
+            typeof ref === "string" ? ref : (ref && ref.id ? ref.id : "")
+        ).filter(Boolean);
+        return [...new Set(ids)];
+    }
+
+    // The "Full context" diagram is the final design (the complete target
+    // architecture). The current step's focus nodes are highlighted within it,
+    // so the reader always sees the whole system and where this step fits.
+    // Falls back to the accumulated prior-steps merge if no final design exists.
     function fullContextDiagramFor(entryIndex, currentDiagram) {
         const entry = state.entries[entryIndex];
         if (!entry || entry.kind !== "step") return currentDiagram;
+
+        const finalDesign = resolveFinalDesign(state.data);
+        const finalView = finalDesign && finalDesign.view;
+        const finalDiagram = graphViewToMermaid(finalView);
+        if (finalDiagram) return finalDiagram;
+
+        // Fallback: no final design — accumulate the diagrams up to this step.
         const sources = [];
         for (let i = 0; i < entryIndex; i++) {
             const prev = state.entries[i];
@@ -1534,6 +1561,16 @@
         if (currentDiagram) sources.push(currentDiagram);
         const merged = mergeFlowchartSources(sources);
         return merged || currentDiagram;
+    }
+
+    // Highlight set for the "Full context" view: the current step's focus nodes,
+    // restricted to nodes that actually appear in the full-context diagram.
+    function fullContextHighlightFor(step, contextDiagram) {
+        const focus = stepFocusNodeIds(step);
+        if (focus.length === 0) return [];
+        const present = extractNodeIds(contextDiagram);
+        const filtered = focus.filter((id) => present.has(id));
+        return filtered.length > 0 ? filtered : focus;
     }
 
     async function renderDiagram(diagramSrc, explicitHighlight, prevStep) {
@@ -2871,11 +2908,10 @@
         let highlight = focus.highlight;
         let diagramPrevStep = prevStep;
         if (entry.kind === "step" && state.currentDiagramView === "context") {
-            highlight = resolveHighlights(
-                {diagram: focus.diagram, highlight: focus.highlight},
-                defaultEffectiveFor(prevStep)
-            );
+            // Full context = the final-design architecture, with this step's
+            // focus nodes highlighted so the reader sees where it fits.
             diagram = fullContextDiagramFor(state.currentEntryIndex, focus.diagram);
+            highlight = fullContextHighlightFor(step, diagram);
             diagramPrevStep = null;
         }
         await renderDiagram(diagram, highlight, diagramPrevStep);

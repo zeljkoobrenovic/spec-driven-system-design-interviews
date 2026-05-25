@@ -55,6 +55,12 @@ def _ignore_non_data(dirpath, names):
     return [n for n in names if n.lower().endswith(NON_DATA_SUFFIXES)]
 
 
+def _ignore_template_docs(dirpath, names):
+    """copytree ignore callback for _templates/: skip developer docs (README,
+    other Markdown) so they don't ship into the deployed docs/<group>/ sites."""
+    return [n for n in names if n.lower().endswith((".md", ".markdown"))]
+
+
 def fail(msg):
     print(f"error: {msg}", file=sys.stderr)
     sys.exit(1)
@@ -85,8 +91,9 @@ def build_group(group):
         shutil.rmtree(out)
 
     # 1. Shared template shell — the whole _templates/ tree (both pages, their
-    #    JS, styles.css, plus icons/ and any other assets).
-    shutil.copytree(TEMPLATES, out)
+    #    JS, styles.css, plus icons/ and any other assets). Developer docs
+    #    (README.md) are skipped — they belong in the repo, not the site.
+    shutil.copytree(TEMPLATES, out, ignore=_ignore_template_docs)
     out_data.mkdir(parents=True)
 
     # 2. The group's data (manifest + every dataset subdir). Authoring/review

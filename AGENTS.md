@@ -4,6 +4,25 @@ Notes for future Claude sessions working on this directory. See `PLAN.md` for
 the product spec and dataset schema — this file covers code conventions,
 where logic lives, and common pitfalls.
 
+## Keeping the docs in sync
+
+This repo has overlapping documentation that must not drift apart:
+
+- **`CLAUDE.md` and `AGENTS.md` are byte-identical.** `AGENTS.md` is a verbatim
+  mirror of `CLAUDE.md` (for agents that read `AGENTS.md`). After editing
+  `CLAUDE.md`, mirror it: `cp CLAUDE.md AGENTS.md` (or edit both identically).
+  Never let them diverge — a reviewer should be able to `diff CLAUDE.md
+  AGENTS.md` and get no output.
+- **`README.md` files are human-facing** and describe the same shared facts at
+  a higher level: the root `README.md` (project overview, build/run, layout)
+  plus per-directory `README.md`s in `_templates/`, `data/`, and `docs/`.
+- **When you change a shared fact** — a build/run command, the directory
+  layout, how datasets are added, a core convention — **update all the docs it
+  appears in**: this file (then mirror to `AGENTS.md`), the relevant
+  `README.md`(s), and `PLAN.md` if it's a schema change. The detailed
+  conventions and pitfalls live here in `CLAUDE.md`/`AGENTS.md`; the READMEs
+  link here rather than duplicating the depth.
+
 ## What this is
 
 A static system-design interview explorer. No framework, one CDN dep
@@ -77,6 +96,10 @@ notice. Loose files at a group root that aren't dataset directories (e.g.
 authoring/review notes and build helpers (`*.md`, `*.py`, `*.mjs` — see
 `NON_DATA_SUFFIXES`) are skipped too, so `interview.json` (and assets like
 `icon.png`) ship but `INPUT.md` / `REVIEW.md` / `_build.py` stay repo-only.
+Developer `README.md`s in `_templates/` are likewise skipped from the template
+copy (`_ignore_template_docs`), so they don't ship into `docs/<group>/`. The
+`docs/README.md` at the `docs/` root is not touched by the build (only
+`docs/<group>/` subdirs are regenerated).
 
 ## Running locally
 

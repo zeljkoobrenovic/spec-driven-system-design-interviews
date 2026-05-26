@@ -31,6 +31,7 @@
         diagram: document.getElementById("diagram"),
         diagramLegend: document.getElementById("diagram-legend"),
         optionTabs: document.getElementById("option-tabs"),
+        optionDescription: document.getElementById("option-description"),
         optionProsCons: document.getElementById("option-proscons"),
         introBlock: document.getElementById("intro-block"),
         stepExtras: document.getElementById("step-extras"),
@@ -1796,15 +1797,26 @@
             if (pros.length > 0) els.optionProsCons.appendChild(col("Pros", pros, "pros"));
             if (cons.length > 0) els.optionProsCons.appendChild(col("Cons", cons, "cons"));
         } else {
-            const c = col("Tradeoffs", tradeoffs, "tradeoffs");
-            if (typeof opt.description === "string" && opt.description.trim()) {
-                const p = document.createElement("p");
-                p.className = "muted";
-                p.textContent = opt.description;
-                c.insertBefore(p, c.children[1] || null);
-            }
-            els.optionProsCons.appendChild(c);
+            els.optionProsCons.appendChild(col("Tradeoffs", tradeoffs, "tradeoffs"));
         }
+    }
+
+    // One-line "what this alternative is", shown between the option tabs and the
+    // diagram. Works for both option shapes (name/pros/cons and title/tradeoffs).
+    function renderOptionDescription(step) {
+        els.optionDescription.innerHTML = "";
+        if (!Array.isArray(step.options) || step.options.length === 0) {
+            els.optionDescription.hidden = true;
+            return;
+        }
+        const opt = step.options[state.currentOptionIndex] || step.options[0];
+        const desc = typeof opt.description === "string" ? opt.description.trim() : "";
+        if (!desc) {
+            els.optionDescription.hidden = true;
+            return;
+        }
+        els.optionDescription.hidden = false;
+        els.optionDescription.textContent = desc;
     }
 
     // ---------- Rendering: per-step extras ----------
@@ -3101,6 +3113,7 @@
         els.diagramBlock.hidden = false;
         renderDiagramViewTabs(entry);
         renderOptionTabs(step);
+        renderOptionDescription(step);
         renderProsCons(step);
         const focus = effectiveDiagramFor(step);
         let diagram = focus.diagram;

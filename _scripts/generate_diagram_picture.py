@@ -30,9 +30,19 @@ Usage:
         --dry-run
 
 When passed an ``interview.json`` file, this script reads the dataset and writes
-standalone image files under ``assets/generated/diagram-pictures/`` by default.
-It does not update ``interview.json``, rebuild ``docs/``, or wire generated
-images into the renderer.
+standalone image files under ``assets/generated/ai-visuals/`` by default. For a
+step or final design that has an ``options`` array it generates one image per
+option (using that option's own ``view``/name/description); steps and the final
+design without options get a single image each. Each file is saved with the
+extension that matches the image bytes Gemini actually returns (e.g. ``.jpg``
+for an ``image/jpeg`` response), not a hard-coded ``.png``. After generating an
+image (not in ``--dry-run`` and not when an existing file is skipped), batch
+mode writes the actual relative image path back into the dataset's ``aiVisual``
+fields (per step, per option, ``finalDesign.aiVisual``) and the top-level
+``aiVisuals`` object (``aiVisuals.requirements``, ``aiVisuals.capacity``) so the
+renderer can find them. The JSON file is rewritten once at the end, preserving key order;
+``--dry-run`` only reports the paths it would write and never touches the file.
+It does not rebuild ``docs/``.
 
 Standard-library only, matching the Gemini scripts in ``_scripts/examples``.
 """
@@ -41,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
 import json
 import os
 import re
@@ -58,7 +69,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL = "gemini-3-pro-image-preview"
 DEFAULT_ASPECT_RATIO = "16:9"
 DEFAULT_IMAGE_SIZE = "2K"
-DEFAULT_BATCH_OUTPUT_DIR = Path("assets/generated/diagram-pictures")
+DEFAULT_BATCH_OUTPUT_DIR = Path("assets/generated/ai-visuals")
 
 STYLE_NOTES = {
     "architecture-map": [
@@ -91,6 +102,15 @@ class DiagramSpec:
     path: Path
     prompt: str
     mode: str
+    # Sequence of keys / indices locating the field that should receive the
+    # generated image's relative path inside the dataset JSON. For example:
+    #   ("aiVisuals", "requirements")
+    #   ("finalDesign", "aiVisual")
+    #   ("finalDesign", "options", 0, "aiVisual")
+    #   ("steps", 2, "aiVisual")
+    #   ("steps", 2, "options", 0, "aiVisual")
+    # ``None`` for the manual one-off mode, which never writes JSON back.
+    json_pointer: tuple[Any, ...] | None = None
 
 
 def endpoint_for(model: str) -> str:
@@ -105,6 +125,52 @@ def rel(path: Path) -> str:
         return str(path.relative_to(REPO_ROOT))
     except ValueError:
         return str(path)
+
+
+def dataset_relative_path(image_path: Path, dataset_dir: Path) -> str:
+    """Path to store in ``aiVisual`` fields, relative to the dataset directory.
+
+    Uses forward slashes. If the image lives under the dataset directory (the
+    default case), returns a clean relative path such as
+    ``assets/generated/ai-visuals/steps/03-cache-opt1.png``. If a custom
+    ``--output-dir`` places the image outside the dataset directory, the path
+    cannot be made cleanly relative; in that case the caller is warned and the
+    path is stored as given (absolute), which is the honest fallback.
+    """
+    try:
+        relative = image_path.resolve().relative_to(dataset_dir.resolve())
+    except ValueError:
+        print(
+            f"warning: {rel(image_path)} is not under the dataset directory "
+            f"{rel(dataset_dir)}; storing the path as given (renderer expects a "
+            "dataset-relative path).",
+            file=sys.stderr,
+        )
+        return image_path.as_posix()
+    return relative.as_posix()
+
+
+def set_json_pointer(root: dict[str, Any], pointer: tuple[Any, ...], value: str) -> None:
+    """Set ``value`` at ``pointer`` inside ``root``, creating dict steps as needed.
+
+    Integer pointer parts index into an existing list (the option must already
+    exist in the dataset). String parts index/create dicts.
+    """
+    node: Any = root
+    for part in pointer[:-1]:
+        if isinstance(part, int):
+            # Index into an existing list (the step/option must already exist).
+            node = node[part]
+        elif part in node:
+            # Descend into whatever already exists there (dict or list, e.g.
+            # "steps" / "options"). Never replace an existing container.
+            node = node[part]
+        else:
+            # Create a missing intermediate dict (e.g. top-level "aiVisuals").
+            child = collections.OrderedDict()
+            node[part] = child
+            node = child
+    node[pointer[-1]] = value
 
 
 def compact(value: Any, max_chars: int = 1600) -> str:
@@ -301,6 +367,7 @@ def requirements_spec(
         path=output_dir / "requirements.png",
         prompt=prompt,
         mode="explainer",
+        json_pointer=("aiVisuals", "requirements"),
     )
 
 
@@ -343,38 +410,83 @@ def capacity_spec(
     return DiagramSpec(
         kind="capacity",
         label="Capacity planning",
-        path=output_dir / "capacity-planning.png",
+        path=output_dir / "capacity.png",
         prompt=prompt,
         mode="explainer",
+        json_pointer=("aiVisuals", "capacity"),
     )
 
 
-def step_spec(
+def step_specs(
     data: dict[str, Any],
     step: dict[str, Any],
     index: int,
+    step_array_index: int,
     output_dir: Path,
     labels: dict[str, str],
     links: dict[str, dict[str, Any]],
-) -> DiagramSpec:
+) -> list[DiagramSpec]:
+    """Return one spec per option, or a single spec when the step has none."""
     title = str(step.get("title") or step.get("id") or f"Step {index}")
-    view = step.get("view")
-    context = [
+    step_id = slugify(str(step.get("id") or title), f"step-{index:02d}")
+    mode = infer_step_mode(step)
+    base_context = [
         compact(data.get("description"), 500),
         compact(step.get("description"), 900),
-        compact(view_caption(view), 700),
         compact({"decisionPrompt": step.get("decisionPrompt")}, 500),
         list_items("Patterns", step.get("patterns"), 6),
         list_items("Why now", step.get("whyNow"), 4),
         list_items("Bottlenecks", step.get("bottlenecks"), 5),
         list_items("Common traps", step.get("traps"), 4),
     ]
-    mode = infer_step_mode(step)
+    step_view = step.get("view")
+
+    options = step.get("options")
+    if isinstance(options, list) and options:
+        specs: list[DiagramSpec] = []
+        for opt_index, option in enumerate(options, start=1):
+            if not isinstance(option, dict):
+                continue
+            option_name = item_name(option, f"Option {opt_index}")
+            view = option.get("view") if isinstance(option.get("view"), dict) else step_view
+            context = base_context + [
+                f"Design alternative under consideration: {compact(option_name, 240)}",
+                compact(option.get("description"), 900),
+                compact(view_caption(view), 700),
+                list_items("Pros", option.get("pros"), 6),
+                list_items("Cons", option.get("cons"), 6),
+            ]
+            prompt = build_prompt(
+                title=f"{title} - {option_name}",
+                context=[item for item in context if item],
+                components=view_components(view, labels, 14),
+                flows=view_flows(view, labels, links, 14),
+                constraints=[
+                    "Focus on this single design step, not the entire final architecture.",
+                    f"Illustrate the specific design alternative '{option_name}', so it visibly differs from the other options for this step.",
+                    "Use visual emphasis for highlighted or newly introduced components when that is clear from context.",
+                ],
+                mode=mode,
+                user_prompt="Create a polished alternative to the step option Mermaid diagram.",
+            )
+            specs.append(
+                DiagramSpec(
+                    kind="step-option",
+                    label=f"{title} - {option_name}",
+                    path=output_dir / "steps" / f"{index:02d}-{step_id}-opt{opt_index}.png",
+                    prompt=prompt,
+                    mode=mode,
+                    json_pointer=("steps", step_array_index, "options", opt_index - 1, "aiVisual"),
+                )
+            )
+        return specs
+
+    context = base_context + [compact(view_caption(step_view), 700)]
     prompt = build_prompt(
         title=title,
         context=[item for item in context if item],
-        components=view_components(view, labels, 14),
-        flows=view_flows(view, labels, links, 14),
+        components=view_components(step_view, labels, 14),
+        flows=view_flows(step_view, labels, links, 14),
         constraints=[
             "Focus on this single design step, not the entire final architecture.",
             "Show what changed or became important in this step.",
@@ -383,51 +495,100 @@ def step_spec(
         mode=mode,
         user_prompt="Create a polished alternative to the step Mermaid diagram.",
     )
-    step_id = slugify(str(step.get("id") or title), f"step-{index:02d}")
-    return DiagramSpec(
-        kind="step",
-        label=title,
-        path=output_dir / "steps" / f"{index:02d}-{step_id}.png",
-        prompt=prompt,
-        mode=mode,
-    )
+    return [
+        DiagramSpec(
+            kind="step",
+            label=title,
+            path=output_dir / "steps" / f"{index:02d}-{step_id}.png",
+            prompt=prompt,
+            mode=mode,
+            json_pointer=("steps", step_array_index, "aiVisual"),
+        )
+    ]
 
 
-def final_design_spec(
+def final_design_specs(
     data: dict[str, Any],
     output_dir: Path,
     labels: dict[str, str],
     links: dict[str, dict[str, Any]],
-) -> DiagramSpec | None:
+) -> list[DiagramSpec]:
+    """Return one spec per option, or a single spec when there are none."""
     final_design = data.get("finalDesign")
     if not isinstance(final_design, dict):
-        return None
-    title = str(final_design.get("title") or f"{data.get('title') or 'System design'} final design")
-    view = final_design.get("view")
+        return []
+    base_title = str(final_design.get("title") or f"{data.get('title') or 'System design'} final design")
+    base_constraints = [
+        "This is the end-to-end design, so show the major regions and lifecycle clearly.",
+        "Group related systems into readable zones rather than placing every node equally.",
+        "Make browse/read path, write/reservation path, asynchronous/recovery path, and external dependencies visually distinct when present.",
+    ]
+    fd_view = final_design.get("view")
+
+    options = final_design.get("options")
+    if isinstance(options, list) and options:
+        specs: list[DiagramSpec] = []
+        for opt_index, option in enumerate(options, start=1):
+            if not isinstance(option, dict):
+                continue
+            option_name = item_name(option, f"Option {opt_index}")
+            view = option.get("view") if isinstance(option.get("view"), dict) else fd_view
+            context = [
+                compact(data.get("description"), 500),
+                compact(final_design.get("description"), 700),
+                f"Final design alternative: {compact(option_name, 240)}",
+                compact(option.get("description"), 1100),
+                compact(view_caption(view), 700),
+                list_items("Pros", option.get("pros"), 6),
+                list_items("Cons", option.get("cons"), 6),
+            ]
+            prompt = build_prompt(
+                title=f"{base_title} - {option_name}",
+                context=[item for item in context if item],
+                components=view_components(view, labels, 22),
+                flows=view_flows(view, labels, links, 22),
+                constraints=base_constraints
+                + [
+                    f"Illustrate the specific final-design alternative '{option_name}', so it visibly differs from the other final-design options.",
+                ],
+                mode="architecture-map",
+                user_prompt="Create the flagship final architecture visual with high production quality.",
+            )
+            specs.append(
+                DiagramSpec(
+                    kind="final-design-option",
+                    label=f"{base_title} - {option_name}",
+                    path=output_dir / f"final-design-opt{opt_index}.png",
+                    prompt=prompt,
+                    mode="architecture-map",
+                    json_pointer=("finalDesign", "options", opt_index - 1, "aiVisual"),
+                )
+            )
+        return specs
+
     prompt = build_prompt(
-        title=title,
+        title=base_title,
         context=[
             compact(data.get("description"), 500),
             compact(final_design.get("description"), 1100),
-            compact(view_caption(view), 700),
+            compact(view_caption(fd_view), 700),
         ],
-        components=view_components(view, labels, 22),
-        flows=view_flows(view, labels, links, 22),
-        constraints=[
-            "This is the end-to-end design, so show the major regions and lifecycle clearly.",
-            "Group related systems into readable zones rather than placing every node equally.",
-            "Make browse/read path, write/reservation path, asynchronous/recovery path, and external dependencies visually distinct when present.",
-        ],
+        components=view_components(fd_view, labels, 22),
+        flows=view_flows(fd_view, labels, links, 22),
+        constraints=base_constraints,
         mode="architecture-map",
         user_prompt="Create the flagship final architecture visual with high production quality.",
     )
-    return DiagramSpec(
-        kind="final-design",
-        label=title,
-        path=output_dir / "final-design.png",
-        prompt=prompt,
-        mode="architecture-map",
-    )
+    return [
+        DiagramSpec(
+            kind="final-design",
+            label=base_title,
+            path=output_dir / "final-design.png",
+            prompt=prompt,
+            mode="architecture-map",
+            json_pointer=("finalDesign", "aiVisual"),
+        )
+    ]
 
 
 def collect_interview_specs(
@@ -455,11 +616,11 @@ def collect_interview_specs(
     if "steps" in include:
         for index, step in enumerate(data.get("steps") or [], start=1):
             if isinstance(step, dict):
-                specs.append(step_spec(data, step, index, base_output_dir, labels, links))
+                specs.extend(
+                    step_specs(data, step, index, index - 1, base_output_dir, labels, links)
+                )
     if "final" in include:
-        spec = final_design_spec(data, base_output_dir, labels, links)
-        if spec:
-            specs.append(spec)
+        specs.extend(final_design_specs(data, base_output_dir, labels, links))
 
     return specs
 
@@ -570,20 +731,31 @@ def call_gemini_image(
     return extract_image(response)
 
 
-def warn_if_extension_mismatch(output: Path, mime_type: str) -> None:
-    suffix = output.suffix.lower()
-    expected = {
-        "image/png": {".png"},
-        "image/jpeg": {".jpg", ".jpeg"},
-        "image/jpg": {".jpg", ".jpeg"},
-        "image/webp": {".webp"},
-    }.get(mime_type.lower())
-    if expected and suffix and suffix not in expected:
-        print(
-            f"warning: Gemini returned {mime_type}, but output extension is {suffix}. "
-            "The file bytes were saved as returned.",
-            file=sys.stderr,
-        )
+def extension_for_mime(mime_type: str) -> str:
+    """File extension matching the image bytes Gemini actually returned.
+
+    Gemini may return JPEG even when the target name ends in .png, so we name
+    the saved file by content type rather than trusting the spec's suffix.
+    """
+    return {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+    }.get(mime_type.lower(), ".png")
+
+
+def existing_for_stem(path: Path) -> Path | None:
+    """Find an already-generated file for this target regardless of extension
+    (the actual extension depends on the MIME type Gemini returned)."""
+    parent = path.parent
+    if not parent.is_dir():
+        return None
+    for candidate in sorted(parent.glob(path.stem + ".*")):
+        if candidate.stem == path.stem and candidate.is_file():
+            return candidate
+    return None
 
 
 def process_spec(
@@ -597,18 +769,25 @@ def process_spec(
     force: bool,
     dry_run: bool,
     show_prompts: bool,
-) -> str:
-    if spec.path.exists() and not force:
-        return f"skip existing: {rel(spec.path)}"
+) -> tuple[str, Path]:
+    """Returns (status string, actual output path).
+
+    The actual path's extension is derived from the returned image's MIME type,
+    so a JPEG response is saved as .jpg (not mislabeled .png). On skip/dry-run
+    the existing or planned path is returned.
+    """
+    existing = existing_for_stem(spec.path)
+    if existing is not None and not force:
+        return f"skip existing: {rel(existing)}", existing
     if dry_run:
         if show_prompts:
-            return f"dry-run: {rel(spec.path)}\n\n{spec.prompt}"
+            return f"dry-run: {rel(spec.path)}\n\n{spec.prompt}", spec.path
         short_prompt = textwrap.shorten(
             re.sub(r"\s+", " ", spec.prompt),
             width=360,
             placeholder="...",
         )
-        return f"dry-run: {rel(spec.path)}\n    prompt: {short_prompt}"
+        return f"dry-run: {rel(spec.path)}\n    prompt: {short_prompt}", spec.path
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set")
     image_bytes, mime_type = call_gemini_image(
@@ -619,10 +798,17 @@ def process_spec(
         image_size=image_size,
         timeout=timeout,
     )
-    spec.path.parent.mkdir(parents=True, exist_ok=True)
-    spec.path.write_bytes(image_bytes)
-    warn_if_extension_mismatch(spec.path, mime_type)
-    return f"generated: {rel(spec.path)} ({mime_type}, {len(image_bytes)} bytes)"
+    out_path = spec.path.with_suffix(extension_for_mime(mime_type))
+    # If a stale file with a different extension exists for this stem, remove it
+    # so the dataset never references an outdated mislabeled file.
+    if existing is not None and existing != out_path:
+        try:
+            existing.unlink()
+        except OSError:
+            pass
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(image_bytes)
+    return f"generated: {rel(out_path)} ({mime_type}, {len(image_bytes)} bytes)", out_path
 
 
 def run_batch(args: argparse.Namespace, interview_file: Path, user_prompt: str) -> int:
@@ -636,6 +822,7 @@ def run_batch(args: argparse.Namespace, interview_file: Path, user_prompt: str) 
                 path=spec.path,
                 prompt=spec.prompt + "\n\nAdditional global instruction:\n" + compact(user_prompt, 1600),
                 mode=spec.mode,
+                json_pointer=spec.json_pointer,
             )
             for spec in specs
         ]
@@ -644,10 +831,12 @@ def run_batch(args: argparse.Namespace, interview_file: Path, user_prompt: str) 
         return 0
 
     api_key = os.environ.get("GEMINI_API_KEY")
-    needs_api = any(args.force or not spec.path.exists() for spec in specs)
+    needs_api = any(args.force or existing_for_stem(spec.path) is None for spec in specs)
     if needs_api and not api_key and not args.dry_run:
         print("error: GEMINI_API_KEY environment variable is not set.", file=sys.stderr)
         return 2
+
+    dataset_dir = interview_file.parent
 
     print(f"Interview: {rel(interview_file)}")
     print(f"Targets: {len(specs)}")
@@ -658,10 +847,12 @@ def run_batch(args: argparse.Namespace, interview_file: Path, user_prompt: str) 
     generated = 0
     skipped = 0
     errors = 0
+    # (json_pointer, dataset-relative path) updates to apply once at the end.
+    json_updates: list[tuple[tuple[Any, ...], str]] = []
     for index, spec in enumerate(specs, start=1):
         print(f"[{index}/{len(specs)}] {spec.kind}: {spec.label}")
         try:
-            status = process_spec(
+            status, actual_path = process_spec(
                 spec=spec,
                 api_key=api_key,
                 model=args.model,
@@ -673,18 +864,64 @@ def run_batch(args: argparse.Namespace, interview_file: Path, user_prompt: str) 
                 show_prompts=args.show_prompts,
             )
             print(f"    {status}")
+            # Write the actual on-disk path (whose extension matches the returned
+            # image's MIME type) back into the JSON, not the spec's .png default.
+            json_path = dataset_relative_path(actual_path, dataset_dir)
             if status.startswith("generated"):
                 generated += 1
+                if spec.json_pointer is not None:
+                    json_updates.append((spec.json_pointer, json_path))
                 if args.sleep and index < len(specs):
                     time.sleep(args.sleep)
             elif status.startswith("skip"):
                 skipped += 1
+                # Keep the dataset pointed at the existing file's real path.
+                if spec.json_pointer is not None:
+                    json_updates.append((spec.json_pointer, json_path))
+            elif status.startswith("dry-run") and spec.json_pointer is not None:
+                pointer_text = "/".join(str(part) for part in spec.json_pointer)
+                print(f"    would write aiVisual: {pointer_text} = {json_path}")
         except Exception as exc:  # noqa: BLE001 -- keep going target by target
             errors += 1
             print(f"    ERROR: {exc}", file=sys.stderr)
 
     print(f"\nDone. Generated {generated}, skipped {skipped}, errors {errors}.")
+
+    if args.dry_run:
+        print(
+            f"dry-run: would write {len([s for s in specs if s.json_pointer is not None])} "
+            "aiVisual path(s) into the dataset; JSON left unchanged."
+        )
+    elif json_updates:
+        try:
+            write_json_updates(interview_file, json_updates)
+            print(f"Wrote {len(json_updates)} aiVisual path(s) into {rel(interview_file)}.")
+        except Exception as exc:  # noqa: BLE001
+            errors += 1
+            print(f"ERROR writing aiVisual paths into {rel(interview_file)}: {exc}", file=sys.stderr)
+
     return 1 if errors else 0
+
+
+def write_json_updates(
+    interview_file: Path,
+    updates: list[tuple[tuple[Any, ...], str]],
+) -> None:
+    """Apply ``(pointer, path)`` updates to the dataset and rewrite it once.
+
+    Preserves key order by loading with ``OrderedDict`` and dumping with
+    ``indent=2``, ``ensure_ascii=False``, plus a trailing newline.
+    """
+    data = json.loads(
+        interview_file.read_text(encoding="utf-8"),
+        object_pairs_hook=collections.OrderedDict,
+    )
+    for pointer, value in updates:
+        set_json_pointer(data, pointer, value)
+    interview_file.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 def run_manual(args: argparse.Namespace, user_prompt: str) -> int:
@@ -749,7 +986,7 @@ def run_manual(args: argparse.Namespace, user_prompt: str) -> int:
         print("error: GEMINI_API_KEY environment variable is not set.", file=sys.stderr)
         return 2
 
-    status = process_spec(
+    status, _actual_path = process_spec(
         spec=spec,
         api_key=api_key,
         model=args.model,
@@ -769,7 +1006,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "interview_json",
         nargs="?",
-        help="Optional path to a data/<group>/<id>/interview.json file. When present, batch mode generates requirements, capacity, steps, and final-design images.",
+        help=(
+            "Optional path to a data/<group>/<id>/interview.json file. When present, "
+            "batch mode generates requirements, capacity, per-step (one image per option, "
+            "or a single image for a step without options), and final-design images (one "
+            "per finalDesign option, or a single image when it has none), then writes the "
+            "relative image paths back into the dataset's aiVisual/aiVisuals fields."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -779,7 +1022,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--output-dir",
         default="",
-        help="Batch output directory. Defaults to <interview-dir>/assets/generated/diagram-pictures.",
+        help=(
+            "Batch output directory. Defaults to "
+            "<interview-dir>/assets/generated/ai-visuals. The aiVisual paths written "
+            "into interview.json are relative to the dataset directory; a custom "
+            "--output-dir outside the dataset directory cannot produce a clean relative "
+            "path and is stored as given (with a warning)."
+        ),
     )
     parser.add_argument(
         "--include",

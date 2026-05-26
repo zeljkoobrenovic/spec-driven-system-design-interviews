@@ -50,7 +50,7 @@ The page is a two-column layout:
     Design** — which leads with an auto-generated **decision-tree map** (steps
     as nodes, their options as branches, converging on the final design; nodes
     are clickable) shown above the final architecture diagram
-  - **Wrap-up**: API Flows · Design vs. Requirements · By Level · Follow-up Questions · To Probe Further
+  - **Wrap-up**: Design vs. Requirements · Technology Choices · API Flows · By Level · Follow-up Questions · To Probe Further
 
   Each item is clickable. The selected item drives the right pane.
 
@@ -73,9 +73,9 @@ Navigation:
 
 A dataset is a JSON file in `data/<group>/<dataset-id>/interview.json`. Each
 group's manifest `data/<group>/index.json` lists its datasets, organized into
-**categories** the overview renders as sections and the explorer renders as
-dropdown `<optgroup>`s. (At runtime the built site fetches `data/index.json`
-relative to its own page, i.e. `docs/<group>/data/index.json`.)
+**categories** the overview renders as sections. (At runtime the built site
+fetches `data/index.json` relative to its own page, i.e.
+`docs/<group>/data/index.json`.)
 
 ```jsonc
 {
@@ -86,7 +86,7 @@ relative to its own page, i.e. `docs/<group>/data/index.json`.)
       "datasets": [
         {
           "id": "url-shortener",       // also the #hash and icon-dir name
-          "name": "URL Shortener",     // shown in card + dropdown
+          "name": "URL Shortener",     // shown on the overview card
           "path": "data/url-shortener/interview.json"
         }
       ]
@@ -97,6 +97,10 @@ relative to its own page, i.e. `docs/<group>/data/index.json`.)
 
 The overview shows each dataset's icon from `data/<id>/icon.png` (derived from
 `path`), falling back to `icons/system-design.png` if that file is missing.
+The explorer header shows the same icon (resolved from `assets.icon`, a
+manifest `icon`, or the `<dir>/icon.png` convention) beside the interview title
+— but only when it's defined and actually loads; there's no fallback there, so
+a missing icon just leaves the title alone.
 
 ## Dataset shape
 
@@ -110,6 +114,10 @@ All fields below are optional except `highLevelArchitecture` and either
   "description": "Short blurb shown under the title.",
   "assets": {
     "icon": "icon.png"                                      // optional; dataset overview icon
+  },
+  "aiVisuals": {                                            // optional; AI-generated images for the intro sections
+    "requirements": "assets/generated/ai-visuals/requirements.png", // toggled via Diagram|AI Visual in Requirements
+    "capacity":     "assets/generated/ai-visuals/capacity.png"      // toggled via Diagram|AI Visual in Capacity Estimation
   },
 
   // Explicit high-level architecture metadata used for generated views,
@@ -246,13 +254,16 @@ All fields below are optional except `highLevelArchitecture` and either
         "caption": "The app checks the cache, then reads the mapping store on a miss." // optional; one-line "what this diagram shows", rendered under the diagram (above pros/cons)
       },
 
+      "aiVisual": "assets/generated/ai-visuals/steps/04-cache.png", // optional; AI image for this step, toggled via the Diagram|AI Visual tab (used when the step has no options)
+
       // Options may define their own view/pros/cons (tabs above the diagram).
       "options": [
         {
           "name":      "Redis (default)",
           "pros":      ["..."],
           "cons":      ["..."],
-          "view":      { "nodes": ["App", "Redis", "DB"], "links": ["app-redis", "redis-db"], "highlight": ["Redis"] }
+          "view":      { "nodes": ["App", "Redis", "DB"], "links": ["app-redis", "redis-db"], "highlight": ["Redis"] },
+          "aiVisual":  "assets/generated/ai-visuals/steps/04-cache-opt1.png" // optional; per-option AI image; the AI Visual follows the selected option tab
         },
         { "name": "Memcached", "pros": ["..."], "cons": ["..."], "view": { "nodes": ["App", "Memcached", "DB"], "links": ["app-memcached", "memcached-db"] } }
       ],
@@ -334,7 +345,7 @@ All fields below are optional except `highLevelArchitecture` and either
   "finalDesign": {                              // optional; if omitted, no "Target Final Design" architecture entry is shown. The entry is always labelled "Target Final Design" in the UI; this object's `title` is not displayed.
     "title":       "Final Design",
     "description": "End-to-end architecture summary.",
-    "image":       "assets/images/final-design.png", // optional; rendered at bottom under "Generated Image"
+    "aiVisual":    "assets/generated/ai-visuals/final-design.png", // optional; AI-generated image, toggled via the Diagram|AI Visual tab
     "view":        { "nodes": ["Client", "App", "Cache", "DB"], "links": ["client-app", "app-cache", "cache-db"] },
     "options": [                               // optional; same shape/renderer as step.options
       {
@@ -352,6 +363,19 @@ All fields below are optional except `highLevelArchitecture` and either
     ],
     "nonFunctional": [ /* same shape */ ]
   },
+
+  // Wrap-up "Technology Choices" entry (between Design vs. Requirements and API
+  // Flows). One object per architecture concern: self-hosted vs cloud-native/SaaS.
+  "technologyChoices": [
+    {
+      "concern": "Relational database",
+      "steps": ["database", "replication", "sharding"], // optional; clickable cross-links
+      "selfHosted": ["PostgreSQL", "MySQL", "Vitess", "..."],
+      "cloud": { "aws": ["RDS", "Aurora"], "gcp": ["Cloud SQL", "Spanner"], "azure": ["SQL Database", "Cosmos DB"] },
+      "tradeoff": "self-host when ...; managed when ...",
+      "makesIrrelevant": "A managed autoscaling/distributed SQL engine can absorb growth so you never hand-shard."
+    }
+  ],
 
   // What to say across the interview's phases. Overview entry ("Interview Script").
   "interviewScript": [
@@ -392,8 +416,11 @@ deduped `step.concepts` are grouped by their optional `group` on the Overview
 pages; step pages still render the local concept and pattern cards flat.
 `step.traps` are exercised in the canonical `url-shortener` example;
 `data/book/payment-system` uses all of them.
-Generated visual assets are optional too: absent `assets`, `icon`, or `image`
-fields simply render nothing.
+Generated visual assets are optional too: absent `assets`/`icon`, `aiVisual`,
+or `aiVisuals` fields simply render nothing. When an `aiVisual` (per step,
+option, or finalDesign) or an `aiVisuals.{requirements,capacity}` path is
+present, the section shows a **Diagram | AI Visual** tab to flip between the
+Mermaid diagram and the generated image.
 
 `highLevelArchitecture` is required for every dataset and always contains
 `nodes`, `links`, and `types` arrays; catalog datasets may keep all three empty.
@@ -500,7 +527,7 @@ Sources (edit these):
 - `data/<group>/<id>/interview.json`     — One dataset per directory.
 - `data/<group>/<id>/icon.png`           — Optional per-interview icon.
 - `data/<group>/<id>/assets/icons/...`   — Optional generated pattern/concept icons linked from JSON.
-- `data/<group>/<id>/assets/images/final-design.png` — Optional generated final-design image linked from JSON.
+- `data/<group>/<id>/assets/generated/ai-visuals/...` — Optional AI-generated visuals (`aiVisual`/`aiVisuals`), one per step/option/section, written by `generate_diagram_picture.py`.
 - `_scripts/generate_interview_assets.py` — Generates interview assets and writes JSON links.
 - `build.py`               — Copy step: `_templates/` + `data/<group>/` →
                              `docs/<group>/`.
@@ -528,8 +555,10 @@ populated URL shortener walkthrough used as the worked example.
   graph diagrams must use structured `view` objects; flow diagrams must use
   structured `sequence` objects.
 - Generated asset paths are relative to the dataset directory. Pattern and
-  concept icons live on the object they describe (`icon`); the only generated
-  walkthrough image is `finalDesign.image`.
+  concept icons live on the object they describe (`icon`). Full diagram-
+  replacement images use `aiVisual` on a step/option/finalDesign and
+  `aiVisuals.{requirements,capacity}` at the top level; the explorer shows a
+  Diagram|AI Visual toggle when present.
 - Sentence-splitting of `description` strings tolerates common abbreviations
   (`e.g.`, `i.e.`, `etc.`, etc.) so they don't break into separate bullets.
 
@@ -540,11 +569,12 @@ Adding a new dataset:
 2. Add it to a category in that group's `data/<group>/index.json`
    (`groups[i].datasets[]`: `id`, `name`, `path`).
 3. Optionally add `data/<group>/<id>/icon.png` for the overview card.
-4. Run `python3 build.py`, reload. It appears in the overview and dropdown.
+4. Run `python3 build.py`, reload. It appears in the overview (and is reachable
+   in the explorer via its `#<id>` hash).
 
 Adding a new category (a section within one site):
 1. Add a `{ id, name, datasets: [...] }` entry to `groups[]` in that site's
-   `index.json`. The overview adds a section and the dropdown an `<optgroup>`.
+   `index.json`. The overview adds a section for it.
 
 Adding a new group (a new deployable site):
 1. Create `data/<group>/` with an `index.json` manifest and dataset subdirs.

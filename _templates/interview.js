@@ -960,7 +960,7 @@
     }
 
     function renderDesignMove(description) {
-        return renderStepTextSection("Design Move", description, "education-card design-move", ICON_FALLBACK.designMove);
+        return renderStepTextSection("Design Rationale", description, "education-card design-move", ICON_FALLBACK.designMove);
     }
 
     function renderDecisionPoint(prompt) {
@@ -1756,7 +1756,7 @@
             const btn = document.createElement("button");
             btn.type = "button";
             btn.className = "option-tab" + (idx === state.currentOptionIndex ? " active" : "");
-            btn.textContent = `${idx + 1}. ${opt.name || "Option"}`;
+            btn.textContent = `${idx + 1}. ${opt.name || opt.title || "Option"}`;
             btn.setAttribute("role", "tab");
             btn.setAttribute("aria-selected", idx === state.currentOptionIndex ? "true" : "false");
             btn.addEventListener("click", () => selectOption(idx));
@@ -1773,7 +1773,10 @@
         const opt = step.options[state.currentOptionIndex] || step.options[0];
         const pros = Array.isArray(opt.pros) ? opt.pros : [];
         const cons = Array.isArray(opt.cons) ? opt.cons : [];
-        if (pros.length === 0 && cons.length === 0) {
+        // Fallback shape: some datasets author options as
+        // { title, description, tradeoffs[] } instead of { name, pros, cons }.
+        const tradeoffs = Array.isArray(opt.tradeoffs) ? opt.tradeoffs : [];
+        if (pros.length === 0 && cons.length === 0 && tradeoffs.length === 0) {
             els.optionProsCons.hidden = true;
             return;
         }
@@ -1789,8 +1792,19 @@
             return c;
         }
 
-        if (pros.length > 0) els.optionProsCons.appendChild(col("Pros", pros, "pros"));
-        if (cons.length > 0) els.optionProsCons.appendChild(col("Cons", cons, "cons"));
+        if (pros.length > 0 || cons.length > 0) {
+            if (pros.length > 0) els.optionProsCons.appendChild(col("Pros", pros, "pros"));
+            if (cons.length > 0) els.optionProsCons.appendChild(col("Cons", cons, "cons"));
+        } else {
+            const c = col("Tradeoffs", tradeoffs, "tradeoffs");
+            if (typeof opt.description === "string" && opt.description.trim()) {
+                const p = document.createElement("p");
+                p.className = "muted";
+                p.textContent = opt.description;
+                c.insertBefore(p, c.children[1] || null);
+            }
+            els.optionProsCons.appendChild(c);
+        }
     }
 
     // ---------- Rendering: per-step extras ----------

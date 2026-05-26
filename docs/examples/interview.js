@@ -960,7 +960,7 @@
     }
 
     function renderDesignMove(description) {
-        return renderStepTextSection("Design Move", description, "education-card design-move", ICON_FALLBACK.designMove);
+        return renderStepTextSection("Design Rationale", description, "education-card design-move", ICON_FALLBACK.designMove);
     }
 
     function renderDecisionPoint(prompt) {

@@ -26,11 +26,16 @@
         stepCounter: document.getElementById("step-counter"),
         prevBtn: document.getElementById("prev-btn"),
         nextBtn: document.getElementById("next-btn"),
+        finalDecisionTree: document.getElementById("final-decision-tree"),
         diagramBlock: document.getElementById("diagram-block"),
+        diagramHeading: document.getElementById("diagram-heading"),
+        diagramDescription: document.getElementById("diagram-description"),
         diagramViewTabs: document.getElementById("diagram-view-tabs"),
+        diagramControls: document.getElementById("diagram-controls"),
         diagram: document.getElementById("diagram"),
         diagramLegend: document.getElementById("diagram-legend"),
         optionTabs: document.getElementById("option-tabs"),
+        optionDescription: document.getElementById("option-description"),
         optionProsCons: document.getElementById("option-proscons"),
         introBlock: document.getElementById("intro-block"),
         stepExtras: document.getElementById("step-extras"),
@@ -53,6 +58,8 @@
         currentOptionIndex: 0,  // per-step (reset on entry change)
         currentFlowIndex: 0,    // per-step (reset on entry change)
         currentDiagramView: "focus",
+        diagramDirection: "TB",   // step/final-design layout; toggled TB<->LR (reset per entry)
+        hiddenNodes: new Set(),   // node ids toggled off in the current diagram (reset per entry)
     };
 
     // Slugs used by intro entries when building/parsing #hash links.
@@ -843,7 +850,7 @@
             entries.push({
                 kind: "intro",
                 id: INTRO_SLUGS.finalDesign,
-                title: "Final Design",
+                title: "Target Final Design",
                 payload: finalDesign,
             });
         }
@@ -873,7 +880,7 @@
 
     function resolveFinalDesign(data) {
         if (data && data.finalDesign && hasStepLikeDiagram(data.finalDesign)) {
-            return Object.assign({title: "Final Design"}, data.finalDesign);
+            return Object.assign({title: "Target Final Design"}, data.finalDesign);
         }
         return null;
     }
@@ -1115,7 +1122,15 @@
     }
 
     function mermaidSequenceText(text) {
-        return String(text || "").replace(/\s+/g, " ").trim();
+        // Mermaid's sequence parser treats `;` (and newlines) as statement
+        // separators inside message/label text, so a label like
+        // "retry with backoff; DLQ after limit" would be cut at the `;` and the
+        // remainder mis-parsed. Encode `;` as its HTML entity (Mermaid decodes
+        // it back when rendering) so the full text survives.
+        return String(text || "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .replace(/;/g, "#59;");
     }
 
     function graphShapeLine(id, label, shape) {
@@ -1147,12 +1162,32 @@
         return graphShapeLine(id, label, shape);
     }
 
+    // Architecture diagrams (steps, options, final design, full context) draw
+    // connections as plain lines without arrowheads. Convert whatever arrow
+    // token a link resolves to into its arrowless equivalent, preserving the
+    // line style (solid vs. dotted) and any length: `-->`/`<-->` -> `---`,
+    // `-.->`/`<-.->` -> `-.-`. Tokens already without an arrowhead pass through.
+    function stripLinkArrowheads(arrow) {
+        const a = String(arrow || "").trim();
+        const dotted = a.includes(".");
+        // Count dashes to roughly preserve edge length (Mermaid uses dash count
+        // for rank distance); arrowless solid edges need >=3 dashes.
+        const dashCount = (a.match(/-/g) || []).length;
+        if (dotted) {
+            // Dotted line, no arrow: -.- (with extra dots for longer edges).
+            const dots = Math.max(1, (a.match(/\./g) || []).length);
+            return `-${".".repeat(dots)}-`;
+        }
+        // Solid line, no arrow: --- (min 3 dashes).
+        return "-".repeat(Math.max(3, dashCount));
+    }
+
     function graphLinkLine(link) {
         if (!link || !link.from || !link.to) return "";
         const from = mermaidSafeId(link.from, "N");
         const to = mermaidSafeId(link.to, "N");
         const render = link.render && typeof link.render === "object" ? link.render : {};
-        const arrow = String(render.arrow || (render.style === "dashed" ? "-.->" : "-->"));
+        const arrow = stripLinkArrowheads(String(render.arrow || (render.style === "dashed" ? "-.->" : "-->")));
         const label = String(link.label || "").trim();
         // Entity-escape so parentheses/brackets/pipes in the text aren't parsed
         // as Mermaid node-shape or label-delimiter tokens; Mermaid decodes the
@@ -1436,6 +1471,18 @@
         };
     }
 
+    // The view object currently shown for a step: the selected option's view
+    // (falling back to the step view), or the step view when there are no
+    // options. Used to read the diagram caption for what's actually displayed.
+    function activeViewFor(step) {
+        if (!step) return null;
+        if (Array.isArray(step.options) && step.options.length > 0) {
+            const opt = step.options[state.currentOptionIndex] || step.options[0];
+            return (opt && opt.view) || step.view || null;
+        }
+        return step.view || null;
+    }
+
     function defaultDiagramFor(step) {
         if (!step) return "";
         if (Array.isArray(step.options) && step.options.length > 0) {
@@ -1531,6 +1578,67 @@
             key: trimmed.replace(/\s+/g, " "),
             line,
         };
+    }
+
+    // The set of connector tokens that can join two node ids on an edge line,
+    // including the arrowless `---`/`-.-` forms generated by stripLinkArrowheads.
+    const FLOWCHART_CONNECTOR = "(?:<?-\\.+->?|<?-+>?|<?==+>?)";
+    const FLOWCHART_EDGE_RE = new RegExp(
+        `^([A-Za-z_][A-Za-z0-9_-]*)\\s*${FLOWCHART_CONNECTOR}\\s*(?:\\|[^|]*\\|\\s*)?([A-Za-z_][A-Za-z0-9_-]*)`
+    );
+
+    // Extract the ordered, de-duplicated list of nodes ({id,label}) declared in
+    // a generated flowchart source — used to build the on/off toggle controls.
+    // Reads explicit node-definition lines (preferred, they carry labels) and
+    // falls back to ids that appear only on edges.
+    function flowchartNodeList(diagramSrc) {
+        const src = diagramSource(diagramSrc);
+        const out = [];
+        const seen = new Map(); // id -> index in out
+        const add = (id, label) => {
+            if (!id) return;
+            if (seen.has(id)) {
+                if (label && !out[seen.get(id)].label) out[seen.get(id)].label = label;
+                return;
+            }
+            seen.set(id, out.length);
+            out.push({id, label: label || id});
+        };
+        for (const raw of src.split("\n")) {
+            const line = raw.trim();
+            if (!line || /^(graph|flowchart|subgraph|end|classDef|class|style|linkStyle)\b/.test(line)) continue;
+            const node = flowchartNodeDefinition(line);
+            if (node) { add(node.id, node.label); continue; }
+            const m = line.match(FLOWCHART_EDGE_RE);
+            if (m) { add(m[1]); add(m[2]); }
+        }
+        return out;
+    }
+
+    // Remove the given node ids (and any edge touching them) from a generated
+    // flowchart source. Header, subgraph/end, and styling lines pass through;
+    // node-definition lines for hidden ids and edge lines referencing a hidden
+    // id are dropped. Used by the interactive on/off node toggles.
+    function filterFlowchartNodes(diagramSrc, hidden) {
+        const src = diagramSource(diagramSrc);
+        if (!hidden || hidden.size === 0 || !isFlowchartDiagram(src)) return src;
+        const kept = [];
+        for (const raw of src.split("\n")) {
+            const line = raw.trim();
+            if (!line) { kept.push(raw); continue; }
+            const node = flowchartNodeDefinition(line);
+            if (node) {
+                if (!hidden.has(node.id)) kept.push(raw);
+                continue;
+            }
+            const m = line.match(FLOWCHART_EDGE_RE);
+            if (m) {
+                if (!hidden.has(m[1]) && !hidden.has(m[2])) kept.push(raw);
+                continue;
+            }
+            kept.push(raw); // header / subgraph / end / styling / other
+        }
+        return kept.join("\n");
     }
 
     function mergeFlowchartSources(sources) {
@@ -1683,11 +1791,118 @@
             return;
         }
         const text = state.currentDiagramView === "context"
-            ? "this step’s nodes within the full design"
-            : "in focus this step";
+            ? "this step’s nodes"
+            : "in focus";
         const textEl = el.querySelector(".diagram-legend-text");
         if (textEl) textEl.textContent = text;
         el.hidden = false;
+    }
+
+    // Interactive controls in the left column beside step/final-design
+    // diagrams: a TB/LR layout switch on top, then a vertical checkbox list of
+    // nodes (toggle each on/off). `nodes` is the full node list of the
+    // unfiltered diagram; checked state reflects state.hiddenNodes. Changing
+    // anything re-renders the diagram.
+    function renderDiagramControls(nodes) {
+        const host = els.diagramControls;
+        if (!host) return;
+        host.innerHTML = "";
+        if (!Array.isArray(nodes) || nodes.length === 0) {
+            host.hidden = true;
+            return;
+        }
+        host.hidden = false;
+
+        // Layout direction switch (TB default <-> LR).
+        const dirWrap = document.createElement("div");
+        dirWrap.className = "diagram-control-group diagram-direction";
+        const dirLabel = document.createElement("span");
+        dirLabel.className = "diagram-control-label";
+        dirLabel.textContent = "Layout";
+        dirWrap.appendChild(dirLabel);
+        [{id: "TB", label: "Top–down"}, {id: "LR", label: "Left–right"}].forEach((d) => {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "diagram-dir-btn" + (state.diagramDirection === d.id ? " active" : "");
+            btn.textContent = d.label;
+            btn.setAttribute("aria-pressed", String(state.diagramDirection === d.id));
+            btn.addEventListener("click", () => {
+                if (state.diagramDirection === d.id) return;
+                state.diagramDirection = d.id;
+                renderCurrentEntry();
+            });
+            dirWrap.appendChild(btn);
+        });
+        host.appendChild(dirWrap);
+
+        // Node on/off toggles.
+        const nodeWrap = document.createElement("div");
+        nodeWrap.className = "diagram-control-group diagram-node-toggles";
+        const nodeLabel = document.createElement("span");
+        nodeLabel.className = "diagram-control-label";
+        nodeLabel.textContent = "Nodes";
+        nodeWrap.appendChild(nodeLabel);
+        nodes.forEach((n) => {
+            const id = `node-toggle-${n.id}`;
+            const lab = document.createElement("label");
+            lab.className = "diagram-node-toggle";
+            const cb = document.createElement("input");
+            cb.type = "checkbox";
+            cb.id = id;
+            cb.checked = !state.hiddenNodes.has(n.id);
+            cb.addEventListener("change", () => {
+                if (cb.checked) state.hiddenNodes.delete(n.id);
+                else state.hiddenNodes.add(n.id);
+                renderCurrentEntry();
+            });
+            const span = document.createElement("span");
+            span.textContent = decodeMermaidLabel(n.label).replace(/<br\s*\/?>/gi, " ").trim();
+            lab.appendChild(cb);
+            lab.appendChild(span);
+            nodeWrap.appendChild(lab);
+        });
+        host.appendChild(nodeWrap);
+
+        // Download the currently-rendered SVG (reflects toggles + direction).
+        const dlWrap = document.createElement("div");
+        dlWrap.className = "diagram-control-group diagram-download";
+        const dlBtn = document.createElement("button");
+        dlBtn.type = "button";
+        dlBtn.className = "diagram-download-btn";
+        dlBtn.textContent = "Download SVG";
+        dlBtn.addEventListener("click", downloadDiagramSvg);
+        dlWrap.appendChild(dlBtn);
+        host.appendChild(dlWrap);
+    }
+
+    // Serialize the rendered diagram SVG and trigger a file download. The SVG
+    // reflects the current node toggles and layout direction. Filename derives
+    // from the current entry title.
+    function downloadDiagramSvg() {
+        const svg = els.diagram && els.diagram.querySelector("svg");
+        if (!svg) return;
+        // Clone so we can add the xmlns the file needs without touching the DOM.
+        const clone = svg.cloneNode(true);
+        clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+        clone.setAttribute("xmlns:xlink", "http://www.w3.org/1999/xlink");
+        const markup = new XMLSerializer().serializeToString(clone);
+        const blob = new Blob(
+            ['<?xml version="1.0" encoding="UTF-8"?>\n', markup],
+            {type: "image/svg+xml"}
+        );
+        const url = URL.createObjectURL(blob);
+        const entry = state.entries[state.currentEntryIndex];
+        const base = (entry && entry.title ? entry.title : "diagram")
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, "-")
+            .replace(/^-+|-+$/g, "") || "diagram";
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `${base}.svg`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
     }
 
     async function renderDiagram(diagramSrc, explicitHighlight, prevStep) {
@@ -1696,9 +1911,20 @@
         const prevEffective = prevStep
             ? defaultEffectiveFor(prevStep)
             : null;
-        const highlights = resolveHighlights(tempStep, prevEffective);
-        // Architecture steps and the final design always lay out top-to-bottom.
-        const directedSrc = forceFlowchartDirection(diagramSrc || "", "TB");
+        let highlights = resolveHighlights(tempStep, prevEffective);
+
+        // Interactive: the on/off toggles list every node of the unfiltered
+        // diagram; render them, then drop hidden nodes (and their edges) before
+        // rendering. Layout direction is user-toggled TB<->LR (default TB).
+        const allNodes = flowchartNodeList(diagramSrc || "");
+        renderDiagramControls(allNodes);
+        const hidden = state.hiddenNodes;
+        const visibleSrc = filterFlowchartNodes(diagramSrc || "", hidden);
+        if (hidden && hidden.size > 0 && Array.isArray(highlights)) {
+            highlights = highlights.filter((id) => !hidden.has(id));
+        }
+
+        const directedSrc = forceFlowchartDirection(visibleSrc, state.diagramDirection || "TB");
         const displaySrc = annotateFlowchartNodeTypes(directedSrc);
         const src = augmentDiagramWithHighlights(displaySrc, highlights);
 
@@ -1756,7 +1982,7 @@
             const btn = document.createElement("button");
             btn.type = "button";
             btn.className = "option-tab" + (idx === state.currentOptionIndex ? " active" : "");
-            btn.textContent = `${idx + 1}. ${opt.name || "Option"}`;
+            btn.textContent = `${idx + 1}. ${opt.name || opt.title || "Option"}`;
             btn.setAttribute("role", "tab");
             btn.setAttribute("aria-selected", idx === state.currentOptionIndex ? "true" : "false");
             btn.addEventListener("click", () => selectOption(idx));
@@ -1773,7 +1999,10 @@
         const opt = step.options[state.currentOptionIndex] || step.options[0];
         const pros = Array.isArray(opt.pros) ? opt.pros : [];
         const cons = Array.isArray(opt.cons) ? opt.cons : [];
-        if (pros.length === 0 && cons.length === 0) {
+        // Fallback shape: some datasets author options as
+        // { title, description, tradeoffs[] } instead of { name, pros, cons }.
+        const tradeoffs = Array.isArray(opt.tradeoffs) ? opt.tradeoffs : [];
+        if (pros.length === 0 && cons.length === 0 && tradeoffs.length === 0) {
             els.optionProsCons.hidden = true;
             return;
         }
@@ -1789,8 +2018,36 @@
             return c;
         }
 
-        if (pros.length > 0) els.optionProsCons.appendChild(col("Pros", pros, "pros"));
-        if (cons.length > 0) els.optionProsCons.appendChild(col("Cons", cons, "cons"));
+        if (pros.length > 0 || cons.length > 0) {
+            if (pros.length > 0) els.optionProsCons.appendChild(col("Pros", pros, "pros"));
+            if (cons.length > 0) els.optionProsCons.appendChild(col("Cons", cons, "cons"));
+        } else {
+            els.optionProsCons.appendChild(col("Tradeoffs", tradeoffs, "tradeoffs"));
+        }
+    }
+
+    // One-line caption shown below the diagram, just above the pros/cons,
+    // describing what THIS diagram view shows (its components and how they
+    // connect) — distinct from the step/option prose. Read from the active
+    // view's `caption`, so each option tab can caption its own diagram.
+    function renderDiagramCaption(step, suppress) {
+        els.optionDescription.innerHTML = "";
+        // On Final Design the caption is shown above the diagram instead
+        // (#diagram-description), so don't also render it below.
+        if (suppress) {
+            els.optionDescription.hidden = true;
+            return;
+        }
+        // The caption describes the step-focus view; in full-context mode the
+        // diagram is the whole architecture, so the focus caption doesn't apply.
+        const view = state.currentDiagramView === "context" ? null : activeViewFor(step);
+        const caption = view && typeof view.caption === "string" ? view.caption.trim() : "";
+        if (!caption) {
+            els.optionDescription.hidden = true;
+            return;
+        }
+        els.optionDescription.hidden = false;
+        els.optionDescription.textContent = caption;
     }
 
     // ---------- Rendering: per-step extras ----------
@@ -2185,7 +2442,10 @@
         let m;
         while ((m = re.exec(diagram)) !== null) {
             const id = m[1];
-            const label = (m[2] || "").trim() || id;
+            // mermaidSequenceText() entity-encodes `;` (a sequence statement
+            // separator) in source labels; the rendered SVG shows the decoded
+            // glyph, so decode here too to keep label matching consistent.
+            const label = ((m[2] || "").trim() || id).replace(/#59;/g, ";");
             map.set(id, label);
         }
         return map;
@@ -2367,6 +2627,11 @@
                     if (opts.annotateParticipants) {
                         applySequenceParticipantTypes(target, labelMap, participantNodeIds);
                     }
+                }
+                // Generic post-render hook for callers that need to walk the
+                // finished SVG (e.g. attach click handlers to flowchart nodes).
+                if (opts && typeof opts.onRendered === "function") {
+                    opts.onRendered(target);
                 }
             },
             (err) => {
@@ -2969,6 +3234,204 @@
         return outer;
     }
 
+    // ---------- Decision Tree ----------
+    //
+    // An auto-generated map of the whole interview: each top-level step is a
+    // node, its options are labelled branches. The default (first) option
+    // carries the spine forward to the next step; the other options hang off
+    // the step as side-branch leaves so you can see the alternatives that were
+    // considered and rejected. The spine ends at a FINAL node (the final
+    // design). Sub-steps (`step.parent`) branch off their parent instead of
+    // sitting on the main spine. Nothing is authored in the dataset for this —
+    // it is derived from steps[]/options/finalDesign — and every node is
+    // clickable, navigating to the matching entry.
+
+    // A Mermaid-safe synthetic id for a tree node. Mermaid ids must match
+    // [A-Za-z_][A-Za-z0-9_-]* and we parse them back out of the rendered SVG,
+    // so keep them simple and collision-free.
+    function decisionTreeStepNodeId(index) {
+        return `dtStep${index}`;
+    }
+    function decisionTreeOptionNodeId(stepIndex, optIndex) {
+        return `dtStep${stepIndex}Opt${optIndex}`;
+    }
+    const DECISION_TREE_FINAL_ID = "dtFinal";
+
+    function optionLabel(opt, idx) {
+        const raw = (opt && (opt.name || opt.title)) || `Option ${idx + 1}`;
+        // Keep edge/leaf labels short so the tree stays legible.
+        return raw.length > 48 ? raw.slice(0, 47).trim() + "…" : raw;
+    }
+
+    // Build the Mermaid flowchart source for the decision tree and, alongside
+    // it, a map of synthetic-node-id -> { kind, entryIndex } so the renderer can
+    // wire clicks. entryIndex is resolved against state.entries.
+    function buildDecisionTreeMermaid(data) {
+        const steps = Array.isArray(data.steps) ? data.steps : [];
+        const lines = ["flowchart TB"];
+        const nodeTargets = new Map(); // synthetic id -> entry index
+
+        const entryIndexForStepId = (stepId) =>
+            state.entries.findIndex((e) => e.kind === "step" && e.id === stepId);
+        const finalEntryIndex = () =>
+            state.entries.findIndex((e) => e.id === INTRO_SLUGS.finalDesign);
+
+        // Top-level steps form the spine; sub-steps branch off their parent.
+        const topLevel = [];
+        const childrenByParent = new Map();
+        const stepIndexById = new Map();
+        steps.forEach((s, i) => stepIndexById.set(s.id, i));
+        steps.forEach((s, i) => {
+            const parent = typeof s.parent === "string" ? s.parent : null;
+            if (parent && stepIndexById.has(parent)) {
+                if (!childrenByParent.has(parent)) childrenByParent.set(parent, []);
+                childrenByParent.get(parent).push(i);
+            } else {
+                topLevel.push(i);
+            }
+        });
+
+        // Emit a step node + its option leaves, and return the id the spine
+        // should continue from.
+        function emitStep(stepIdx) {
+            const step = steps[stepIdx];
+            const nodeId = decisionTreeStepNodeId(stepIdx);
+            lines.push(`  ${nodeId}["${mermaidNodeLabel(step.title || step.id || `Step ${stepIdx + 1}`)}"]`);
+            lines.push(`  class ${nodeId} dtStepNode`);
+            const ei = entryIndexForStepId(step.id);
+            if (ei >= 0) nodeTargets.set(nodeId, ei);
+
+            const opts = Array.isArray(step.options) ? step.options : [];
+            // Default (first) option is the chosen path — it labels the spine
+            // edge, not a leaf. The rest become alternative leaves.
+            opts.forEach((opt, oi) => {
+                if (oi === 0) return; // chosen option rides the spine edge
+                const leafId = decisionTreeOptionNodeId(stepIdx, oi);
+                lines.push(`  ${leafId}(["${mermaidNodeLabel(optionLabel(opt, oi))}"])`);
+                lines.push(`  class ${leafId} dtAltNode`);
+                lines.push(`  ${nodeId} -. alt .-> ${leafId}`);
+                if (ei >= 0) nodeTargets.set(leafId, ei); // leaf jumps to its step
+            });
+
+            // Sub-steps branch off the parent step node.
+            const kids = childrenByParent.get(step.id) || [];
+            kids.forEach((kidIdx) => {
+                const kidId = emitStep(kidIdx);
+                lines.push(`  ${nodeId} -. sub .-> ${kidId}`);
+            });
+
+            return nodeId;
+        }
+
+        // Walk the spine, connecting consecutive top-level steps. The chosen
+        // (first) option of the source step labels the connecting edge.
+        let prevId = null;
+        let prevStepIdx = null;
+        topLevel.forEach((stepIdx) => {
+            const nodeId = emitStep(stepIdx);
+            if (prevId !== null) {
+                const prevStep = steps[prevStepIdx];
+                const chosen = Array.isArray(prevStep.options) && prevStep.options.length > 0
+                    ? prevStep.options[0]
+                    : null;
+                if (chosen) {
+                    lines.push(`  ${prevId} -->|"${mermaidNodeLabel(optionLabel(chosen, 0))}"| ${nodeId}`);
+                } else {
+                    lines.push(`  ${prevId} --> ${nodeId}`);
+                }
+            }
+            prevId = nodeId;
+            prevStepIdx = stepIdx;
+        });
+
+        // Final design node closes the spine.
+        const fi = finalEntryIndex();
+        if (fi >= 0) {
+            lines.push(`  ${DECISION_TREE_FINAL_ID}["${mermaidNodeLabel("Target Final Design")}"]`);
+            lines.push(`  class ${DECISION_TREE_FINAL_ID} dtFinalNode`);
+            nodeTargets.set(DECISION_TREE_FINAL_ID, fi);
+            if (prevId !== null) {
+                const lastStep = steps[prevStepIdx];
+                const chosen = Array.isArray(lastStep.options) && lastStep.options.length > 0
+                    ? lastStep.options[0]
+                    : null;
+                if (chosen) {
+                    lines.push(`  ${prevId} -->|"${mermaidNodeLabel(optionLabel(chosen, 0))}"| ${DECISION_TREE_FINAL_ID}`);
+                } else {
+                    lines.push(`  ${prevId} --> ${DECISION_TREE_FINAL_ID}`);
+                }
+            }
+        }
+
+        // Style classes: chosen-path step nodes vs. alternative leaves vs final.
+        lines.push("  classDef dtStepNode fill:#eef2ff,stroke:#6366f1,stroke-width:1.5px,color:#1e1b4b");
+        lines.push("  classDef dtAltNode fill:#f8fafc,stroke:#cbd5e1,color:#475569");
+        lines.push("  classDef dtFinalNode fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#14532d");
+
+        return {source: lines.join("\n"), nodeTargets};
+    }
+
+    // After Mermaid renders, attach click handlers to each node group so
+    // clicking a step / alternative / final node navigates to that entry.
+    // Mermaid v10 gives each node <g class="node"> an id like
+    // "flowchart-<nodeId>-<n>"; we recover <nodeId> from it.
+    function wireDecisionTreeClicks(targetEl, nodeTargets) {
+        const svg = targetEl.querySelector("svg");
+        if (!svg) return;
+        // Recover the synthetic node id from the rendered <g>. Mermaid v10 uses
+        // `data-id` and an `id` of the form `flowchart-<nodeId>-<n>`; fall back
+        // to a bare id match so minor version drift still resolves a node.
+        function nodeIdFor(g) {
+            const dataId = g.getAttribute && g.getAttribute("data-id");
+            if (dataId && nodeTargets.has(dataId)) return dataId;
+            const m = (g.id || "").match(/^flowchart-(.+)-\d+$/);
+            if (m && nodeTargets.has(m[1])) return m[1];
+            if (g.id && nodeTargets.has(g.id)) return g.id;
+            return null;
+        }
+        svg.querySelectorAll("g.node").forEach((g) => {
+            const nodeId = nodeIdFor(g);
+            if (!nodeId) return;
+            const entryIdx = nodeTargets.get(nodeId);
+            g.classList.add("dt-clickable");
+            g.style.cursor = "pointer";
+            g.addEventListener("click", () => selectEntry(entryIdx));
+        });
+    }
+
+    // Populate (or clear) the decision-tree map shown above the Final Design
+    // diagram. The tree is derived from the whole dataset (state.data); the
+    // Final Design entry's own payload is just the finalDesign object, so we
+    // read state.data here. Hidden on every entry except Final Design.
+    function renderFinalDecisionTree(show) {
+        const host = els.finalDecisionTree;
+        if (!host) return;
+        host.innerHTML = "";
+        if (!show || !state.data || !Array.isArray(state.data.steps) || state.data.steps.length === 0) {
+            host.hidden = true;
+            return;
+        }
+        host.hidden = false;
+
+        const heading = document.createElement("h3");
+        heading.className = "final-decision-tree-heading";
+        heading.textContent = "Decision Tree";
+        host.appendChild(heading);
+
+        const intro = document.createElement("p");
+        intro.className = "decision-tree-intro";
+        intro.textContent = "How the design is reached, step by step. Each step's chosen option carries the path forward; dashed branches are the alternatives considered. Click any node to jump to it.";
+        host.appendChild(intro);
+
+        const {source, nodeTargets} = buildDecisionTreeMermaid(state.data);
+        // Top-to-bottom spine, no node-type captions (this is a flow map, not
+        // the typed architecture); wire clicks once the SVG exists.
+        host.appendChild(makeMermaidEl(forceFlowchartDirection(source, "TB"), "decision-tree-diagram", {
+            annotateNodeTypes: false,
+            onRendered: (target) => wireDecisionTreeClicks(target, nodeTargets),
+        }));
+    }
+
     // Overview > Interview Script. Each item: { phase, time?, say }.
     // What to say across the interview's phases (first 5 min, 15, 30, final 5).
     function renderIntroInterviewScript(items) {
@@ -3075,7 +3538,20 @@
 
     async function renderStepLikeEntry(entry, prevStep) {
         const step = entry.payload;
-        renderDescription(step.description, step.whyNow, step.decisionPrompt);
+        const isFinalDesign = entry.id === INTRO_SLUGS.finalDesign;
+
+        // The Final Design entry skips the "Design Rationale" prose and leads
+        // straight with the decision-tree map; ordinary steps show it.
+        if (isFinalDesign) {
+            els.stepDescription.innerHTML = "";
+        } else {
+            renderDescription(step.description, step.whyNow, step.decisionPrompt);
+        }
+
+        // The Final Design entry leads with the decision-tree map (the whole
+        // journey of steps -> chosen options -> final design); other steps
+        // don't show it.
+        renderFinalDecisionTree(isFinalDesign);
 
         if (Array.isArray(step.options) && step.options.length > 0) {
             if (state.currentOptionIndex >= step.options.length) state.currentOptionIndex = 0;
@@ -3085,8 +3561,28 @@
 
         els.introBlock.hidden = true;
         els.diagramBlock.hidden = false;
+        // On Final Design the diagram is the high-level architecture; label it
+        // and move the diagram's caption (the "step description" otherwise shown
+        // *under* the diagram) above it, between the decision-tree map and the
+        // diagram itself.
+        if (els.diagramHeading) {
+            els.diagramHeading.hidden = !isFinalDesign;
+            els.diagramHeading.textContent = isFinalDesign ? "High-Level Architecture" : "";
+        }
+        if (els.diagramDescription) {
+            els.diagramDescription.innerHTML = "";
+            const view = isFinalDesign ? activeViewFor(step) : null;
+            const caption = view && typeof view.caption === "string" ? view.caption.trim() : "";
+            if (caption) {
+                els.diagramDescription.textContent = caption;
+                els.diagramDescription.hidden = false;
+            } else {
+                els.diagramDescription.hidden = true;
+            }
+        }
         renderDiagramViewTabs(entry);
         renderOptionTabs(step);
+        renderDiagramCaption(step, isFinalDesign);
         renderProsCons(step);
         const focus = effectiveDiagramFor(step);
         let diagram = focus.diagram;
@@ -3103,7 +3599,7 @@
 
         renderStepExtras(step);
         if (entry.id === INTRO_SLUGS.finalDesign) {
-            appendStepExtra(renderGeneratedImage(step.image, `${step.title || "Final Design"} generated image`));
+            appendStepExtra(renderGeneratedImage(step.image, `${step.title || "Target Final Design"} generated image`));
         }
     }
 
@@ -3121,6 +3617,7 @@
             await renderStepLikeEntry(entry, null);
         } else if (entry.kind === "intro") {
             els.stepDescription.innerHTML = "";
+            renderFinalDecisionTree(false);
             els.diagramBlock.hidden = true;
             els.stepExtras.innerHTML = "";
             els.introBlock.hidden = false;
@@ -3134,6 +3631,13 @@
 
     // ---------- Navigation ----------
 
+    // Node visibility and layout direction are per-diagram interactions; reset
+    // them whenever the diagram's node set changes (new entry, option, or view).
+    function resetDiagramInteractivity() {
+        state.diagramDirection = "TB";
+        state.hiddenNodes = new Set();
+    }
+
     function selectEntry(index) {
         const clamped = Math.max(0, Math.min(index, state.entries.length - 1));
         if (clamped === state.currentEntryIndex) return;
@@ -3141,6 +3645,7 @@
         state.currentOptionIndex = 0; // reset on entry change
         state.currentFlowIndex = 0;
         state.currentDiagramView = "focus";
+        resetDiagramInteractivity();
         renderCurrentEntry();
     }
 
@@ -3150,6 +3655,7 @@
         if (view !== "focus" && view !== "context") return;
         if (view === state.currentDiagramView) return;
         state.currentDiagramView = view;
+        resetDiagramInteractivity();
         renderCurrentEntry();
     }
 
@@ -3175,6 +3681,7 @@
         const clamped = Math.max(0, Math.min(index, opts.length - 1));
         if (clamped === state.currentOptionIndex) return;
         state.currentOptionIndex = clamped;
+        resetDiagramInteractivity();
         renderCurrentEntry();
     }
 
@@ -3366,6 +3873,7 @@
             if (view.nodes !== undefined && !Array.isArray(view.nodes)) throw new Error(`${label}: view.nodes must be an array`);
             if (view.links !== undefined && !Array.isArray(view.links)) throw new Error(`${label}: view.links must be an array`);
             if (view.groups !== undefined && !Array.isArray(view.groups)) throw new Error(`${label}: view.groups must be an array`);
+            if (view.caption !== undefined && typeof view.caption !== "string") throw new Error(`${label}: view.caption must be a string`);
             (view.links || []).forEach((ref) => {
                 if (typeof ref === "string" && !linkIds.has(ref)) throw new Error(`${label}: view.links references unknown link "${ref}"`);
             });

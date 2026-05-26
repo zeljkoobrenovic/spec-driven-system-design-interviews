@@ -590,6 +590,7 @@
           "OrderDB",
           "Restaurant"
         ],
+        "caption": "The eater places an order through the API gateway to the order service, which persists state in the order store and sends the order to the restaurant client.",
         "links": [
           "eater-lb",
           "lb-order",
@@ -641,6 +642,7 @@
           "Restaurant",
           "Notify"
         ],
+        "caption": "The order service drives each state change in the order store and emits to the notification service, which pushes lifecycle updates back to the eater client.",
         "links": [
           "eater-lb",
           "lb-order",
@@ -701,6 +703,7 @@
           "GeoIndex",
           "Dispatch"
         ],
+        "caption": "Couriers' GPS updates flow through the location stream into the courier geo index, which the dispatch/matching service queries for nearby couriers.",
         "links": [
           "courier-locstream",
           "locstream-geo",
@@ -714,6 +717,117 @@
           "logistics"
         ]
       },
+      "options": [
+        {
+          "name": "Geohash/S2 cell index in a KV store (default)",
+          "description": "Each courier's position is encoded to a geohash/S2 cell and upserted in a KV store keyed by courier id, so a nearby query reads a cell plus its neighbors.",
+          "pros": [
+            "Encode each courier's lat/lng to a geohash/S2 cell key, so 'nearby' is a cheap prefix/cell lookup.",
+            "Writes are simple upserts keyed by courier id, absorbing 100K pings every 4s.",
+            "Cells shard naturally by region, so dense cities scale horizontally."
+          ],
+          "cons": [
+            "Fixed cell size means a sparse area returns too few and a dense area too many couriers - must query neighbor cells.",
+            "Boundary effects: the nearest courier can sit just across a cell edge.",
+            "Recency must be tracked separately so stale positions aren't matched."
+          ],
+          "view": {
+            "nodes": [
+              "Courier",
+              "LocStream",
+              "GeoIndex",
+              "Dispatch"
+            ],
+            "caption": "Each courier's position is encoded to a geohash/S2 cell and upserted in the KV-backed courier geo index that dispatch reads for nearby couriers.",
+            "links": [
+              "courier-locstream",
+              "locstream-geo",
+              "dispatch-geo"
+            ],
+            "highlight": [
+              "GeoIndex",
+              "LocStream"
+            ],
+            "groups": [
+              "logistics"
+            ]
+          }
+        },
+        {
+          "name": "In-memory geo store (Redis GEO)",
+          "description": "Live courier positions are held in Redis GEO sets, so a nearby query is a GEORADIUS lookup served from memory in sub-millisecond time.",
+          "pros": [
+            "GEOADD/GEORADIUS gives radius queries out of the box with sub-millisecond reads.",
+            "Holding only live courier positions in memory keeps the working set tiny and fast.",
+            "Simple to operate for the 'where are nearby couriers right now' query."
+          ],
+          "cons": [
+            "Single-instance memory caps how many live couriers you hold; sharding GEO sets is manual.",
+            "Volatile - a restart loses positions until couriers re-ping.",
+            "High write rate (100K/4s) can saturate one node without careful sharding."
+          ],
+          "view": {
+            "nodes": [
+              "Courier",
+              "LocStream",
+              {
+                "id": "GeoIndex",
+                "label": "Redis GEO (radius query)"
+              },
+              "Dispatch"
+            ],
+            "caption": "Courier positions land in an in-memory Redis GEO store, so dispatch answers a nearby query with a single GEORADIUS lookup fed by the location stream.",
+            "links": [
+              "courier-locstream",
+              "locstream-geo",
+              "dispatch-geo"
+            ],
+            "highlight": [
+              "GeoIndex"
+            ],
+            "groups": [
+              "logistics"
+            ]
+          }
+        },
+        {
+          "name": "Quadtree / adaptive spatial index",
+          "description": "A quadtree subdivides space where couriers are dense and stays coarse where sparse, so each region query returns a balanced number of candidate couriers.",
+          "pros": [
+            "Cells subdivide where couriers are dense, so each query returns a balanced candidate count.",
+            "Adapts to a city's uneven courier density better than fixed cells.",
+            "Good for k-nearest queries where you want exactly N candidates."
+          ],
+          "cons": [
+            "Tree rebalancing under a flood of position updates is expensive and complex.",
+            "Harder to shard and replicate than a flat geohash keyspace.",
+            "Update-heavy workload (every courier every 4s) stresses the mutable tree."
+          ],
+          "view": {
+            "nodes": [
+              "Courier",
+              "LocStream",
+              {
+                "id": "GeoIndex",
+                "label": "Quadtree Index (adaptive cells)"
+              },
+              "Dispatch"
+            ],
+            "caption": "A quadtree index with adaptive cells holds courier positions from the location stream, returning a balanced candidate set to dispatch per region query.",
+            "links": [
+              "courier-locstream",
+              "locstream-geo",
+              "dispatch-geo"
+            ],
+            "highlight": [
+              "GeoIndex"
+            ],
+            "groups": [
+              "logistics"
+            ]
+          }
+        }
+      ],
       "decisionPrompt": "100K couriers each send GPS every 4 seconds. Where do those updates go, and how do you query 'nearby'?",
       "concepts": [
         {
@@ -759,6 +873,7 @@
           "ETA",
           "Courier"
         ],
+        "caption": "The dispatch/matching service takes an order ready to assign, queries the courier geo index for nearby couriers, scores them via the ETA/routing service, and offers the delivery to a courier.",
         "links": [
           "order-dispatch",
           "dispatch-geo",
@@ -773,6 +888,124 @@
           "order-core"
         ]
       },
+      "options": [
+        {
+          "name": "Greedy nearest-courier assignment (default)",
+          "description": "When an order is ready, dispatch picks the single best-scoring nearby courier by distance and ETA and offers it immediately, claiming the courier atomically.",
+          "pros": [
+            "When an order is ready, pick the best-scoring nearby courier (distance + ETA) and offer immediately - low latency.",
+            "Simple to reason about and easy to fall back to under load.",
+            "Claiming the courier atomically (compare-and-set on courier state) prevents double-booking."
+          ],
+          "cons": [
+            "Locally optimal, globally poor: grabbing the nearest courier for one order can strand a better-fit order.",
+            "Two near-simultaneous orders can contend for the same courier, needing a lock/retry.",
+            "Ignores future orders, so it leaves the fleet poorly positioned."
+          ],
+          "view": {
+            "nodes": [
+              "OrderSvc",
+              "Dispatch",
+              "GeoIndex",
+              "ETA",
+              "Courier"
+            ],
+            "caption": "Dispatch greedily picks the single best-scoring nearby courier from the geo index, scores it via the ETA service, and offers that one courier the delivery.",
+            "links": [
+              "order-dispatch",
+              "dispatch-geo",
+              "dispatch-eta",
+              "dispatch-courier"
+            ],
+            "highlight": [
+              "Dispatch"
+            ],
+            "groups": [
+              "logistics",
+              "order-core"
+            ]
+          }
+        },
+        {
+          "name": "Batched assignment (windowed matching)",
+          "description": "Dispatch collects orders and couriers over a short window and solves them together as a batch (min-cost bipartite matching) for a globally better assignment.",
+          "pros": [
+            "Collect orders and couriers over a short window, then solve as a batch (e.g. min-cost bipartite matching) for a globally better assignment.",
+            "Naturally avoids double-booking - one solver assigns each courier once.",
+            "Enables batching multiple pickups along one courier's route."
+          ],
+          "cons": [
+            "Adds a few seconds of matching latency that's bad for a 'ready now' order.",
+            "The optimizer is far more complex to build, tune, and operate.",
+            "A late-arriving urgent order waits for the next window."
+          ],
+          "view": {
+            "nodes": [
+              "OrderSvc",
+              {
+                "id": "Dispatch",
+                "label": "Batch Matcher (windowed)"
+              },
+              "GeoIndex",
+              "ETA",
+              "Courier"
+            ],
+            "caption": "A batch matcher collects orders and couriers over a window, scores candidates from the geo index against the ETA service, and offers couriers a globally optimized assignment.",
+            "links": [
+              "order-dispatch",
+              "dispatch-geo",
+              "dispatch-eta",
+              "dispatch-courier"
+            ],
+            "highlight": [
+              "Dispatch"
+            ],
+            "groups": [
+              "logistics",
+              "order-core"
+            ]
+          }
+        },
+        {
+          "name": "Broadcast offer, couriers accept (pull)",
+          "description": "Dispatch fans the order out as an offer to several nearby couriers at once, and the first to accept claims it atomically — no central optimizer decides.",
+          "pros": [
+            "Offer the order to several nearby couriers and let the first to accept take it - no central optimizer.",
+            "Respects courier choice and works when courier availability is uncertain.",
+            "Simple to scale: dispatch just fans out offers."
+          ],
+          "cons": [
+            "Races on acceptance need an atomic claim so two couriers don't both take it.",
+            "Unattractive orders go unaccepted, requiring re-offer and escalation logic.",
+            "Less control over global efficiency and ETA promises."
+          ],
+          "view": {
+            "nodes": [
+              "OrderSvc",
+              {
+                "id": "Dispatch",
+                "label": "Offer Broadcaster"
+              },
+              "GeoIndex",
+              "Courier"
+            ],
+            "caption": "An offer broadcaster reads nearby couriers from the geo index and fans the offer to several at once, letting the first courier to accept claim it.",
+            "links": [
+              "order-dispatch",
+              "dispatch-geo",
+              "dispatch-courier"
+            ],
+            "highlight": [
+              "Dispatch",
+              "Courier"
+            ],
+            "groups": [
+              "logistics",
+              "order-core"
+            ]
+          }
+        }
+      ],
       "decisionPrompt": "Two orders become ready near the same courier at once. How do you assign without double-booking or starving one?",
       "concepts": [
         {
@@ -906,6 +1139,7 @@
           "ETA",
           "Notify"
         ],
+        "caption": "The tracking service feeds the eater live positions from the location stream and ETAs from the ETA/routing service, while the notification service pushes order state changes.",
         "links": [
           "eater-tracking",
           "locstream-tracking",
@@ -921,6 +1155,87 @@
           "logistics"
         ]
       },
+      "options": [
+        {
+          "name": "Server-push over a persistent connection (default)",
+          "description": "The eater app holds a persistent WebSocket/SSE to the tracking service, which reads courier positions from the location stream and pushes them on movement.",
+          "pros": [
+            "The eater app holds a WebSocket/SSE to the Tracking service and receives courier positions as they stream in - no polling.",
+            "Tracking reads live positions from the location stream, never the orders database, so map updates don't touch OrderDB.",
+            "Pushes only on movement, cutting redundant traffic versus fixed-interval polls."
+          ],
+          "cons": [
+            "Maintaining millions of long-lived connections needs a connection/gateway tier.",
+            "Reconnect and backfill logic is required for flaky mobile networks.",
+            "More infrastructure than stateless polling."
+          ],
+          "view": {
+            "nodes": [
+              "Eater",
+              "Tracking",
+              "LocStream",
+              "ETA",
+              "Notify"
+            ],
+            "caption": "The eater app holds a persistent connection to the tracking service, which reads positions from the location stream, computes ETAs, and pushes updates through the notification service.",
+            "links": [
+              "eater-tracking",
+              "locstream-tracking",
+              "tracking-eta",
+              {
+                "from": "ETA",
+                "to": "Notify",
+                "label": "ETA change"
+              },
+              "notify-eater"
+            ],
+            "highlight": [
+              "Tracking",
+              "ETA"
+            ],
+            "groups": [
+              "logistics"
+            ]
+          }
+        },
+        {
+          "name": "Client polls a cached position endpoint",
+          "description": "The eater app polls a stateless endpoint every few seconds, and tracking serves the courier's last-known position from an in-memory cache rather than OrderDB.",
+          "pros": [
+            "Stateless HTTP: the app polls every few seconds and Tracking serves the courier's last position from an in-memory cache.",
+            "No long-lived connections to manage - trivial to scale behind a load balancer.",
+            "Polling the cache (not OrderDB) still keeps the database off the hot path."
+          ],
+          "cons": [
+            "Fixed-interval polling wastes requests when the courier is idle and lags when they move fast.",
+            "At millions of eaters, poll volume itself becomes a scaling concern.",
+            "Map feels less smooth than continuous push."
+          ],
+          "view": {
+            "nodes": [
+              "Eater",
+              {
+                "id": "Tracking",
+                "label": "Tracking (poll last position)"
+              },
+              "LocStream",
+              "ETA"
+            ],
+            "caption": "The eater app polls the stateless tracking endpoint, which serves the courier's last-known position from the location stream plus a live ETA from the ETA/routing service.",
+            "links": [
+              "eater-tracking",
+              "locstream-tracking",
+              "tracking-eta"
+            ],
+            "highlight": [
+              "Tracking"
+            ],
+            "groups": [
+              "logistics"
+            ]
+          }
+        }
+      ],
       "decisionPrompt": "Should the eater's app poll the courier's GPS directly, and should each ping hit the database?",
       "patterns": [
         "Location streaming + last-known",
@@ -1029,6 +1344,7 @@
           "Dispatch",
           "Notify"
         ],
+        "caption": "The order service authorizes/captures through the payment service, persists to the order store, hands the order to dispatch, and emits state to the notification service.",
         "links": [
           "order-pay",
           "order-db",
@@ -1043,6 +1359,120 @@
           "order-core"
         ]
       },
+      "options": [
+        {
+          "name": "Orchestrated saga with compensations (default)",
+          "description": "A central order orchestrator drives each step — authorize payment, confirm restaurant, dispatch — and runs compensating actions like voiding the auth when a later step fails.",
+          "pros": [
+            "A central order orchestrator drives steps (authorize payment, confirm restaurant, dispatch) and runs compensations on failure.",
+            "If the restaurant rejects after payment auth, the saga voids/refunds the authorization so the eater isn't charged.",
+            "One place to see and reason about the order's distributed transaction state."
+          ],
+          "cons": [
+            "The orchestrator is a complex, critical component that must itself be highly available.",
+            "Compensations (void auth, cancel dispatch) must be carefully designed and idempotent.",
+            "Centralizing the flow can couple the services to the orchestrator."
+          ],
+          "view": {
+            "nodes": [
+              "OrderSvc",
+              "PaySvc",
+              "OrderDB",
+              "Dispatch",
+              "Notify"
+            ],
+            "caption": "A central order orchestrator sequences the payment service, order store, dispatch, and notification service, running compensations when a later step fails.",
+            "links": [
+              "order-pay",
+              "order-db",
+              "order-dispatch",
+              "order-notify"
+            ],
+            "highlight": [
+              "OrderSvc",
+              "PaySvc"
+            ],
+            "groups": [
+              "order-core"
+            ]
+          }
+        },
+        {
+          "name": "Choreographed saga (events between services)",
+          "description": "Each service reacts to events emitted by the others and emits its own, so the order flow and its compensations emerge from event handlers with no central coordinator.",
+          "pros": [
+            "Each service reacts to events and emits its own - no central orchestrator to build or scale.",
+            "Loosely coupled: payment, restaurant, and dispatch evolve independently.",
+            "Naturally resilient - a slow consumer just processes its events later."
+          ],
+          "cons": [
+            "The end-to-end flow is implicit across many handlers, making it hard to follow and debug.",
+            "Compensation chains (refund after a late rejection) are easy to get wrong with no central view.",
+            "Cyclic event dependencies can emerge as the flow grows."
+          ],
+          "view": {
+            "nodes": [
+              "OrderSvc",
+              "PaySvc",
+              "OrderDB",
+              "Dispatch",
+              "Notify"
+            ],
+            "caption": "Each of the payment service, dispatch, and notification service reacts to and emits events around the order service and store, with no central coordinator driving the flow.",
+            "links": [
+              "order-pay",
+              "order-db",
+              "order-dispatch",
+              "order-notify"
+            ],
+            "highlight": [
+              "PaySvc",
+              "Dispatch",
+              "Notify"
+            ],
+            "groups": [
+              "order-core"
+            ]
+          }
+        },
+        {
+          "name": "Auth-then-capture (delay the charge)",
+          "description": "Payment is only authorized (held) at order time and captured after the restaurant confirms, so a pre-confirm rejection just releases the hold instead of refunding.",
+          "pros": [
+            "Only authorize (hold) at order time and capture the charge after the restaurant confirms - a rejection just releases the hold, no refund.",
+            "Avoids the refund path entirely for the common reject-before-confirm case.",
+            "Maps cleanly to how card networks already work (auth vs capture)."
+          ],
+          "cons": [
+            "Holds expire, so a long delay before confirm can drop the authorization.",
+            "Still needs saga logic for failures after capture (e.g. courier never arrives).",
+            "Two-phase payment adds states to the order lifecycle to track."
+          ],
+          "view": {
+            "nodes": [
+              "OrderSvc",
+              {
+                "id": "PaySvc",
+                "label": "Payment (auth then capture)"
+              },
+              "OrderDB",
+              "Notify"
+            ],
+            "caption": "The order service authorizes a hold on the payment service and captures only after restaurant confirmation, persisting state and notifying as the order advances.",
+            "links": [
+              "order-pay",
+              "order-db",
+              "order-notify"
+            ],
+            "highlight": [
+              "PaySvc"
+            ],
+            "groups": [
+              "order-core"
+            ]
+          }
+        }
+      ],
       "decisionPrompt": "Payment is authorized, the restaurant then rejects the order. What has to happen, and how do you avoid charging the eater?",
       "concepts": [
         {
@@ -1162,6 +1592,7 @@
           "OrderDB",
           "Tracking"
         ],
+        "caption": "Under load the location stream feeds the courier geo index that dispatch queries, the order service writes the order store, and tracking reads live positions from the stream.",
         "links": [
           "locstream-geo",
           "dispatch-geo",
@@ -1223,6 +1654,7 @@
         "ETA",
         "Notify"
       ],
+      "caption": "The eater, courier, and restaurant clients work through the API gateway and order service, which persists to the order store, charges via payments, dispatches couriers found in the geo index, and streams live positions and ETAs back through tracking and notifications.",
       "links": [
         "eater-lb",
         "lb-order",

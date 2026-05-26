@@ -44,16 +44,24 @@ The page is a two-column layout:
 
 - **Left sidebar** — a navigation list grouped into three sections:
   - **Overview**: Requirements · Capacity Estimation · API Design · Data Model
-  - **Architecture**: the sequence of design steps (sub-steps with a
-    `parent` field render indented under their parent — useful for focused
-    deep-dives on one aspect of a step, like an algorithm choice)
+  - **Architecture**: the sequence of design steps (sub-steps with a `parent`
+    field render indented under their parent — useful for focused deep-dives
+    on one aspect of a step, like an algorithm choice), and the **Target Final
+    Design** — which leads with an auto-generated **decision-tree map** (steps
+    as nodes, their options as branches, converging on the final design; nodes
+    are clickable) shown above the final architecture diagram
   - **Wrap-up**: API Flows · Design vs. Requirements · By Level · Follow-up Questions · To Probe Further
 
   Each item is clickable. The selected item drives the right pane.
 
 - **Right pane** — title, prev/next buttons, step counter, and the rendered
   content for the selected entry (intro section, architecture step, or
-  wrap-up section).
+  wrap-up section). Step and Target Final Design architecture diagrams are
+  interactive: a controls panel to the right of the diagram lets you toggle
+  individual nodes on/off (hidden nodes drop their edges), flip the layout
+  between top–down (default) and left–right, and download the diagram as SVG.
+  The toggle/direction state is per-diagram and resets when you move to another
+  step/option/view.
 
 Navigation:
 - Click any sidebar entry.
@@ -124,6 +132,11 @@ All fields below are optional except `highLevelArchitecture` and either
     // Canonical architecture links used by structured step views. `from` and `to`
     // reference node ids from highLevelArchitecture.nodes. `render` is optional
     // and should stay an escape hatch for Mermaid-specific arrows/classes.
+    // NOTE: generated architecture diagrams (steps, options, final design,
+    // full context) draw connections as plain lines with NO arrowheads —
+    // `graphLinkLine` strips the arrowhead from whatever token `render.arrow`
+    // resolves to, keeping only the line style (solid `---` / dotted `-.-`).
+    // The decision-tree map keeps its directed arrows.
     "links": [
       {
         "id": "client-cache",
@@ -229,7 +242,8 @@ All fields below are optional except `highLevelArchitecture` and either
         ],
         "links": ["client-cache", "cache-db"],
         "groups": ["read-path"],                 // optional highLevelArchitecture.types ids
-        "highlight": ["Cache"]
+        "highlight": ["Cache"],
+        "caption": "The app checks the cache, then reads the mapping store on a miss." // optional; one-line "what this diagram shows", rendered under the diagram (above pros/cons)
       },
 
       // Options may define their own view/pros/cons (tabs above the diagram).
@@ -317,7 +331,7 @@ All fields below are optional except `highLevelArchitecture` and either
   ],
 
   // ---- Wrap-up ----
-  "finalDesign": {                              // optional; if omitted, no Final Design architecture entry is shown
+  "finalDesign": {                              // optional; if omitted, no "Target Final Design" architecture entry is shown. The entry is always labelled "Target Final Design" in the UI; this object's `title` is not displayed.
     "title":       "Final Design",
     "description": "End-to-end architecture summary.",
     "image":       "assets/images/final-design.png", // optional; rendered at bottom under "Generated Image"
@@ -431,6 +445,13 @@ relative to the previous step:
   default-option view and highlights the additions.
 - Applied by appending Mermaid `classDef newNode ...; class A,B,C newNode;`
   to the source. CSS in `styles.css` targets the rendered SVG.
+
+Each view may carry an optional `caption` string: a one-line description of
+**what that diagram shows** (its components and how they connect), rendered
+under the diagram and just above the pros/cons. The renderer shows the caption
+of the active view — the selected option's view, or the step view when there
+are no options — and hides it in the "Full context" diagram mode. It is
+diagram-specific and intentionally distinct from the step/option prose.
 
 Per-step flow diagrams (`sequence` objects) get the same treatment for
 **participants**, but via a different mechanism (the sequence-diagram parser

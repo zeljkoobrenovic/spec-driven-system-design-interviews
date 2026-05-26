@@ -504,6 +504,7 @@
           "API",
           "JobDB"
         ],
+        "caption": "The client registers a job through the scheduler API, which persists the job definition to the schedule store.",
         "links": [
           "client-api",
           "api-jobdb"
@@ -551,6 +552,7 @@
           "API",
           "JobDB"
         ],
+        "caption": "The client registers jobs through the scheduler API, which durably persists each definition to the schedule store.",
         "links": [
           "client-api",
           "api-jobdb"
@@ -605,6 +607,7 @@
           "Dispatcher",
           "JobDB"
         ],
+        "caption": "The scheduler API indexes each job's next-fire time in the due-job index, which the leader dispatcher polls for due jobs before marking them fired in the schedule store.",
         "links": [
           "api-timewheel",
           "dispatcher-timewheel",
@@ -617,6 +620,112 @@
           "control"
         ]
       },
+      "options": [
+        {
+          "name": "Time-ordered index / time wheel (default)",
+          "description": "Jobs are bucketed by fire time in a time wheel keyed on next_fire_at, so each tick the dispatcher reads only the imminent bucket as a cheap range query.",
+          "pros": [
+            "'What's due in the next window' is a cheap range query keyed by next_fire_at, not a scan of millions of jobs.",
+            "A time wheel buckets jobs by fire time so the dispatcher only touches the imminent ones each tick.",
+            "Derived from and rebuildable from the job store, so a lost index is a recompute, not data loss."
+          ],
+          "cons": [
+            "The index must be kept in sync as jobs are added, fired, or rescheduled.",
+            "Round-time bursts (everything at 02:00) still land in one bucket and must be fanned out.",
+            "Far-future jobs sit in the structure occupying memory or storage until due."
+          ],
+          "view": {
+            "nodes": [
+              "API",
+              "TimeWheel",
+              "Dispatcher",
+              "JobDB"
+            ],
+            "caption": "The API writes next-fire times into a time-ordered due-job index that the dispatcher polls, marking fired jobs in the schedule store.",
+            "links": [
+              "api-timewheel",
+              "dispatcher-timewheel",
+              "dispatcher-jobdb"
+            ],
+            "highlight": [
+              "TimeWheel"
+            ],
+            "groups": [
+              "control"
+            ]
+          }
+        },
+        {
+          "name": "Indexed DB range query (ORDER BY next_fire_at)",
+          "description": "An index on next_fire_at in the job store answers 'due now' directly, with the dispatcher polling the store for due rows each tick.",
+          "pros": [
+            "No separate index structure: an index on next_fire_at in the job store answers 'due now' directly.",
+            "One source of truth — the store IS the due index, so nothing can drift out of sync.",
+            "Trivial to operate and reason about; survives restart with no rebuild."
+          ],
+          "cons": [
+            "Polling the DB every second for due rows adds steady query load at millions of jobs.",
+            "Hot range of imminent rows can become a contention/lock hotspot under bursts.",
+            "Less control over in-memory bucketing than a purpose-built time wheel."
+          ],
+          "view": {
+            "nodes": [
+              "API",
+              "Dispatcher",
+              "JobDB"
+            ],
+            "caption": "The dispatcher runs an indexed range query over the schedule store (next_fire_at <= now) to find due jobs the API persisted there.",
+            "links": [
+              "api-jobdb",
+              {
+                "from": "Dispatcher",
+                "to": "JobDB",
+                "label": "SELECT WHERE next_fire_at<=now"
+              }
+            ],
+            "highlight": [
+              "JobDB"
+            ],
+            "groups": [
+              "control"
+            ]
+          }
+        },
+        {
+          "name": "Periodic full scan (naive)",
+          "description": "Each tick reads every job in the store and checks whether its fire time has arrived, with no index or due-time structure.",
+          "pros": [
+            "Dead simple: each tick, read every job and check if its time has come.",
+            "No index to maintain or keep consistent.",
+            "Fine for a handful of jobs on one box (this is what cron does)."
+          ],
+          "cons": [
+            "Scanning millions of jobs every second is hopelessly expensive — the problem this design exists to solve.",
+            "CPU and I/O grow with total job count, not with how many are actually due.",
+            "Cannot scale past one machine's memory."
+          ],
+          "view": {
+            "nodes": [
+              "Dispatcher",
+              "JobDB"
+            ],
+            "caption": "The dispatcher scans every row in the schedule store each tick to find which jobs are due.",
+            "links": [
+              {
+                "from": "Dispatcher",
+                "to": "JobDB",
+                "label": "scan all jobs each tick"
+              }
+            ],
+            "highlight": [
+              "Dispatcher"
+            ],
+            "groups": [
+              "control"
+            ]
+          }
+        }
+      ],
       "decisionPrompt": "With millions of schedules, how do you find the ones due this second without scanning them all?",
       "concepts": [
         {
@@ -658,6 +767,7 @@
           "Lease",
           "TimeWheel"
         ],
+        "caption": "The dispatcher acquires a leader lease from the election store before polling the due-job index, so only the leader triggers jobs.",
         "links": [
           "dispatcher-lease",
           "dispatcher-timewheel"
@@ -670,6 +780,120 @@
           "control"
         ]
       },
+      "options": [
+        {
+          "name": "Lease + fencing token (default)",
+          "description": "A short-TTL lease in a coordination store elects one dispatcher per shard, and a fencing token rejects a stale leader that resumes after pausing.",
+          "pros": [
+            "A short-TTL lease in a coordination store elects one active dispatcher per shard; only the holder dispatches.",
+            "On leader death the lease simply expires and a peer takes over — brief gap, no duplicate leaders.",
+            "The fencing token rejects a paused-then-resumed old leader acting late.",
+            "Sharding the lease space lets dispatch scale horizontally while each shard stays single-writer."
+          ],
+          "cons": [
+            "Depends on a coordination store (etcd/ZooKeeper/Redis) that must itself be HA.",
+            "A failover gap exists while the lease TTL elapses before takeover.",
+            "Clock/TTL tuning matters: too short flaps, too long delays failover."
+          ],
+          "view": {
+            "nodes": [
+              "Dispatcher",
+              "Lease",
+              "TimeWheel"
+            ],
+            "caption": "The dispatcher holds a lease from the election store and uses its fencing token while polling the due-job index, preventing a stale leader from firing.",
+            "links": [
+              "dispatcher-lease",
+              "dispatcher-timewheel"
+            ],
+            "highlight": [
+              "Lease",
+              "Dispatcher"
+            ],
+            "groups": [
+              "control"
+            ]
+          }
+        },
+        {
+          "name": "Consensus-based election (Raft/ZooKeeper)",
+          "description": "A consensus group (Raft/ZooKeeper) elects the active dispatcher with linearizable leadership, so no two leaders dispatch even under partitions.",
+          "pros": [
+            "A consensus group elects a leader with strong safety guarantees — no two leaders even under partitions.",
+            "Leadership and committed state are linearizable, removing fencing edge cases.",
+            "Battle-tested coordination primitives (sessions, ephemeral nodes) handle liveness."
+          ],
+          "cons": [
+            "Heavier to run and operate than a TTL lease for what is essentially mutual exclusion.",
+            "A single elected leader per group can become a dispatch bottleneck without sharding.",
+            "Election rounds add latency on failover compared with passive lease expiry."
+          ],
+          "view": {
+            "nodes": [
+              "Dispatcher",
+              {
+                "id": "Consensus",
+                "label": "Consensus Group (Raft)"
+              },
+              "TimeWheel"
+            ],
+            "caption": "A Raft consensus group elects the dispatcher leader, which then polls the due-job index.",
+            "links": [
+              {
+                "from": "Dispatcher",
+                "to": "Consensus",
+                "label": "elect leader"
+              },
+              "dispatcher-timewheel"
+            ],
+            "highlight": [
+              "Consensus"
+            ],
+            "groups": [
+              "control"
+            ]
+          }
+        },
+        {
+          "name": "Static partition ownership",
+          "description": "Each dispatcher statically owns a fixed shard of the job-id space, dispatching only its own jobs with no election or lease.",
+          "pros": [
+            "Each dispatcher statically owns a fixed shard of the job-id space — no election at all.",
+            "Simple and predictable: no leader, no lease, no failover protocol.",
+            "Dispatch scales linearly by adding shards/owners."
+          ],
+          "cons": [
+            "When an owner dies, its shard's jobs stop firing until ops reassigns it — availability gap.",
+            "Reassignment needs a coordinator anyway, or you risk two owners firing the same shard.",
+            "Uneven shards create hot owners with no automatic rebalancing."
+          ],
+          "view": {
+            "nodes": [
+              {
+                "id": "Dispatcher",
+                "label": "Dispatcher (owns shard k)"
+              },
+              "TimeWheel",
+              "JobDB"
+            ],
+            "caption": "Each dispatcher statically owns a shard, polling only its slice of the due-job index and marking fired jobs in the schedule store.",
+            "links": [
+              {
+                "from": "Dispatcher",
+                "to": "TimeWheel",
+                "label": "poll shard k only"
+              },
+              "dispatcher-jobdb"
+            ],
+            "highlight": [
+              "Dispatcher"
+            ],
+            "groups": [
+              "control"
+            ]
+          }
+        }
+      ],
       "decisionPrompt": "You run 3 scheduler instances for HA. How do you stop a job from firing 3 times?",
       "concepts": [
         {
@@ -719,6 +943,7 @@
           "JobDB",
           "RunQ"
         ],
+        "caption": "The leader dispatcher atomically marks a job fired in the schedule store and enqueues a run onto the run queue.",
         "links": [
           "dispatcher-jobdb",
           "dispatcher-runq"
@@ -732,6 +957,88 @@
           "execution"
         ]
       },
+      "options": [
+        {
+          "name": "Atomic mark + enqueue (CAS) (default)",
+          "description": "Keyed on (job_id, scheduled_fire_time), the dispatcher atomically marks the fire as done and enqueues the run, so a redelivery finds it already marked and no-ops.",
+          "pros": [
+            "A natural key (job_id, scheduled_fire_time) plus an atomic mark-and-enqueue makes re-dispatch a no-op.",
+            "Turns at-least-once dispatch into exactly-once triggering — one run per scheduled fire.",
+            "For recurring jobs, advancing next_fire_at in the same atomic step closes the double-fire window."
+          ],
+          "cons": [
+            "Requires the marker and the run-queue write to be atomic (one transactional store, or a careful protocol).",
+            "The (job_id, fire_time) dedup keys must be retained long enough to catch late retries.",
+            "If the queue is separate from the DB, you still need an outbox to make the two writes atomic."
+          ],
+          "view": {
+            "nodes": [
+              "Dispatcher",
+              "JobDB",
+              "RunQ"
+            ],
+            "caption": "The dispatcher uses a compare-and-swap to mark the job fired in the schedule store and enqueue the run together, so a duplicate trigger can't slip through.",
+            "links": [
+              "dispatcher-jobdb",
+              "dispatcher-runq"
+            ],
+            "highlight": [
+              "Dispatcher",
+              "RunQ"
+            ],
+            "groups": [
+              "control",
+              "execution"
+            ]
+          }
+        },
+        {
+          "name": "Transactional outbox",
+          "description": "Marking the job fired and writing an outbox row commit in one DB transaction, then a relay reads the outbox and publishes the run to the queue at least once.",
+          "pros": [
+            "Mark-fired and the outbox row commit in one DB transaction, so the enqueue can never be lost or doubled.",
+            "A relay reads the outbox and publishes to the run queue, retrying safely until acked.",
+            "Decouples 'decided to fire' (durable) from 'delivered to queue' (at-least-once) cleanly."
+          ],
+          "cons": [
+            "Adds an outbox table and a relay process to build and operate.",
+            "The relay's at-least-once publish still needs consumer-side idempotency downstream.",
+            "Slight added latency between marking fired and the run appearing on the queue."
+          ],
+          "view": {
+            "nodes": [
+              "Dispatcher",
+              "JobDB",
+              {
+                "id": "Outbox",
+                "label": "Outbox + Relay"
+              },
+              "RunQ"
+            ],
+            "caption": "The dispatcher marks the job fired and writes an outbox row in the same transaction; a relay then moves it from the outbox into the run queue.",
+            "links": [
+              "dispatcher-jobdb",
+              {
+                "from": "JobDB",
+                "to": "Outbox",
+                "label": "same-tx outbox row"
+              },
+              {
+                "from": "Outbox",
+                "to": "RunQ",
+                "label": "relay -> enqueue"
+              }
+            ],
+            "highlight": [
+              "Outbox"
+            ],
+            "groups": [
+              "control",
+              "execution"
+            ]
+          }
+        }
+      ],
       "decisionPrompt": "The dispatcher enqueues a run, then crashes before recording it fired. On restart it sees the job still due. What stops a double-fire?",
       "concepts": [
         {
@@ -848,6 +1155,7 @@
           "RunStore",
           "JobDB"
         ],
+        "caption": "The run queue delivers runs to job workers, which record each attempt and result in the run store and compute the next fire time in the schedule store for recurring jobs.",
         "links": [
           "runq-workers",
           "workers-runstore",
@@ -973,6 +1281,7 @@
           "RunQ",
           "DLQ"
         ],
+        "caption": "Workers report failures to the retry controller, which re-enqueues the run with backoff onto the run queue or gives up to the dead-letter store.",
         "links": [
           "workers-retry",
           "retry-runq",
@@ -1049,6 +1358,7 @@
         "Retry",
         "DLQ"
       ],
+      "caption": "The client registers jobs via the API into the schedule store and due-job index; a leased leader dispatcher polls due jobs, marks them fired, and enqueues runs that workers execute and record, with failures retried through backoff or dead-lettered.",
       "links": [
         "client-api",
         "api-jobdb",

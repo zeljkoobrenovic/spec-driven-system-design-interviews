@@ -1684,8 +1684,8 @@
             return;
         }
         const text = state.currentDiagramView === "context"
-            ? "this step’s nodes within the full design"
-            : "in focus this step";
+            ? "this step’s nodes"
+            : "in focus";
         const textEl = el.querySelector(".diagram-legend-text");
         if (textEl) textEl.textContent = text;
         el.hidden = false;
@@ -1801,16 +1801,24 @@
         }
     }
 
-    // One-line "what this alternative is", shown between the option tabs and the
-    // diagram. Works for both option shapes (name/pros/cons and title/tradeoffs).
+    // One-line caption shown below the diagram, just above the pros/cons.
+    // For a step with options it's the selected option's `description` ("what
+    // this alternative is"). For a step with no options it falls back to the
+    // first sentence of the step's own description, so single-design steps get
+    // an equivalent one-liner under their diagram.
     function renderOptionDescription(step) {
         els.optionDescription.innerHTML = "";
-        if (!Array.isArray(step.options) || step.options.length === 0) {
-            els.optionDescription.hidden = true;
-            return;
+        let desc = "";
+        if (Array.isArray(step.options) && step.options.length > 0) {
+            const opt = step.options[state.currentOptionIndex] || step.options[0];
+            desc = typeof opt.description === "string" ? opt.description.trim() : "";
+        } else {
+            // First sentence of the step description. The description may be an
+            // array of paragraphs/sentences; take its first element, then split
+            // that into sentences so we get a single clean lead-in.
+            const first = bulletsFrom(step.description)[0] || "";
+            desc = (splitIntoSentences(first)[0] || first).trim();
         }
-        const opt = step.options[state.currentOptionIndex] || step.options[0];
-        const desc = typeof opt.description === "string" ? opt.description.trim() : "";
         if (!desc) {
             els.optionDescription.hidden = true;
             return;

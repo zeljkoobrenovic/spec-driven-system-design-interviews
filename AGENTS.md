@@ -393,7 +393,8 @@ per family. Foundational/social families are intentionally left to `examples`.
 - **Architecture diagrams are structured now**: do not add `diagram` to
   `steps[]`, `step.options[]`, `step.deepDives[]`, `finalDesign`, or
   `finalDesign.options[]`. Use `view.nodes`, `view.links`, optional
-  `view.groups`, and optional `view.highlight`.
+  `view.groups`, optional `view.highlight`, and optional `view.caption` (a
+  one-line description of what that diagram shows, rendered under the diagram).
 - **Flow diagrams are structured now**: do not add raw Mermaid sequence
   `diagram` fields. Use `sequence.participants` and `sequence.messages` for
   `step.flows[]`, `finalDesign.flows[]`, and `api[].sequence`.

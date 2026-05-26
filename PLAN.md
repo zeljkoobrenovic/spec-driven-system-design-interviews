@@ -229,7 +229,8 @@ All fields below are optional except `highLevelArchitecture` and either
         ],
         "links": ["client-cache", "cache-db"],
         "groups": ["read-path"],                 // optional highLevelArchitecture.types ids
-        "highlight": ["Cache"]
+        "highlight": ["Cache"],
+        "caption": "The app checks the cache, then reads the mapping store on a miss." // optional; one-line "what this diagram shows", rendered under the diagram (above pros/cons)
       },
 
       // Options may define their own view/pros/cons (tabs above the diagram).
@@ -431,6 +432,13 @@ relative to the previous step:
   default-option view and highlights the additions.
 - Applied by appending Mermaid `classDef newNode ...; class A,B,C newNode;`
   to the source. CSS in `styles.css` targets the rendered SVG.
+
+Each view may carry an optional `caption` string: a one-line description of
+**what that diagram shows** (its components and how they connect), rendered
+under the diagram and just above the pros/cons. The renderer shows the caption
+of the active view — the selected option's view, or the step view when there
+are no options — and hides it in the "Full context" diagram mode. It is
+diagram-specific and intentionally distinct from the step/option prose.
 
 Per-step flow diagrams (`sequence` objects) get the same treatment for
 **participants**, but via a different mechanism (the sequence-diagram parser

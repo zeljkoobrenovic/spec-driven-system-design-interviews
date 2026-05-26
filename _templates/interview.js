@@ -1437,6 +1437,18 @@
         };
     }
 
+    // The view object currently shown for a step: the selected option's view
+    // (falling back to the step view), or the step view when there are no
+    // options. Used to read the diagram caption for what's actually displayed.
+    function activeViewFor(step) {
+        if (!step) return null;
+        if (Array.isArray(step.options) && step.options.length > 0) {
+            const opt = step.options[state.currentOptionIndex] || step.options[0];
+            return (opt && opt.view) || step.view || null;
+        }
+        return step.view || null;
+    }
+
     function defaultDiagramFor(step) {
         if (!step) return "";
         if (Array.isArray(step.options) && step.options.length > 0) {
@@ -1801,30 +1813,22 @@
         }
     }
 
-    // One-line caption shown below the diagram, just above the pros/cons.
-    // For a step with options it's the selected option's `description` ("what
-    // this alternative is"). For a step with no options it falls back to the
-    // first sentence of the step's own description, so single-design steps get
-    // an equivalent one-liner under their diagram.
-    function renderOptionDescription(step) {
+    // One-line caption shown below the diagram, just above the pros/cons,
+    // describing what THIS diagram view shows (its components and how they
+    // connect) — distinct from the step/option prose. Read from the active
+    // view's `caption`, so each option tab can caption its own diagram.
+    function renderDiagramCaption(step) {
         els.optionDescription.innerHTML = "";
-        let desc = "";
-        if (Array.isArray(step.options) && step.options.length > 0) {
-            const opt = step.options[state.currentOptionIndex] || step.options[0];
-            desc = typeof opt.description === "string" ? opt.description.trim() : "";
-        } else {
-            // First sentence of the step description. The description may be an
-            // array of paragraphs/sentences; take its first element, then split
-            // that into sentences so we get a single clean lead-in.
-            const first = bulletsFrom(step.description)[0] || "";
-            desc = (splitIntoSentences(first)[0] || first).trim();
-        }
-        if (!desc) {
+        // The caption describes the step-focus view; in full-context mode the
+        // diagram is the whole architecture, so the focus caption doesn't apply.
+        const view = state.currentDiagramView === "context" ? null : activeViewFor(step);
+        const caption = view && typeof view.caption === "string" ? view.caption.trim() : "";
+        if (!caption) {
             els.optionDescription.hidden = true;
             return;
         }
         els.optionDescription.hidden = false;
-        els.optionDescription.textContent = desc;
+        els.optionDescription.textContent = caption;
     }
 
     // ---------- Rendering: per-step extras ----------
@@ -3121,7 +3125,7 @@
         els.diagramBlock.hidden = false;
         renderDiagramViewTabs(entry);
         renderOptionTabs(step);
-        renderOptionDescription(step);
+        renderDiagramCaption(step);
         renderProsCons(step);
         const focus = effectiveDiagramFor(step);
         let diagram = focus.diagram;
@@ -3401,6 +3405,7 @@
             if (view.nodes !== undefined && !Array.isArray(view.nodes)) throw new Error(`${label}: view.nodes must be an array`);
             if (view.links !== undefined && !Array.isArray(view.links)) throw new Error(`${label}: view.links must be an array`);
             if (view.groups !== undefined && !Array.isArray(view.groups)) throw new Error(`${label}: view.groups must be an array`);
+            if (view.caption !== undefined && typeof view.caption !== "string") throw new Error(`${label}: view.caption must be a string`);
             (view.links || []).forEach((ref) => {
                 if (typeof ref === "string" && !linkIds.has(ref)) throw new Error(`${label}: view.links references unknown link "${ref}"`);
             });

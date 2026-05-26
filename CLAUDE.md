@@ -216,6 +216,14 @@ validator rejects them. The renderer generates Mermaid from
 `highLevelArchitecture.nodes`, `highLevelArchitecture.links`, and
 `highLevelArchitecture.types`.
 
+Connections in these generated diagrams are drawn as **plain lines without
+arrowheads**: `graphLinkLine` runs every link's arrow token through
+`stripLinkArrowheads`, which keeps the line style (solid `---` / dotted `-.-`)
+and approximate length but removes the arrowhead. So a link's `render.arrow`
+still controls solid-vs-dotted, but never the arrowhead. (The decision-tree map
+is built separately in `buildDecisionTreeMermaid` and keeps its directed
+arrows.)
+
 1. `effectiveDiagramFor(step)` generates Mermaid from `view.nodes` /
    `view.links`, accounting for `options` if present.
 2. For auto-diff, the previous step's default-option view is generated and
@@ -229,11 +237,35 @@ validator rejects them. The renderer generates Mermaid from
 
 **Layout direction is forced at render time, not authored.**
 `forceFlowchartDirection(src, dir)` rewrites the `graph`/`flowchart` header:
-requirements + capacity diagrams → `LR`, generated architecture views → `TB`.
-Applied in
-`renderIntroRequirements`/`renderIntroCapacity` (LR) and `renderDiagram` (TB,
-which serves both steps and the `final-design` intro entry). It only touches
-flowcharts — sequence/ER sources pass through.
+requirements + capacity diagrams → `LR`. For generated architecture views
+(`renderDiagram`, which serves both steps and the `final-design` intro entry)
+the direction is `state.diagramDirection` — `TB` by default but user-togglable
+to `LR` (see "Interactive diagram controls" below). It only touches flowcharts
+— sequence/ER sources pass through.
+
+**Interactive diagram controls (steps + final design only).** Each generated
+architecture diagram renders in a two-column row (`#diagram-layout`): the
+diagram fills the left, and a fixed-width right column (`#diagram-controls`,
+built by `renderDiagramControls(nodes)`) holds a TB/LR layout switch on top and
+a vertical checkbox list of nodes, with a "Download SVG" action beneath the
+list. (The controls are the *second* flex child, so they sit on the right.)
+- `flowchartNodeList(src)` extracts the ordered node list (id + label) from the
+  *unfiltered* generated source, so every node has a checkbox even when hidden.
+- Unchecking a node adds its id to `state.hiddenNodes`;
+  `filterFlowchartNodes(src, hidden)` then drops that node's definition line and
+  every edge touching it (handles the arrowless `---`/`-.-` connectors via
+  `FLOWCHART_EDGE_RE`). Highlights are intersected with the visible set before
+  `augmentDiagramWithHighlights` so we never `class` a removed node.
+- The TB/LR buttons set `state.diagramDirection`.
+- "Download SVG" (`downloadDiagramSvg`) serializes the rendered `#diagram` SVG
+  (reflecting the current toggles/direction) to a downloadable file named from
+  the entry title.
+- Both `state.hiddenNodes` and `state.diagramDirection` are **per-diagram**:
+  `resetDiagramInteractivity()` clears them (back to all-visible / `TB`) on every
+  entry, option, and diagram-view change. Any control change calls
+  `renderCurrentEntry()` to re-render.
+- These controls do **not** apply to flow (sequence) diagrams or the
+  requirements/capacity/decision-tree diagrams.
 
 Requirements and capacity diagrams are raw overview Mermaid arrays rendered as
 authored, with `annotateNodeTypes: false`. Do not inject HTML type captions into
@@ -292,7 +324,9 @@ For flowcharts, `makeMermaidEl()` annotates node labels/types by default. Pass
 `requirementsDiagram` and `capacityDiagram`; those should remain simple Mermaid
 source with no injected HTML labels. For sequence diagrams, pass
 `highlightParticipants`, `sourceForLabels`, and `annotateParticipants` so the
-rendered SVG can be patched after Mermaid finishes.
+rendered SVG can be patched after Mermaid finishes. Pass
+`{ onRendered(targetEl) }` for a generic post-render hook on the finished SVG —
+used by the Decision Tree to attach node click handlers (see above).
 
 Mermaid render IDs must be unique per page render. We use a monotonically
 incrementing `mermaidIdSeq` plus `Date.now()`. Don't reuse IDs.
@@ -301,13 +335,52 @@ incrementing `mermaidIdSeq` plus `Date.now()`. Don't reuse IDs.
 
 There are exactly three groups: **Overview**, **Architecture**, **Wrap-up**.
 
-- Architecture is always `entries.filter(e => e.kind === 'step')`.
+- Architecture is `entries.filter(e => e.kind === 'step' ||
+  ARCHITECTURE_INTRO_SLUGS.has(e.id))` — i.e. all steps **plus** the
+  architecture intro entry (`final-design`).
 - Wrap-up is `entries with id in WRAPUP_SLUGS`, ordered by `WRAPUP_ORDER`.
 - Overview is everything else among intros.
 
 To move a section between Overview and Wrap-up, add/remove its slug from
 `WRAPUP_SLUGS` and adjust `WRAPUP_ORDER`. The builder still pushes intros
 to the same `entries` array; the grouping is purely a render-time filter.
+
+### Decision Tree (auto-generated, lives on the Final Design entry)
+
+> The Final Design entry is labelled **"Target Final Design"** in the UI (the
+> sidebar nav, the page heading, and the decision-tree's terminal node). The
+> internal slug stays `final-design` (`INTRO_SLUGS.finalDesign`) and the dataset
+> field stays `finalDesign` — only the display string changed. A dataset's
+> `finalDesign.title` is not displayed.
+
+The **Final Design** entry leads with a decision-tree map of the whole
+interview, rendered *above* the final-design diagram. There is no separate
+sidebar entry for it. `renderFinalDecisionTree(show)` populates (or, when
+`show` is false, clears) the dedicated `#final-decision-tree` container that
+sits between `#step-description` and `#diagram-block` in the HTML shell. It is
+called from `renderStepLikeEntry` with `entry.id === INTRO_SLUGS.finalDesign`,
+and cleared (`renderFinalDecisionTree(false)`) on the intro branch of
+`renderCurrentEntry` so it never lingers when you navigate away.
+
+The tree maps the journey as a flowchart: each top-level step is a node, the
+**first** (default/chosen) option labels the spine edge to the next step, and
+the remaining options become dashed-`alt` side-branch leaves. Sub-steps
+(`step.parent`) branch off their parent via a dashed-`sub` edge instead of
+sitting on the spine. The spine ends at a **Target Final Design** node. It is **fully
+derived** from `steps[]`/`options`/`finalDesign` — nothing is authored per
+dataset — and reads `state.data` (the Final Design entry's own payload is just
+the `finalDesign` object).
+
+`buildDecisionTreeMermaid(data)` returns `{ source, nodeTargets }` where
+`nodeTargets` maps each synthetic Mermaid id (`dtStep<i>`, `dtStep<i>Opt<o>`,
+`dtFinal`) to an entry index. Because Mermaid runs at `securityLevel: 'strict'`
+(its own `click` directive is sanitized away), clicks are wired **after** render
+via the `makeMermaidEl(..., { onRendered })` hook: `wireDecisionTreeClicks`
+walks `g.node` elements, recovers the node id from Mermaid's
+`flowchart-<id>-<n>` group id, and attaches a `selectEntry` listener (clicking
+the step nodes jumps to that step; the `dtFinal` node is a no-op since you're
+already on Final Design). If a future Mermaid upgrade changes that group-id
+format, update the regex in `wireDecisionTreeClicks`.
 
 ### Sub-steps (`step.parent`)
 

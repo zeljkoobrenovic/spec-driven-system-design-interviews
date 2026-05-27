@@ -83,10 +83,12 @@
         levelVariants: "by-level",
         followUps: "follow-ups",
         toProbeFurther: "to-probe-further",
+        explainerComic: "explainer-comic",
     };
 
     // Slugs that belong in the bottom "Wrap-up" sidebar group, in order.
     const WRAPUP_ORDER = [
+        INTRO_SLUGS.explainerComic,
         INTRO_SLUGS.satisfies,
         INTRO_SLUGS.technologyChoices,
         INTRO_SLUGS.apiFlows,
@@ -838,6 +840,9 @@
         }
         if (Array.isArray(data.steps)) {
             for (const step of data.steps) entries.push({kind: "step", id: step.id, title: step.title, payload: step});
+        }
+        if (typeof data.explainerComic === "string" && data.explainerComic.trim() !== "") {
+            entries.push({kind: "intro", id: INTRO_SLUGS.explainerComic, title: "Explainer Comic", payload: data.explainerComic});
         }
         if (data.satisfies && typeof data.satisfies === "object" && (
             (Array.isArray(data.satisfies.functional) && data.satisfies.functional.length > 0) ||
@@ -1995,7 +2000,7 @@
         els.visualTabs.hidden = false;
         [
             {id: "diagram", label: "Diagram"},
-            {id: "ai", label: "AI Visual"},
+            {id: "ai", label: "Alternative Visual (AI-generated)"},
         ].forEach((v) => {
             const btn = document.createElement("button");
             btn.type = "button";
@@ -2695,7 +2700,7 @@
 
         const views = [
             {id: "diagram", label: "Diagram", el: diagramEl},
-            {id: "ai", label: "AI Visual", el: img},
+            {id: "ai", label: "Alternative Visual (AI-generated)", el: img},
         ];
         let mode = "diagram";
         const buttons = [];
@@ -3159,8 +3164,14 @@
                 // dataset-relative path assigned by assign_tech_icons.py).
                 const name = typeof v === "string" ? v : (v && v.name) || "";
                 const iconPath = v && typeof v === "object" ? v.icon : "";
-                const chip = document.createElement("span");
+                // The chip is a link that opens a Google search for the tech in
+                // a new tab (rel=noopener so the new tab can't reach window.opener).
+                const chip = document.createElement("a");
                 chip.className = "tech-chip";
+                chip.href = "https://www.google.com/search?q=" + encodeURIComponent(String(name));
+                chip.target = "_blank";
+                chip.rel = "noopener noreferrer";
+                chip.title = "Search Google for " + String(name);
                 if (iconPath) {
                     const img = document.createElement("img");
                     img.className = "tech-chip-icon";
@@ -3215,24 +3226,22 @@
                 card.appendChild(cloudWrap);
             }
 
-            if (item.tradeoff) {
-                const t = document.createElement("p");
-                t.className = "tech-tradeoff";
-                const b = document.createElement("strong");
-                b.textContent = "When to self-host vs. managed: ";
-                t.appendChild(b);
-                t.appendChild(document.createTextNode(String(item.tradeoff)));
-                card.appendChild(t);
+            const irrelevantBullets = bulletsFrom(item.makesIrrelevant);
+            if (irrelevantBullets.length > 0) {
+                const label = document.createElement("div");
+                label.className = "tech-note-label";
+                label.textContent = "What technology can make irrelevant";
+                card.appendChild(label);
+                card.appendChild(makeBulletList(irrelevantBullets, "tech-irrelevant bullets"));
             }
 
-            if (item.makesIrrelevant) {
-                const m = document.createElement("p");
-                m.className = "tech-irrelevant";
-                const b = document.createElement("strong");
-                b.textContent = "What technology can make irrelevant: ";
-                m.appendChild(b);
-                m.appendChild(document.createTextNode(String(item.makesIrrelevant)));
-                card.appendChild(m);
+            const tradeoffBullets = bulletsFrom(item.tradeoff);
+            if (tradeoffBullets.length > 0) {
+                const label = document.createElement("div");
+                label.className = "tech-note-label";
+                label.textContent = "When to self-host vs. managed";
+                card.appendChild(label);
+                card.appendChild(makeBulletList(tradeoffBullets, "tech-tradeoff bullets"));
             }
 
             wrap.appendChild(card);
@@ -3244,6 +3253,41 @@
         const wrap = document.createElement("div");
         wrap.className = "followups-card";
         wrap.appendChild(makeBulletList(items));
+        return wrap;
+    }
+
+    // The Explainer Comic entry: a generated comic-strip image summarizing the
+    // whole interview (path is dataset-relative, written by
+    // generate_interview_comic.py). Shows the image, with a "open full size"
+    // link to the same asset in a new tab.
+    function renderIntroExplainerComic(path) {
+        const wrap = document.createElement("div");
+        wrap.className = "explainer-comic";
+        const src = assetUrl(path);
+        if (!src) {
+            wrap.textContent = "(no explainer comic)";
+            return wrap;
+        }
+        const link = document.createElement("a");
+        link.href = src;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.className = "explainer-comic-link";
+        const img = document.createElement("img");
+        img.className = "explainer-comic-img";
+        img.src = src;
+        img.alt = "Explainer comic for this interview";
+        img.loading = "lazy";
+        img.decoding = "async";
+        img.addEventListener("error", () => {
+            wrap.textContent = "(explainer comic image failed to load)";
+        });
+        link.appendChild(img);
+        wrap.appendChild(link);
+        const caption = document.createElement("div");
+        caption.className = "explainer-comic-caption muted";
+        caption.textContent = "A comic-strip walkthrough of this interview. Click to open full size.";
+        wrap.appendChild(caption);
         return wrap;
     }
 
@@ -3773,6 +3817,9 @@
             case INTRO_SLUGS.toProbeFurther:
                 node = renderIntroToProbeFurther(entry.payload);
                 break;
+            case INTRO_SLUGS.explainerComic:
+                node = renderIntroExplainerComic(entry.payload);
+                break;
             default:
                 node = document.createElement("div");
                 node.textContent = "(no renderer for this section)";
@@ -3991,6 +4038,8 @@
             }
             validateAssetPath(d.assets.icon, `Dataset ${path} assets.icon`);
         }
+        // Optional generated comic-strip summary (Wrap-up "Explainer Comic").
+        validateAssetPath(d.explainerComic, `Dataset ${path} explainerComic`);
         // Optional AI-generated visuals (path-based, relative to the dataset dir).
         // Top-level `aiVisuals` carries the requirements/capacity visuals; per-step,
         // per-option, and finalDesign visuals live in their own `aiVisual` field.

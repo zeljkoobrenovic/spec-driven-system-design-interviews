@@ -424,6 +424,9 @@ when absent, so the `examples` datasets are unaffected):
   makesIrrelevant? }` — self-hosted vs cloud-native/SaaS options by provider, a
   self-host-vs-managed trade-off, and a note on what a given choice can make
   unnecessary (e.g. a managed autoscaling DB removing the need to hand-shard).
+  `tradeoff` and `makesIrrelevant` are each a string **or** an array of strings;
+  both render as a bulleted list under a label (a string is sentence-split into
+  bullets via `bulletsFrom`, so prefer an array for clean, deliberate bullets).
   `steps[]` cross-links to the steps it relates to (clickable chips). Each tech
   chip in `selfHosted`/`cloud.*` is a bare string **or** `{ name, icon }`, where
   `icon` is a dataset-relative path shown to the left of the name.
@@ -463,6 +466,15 @@ when absent, so the `examples` datasets are unaffected):
   these (one image per option) under `assets/generated/ai-visuals/` and writes
   the `aiVisual`/`aiVisuals` paths back into `interview.json`. (The old
   final-design-only `finalDesign.image` field was removed.)
+- `explainerComic` (dataset, string path) → Wrap-up **"Explainer Comic"** entry,
+  rendered **first** in the Wrap-up group (it leads `WRAPUP_ORDER`). A single
+  generated comic-strip image summarizing the whole interview, shown full-width
+  with a click-to-open-full-size link. `_scripts/generate_interview_comic.py`
+  generates the image under `assets/generated/comic/` and writes the
+  dataset-relative `explainerComic` path back into `interview.json` (on a fresh
+  generation, or when it finds an existing image and just wires up the field;
+  `--force` regenerates, `--no-write-json` skips the write, `--dry-run` never
+  touches the JSON).
 
 `data/book/payment-system` is the reference dataset using the per-step/wrap-up
 fields; `data/book/notification-system` is a second full case;

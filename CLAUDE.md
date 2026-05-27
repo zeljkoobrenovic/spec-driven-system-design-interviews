@@ -177,8 +177,11 @@ The explorer (`interview.js`). One IIFE. Top to bottom:
 12. **Dataset loading** — `validateDataset`, `normalizeManifest`,
     `loadDataset`, `init`. `normalizeManifest` accepts the grouped manifest
     (`groups[]`), returning a flat `datasets` list (each tagged with
-    `groupId`/`groupName`) plus the `groups` for the dropdown's `<optgroup>`s.
-13. **Event wiring** — buttons, dataset dropdown, arrow keys, `hashchange`.
+    `groupId`/`groupName`) plus the `groups`. The explorer has **no dataset
+    picker** — you reach an interview from the overview or via the
+    `#<datasetId>/<entryId>` hash; the explorer only switches datasets in
+    response to a hash change.
+13. **Event wiring** — buttons, arrow keys, `hashchange`.
 
 The overview page (`overview.js`) is a separate, much smaller IIFE: fetch
 `data/index.json`, `normalizeGroups()` (same grouped-manifest logic), render one
@@ -415,6 +418,30 @@ when absent, so the `examples` datasets are unaffected):
 - `step.patterns` → per-step pattern-tag chips (string names, ideally matching
   a dataset-level pattern name).
 - `step.traps` → per-step "Common traps" section. Each `{ trap, why?, instead? }`.
+- `technologyChoices` (dataset) → Wrap-up "Technology Choices" entry (between
+  Design vs. Requirements and API Flows). Each is one architecture concern:
+  `{ concern, steps?, selfHosted[], cloud:{ aws[], gcp[], azure[] }, tradeoff?,
+  makesIrrelevant? }` — self-hosted vs cloud-native/SaaS options by provider, a
+  self-host-vs-managed trade-off, and a note on what a given choice can make
+  unnecessary (e.g. a managed autoscaling DB removing the need to hand-shard).
+  `steps[]` cross-links to the steps it relates to (clickable chips). Each tech
+  chip in `selfHosted`/`cloud.*` is a bare string **or** `{ name, icon }`, where
+  `icon` is a dataset-relative path shown to the left of the name.
+  `_scripts/assign_tech_icons.py <interview.json>` assigns those icons from a
+  curated mapping in **`_media/index.yaml`** (a list of `{ icon, terms }`;
+  terms match case-insensitively, with parenthetical qualifiers stripped, a
+  longest-leading-prefix fallback, and a `/`-segment fallback so "IPVS/LVS",
+  "Aurora (PostgreSQL/MySQL)", etc. resolve). It copies each matched icon (or
+  `_media/tech.png` for unmatched terms) into `<interview>/assets/tech-icons/`,
+  rewrites the chips to `{ name, icon }`, and keeps **`_media/missing.yaml`** in
+  sync as the list of **every term that uses the `tech.png` fallback** (no match,
+  family-rejected, or mapped file absent) — adding new fallbacks and pruning
+  terms that now resolve. **Provider rule (enforced):** an AWS-column chip may
+  only use an icon under `aws-icons/`, GCP only `gcp-icons/` (per-category
+  icons), Azure only `azure-icons/` (per-service SVGs); a cross-family mapping
+  is rejected and falls back to `tech.png`. Self-hosted chips may use any
+  directory (usually `general-icons/`). To fix a chip's icon, edit
+  `_media/index.yaml` (and remove the term from `missing.yaml`) and re-run.
 - `interviewScript` (dataset) → Wrap-up "Interview Script" entry. Each
   `{ phase, time?, say }` (`say` is a string or array).
 - `levelVariants` (dataset) → Wrap-up "By Level" entry. Each
@@ -423,10 +450,19 @@ when absent, so the `examples` datasets are unaffected):
   `category`. Each `{ name, category?, what, whenToUse?, tradeoffs?, usedBy? }`.
   **A dataset with `patternCatalog` and no `steps` is valid** (a catalog, not a
   walkthrough) — `validateDataset` requires `steps[]` *or* `patternCatalog[]`.
-- Generated visual assets are optional and path-based. Top-level `assets`
-  stores `icon`; pattern/concept objects use `icon`; `finalDesign` uses
-  `image`. Generated images are only rendered for the final design. Paths are
-  relative to the dataset directory and render only when present.
+- Generated visual assets are optional and path-based, relative to the dataset
+  directory. Top-level `assets` stores `icon`; pattern/concept objects use
+  `icon` (small inline icons). **AI Visuals** are full diagram-replacement
+  images: `aiVisual` (a string path) lives on each `step`, each step/finalDesign
+  `option`, and `finalDesign`; the requirements/capacity visuals live in a
+  top-level `aiVisuals: { requirements, capacity }`. When present, the explorer
+  shows a **Diagram | AI Visual** tab strip above the diagram that flips between
+  the Mermaid diagram and the generated image (for steps/final design the visual
+  follows the selected option; for requirements/capacity it's a self-contained
+  toggle in the intro section). `_scripts/generate_diagram_picture.py` generates
+  these (one image per option) under `assets/generated/ai-visuals/` and writes
+  the `aiVisual`/`aiVisuals` paths back into `interview.json`. (The old
+  final-design-only `finalDesign.image` field was removed.)
 
 `data/book/payment-system` is the reference dataset using the per-step/wrap-up
 fields; `data/book/notification-system` is a second full case;
@@ -488,7 +524,7 @@ per family. Foundational/social families are intentionally left to `examples`.
 - **Adding a new dataset**: create it under `data/<group>/<id>/interview.json`
   and register it inside one of the `groups[]` categories in that group's
   `data/<group>/index.json` (`{ id, name, path }`), otherwise it won't appear in
-  the dropdown or the overview. Optionally drop a `data/<group>/<id>/icon.png`
+  the overview (or be reachable in the explorer). Optionally drop a `data/<group>/<id>/icon.png`
   for the overview card (else it falls back to `icons/system-design.png`). Then
   re-run `python3 build.py` and commit `docs/`.
 - **Manifest is grouped**: `index.json` is `{ groups: [{ id, name, datasets:

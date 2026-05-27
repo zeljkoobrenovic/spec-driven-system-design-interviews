@@ -19,7 +19,8 @@
     // ---------- DOM ----------
     const els = {
         datasetTitle: document.getElementById("dataset-title"),
-        datasetSelect: document.getElementById("dataset-select"),
+        datasetIcon: document.getElementById("dataset-icon"),
+        content: document.getElementById("content"),
         navList: document.getElementById("nav-list"),
         stepTitle: document.getElementById("step-title"),
         stepDescription: document.getElementById("step-description"),
@@ -31,8 +32,10 @@
         diagramHeading: document.getElementById("diagram-heading"),
         diagramDescription: document.getElementById("diagram-description"),
         diagramViewTabs: document.getElementById("diagram-view-tabs"),
+        visualTabs: document.getElementById("visual-tabs"),
         diagramControls: document.getElementById("diagram-controls"),
         diagram: document.getElementById("diagram"),
+        diagramImage: document.getElementById("diagram-image"),
         diagramLegend: document.getElementById("diagram-legend"),
         optionTabs: document.getElementById("option-tabs"),
         optionDescription: document.getElementById("option-description"),
@@ -58,6 +61,7 @@
         currentOptionIndex: 0,  // per-step (reset on entry change)
         currentFlowIndex: 0,    // per-step (reset on entry change)
         currentDiagramView: "focus",
+        visualMode: "diagram",    // "diagram" | "ai" — Diagram vs AI Visual tab (reset per entry)
         diagramDirection: "TB",   // step/final-design layout; toggled TB<->LR (reset per entry)
         hiddenNodes: new Set(),   // node ids toggled off in the current diagram (reset per entry)
     };
@@ -74,6 +78,7 @@
         finalDesign: "final-design",
         apiFlows: "api-flows",
         satisfies: "satisfies",
+        technologyChoices: "technology-choices",
         interviewScript: "interview-script",
         levelVariants: "by-level",
         followUps: "follow-ups",
@@ -82,8 +87,9 @@
 
     // Slugs that belong in the bottom "Wrap-up" sidebar group, in order.
     const WRAPUP_ORDER = [
-        INTRO_SLUGS.apiFlows,
         INTRO_SLUGS.satisfies,
+        INTRO_SLUGS.technologyChoices,
+        INTRO_SLUGS.apiFlows,
         INTRO_SLUGS.levelVariants,
         INTRO_SLUGS.followUps,
         INTRO_SLUGS.toProbeFurther,
@@ -162,30 +168,6 @@
         return img;
     }
 
-    function renderGeneratedImage(path, alt) {
-        const src = assetUrl(path);
-        if (!src) return null;
-        const figure = document.createElement("figure");
-        figure.className = "generated-image-card";
-        const link = document.createElement("a");
-        link.className = "generated-image-link";
-        link.href = src;
-        link.target = "_blank";
-        link.rel = "noopener noreferrer";
-        const img = document.createElement("img");
-        img.className = "generated-image";
-        img.src = src;
-        img.alt = alt || "Generated image";
-        img.loading = "lazy";
-        img.decoding = "async";
-        link.appendChild(img);
-        figure.appendChild(link);
-        const section = makeSection("Generated Image", figure, "generated-image-section");
-        img.addEventListener("error", () => {
-            section.remove();
-        });
-        return section;
-    }
 
     async function loadNodeTypeConfig() {
         const cfg = await fetchJson("node-types.json");
@@ -857,14 +839,17 @@
         if (Array.isArray(data.steps)) {
             for (const step of data.steps) entries.push({kind: "step", id: step.id, title: step.title, payload: step});
         }
-        if (Array.isArray(data.api) && data.api.length > 0) {
-            entries.push({kind: "intro", id: INTRO_SLUGS.apiFlows, title: "API Flows", payload: data.api});
-        }
         if (data.satisfies && typeof data.satisfies === "object" && (
             (Array.isArray(data.satisfies.functional) && data.satisfies.functional.length > 0) ||
             (Array.isArray(data.satisfies.nonFunctional) && data.satisfies.nonFunctional.length > 0)
         )) {
             entries.push({kind: "intro", id: INTRO_SLUGS.satisfies, title: "Design vs. Requirements", payload: data.satisfies});
+        }
+        if (Array.isArray(data.technologyChoices) && data.technologyChoices.length > 0) {
+            entries.push({kind: "intro", id: INTRO_SLUGS.technologyChoices, title: "Technology Choices", payload: data.technologyChoices});
+        }
+        if (Array.isArray(data.api) && data.api.length > 0) {
+            entries.push({kind: "intro", id: INTRO_SLUGS.apiFlows, title: "API Flows", payload: data.api});
         }
         if (Array.isArray(data.levelVariants) && data.levelVariants.length > 0) {
             entries.push({kind: "intro", id: INTRO_SLUGS.levelVariants, title: "Expectations By Level", payload: data.levelVariants});
@@ -1483,6 +1468,19 @@
         return step.view || null;
     }
 
+    // The AI-generated visual path for what's currently shown: the selected
+    // option's `aiVisual` (falling back to the step's), or the step's when there
+    // are no options. Returns "" when none. Tracks the active option tab.
+    function activeAiVisualFor(step) {
+        if (!step) return "";
+        if (Array.isArray(step.options) && step.options.length > 0) {
+            const opt = step.options[state.currentOptionIndex] || step.options[0];
+            const v = opt && typeof opt.aiVisual === "string" ? opt.aiVisual : "";
+            if (v) return v;
+        }
+        return typeof step.aiVisual === "string" ? step.aiVisual : "";
+    }
+
     function defaultDiagramFor(step) {
         if (!step) return "";
         if (Array.isArray(step.options) && step.options.length > 0) {
@@ -1806,9 +1804,15 @@
     function renderDiagramControls(nodes) {
         const host = els.diagramControls;
         if (!host) return;
+        // The legend may have been moved into this panel on a prior render;
+        // detach it first so innerHTML reset doesn't destroy the cached node.
+        if (els.diagramLegend && els.diagramLegend.parentNode === host) {
+            host.removeChild(els.diagramLegend);
+        }
         host.innerHTML = "";
         if (!Array.isArray(nodes) || nodes.length === 0) {
             host.hidden = true;
+            if (els.diagramLegend) els.diagramLegend.hidden = true;
             return;
         }
         host.hidden = false;
@@ -1873,6 +1877,11 @@
         dlBtn.addEventListener("click", downloadDiagramSvg);
         dlWrap.appendChild(dlBtn);
         host.appendChild(dlWrap);
+
+        // The highlight legend lives at the bottom of this controls column.
+        // renderDiagramLegend() (called after the diagram renders) toggles its
+        // visibility/text; we just move the existing node into place here.
+        if (els.diagramLegend) host.appendChild(els.diagramLegend);
     }
 
     // Serialize the rendered diagram SVG and trigger a file download. The SVG
@@ -1969,6 +1978,66 @@
             btn.addEventListener("click", () => selectDiagramView(view.id));
             els.diagramViewTabs.appendChild(btn);
         });
+    }
+
+    // A "Diagram | AI Visual" tab strip shown above the diagram, but only when
+    // an AI-generated visual exists for what's currently shown. Toggling does
+    // not re-render the whole entry — it just flips which element is visible
+    // (see applyVisualMode). Used by step/final-design diagrams.
+    function renderVisualTabs(hasVisual) {
+        if (!els.visualTabs) return;
+        els.visualTabs.innerHTML = "";
+        if (!hasVisual) {
+            els.visualTabs.hidden = true;
+            state.visualMode = "diagram";
+            return;
+        }
+        els.visualTabs.hidden = false;
+        [
+            {id: "diagram", label: "Diagram"},
+            {id: "ai", label: "AI Visual"},
+        ].forEach((v) => {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "visual-tab" + (v.id === state.visualMode ? " active" : "");
+            btn.textContent = v.label;
+            btn.setAttribute("role", "tab");
+            btn.setAttribute("aria-selected", v.id === state.visualMode ? "true" : "false");
+            btn.addEventListener("click", () => selectVisualMode(v.id));
+            els.visualTabs.appendChild(btn);
+        });
+    }
+
+    // Show either the Mermaid diagram or the AI-visual image in the diagram
+    // container, per state.visualMode. `aiVisualPath` is dataset-relative.
+    function applyVisualMode(aiVisualPath) {
+        const showAi = state.visualMode === "ai" && !!aiVisualPath;
+        if (els.diagram) els.diagram.hidden = showAi;
+        if (els.diagramImage) {
+            if (showAi) {
+                const src = assetUrl(aiVisualPath);
+                if (els.diagramImage.getAttribute("src") !== src) els.diagramImage.src = src;
+                els.diagramImage.hidden = false;
+            } else {
+                els.diagramImage.hidden = true;
+            }
+        }
+        // Layout controls (node toggles, TB/LR, download) only make sense for
+        // the diagram; hide them while the AI visual is showing.
+        if (els.diagramControls && !els.diagramControls.hidden && showAi) {
+            els.diagramControls.dataset.suppressed = "1";
+            els.diagramControls.hidden = true;
+        } else if (els.diagramControls && els.diagramControls.dataset.suppressed === "1" && !showAi) {
+            delete els.diagramControls.dataset.suppressed;
+            els.diagramControls.hidden = false;
+        }
+    }
+
+    function selectVisualMode(mode) {
+        if (mode !== "diagram" && mode !== "ai") return;
+        if (mode === state.visualMode) return;
+        state.visualMode = mode;
+        renderCurrentEntry();
     }
 
     function renderOptionTabs(step) {
@@ -2601,8 +2670,75 @@
     // The optional `opts` argument supports `{ highlightParticipants,
     // sourceForLabels, annotateParticipants, annotateNodeTypes }`
     // for sequence diagrams. We can't use Mermaid's `classDef`/`class` syntax
-    // there (the sequence parser rejects it), so instead we patch the rendered
-    // SVG to tag participant boxes whose label matches a highlighted id.
+    // Wrap an intro diagram element (requirements/capacity) in a local
+    // "Diagram | AI Visual" tab strip when an AI-generated visual exists. The
+    // toggle is self-contained (its own DOM state), independent of the
+    // step-diagram visualMode. Returns the diagram element unchanged when there
+    // is no aiVisual. `aiVisualPath` is dataset-relative.
+    function makeVisualSwitcher(diagramEl, aiVisualPath, alt) {
+        const src = aiVisualPath ? assetUrl(aiVisualPath) : "";
+        if (!diagramEl || !src) return diagramEl;
+        const wrap = document.createElement("div");
+        wrap.className = "visual-switcher";
+
+        const tabs = document.createElement("div");
+        tabs.className = "visual-tabs";
+        tabs.setAttribute("role", "tablist");
+
+        const img = document.createElement("img");
+        img.className = "diagram-image intro-ai-visual";
+        img.src = src;
+        img.alt = alt || "AI-generated visual";
+        img.loading = "lazy";
+        img.decoding = "async";
+        img.hidden = true;
+
+        const views = [
+            {id: "diagram", label: "Diagram", el: diagramEl},
+            {id: "ai", label: "AI Visual", el: img},
+        ];
+        let mode = "diagram";
+        const buttons = [];
+        function apply() {
+            views.forEach((v) => { v.el.hidden = v.id !== mode; });
+            buttons.forEach((b) => {
+                const on = b.dataset.mode === mode;
+                b.classList.toggle("active", on);
+                b.setAttribute("aria-selected", on ? "true" : "false");
+            });
+        }
+        views.forEach((v) => {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "visual-tab";
+            btn.dataset.mode = v.id;
+            btn.textContent = v.label;
+            btn.setAttribute("role", "tab");
+            btn.addEventListener("click", () => { mode = v.id; apply(); });
+            buttons.push(btn);
+            tabs.appendChild(btn);
+        });
+
+        wrap.appendChild(tabs);
+        wrap.appendChild(diagramEl);
+        wrap.appendChild(img);
+        apply();
+        return wrap;
+    }
+
+    // A standalone AI-visual image (no Mermaid alternative to toggle against).
+    function makeAiVisualOnly(aiVisualPath, alt) {
+        const src = aiVisualPath ? assetUrl(aiVisualPath) : "";
+        if (!src) return document.createComment("no ai visual");
+        const img = document.createElement("img");
+        img.className = "diagram-image intro-ai-visual standalone";
+        img.src = src;
+        img.alt = alt || "AI-generated visual";
+        img.loading = "lazy";
+        img.decoding = "async";
+        return img;
+    }
+
     function makeMermaidEl(diagramSrc, className, opts) {
         diagramSrc = diagramSource(diagramSrc);
         const annotateNodeTypes = !opts || opts.annotateNodeTypes !== false;
@@ -2695,11 +2831,16 @@
             list.id = "dataset-description";
             outer.appendChild(list);
         }
+        const reqVisual = state.data && state.data.aiVisuals && typeof state.data.aiVisuals.requirements === "string"
+            ? state.data.aiVisuals.requirements : "";
         if (state.data && hasDiagram(state.data.requirementsDiagram)) {
             // Requirements diagrams lay out left-to-right.
-            outer.appendChild(makeMermaidEl(forceFlowchartDirection(state.data.requirementsDiagram, "LR"), "requirements-diagram", {
+            const diagramEl = makeMermaidEl(forceFlowchartDirection(state.data.requirementsDiagram, "LR"), "requirements-diagram", {
                 annotateNodeTypes: false,
-            }));
+            });
+            outer.appendChild(makeVisualSwitcher(diagramEl, reqVisual, "Requirements — AI visual"));
+        } else if (reqVisual) {
+            outer.appendChild(makeAiVisualOnly(reqVisual, "Requirements — AI visual"));
         }
         const wrap = document.createElement("div");
         wrap.className = "req-columns";
@@ -2731,11 +2872,16 @@
 
     function renderIntroCapacity(rows) {
         const outer = document.createElement("div");
+        const capVisual = state.data && state.data.aiVisuals && typeof state.data.aiVisuals.capacity === "string"
+            ? state.data.aiVisuals.capacity : "";
         if (state.data && hasDiagram(state.data.capacityDiagram)) {
             // Capacity-estimation diagrams lay out left-to-right.
-            outer.appendChild(makeMermaidEl(forceFlowchartDirection(state.data.capacityDiagram, "LR"), "capacity-diagram", {
+            const diagramEl = makeMermaidEl(forceFlowchartDirection(state.data.capacityDiagram, "LR"), "capacity-diagram", {
                 annotateNodeTypes: false,
-            }));
+            });
+            outer.appendChild(makeVisualSwitcher(diagramEl, capVisual, "Capacity planning — AI visual"));
+        } else if (capVisual) {
+            outer.appendChild(makeAiVisualOnly(capVisual, "Capacity planning — AI visual"));
         }
         const table = document.createElement("table");
         table.className = "capacity-table";
@@ -2987,6 +3133,110 @@
 
         wrap.appendChild(col("Functional", payload.functional));
         wrap.appendChild(col("Non-functional", payload.nonFunctional));
+        return wrap;
+    }
+
+    // Wrap-up > Technology Choices. Each item is a concern:
+    // { concern, steps?, selfHosted[], cloud:{aws,gcp,azure}, tradeoff?, makesIrrelevant? }.
+    // Self-hosted vs cloud-native/SaaS (by provider), with a trade-off line and a
+    // note on what a given choice can make unnecessary.
+    function renderIntroTechChoices(items) {
+        const wrap = document.createElement("div");
+        wrap.className = "tech-choices";
+
+        function chipRow(label, values) {
+            if (!Array.isArray(values) || values.length === 0) return null;
+            const row = document.createElement("div");
+            row.className = "tech-row";
+            const lab = document.createElement("span");
+            lab.className = "tech-row-label";
+            lab.textContent = label;
+            row.appendChild(lab);
+            const chips = document.createElement("div");
+            chips.className = "tech-chip-list";
+            for (const v of values) {
+                // Each chip is a bare string or { name, icon } (icon is a
+                // dataset-relative path assigned by assign_tech_icons.py).
+                const name = typeof v === "string" ? v : (v && v.name) || "";
+                const iconPath = v && typeof v === "object" ? v.icon : "";
+                const chip = document.createElement("span");
+                chip.className = "tech-chip";
+                if (iconPath) {
+                    const img = document.createElement("img");
+                    img.className = "tech-chip-icon";
+                    img.src = assetUrl(iconPath);
+                    img.alt = "";
+                    img.loading = "lazy";
+                    img.decoding = "async";
+                    img.addEventListener("error", () => img.remove());
+                    chip.appendChild(img);
+                }
+                chip.appendChild(document.createTextNode(String(name)));
+                chips.appendChild(chip);
+            }
+            row.appendChild(chips);
+            return row;
+        }
+
+        for (const item of (Array.isArray(items) ? items : [])) {
+            if (!item || typeof item !== "object") continue;
+            const card = document.createElement("div");
+            card.className = "tech-card";
+
+            const head = document.createElement("div");
+            head.className = "tech-head";
+            const title = document.createElement("h3");
+            title.className = "tech-concern";
+            title.textContent = item.concern || "Technology choice";
+            head.appendChild(title);
+            if (Array.isArray(item.steps) && item.steps.length > 0) {
+                head.appendChild(makeStepChips(item.steps));
+            }
+            card.appendChild(head);
+
+            const self = chipRow("Self-hosted", item.selfHosted);
+            if (self) card.appendChild(self);
+
+            const cloud = item.cloud && typeof item.cloud === "object" ? item.cloud : {};
+            const cloudWrap = document.createElement("div");
+            cloudWrap.className = "tech-cloud";
+            [["AWS", cloud.aws], ["GCP", cloud.gcp], ["Azure", cloud.azure]].forEach(([label, vals]) => {
+                const r = chipRow(label, vals);
+                if (r) {
+                    r.classList.add("tech-cloud-row");
+                    cloudWrap.appendChild(r);
+                }
+            });
+            if (cloudWrap.children.length > 0) {
+                const cloudLabel = document.createElement("div");
+                cloudLabel.className = "tech-section-label";
+                cloudLabel.textContent = "Cloud-native / SaaS";
+                card.appendChild(cloudLabel);
+                card.appendChild(cloudWrap);
+            }
+
+            if (item.tradeoff) {
+                const t = document.createElement("p");
+                t.className = "tech-tradeoff";
+                const b = document.createElement("strong");
+                b.textContent = "When to self-host vs. managed: ";
+                t.appendChild(b);
+                t.appendChild(document.createTextNode(String(item.tradeoff)));
+                card.appendChild(t);
+            }
+
+            if (item.makesIrrelevant) {
+                const m = document.createElement("p");
+                m.className = "tech-irrelevant";
+                const b = document.createElement("strong");
+                b.textContent = "What technology can make irrelevant: ";
+                m.appendChild(b);
+                m.appendChild(document.createTextNode(String(item.makesIrrelevant)));
+                card.appendChild(m);
+            }
+
+            wrap.appendChild(card);
+        }
         return wrap;
     }
 
@@ -3508,6 +3758,9 @@
             case INTRO_SLUGS.satisfies:
                 node = renderIntroSatisfies(entry.payload);
                 break;
+            case INTRO_SLUGS.technologyChoices:
+                node = renderIntroTechChoices(entry.payload);
+                break;
             case INTRO_SLUGS.interviewScript:
                 node = renderIntroInterviewScript(entry.payload);
                 break;
@@ -3582,6 +3835,9 @@
         }
         renderDiagramViewTabs(entry);
         renderOptionTabs(step);
+        // Diagram vs AI Visual toggle — follows the selected option.
+        const aiVisual = activeAiVisualFor(step);
+        renderVisualTabs(!!aiVisual);
         renderDiagramCaption(step, isFinalDesign);
         renderProsCons(step);
         const focus = effectiveDiagramFor(step);
@@ -3596,11 +3852,9 @@
             diagramPrevStep = null;
         }
         await renderDiagram(diagram, highlight, diagramPrevStep);
+        applyVisualMode(aiVisual);
 
         renderStepExtras(step);
-        if (entry.id === INTRO_SLUGS.finalDesign) {
-            appendStepExtra(renderGeneratedImage(step.image, `${step.title || "Target Final Design"} generated image`));
-        }
     }
 
     async function renderCurrentEntry() {
@@ -3645,7 +3899,10 @@
         state.currentOptionIndex = 0; // reset on entry change
         state.currentFlowIndex = 0;
         state.currentDiagramView = "focus";
+        state.visualMode = "diagram"; // start each entry on the diagram, not the AI visual
         resetDiagramInteractivity();
+        // New entry: always start scrolled at the top of the content pane.
+        if (els.content) els.content.scrollTop = 0;
         renderCurrentEntry();
     }
 
@@ -3732,14 +3989,54 @@
             if (!d.assets || typeof d.assets !== "object" || Array.isArray(d.assets)) {
                 throw new Error(`Dataset ${path}: "assets" must be an object if present`);
             }
-            for (const key of ["icon"]) {
-                validateAssetPath(d.assets[key], `Dataset ${path} assets.${key}`);
+            validateAssetPath(d.assets.icon, `Dataset ${path} assets.icon`);
+        }
+        // Optional AI-generated visuals (path-based, relative to the dataset dir).
+        // Top-level `aiVisuals` carries the requirements/capacity visuals; per-step,
+        // per-option, and finalDesign visuals live in their own `aiVisual` field.
+        if (d.aiVisuals !== undefined) {
+            if (!d.aiVisuals || typeof d.aiVisuals !== "object" || Array.isArray(d.aiVisuals)) {
+                throw new Error(`Dataset ${path}: "aiVisuals" must be an object if present`);
             }
-            for (const key of ["requirements", "capacityEstimation", "apiDesign"]) {
-                if (d.assets[key] !== undefined) {
-                    throw new Error(`Dataset ${path}: assets.${key} is not supported; generated images are only rendered for finalDesign.image`);
+            validateAssetPath(d.aiVisuals.requirements, `Dataset ${path} aiVisuals.requirements`);
+            validateAssetPath(d.aiVisuals.capacity, `Dataset ${path} aiVisuals.capacity`);
+        }
+        if (d.technologyChoices !== undefined) {
+            if (!Array.isArray(d.technologyChoices)) {
+                throw new Error(`Dataset ${path}: "technologyChoices" must be an array if present`);
+            }
+            d.technologyChoices.forEach((item, i) => {
+                if (!item || typeof item !== "object" || Array.isArray(item)) {
+                    throw new Error(`Dataset ${path}: technologyChoices[${i}] must be an object`);
                 }
-            }
+                if (!item.concern || typeof item.concern !== "string") {
+                    throw new Error(`Dataset ${path}: technologyChoices[${i}] needs a non-empty "concern" string`);
+                }
+                if (item.steps !== undefined && !Array.isArray(item.steps)) {
+                    throw new Error(`Dataset ${path}: technologyChoices[${i}].steps must be an array if present`);
+                }
+                if (item.cloud !== undefined && (typeof item.cloud !== "object" || Array.isArray(item.cloud))) {
+                    throw new Error(`Dataset ${path}: technologyChoices[${i}].cloud must be an object if present`);
+                }
+                // Chips are bare strings OR { name, icon? } (icon is a path).
+                const checkChips = (chips, label) => {
+                    if (chips === undefined) return;
+                    if (!Array.isArray(chips)) {
+                        throw new Error(`Dataset ${path}: technologyChoices[${i}].${label} must be an array`);
+                    }
+                    chips.forEach((chip, j) => {
+                        if (typeof chip === "string") return;
+                        if (!chip || typeof chip !== "object" || Array.isArray(chip) || !chip.name) {
+                            throw new Error(`Dataset ${path}: technologyChoices[${i}].${label}[${j}] must be a string or { name, icon? }`);
+                        }
+                        validateAssetPath(chip.icon, `Dataset ${path} technologyChoices[${i}].${label}[${j}].icon`);
+                    });
+                };
+                checkChips(item.selfHosted, "selfHosted");
+                if (item.cloud && typeof item.cloud === "object") {
+                    ["aws", "gcp", "azure"].forEach((p) => checkChips(item.cloud[p], `cloud.${p}`));
+                }
+            });
         }
         const knownProbeLinks = new Set();
         if (d.toProbeFurther !== undefined) {
@@ -3769,8 +4066,13 @@
         (d.steps || []).forEach((step, i) => {
             if (!step || typeof step !== "object") throw new Error(`Step ${i} is not an object`);
             if (step.diagram !== undefined) throw new Error(`Step ${i} ("${step.title || step.id || ""}") must use "view", not "diagram"`);
-            if (step.image !== undefined) {
-                throw new Error(`Step ${i} ("${step.title || step.id || ""}"): generated images are only supported for finalDesign.image`);
+            validateAssetPath(step.aiVisual, `Step ${i} ("${step.title || step.id || ""}") aiVisual`);
+            if (Array.isArray(step.options)) {
+                step.options.forEach((opt, k) => {
+                    if (opt && typeof opt === "object") {
+                        validateAssetPath(opt.aiVisual, `Step ${i} option ${k} aiVisual`);
+                    }
+                });
             }
             if (step.probeLinks !== undefined) {
                 if (!Array.isArray(step.probeLinks)) {
@@ -3806,9 +4108,10 @@
         });
         if (d.finalDesign) {
             if (d.finalDesign.diagram !== undefined) throw new Error(`Dataset ${path}: finalDesign must use "view", not "diagram"`);
-            validateAssetPath(d.finalDesign.image, `Dataset ${path}: finalDesign.image`);
+            validateAssetPath(d.finalDesign.aiVisual, `Dataset ${path}: finalDesign.aiVisual`);
             (d.finalDesign.options || []).forEach((opt, j) => {
                 if (opt.diagram !== undefined) throw new Error(`Dataset ${path}: finalDesign option ${j} must use "view", not "diagram"`);
+                validateAssetPath(opt.aiVisual, `Dataset ${path}: finalDesign option ${j} aiVisual`);
             });
         }
         if (d.finalDesign && !hasStepLikeDiagram(d.finalDesign)) {
@@ -3943,6 +4246,35 @@
         });
     }
 
+    // Show the interview's icon in the header — but only if one is defined and
+    // actually loads. Resolution mirrors the overview: explicit `assets.icon`
+    // (dataset-relative) or manifest `icon`, else the conventional
+    // `<dataset dir>/icon.png`. Unlike concept/pattern icons there is no shared
+    // fallback here: if the candidate is missing or fails to load, the header
+    // shows the title alone.
+    function renderDatasetHeaderIcon(meta, data) {
+        const el = els.datasetIcon;
+        if (!el) return;
+        let src = "";
+        if (data && data.assets && typeof data.assets.icon === "string" && data.assets.icon) {
+            src = assetUrl(data.assets.icon);
+        } else if (meta && meta.icon) {
+            src = meta.icon;
+        } else if (meta && typeof meta.path === "string" && meta.path.includes("/")) {
+            src = meta.path.replace(/\/[^/]*$/, "/") + "icon.png";
+        }
+        if (!src) {
+            el.hidden = true;
+            el.removeAttribute("src");
+            return;
+        }
+        el.alt = `${(data && data.title) || (meta && meta.name) || "Interview"} icon`;
+        el.onerror = () => { el.hidden = true; };
+        el.onload = () => { el.hidden = false; };
+        el.hidden = true; // stay hidden until it actually loads
+        el.src = src;
+    }
+
     async function loadDataset(datasetId, initialEntryId) {
         const meta = state.datasets.find((d) => d.id === datasetId);
         if (!meta) {
@@ -3961,6 +4293,7 @@
             state.entries = buildEntries(data);
 
             els.datasetTitle.textContent = data.title || meta.name || "System Design Explorer";
+            renderDatasetHeaderIcon(meta, data);
 
             let startIndex = 0;
             if (initialEntryId) {
@@ -3973,6 +4306,7 @@
             state.currentDiagramView = "focus";
 
             renderNav();
+            if (els.content) els.content.scrollTop = 0;
             await renderCurrentEntry();
         } catch (err) {
             showError(err.message || String(err));
@@ -4000,24 +4334,6 @@
         return {groups, datasets};
     }
 
-    function populateDatasetSelect() {
-        els.datasetSelect.innerHTML = "";
-        const single = state.groups.length <= 1;
-        state.groups.forEach((g) => {
-            const parent = single
-                ? els.datasetSelect
-                : els.datasetSelect.appendChild(
-                      Object.assign(document.createElement("optgroup"), {label: g.name})
-                  );
-            g.datasets.forEach((d) => {
-                const opt = document.createElement("option");
-                opt.value = d.id;
-                opt.textContent = d.name || d.id;
-                parent.appendChild(opt);
-            });
-        });
-    }
-
     async function init() {
         try {
             const manifest = await fetchJson("data/index.json");
@@ -4028,7 +4344,6 @@
             state.groups = groups;
             state.datasets = datasets;
             state.nodeTypeConfig = await loadNodeTypeConfig();
-            populateDatasetSelect();
 
             const hash = parseHash();
             const initialDatasetId = (hash && hash.datasetId && state.datasets.find((d) => d.id === hash.datasetId))
@@ -4036,7 +4351,6 @@
                 : state.datasets[0].id;
             const initialEntryId = hash ? hash.entryId : null;
 
-            els.datasetSelect.value = initialDatasetId;
             await loadDataset(initialDatasetId, initialEntryId);
         } catch (err) {
             showError(err.message || String(err));
@@ -4047,8 +4361,6 @@
 
     els.prevBtn.addEventListener("click", () => selectEntry(state.currentEntryIndex - 1));
     els.nextBtn.addEventListener("click", () => selectEntry(state.currentEntryIndex + 1));
-
-    els.datasetSelect.addEventListener("change", (e) => loadDataset(e.target.value, null));
 
     document.addEventListener("keydown", (e) => {
         const t = e.target;
@@ -4066,7 +4378,6 @@
         const h = parseHash();
         if (!h) return;
         if (h.datasetId && h.datasetId !== state.currentDatasetId) {
-            els.datasetSelect.value = h.datasetId;
             loadDataset(h.datasetId, h.entryId);
             return;
         }

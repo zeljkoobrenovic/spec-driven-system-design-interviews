@@ -3155,9 +3155,23 @@
             const chips = document.createElement("div");
             chips.className = "tech-chip-list";
             for (const v of values) {
+                // Each chip is a bare string or { name, icon } (icon is a
+                // dataset-relative path assigned by assign_tech_icons.py).
+                const name = typeof v === "string" ? v : (v && v.name) || "";
+                const iconPath = v && typeof v === "object" ? v.icon : "";
                 const chip = document.createElement("span");
                 chip.className = "tech-chip";
-                chip.textContent = String(v);
+                if (iconPath) {
+                    const img = document.createElement("img");
+                    img.className = "tech-chip-icon";
+                    img.src = assetUrl(iconPath);
+                    img.alt = "";
+                    img.loading = "lazy";
+                    img.decoding = "async";
+                    img.addEventListener("error", () => img.remove());
+                    chip.appendChild(img);
+                }
+                chip.appendChild(document.createTextNode(String(name)));
                 chips.appendChild(chip);
             }
             row.appendChild(chips);
@@ -3215,7 +3229,7 @@
                 const m = document.createElement("p");
                 m.className = "tech-irrelevant";
                 const b = document.createElement("strong");
-                b.textContent = "What this can make irrelevant: ";
+                b.textContent = "What technology can make irrelevant: ";
                 m.appendChild(b);
                 m.appendChild(document.createTextNode(String(item.makesIrrelevant)));
                 card.appendChild(m);
@@ -4003,6 +4017,24 @@
                 }
                 if (item.cloud !== undefined && (typeof item.cloud !== "object" || Array.isArray(item.cloud))) {
                     throw new Error(`Dataset ${path}: technologyChoices[${i}].cloud must be an object if present`);
+                }
+                // Chips are bare strings OR { name, icon? } (icon is a path).
+                const checkChips = (chips, label) => {
+                    if (chips === undefined) return;
+                    if (!Array.isArray(chips)) {
+                        throw new Error(`Dataset ${path}: technologyChoices[${i}].${label} must be an array`);
+                    }
+                    chips.forEach((chip, j) => {
+                        if (typeof chip === "string") return;
+                        if (!chip || typeof chip !== "object" || Array.isArray(chip) || !chip.name) {
+                            throw new Error(`Dataset ${path}: technologyChoices[${i}].${label}[${j}] must be a string or { name, icon? }`);
+                        }
+                        validateAssetPath(chip.icon, `Dataset ${path} technologyChoices[${i}].${label}[${j}].icon`);
+                    });
+                };
+                checkChips(item.selfHosted, "selfHosted");
+                if (item.cloud && typeof item.cloud === "object") {
+                    ["aws", "gcp", "azure"].forEach((p) => checkChips(item.cloud[p], `cloud.${p}`));
                 }
             });
         }

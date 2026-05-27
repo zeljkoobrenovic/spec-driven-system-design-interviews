@@ -5,863 +5,672 @@ Review date: 2026-05-27
 
 ## Executive Summary
 
-This is a strong flagship-style system design case. The core arc is clear and
-teachable: begin with a fragile synchronous provider call, introduce a durable
-queue and workers, then layer deduplication, fanout, preferences, multi-channel
-routing, rate limiting, and finally queue sharding/fairness. That sequence maps
-well to how a candidate would discover pressure points in a real interview.
+The current notification-system dataset is materially stronger than the earlier
+version. The recent changes addressed most of the previous high-impact gaps:
+provider receipts now exist, delivery status has an asynchronous reconciliation
+path, the API exposes category/priority/tenant/locale/target fields, the data
+model includes delivery attempts, templates, contact points, and provider
+callbacks, step 6 teaches callback/receipt handling, step 8 separates priority
+lanes from tenant partitioning, and `finalDesign.flows[]` now includes an
+end-to-end accept -> fanout -> deliver -> receipt-reconcile path.
 
-The biggest opportunity is not the high-level architecture. The backbone is
-sound. The main gaps are in production realism around delivery status,
-provider callbacks, legal/consent semantics, data model detail, and the exact
-meaning of "delivered" in a third-party notification ecosystem. The current
-dataset teaches the central ideas well, but it sometimes implies cleaner
-delivery guarantees than a real notification platform can provide.
+The case is now close to flagship quality. The main remaining work is polish and
+alignment rather than architectural repair: update the `satisfies` mapping so it
+credits the new receipt path, soften a few "notify once" phrases that still
+sound stronger than provider reality, add consent/audit and limiter/digest state
+where the prose already promises it, and tighten a few technology-choice labels.
 
 Overall assessment:
 
 | Dimension | Rating | Notes |
 |---|---:|---|
-| System design soundness | 4.1 / 5 | Correct backbone: queue, workers, dedup, fanout, preferences, channel routing, rate limits, sharding. |
-| Production realism | 3.6 / 5 | Plausible, but under-specifies provider receipts, delivery state transitions, compliance, device tokens, and retry/callback handling. |
-| Pedagogical flow | 4.5 / 5 | Excellent stepwise buildup with just-in-time concepts, traps, and interviewer signals. |
-| Final design coherence | 4.0 / 5 | Final design includes all introduced major components, but status/receipt and state-store details are underrepresented. |
-| Dataset/rendering fit | 4.0 / 5 | Conforms broadly to local conventions; a few metadata and modeling inconsistencies are worth cleaning up. |
+| System design soundness | 4.6 / 5 | Strong architecture with queueing, fanout, dedup, receipts, preferences, rate limits, lane/tenant scaling, and implementation trade-offs. |
+| Production realism | 4.4 / 5 | Major realism gaps fixed; remaining gaps are consent audit, limiter/digest state, observability in the main flow, and schedule semantics. |
+| Pedagogical flow | 4.7 / 5 | Clear problem-by-problem buildup with richer concepts, traps, and final flow. |
+| Final design coherence | 4.6 / 5 | Final design now closes the provider receipt loop and integrates most introduced components. |
+| Dataset/rendering fit | 4.4 / 5 | Structured views and sequences are valid; technology icons resolve; remaining issues are mostly metadata polish and duplicate aliases. |
 
-Recommendation: keep the structure and step order. Improve the realism by
-adding a delivery-status/callback subsystem, expanding the API/data model with
-production fields, clarifying delivery guarantees, and adding one or two final
-end-to-end flows that connect the pieces.
+Recommendation: keep the current structure. Do not rework the step order. Focus
+on tightening the remaining inconsistencies and polishing implementation-choice
+coverage.
 
-## What Works Well
+## What Improved
 
-The problem framing is strong. The description names the real tensions:
-reliability, scale, multi-channel delivery, user control, and spam prevention.
-It avoids treating notification delivery as a trivial wrapper around email/SMS
-providers.
+The previous review's largest concerns are now mostly resolved:
 
-The step sequence is well chosen. Each step fixes a specific problem exposed by
-the previous one:
+- Delivery-status realism: `ReceiptAPI`, `StatusUpdater`, provider callback
+  links, `provider_callbacks`, and a final receipt-reconciliation flow were
+  added.
+- API grounding: `POST /v1/notifications` now includes `tenant_id`, `category`,
+  `priority`, `target`, `locale`, and `schedule_at`; status APIs now separate
+  aggregate notification status from paginated delivery rows.
+- Data model depth: `deliveries` now carries provider correlation, suppression
+  reason, retry timing, priority, and last error; `delivery_attempts`,
+  `templates`, `contact_points`, and `provider_callbacks` were added.
+- Capacity analysis: "Delivery units per event" now explains
+  `recipients * channels` and calls out retries/receipts as extra write
+  streams.
+- Provider realism: step 6 now covers provider callbacks, health/circuit
+  breakers, contact-point lifecycle, template versioning, failover ambiguity,
+  and feedback loops.
+- Compliance realism: step 5 now distinguishes preference, legal consent, and
+  provider suppression.
+- Scaling clarity: step 8 now frames priority lane and tenant partitioning as
+  independent axes, adds fair scheduling, hot-partition concerns, and
+  backpressure.
+- Final design coherence: `finalDesign.flows[]` now gives a full operational
+  path from accept through provider receipt reconciliation.
+- Technology choices: 9 implementation concerns now cover queues/streams,
+  dedup, delivery storage, preferences/cache, limiter/digest counters, push,
+  email/SMS, workflow/scheduling, and observability, with self-hosted and cloud
+  options plus trade-off notes.
 
-1. Synchronous provider calls expose third-party latency and outage coupling.
-2. Queue plus workers decouple accept from delivery.
-3. Idempotency handles the duplicate risk created by retries and at-least-once queues.
-4. Fanout handles the load multiplier.
-5. Preferences introduce user policy at the correct point in the pipeline.
-6. Channel routing turns one provider call into a multi-channel platform.
-7. Rate limiting handles spam and provider quotas.
-8. Sharding and priority lanes address fairness and peak throughput.
+These are the right changes. They substantially improve both realism and the
+learner's ability to explain why the final design looks the way it does.
 
-The teaching scaffolding is unusually good. `decisionPrompt`, `concepts`,
-`traps`, `failureDrills`, `interviewerSignals`, `recap`, and `whyNow` make the
-case more than a diagram collection. They explain why a candidate should add
-each component and what mistakes an interviewer would watch for.
+## Highest-Impact Remaining Issues
 
-The default options are mostly defensible. Pull-based workers, dual dedup,
-hybrid fanout, delivery-time preferences, provider adapters, per-user rate
-limits, and partitioned priority queues are good defaults for a senior-level
-answer.
+### 1. `satisfies` is now stale for delivery status
 
-The dataset emphasizes user experience, not only throughput. Preferences,
-quiet hours, spam prevention, suppressed-status recording, and digest collapse
-are the right product concerns for a notification system.
+The functional requirement "Track delivery status" still says:
 
-## Highest-Impact Issues
+```json
+{
+  "how": "Per-(notification, recipient, channel) delivery rows updated by workers.",
+  "steps": ["queue-workers", "preferences"]
+}
+```
 
-### 1. Delivery status is too simplified
+That no longer reflects the current design. The important new mechanism is in
+step 6 and the final design: providers call back to the Receipt API, and the
+StatusUpdater reconciles final status by `provider_message_id`.
 
-The requirements say the system should "track delivery status and expose it to
-senders", and the data model includes `deliveries.status`. However, the design
-does not model how status changes arrive from providers.
+Suggested update:
 
-In real systems, provider interaction has at least three different moments:
+- Include `channels` in the steps list.
+- Mention provider callbacks and receipt reconciliation.
+- Optionally mention `finalDesign` in the prose even though `satisfies.steps`
+  should stay step IDs.
 
-- The worker attempted to send the message.
-- The provider accepted or rejected the message.
-- A later provider callback, webhook, receipt, bounce, or device feedback event
-  changed the delivery state.
+Better wording:
 
-The current architecture has workers writing status to the DB after calling the
-provider, but no callback receiver, receipt processor, provider message ID, or
-status event stream. This makes `sent`, `delivered`, `failed`, `bounced`,
-`suppressed`, and `expired` feel flatter than they are.
+```text
+Per-(notification, recipient, channel) delivery rows are first updated by
+workers, then finalized by provider receipts through the Receipt API and status
+worker.
+```
 
-Suggested improvement:
+This is the most visible stale review point because the dataset now has the
+correct architecture but the requirement traceability table still points to the
+old explanation.
 
-- Add a `Provider Callback / Receipt API` node.
-- Add a `Status Updater` or `Receipt Worker` node.
-- Add a `provider_message_id` field to deliveries or a separate
-  `provider_messages` / `delivery_attempts` table.
-- Add a flow showing provider callback -> receipt processor -> delivery status
-  update.
-- Clarify in concepts that "delivered" often means different things by
-  channel. Push providers may only confirm acceptance. Email may report
-  delivered/bounced later. SMS delivery receipts vary by carrier and vendor.
+### 2. A few "notify once" phrases still overstate the guarantee
 
-This is the single biggest realism gap because status tracking is explicitly
-in scope.
+The requirements now correctly say exactly-once across third-party providers is
+not guaranteed. Step 3 also added "Idempotent side effect (vs exactly-once)" and
+a trap for claiming exactly-once delivery. That is a strong improvement.
 
-### 2. Delivery guarantees should be worded more carefully
+Some step-level wording still sounds too strong:
 
-The dataset says "eventually delivered or explicitly failed" and "notify once".
-Those are useful interview goals, but they need caveats.
+- Step 3 title: "notify once".
+- Step 3 description: "ensure a user is notified at most once per event within
+  a window."
+- Step 3 recap: "At-most-once effect per logical event within the window."
 
-For third-party notification channels, exactly-once user-visible delivery is
-not realistically guaranteed. A worker can crash after the provider accepts a
-send but before the system records success. A provider can accept a request and
-later fail. A failover path can accidentally send through two vendors if the
-first vendor times out but still delivers.
+Those phrases are useful interview shorthand, but they can still imply a
+stronger user-visible guarantee than the provider boundary allows. A timeout
+before provider response, a failover send, or a provider callback arriving late
+can still create ambiguity.
 
-The design should teach a more precise guarantee:
+Suggested update:
 
-- The platform accepts once per idempotency key.
-- It creates one intended delivery per `(notification, user, channel)`.
-- Workers use at-least-once processing.
-- The system uses dedup and provider idempotency keys where available to
-  minimize duplicate user-visible effects.
-- Final status is best-effort and channel-dependent.
+- Rename the parenthetical to "bounded duplicate control" or "minimize
+  duplicate sends".
+- Change "ensure" to "reduce" or "guard against".
+- Keep the trap and concept because they teach the caveat well.
 
-Suggested wording change:
+This is a wording issue, not an architecture issue.
 
-- Replace broad "notify once" language with "deduplicate intended deliveries
-  and minimize duplicate user-visible sends within a bounded window."
-- In the idempotency step, explicitly state the dedup key granularity:
-  `(producer_event_id, recipient_id, channel)` or
-  `(notification_id, recipient_id, channel)`.
-- Add a caveat that at-most-once user effect is not strictly provable across
-  all providers.
+### 3. Consent and suppression are conceptually present but not fully modeled
 
-This would make the design more honest without weakening the interview answer.
+Step 5 now has the right conceptual split: product preferences, legal consent,
+and provider suppression are different gates. That is a major improvement.
 
-### 3. The data model is too thin for the behaviors being taught
+The data model still has only `preferences` and `deliveries.suppression_reason`.
+For a production-grade notification system, consent/suppression typically needs
+more durable state:
 
-The current tables are a good starter set:
+- Legal consent history: when consent was granted/revoked, source, IP/user
+  agent or audit metadata, channel/category scope.
+- Suppression list state: bounced address, complained email, invalid push token,
+  SMS STOP/unsubscribe, provider source, expiry if any.
+- A policy decision record: why a specific delivery was allowed, deferred,
+  suppressed, or bypassed quiet hours.
 
-- `notifications`
-- `deliveries`
-- `preferences`
-- `subscriptions`
-- `dedup_keys`
+The current model is acceptable for a 45-minute interview, but the review should
+now say "expand consent/audit if this is meant to be a production-grade case"
+rather than "consent is missing".
 
-But several later steps rely on state that is not represented:
+### 4. Limiter and digest behavior still lacks state shape
 
-- Templates and localization.
-- Device tokens / contact endpoints.
-- Provider message IDs.
-- Delivery attempts and retry history.
-- Suppression reason.
-- Priority, category, tenant, and locale.
-- Scheduled/deferred sends.
-- Rate-limit buckets and digest/collapse state.
-- Provider callback events.
+Step 7 now teaches per-user, per-tenant, and per-category limits backed by a
+fast shared counter store. The `Limiter` node description also names a "Limiter
+/ Digest Store." That is good.
 
-The result is a mild mismatch: the architecture teaches templates, retries,
-provider failover, rate limiting, quiet hours, and digest collapse, but the data
-model only covers the first half of that behavior.
+What is still thin:
 
-Suggested additions:
+- No explicit table or cache shape for limiter buckets.
+- No digest/collapse accumulator model.
+- No stated disposition model for over-limit events beyond prose: defer,
+  digest, suppress, or fail.
+- No operational metric for limiter health or hot keys.
 
-- Add fields to `notifications`: `tenant_id`, `category`, `priority`,
-  `locale`, `scheduled_at`, `dedup_key`, `target_type`, `target_id`.
-- Add fields to `deliveries`: `recipient_id`, `provider`, `provider_message_id`,
-  `priority`, `next_attempt_at`, `last_error`, `suppression_reason`,
-  `created_at`.
-- Add `delivery_attempts`: `attempt_id`, `delivery_id`, `provider`,
-  `status_code`, `error_class`, `started_at`, `finished_at`.
-- Add `templates`: `template_id`, `channel`, `locale`, `version`, `content`.
-- Add `device_tokens` or `contact_points`: `user_id`, `channel`, `address`,
-  `provider`, `token_status`, `updated_at`.
-- Add `provider_callbacks`: raw callback payloads keyed by provider message ID.
+This does not need a full relational table in the data model; a small data model
+entry or deep-dive note would be enough. The important thing is to connect the
+prose promise ("digest/collapse") to state that can actually accumulate and
+flush a digest.
 
-Not all of these need to become full tables in the explorer, but the review
-case would be stronger if at least provider IDs, attempts, suppression reason,
-category, priority, tenant, and locale were visible.
+### 5. `schedule_at` appears in the API but scheduled delivery remains a follow-up
 
-### 4. API shape does not expose several core design decisions
+The POST request now includes `schedule_at: null`, while follow-ups still ask
+how to implement scheduled and recurring notifications. That is not wrong, but
+it creates a small scope ambiguity.
 
-The `POST /v1/notifications` example is clean and readable, but it does not
-include some fields that become essential later:
+Two clean options:
 
-- `tenant_id` or producer identity.
-- `category`, such as `marketing`, `security`, or `transactional`.
-- `priority`, such as `urgent` vs `bulk`.
-- `locale`.
-- `target`, such as users, topic, segment, or explicit recipients.
-- `schedule_at` or `not_before`.
-- Optional provider/channel overrides.
-- Metadata for tracing and audit.
+- If scheduled sends are out of scope, remove `schedule_at` from the starter
+  request or mark it as future/optional.
+- If scheduled sends are in scope, add a tiny scheduler/delay-queue note:
+  scheduled notifications should not enter urgent/bulk delivery lanes until
+  their due time, and local-time scheduling needs time-zone handling.
 
-The GET response also returns only a channel map for one notification ID. Since
-POST can target multiple recipients, the API needs to clarify whether
-`notification_id` is the logical event, one recipient delivery, or a batch. A
-real sender usually needs per-recipient and per-channel status pagination.
+Given the current case is already rich, keeping scheduled delivery as a
+follow-up is probably better. Just avoid making the API imply it is already
+implemented.
 
-Suggested improvement:
+### 6. Technology choices are strong but a few labels need tightening
 
-- Keep the simple API example, but add a note that the production request needs
-  `category`, `priority`, `locale`, `tenant_id`, and `target`.
-- Show a status response that distinguishes logical notification status from
-  per-recipient delivery status.
-- Consider a `GET /v1/notifications/{id}/deliveries` endpoint for paginated
-  delivery rows.
+The new `technologyChoices` section is a major addition. It covers the right
+concerns and every item has trade-off and "makes irrelevant" notes. Icon paths
+also resolve.
 
-### 5. Provider callback and device-token lifecycle are only follow-ups
+Remaining polish:
 
-The follow-ups ask about delivery receipts and device-token lifecycle, which is
-good. But for this case, they are central enough to deserve at least a brief
-presence in the main design.
+- The "Email & SMS providers" concern mixes true self-hosted infrastructure
+  (`Postfix`) with third-party SaaS vendors (`Twilio`, `SendGrid`, `Mailgun`,
+  `Vonage`) under `selfHosted`. If this column is meant to mean "non-cloud
+  hyperscaler choices", that is fine, but the label may mislead readers.
+- `Cloud Functions` under GCP email/SMS is compute glue, not an email/SMS
+  provider. It may belong under webhook/workflow glue rather than provider
+  choice, unless the note explicitly says it is used to integrate a vendor.
+- The workflow/scheduling concern makes `schedule_at` more defensible, but the
+  main API section should still say whether scheduled sends are in scope or a
+  follow-up.
+- Observability is covered in technology choices, but the main walkthrough
+  still needs one short metrics/deep-dive note so it is not only a wrap-up topic.
 
-For push notifications, invalid device tokens and feedback from APNs/FCM are
-basic operational concerns. For email and SMS, bounces, complaints,
-unsubscribe, carrier errors, and delivery receipts affect suppression lists and
-future routing.
-
-Suggested improvement:
-
-- Move a small part of device-token/provider feedback handling into step 6
-  (Multi-Channel Routing & Providers).
-- Add a trap: "Ignoring provider feedback loops".
-- Add a concept: "Provider receipt / feedback event".
-- Add a data-model field or table for provider callback correlation.
-
-This keeps the follow-up available while making the main design feel more
-production-grade.
-
-### 6. Compliance and consent are underplayed
-
-The preferences step correctly covers opt-outs and quiet hours, but compliance
-is broader:
-
-- Legal unsubscribe for email/SMS marketing.
-- Transactional vs marketing classification.
-- Auditability of consent changes.
-- GDPR deletion or retention constraints.
-- Regional sender rules and provider-specific requirements.
-- Suppression lists for bounced/complained addresses.
-
-The dataset mentions compliance only in follow-ups. For a notification system,
-the candidate should at least distinguish product preferences from legal
-consent and suppression.
-
-Suggested improvement:
-
-- In step 5, add "consent/suppression policy" alongside preferences.
-- Add `suppression_reason` and consent history to the data model or concepts.
-- Clarify that urgent/security notifications may bypass quiet hours, but not
-  necessarily legal opt-outs for a given channel/category.
+This is polish, not a blocker.
 
 ## System Design Soundness
 
 ### Requirements and Capacity
 
-The functional requirements cover the right surface area: accept requests,
-multi-channel delivery, preferences, fanout, templates/localization, and status
-tracking. The non-functional requirements are also directionally right:
-reliable delivery, dedup, urgent latency, burst throughput, spam prevention,
-and provider degradation.
+The requirements are now better worded. The reliability requirement explicitly
+uses terminal states ("delivered, suppressed, or explicitly failed") rather than
+promising delivery at all costs. The at-least-once requirement now includes the
+right caveat that exactly-once across third-party providers is not guaranteed.
 
-The capacity section is plausible but could be more analytical. `~50,000/s peak`
-and `10M recipients per broadcast` are realistic interview-scale numbers, but
-the dataset does not derive the consequences:
+The capacity section is also stronger. Adding "Delivery units per event" fixes
+the earlier gap by converting logical notification requests into the real work
+unit. A 10M-recipient, two-channel broadcast is correctly framed as roughly 20M
+delivery rows or queue messages, before retries and receipts.
 
-- A 10M-recipient broadcast creates up to 10M delivery rows or queue messages.
-- Multi-channel sends can multiply delivery units per recipient.
-- Retry storms can multiply provider requests during outages.
-- Status updates and provider callbacks can add another high-write stream.
-- Delivery status retention for 30 days implies large write and storage volume.
+Remaining capacity additions to consider:
 
-Recommended addition:
+- Approximate status/callback write volume during a large blast.
+- Queue age/depth targets for urgent, normal, and bulk lanes.
+- Contact-point scale: push tokens, emails, and phone numbers per user.
+- Retention cost for delivery attempts and raw provider callbacks.
 
-- Add one capacity note that converts logical notification requests into
-  delivery units: `delivery_units = recipients * channels`.
-- Add a note that queue depth and oldest-message age are more useful than CPU
-  for autoscaling delivery workers.
-
-There is also a small typo in the non-functional requirements:
-
-- "a accepted notification" should be "an accepted notification".
-
-### Architecture Backbone
-
-The main architecture is sound. A production notification platform usually does
-look like:
-
-- Fast accept API.
-- Idempotency/dedup store.
-- Durable queue or stream.
-- Fanout/expansion service.
-- Delivery workers.
-- Preference and policy check.
-- Template rendering.
-- Provider routing/adapters.
-- Provider quotas and failover.
-- DLQ and retry handling.
-- Status storage.
-
-The final design includes these elements. It is a credible answer for a
-system-design interview.
-
-Where it currently simplifies too much:
-
-- The provider callback path is missing.
-- Template service has no template store or versioning.
-- Limiter has no counter store shown.
-- The preference cache/invalidation story is only in prose.
-- Provider health and circuit breaker behavior are not modeled.
-- DLQ ownership is slightly blurred: in diagrams, the router sends to DLQ, but
-  operationally the worker/queue consumer usually owns retry exhaustion and DLQ
-  routing after adapter failures.
-
-These simplifications are acceptable for a 45-minute interview, but the review
-case would be stronger if one or two were explicit trade-offs.
-
-### Data Model
-
-The starter model is understandable and teachable, but it underspecifies the
-final system.
-
-Important mismatch:
-
-- The `notifications` note says "with per-channel delivery state", but the
-  fields do not contain delivery state. The `deliveries` table carries that
-  state. The note should be revised to avoid confusion.
-
-Potential table/field additions:
-
-| Area | Missing data |
-|---|---|
-| Routing | `tenant_id`, `category`, `priority`, `channel`, `locale` |
-| Fanout | `target_type`, `target_id`, fanout cursor/checkpoint |
-| Provider correlation | `provider`, `provider_message_id`, provider request ID |
-| Retry | `next_attempt_at`, `last_error`, attempt history |
-| Suppression | `suppression_reason`, consent source, quiet-hours decision |
-| Templates | template version, channel-specific variant, locale |
-| Devices/contact points | push token, email address, phone number, token status |
-| Rate limiting | bucket key, refill rate, remaining tokens, digest window |
-| Receipts | callback event ID, raw payload, received time |
-
-The case does not need to fully normalize all of these, but adding a few fields
-would make the later steps feel grounded.
+These are optional. The current capacity model is good for an interview case.
 
 ### API Design
 
-The API is good for a starter example. `POST /v1/notifications` with
-`Idempotency-Key` and a `202 Accepted` response is exactly the right baseline.
-The GET status and preference endpoints are also reasonable.
+The API is now much more aligned with the architecture. The POST request exposes
+fields used by later steps:
 
-Concerns:
+- `tenant_id` for quotas and tenant partitioning.
+- `category` for preferences, consent, and rate limits.
+- `priority` for urgent/bulk lanes.
+- `target` for users/topic/segment expansion.
+- `locale` for template selection.
+- `schedule_at` for possible delayed sends.
 
-- POST includes `recipients` but no topic/segment target shape, even though
-  fanout is core.
-- POST includes `channels` but no category or priority, making preferences,
-  quiet hours, and urgent lanes harder to explain.
-- POST includes `template` but no `locale`.
-- Status GET does not distinguish one logical notification from many
-  recipient/channel deliveries.
-- Preferences PUT is coarse; real systems often need patching by category,
-  audit, and validation against legal opt-out rules.
+The addition of `GET /v1/notifications/{id}/deliveries` is especially good
+because one logical notification can produce millions of recipient/channel
+deliveries.
 
-Suggested request shape:
+Remaining API polish:
 
-```json
-{
-  "event": "order.shipped",
-  "tenant_id": "merchant_123",
-  "category": "transactional",
-  "priority": "normal",
-  "target": { "type": "users", "ids": ["usr_1", "usr_2"] },
-  "channels": ["push", "email"],
-  "template": "order_shipped",
-  "locale": "en-US",
-  "data": { "order_id": "ord_9" }
-}
-```
+- Clarify whether `target.type: segment` is accepted synchronously or resolved
+  by fanout workers.
+- Either scope out `schedule_at` or add a minimal scheduler note.
+- Consider a separate endpoint for consent/suppression updates rather than
+  putting all policy state behind preferences.
+- Mention webhook signature verification for provider callbacks if the callback
+  API is documented later.
 
-This would connect the API to the later decisions without making it much more
-complex.
+### Data Model
+
+The data model now supports most of the behaviors taught in the walkthrough:
+
+- `notifications` carries routing metadata and explicitly says per-delivery
+  state lives elsewhere.
+- `deliveries` is the worker unit and includes provider correlation,
+  suppression reason, priority, retry timing, and terminal states.
+- `delivery_attempts` captures provider attempt history.
+- `templates` models channel/locale/version content.
+- `contact_points` models push/email/SMS endpoints and health.
+- `provider_callbacks` stores raw asynchronous provider events.
+
+This is a strong correction. The model now matches the architecture much more
+closely.
+
+Remaining model gaps:
+
+- Consent history and suppression list state are still implicit.
+- Limiter buckets and digest accumulation are not represented.
+- Fanout checkpoint/cursor state is discussed in traps/drills but not modeled.
+- Provider health/circuit-breaker state is conceptual only.
+
+These are reasonable omissions for a 45-minute interview, but they are useful
+P2 polish for a book case.
+
+### Architecture Backbone
+
+The final architecture is now credible for a production-style answer:
+
+- Fast accept API with idempotency.
+- Fanout service and topic/subscription store.
+- Durable lanes partitioned by tenant.
+- Delivery workers with preferences, limiter, template rendering, and routing.
+- Multi-provider channel router.
+- DLQ for exhausted/poison messages.
+- Provider callback ingestion.
+- Status updater closing the delivery-state loop.
+- DB storing logical notification, delivery, attempts, contacts, and callbacks.
+
+The biggest architectural ambiguity left is DLQ ownership. Some diagrams route
+exhausted messages from `Router` to `DLQ`, while operationally retry exhaustion
+is usually owned by the worker/queue consumer after adapter failures. This is
+not fatal, but a one-line note would prevent readers from thinking the router
+itself owns queue retry semantics.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Synchronous Single-Channel Send
 
-This is a good baseline. It surfaces the central failure: provider latency and
-outages are coupled to the caller. The concepts "Provider" and "Delivery vs
-sent" are exactly the right first concepts.
+Still a strong baseline. It now includes "Write-after-send crash window", which
+is exactly the kind of concrete ambiguity that motivates async status and
+idempotency later.
 
-What to improve:
+Good:
 
-- Mention the request thread/connection pool exhaustion failure mode.
-- Clarify that status is already asynchronous even in this naive design.
-- Add a small note that the DB write after provider send creates ambiguity if
-  the process crashes between provider success and DB update.
+- Starts with the simplest wrong thing.
+- Makes provider latency and request-path coupling visible.
+- Introduces the "sent vs delivered" distinction early.
 
-Pedagogical value: high. The baseline is intentionally wrong in the right way.
+Remaining polish:
+
+- The step has no recap while later steps do. Adding a short recap would make
+  the baseline consistent with the rest of the walkthrough.
 
 ### Step 2: Queue + Workers
 
-This is one of the strongest steps. It introduces the backbone of the system:
-durable queue, pull workers, retry with backoff, and DLQ. The trap list is
-practical and the failure drill is realistic.
+This step is now stronger because it includes visibility timeout / lease / ack
+and retry budget + circuit breaking. Those are the right operational details.
 
-What to improve:
+Good:
 
-- Add the idea of ack/visibility timeout/lease. The worker should only ack the
-  queue after the provider attempt and state update are handled.
-- Distinguish transient provider failures from permanent request/data failures.
-- Add a DLQ operating note: alert, inspect, replay after fix, or discard with
-  audit.
-- Mention retry budgets and provider circuit breaking to avoid retry storms.
+- Durable queue and pull workers are the correct backbone.
+- Retries, backoff, jitter, DLQ, and queue backpressure are taught early.
+- The flow makes transient vs permanent failures concrete.
 
-The current step says "No notifications lost; delivery resumes when it
-recovers." In production, that should be qualified: no accepted messages are
-intentionally dropped, but expired/invalid/provider-rejected deliveries may
-become failed rather than delivered.
+Remaining polish:
+
+- Add a small DLQ operations note: alert, inspect, fix, replay, or mark failed.
+- Clarify that the worker should ack after state update decisions, not merely
+  after provider call return.
 
 ### Step 3: Idempotency & Deduplication
 
-The placement is excellent. It comes immediately after the queue, because
-at-least-once processing creates duplicate risk.
+The added exactly-once caveat is the right fix. The step now teaches both
+producer idempotency and delivery-time dedup.
 
-Strengths:
+Good:
 
-- It correctly dedupes both producer retries and queue redelivery.
-- It warns against server-generated dedup keys.
-- It explains dedup window trade-offs.
+- Places dedup immediately after at-least-once queues.
+- Covers server-generated key pitfalls.
+- Adds the right trap: "Claiming exactly-once delivery through third-party
+  providers."
 
-What to improve:
+Remaining polish:
 
-- Define the dedup key granularity explicitly.
-- Explain the crash window around provider calls.
-- Mention atomic claim/set-if-not-exists with TTL for the dedup store.
-- Avoid implying strict exactly-once delivery across external providers.
-
-Recommended concept addition:
-
-- "Idempotent side effect": the system cannot make every provider exactly-once,
-  but it can make the platform's intended delivery operation idempotent.
+- Soften "notify once" and "ensure at-most-once effect" wording.
+- Name the delivery dedup key shape in the prose, for example
+  `(notification_id, recipient_id, channel)` or
+  `(producer_event_id, recipient_id, channel)`.
 
 ### Step 4: Fanout
 
-This step is well placed and correctly identifies fanout as the load
-multiplier. The failure drill about fanout worker crash and checkpointing is
-very good.
+The fanout step is now more realistic. It has traps for long expansion,
+opt-outs during expansion, and expanding faster than workers can drain.
 
-The hybrid strategy is directionally correct, but the terminology needs care.
-"Fanout-on-read" is a natural phrase for feeds, where a user reads a timeline.
-For notifications, users do not usually "read" a push/email delivery queue in
-the same way. The design likely means "store once and expand lazily or in
-chunks at delivery time." That is valid, but the wording can be sharpened.
+Good:
 
-Suggested wording:
+- Keeps fanout async and chunked.
+- Treats fanout as the load multiplier.
+- Mentions checkpoint/resume/idempotent enqueue behavior.
+- Connects fanout to downstream queue backpressure.
 
-- "Hybrid: materialize small audiences immediately; for large audiences, store
-  the event once and stream recipients in chunks into delivery queues."
+Remaining polish:
 
-What to improve:
-
-- Add chunk size, checkpoint cursor, and idempotent enqueue per recipient.
-- Show how unsubscribe/preference changes are honored during long fanouts.
-- Clarify whether fanout creates delivery rows first or queue messages first.
-- Add backpressure from queue depth to fanout expansion rate.
-
-Pedagogically, this step is excellent because it explains why scale is not just
-more workers.
+- Consider adding explicit fanout checkpoint state to the data model or a
+  deep-dive note.
+- The phrase "fanout-on-read" is still slightly feed-system flavored. For
+  notifications, "lazy/chunked expansion for large audiences" is clearer.
 
 ### Step 5: User Preferences & Quiet Hours
 
-This is a strong product-aware step. Applying preferences close to delivery is
-the right default, especially for delayed/big fanout.
+This step now handles a major realism issue: preference, consent, and provider
+suppression are distinct.
 
-Strengths:
+Good:
 
-- It records suppressed deliveries rather than silently dropping.
-- It separates urgent categories from quiet hours.
-- It includes caching in the deep dive.
+- Delivery-time preference evaluation is the right default.
+- Suppression reason is now modeled in `deliveries`.
+- Urgent bypass is constrained by consent/suppression gates.
+- The preference failure drill is more careful than before.
 
-What to improve:
+Remaining polish:
 
-- Distinguish preference, legal consent, and provider suppression.
-- Include time zone handling for quiet hours.
-- Clarify whether quiet-hours messages are deferred, digested, or suppressed.
-- Expand failure behavior. The current "for urgent, deliver" fallback is
-  sensible for security/OTP, but should not bypass legal consent constraints.
-- Add cache invalidation or event-driven preference updates for opt-outs.
-
-This step also creates a useful teaching contrast: preferences at accept time
-save capacity, but can become stale. The dataset handles that trade-off well in
-the options.
+- Add consent/suppression persistence if the dataset wants production-level
+  completeness.
+- Mention user time zone for quiet hours.
+- Clarify whether quiet-hours messages are deferred, digested, or suppressed by
+  category.
 
 ### Step 6: Multi-Channel Routing & Providers
 
-This step is conceptually right. Provider adapters, channel-specific templates,
-per-channel retry profiles, and failover are all important.
+This step had the biggest improvement. It now closes the feedback loop that
+makes status tracking honest.
 
-What to improve:
+Good:
 
-- Add provider callbacks/receipts here or as a sub-flow.
-- Add device-token/contact-point lifecycle.
-- Add provider health, circuit breaker, and per-provider quota concepts.
-- Explain failover duplicate risk: timeout from primary does not prove primary
-  did not deliver.
-- Add suppression feedback: email bounces, SMS opt-outs, invalid push tokens.
+- Provider adapters and health-aware routing are the right abstraction.
+- Callback/receipt handling is now part of the main design.
+- Contact-point lifecycle and invalid-token suppression are covered.
+- Template versioning is introduced at the right point.
+- Failover duplicate risk is explicitly taught.
 
-One renderer/data-model note: the "Single multi-channel provider" option uses
-`MultiProvider` in a view, but `MultiProvider` is not in
-`highLevelArchitecture.nodes`. The renderer can synthesize a generic node, but
-adding it explicitly would give it a proper type/style and reduce hidden
-metadata drift.
+Remaining polish:
+
+- If provider callbacks become part of the public API section later, include
+  signature verification and replay protection.
+- Clarify whether provider health is stored/configured in the router, an
+  external config service, or the DB. This can stay conceptual.
 
 ### Step 7: Rate Limiting & Throttling
 
-This step correctly separates user spam prevention from provider quota
-protection. A per-user token bucket plus provider throttle is the right default
-for the interview.
+The step now teaches per-user, per-tenant, and per-category limits, which aligns
+with the step 8 noisy-tenant story.
 
-What to improve:
+Good:
 
-- Add tenant-level quotas, since step 8 later discusses noisy tenants.
-- Add category-specific limits, such as stricter marketing limits and looser
-  transactional/security limits.
-- Clarify where excess notifications go: defer, digest accumulator, suppress,
-  or DLQ. These are different outcomes.
-- Add limiter storage to the architecture or data model.
-- Mention that urgent notifications may bypass user spam limits only within
-  carefully bounded rules.
+- Separates user fatigue, tenant quota, category policy, and provider quotas.
+- Names token bucket and digest/collapse behavior.
+- Adds a trap around treating urgent/security like marketing.
 
-The digest/collapse idea is good but currently only prose. A small data model
-or flow for digest accumulation would make it more concrete.
+Remaining polish:
+
+- Add limiter/digest state shape, even if only as a conceptual data model row.
+- Define excess disposition more explicitly: defer, digest, suppress, or fail.
+- Mention hot limiter keys for celebrity users or huge tenants.
 
 ### Step 8: Scaling the Pipeline
 
-The step addresses the right final bottleneck: one queue can create head-of-line
-blocking and tenant interference. Autoscaling on queue depth and oldest message
-age is a strong detail.
+This step is now crisp. It separates priority lanes from tenant partitioning and
+adds a fair scheduler and backpressure.
 
-What to improve:
+Good:
 
-- Clarify the relationship between tenant partitioning and priority lanes.
-  The current diagrams use `QueueA` and `QueueB` both as shards and as urgent
-  vs bulk lanes, which can blur two different concepts.
-- Explain the partition key trade-off: tenant isolation vs per-user ordering
-  and locality for dedup/rate-limit state.
-- Add a fairness scheduler concept, not only sharded queues.
-- Mention hot partitions and rebalancing.
-- Add backpressure from queue age/depth to fanout and producer admission.
+- Correctly frames lane and partition key as independent axes.
+- Explains fair scheduling, hot partitions, and autoscaling on depth/age.
+- Adds backpressure to fanout and producer admission.
 
-Suggested mental model:
+Remaining polish:
 
-- First dimension: priority lane (`urgent`, `normal`, `bulk`).
-- Second dimension: partition key inside each lane (`tenant_id`, maybe with
-  consistent hashing).
-- Scheduler: weighted fair allocation across tenants and lanes.
-
-That would make the final scale story more precise.
+- The diagram still uses `QueueA` and `QueueB` as concrete lane nodes. The
+  labels now make their meaning clear, but "Bulk Lane" and "Urgent Lane" are
+  better mental names than A/B.
+- If normal priority exists in prose, consider adding it to the diagram or
+  explicitly say the diagram only shows bulk and urgent.
 
 ## Final Design Review
 
-The final design is coherent with the steps. It includes:
+The final design now integrates the journey well. It includes the major
+components introduced across the steps:
 
-- Client / service.
-- Notification API.
-- Idempotency store.
-- Fanout service and topic store.
-- Queue shards / priority lanes.
+- API, idempotency store, fanout, topic/subscription store.
+- Tenant-partitioned urgent/bulk lanes.
 - Delivery workers.
-- Preference service and store.
-- Rate limiter.
+- Preference service/store.
+- Limiter/digest store.
 - Template service.
-- Channel router.
-- Push, email, and SMS providers.
+- Channel router and push/email/SMS providers.
 - DLQ.
+- Receipt API and StatusUpdater.
 - Notifications DB.
 
-This is the right component set for the case.
+The final sequence flow is the key improvement. It turns the final design from
+a component inventory into an operational story:
 
-Main gaps in the final design:
+1. Producer submits with idempotency, category, priority, and target.
+2. API claims the key and hands off to fanout.
+3. Fanout enqueues per recipient/channel into lane x tenant partitions.
+4. Worker leases a job with visibility timeout semantics.
+5. Worker either sends and records `provider_message_id`, or records
+   suppression.
+6. Worker acks the queue.
+7. Provider later emits a receipt.
+8. Receipt API hands it to the status worker.
+9. Status worker reconciles final status and suppresses dead contact points.
 
-- No provider callback / receipt path.
-- No explicit provider health or circuit breaker component.
-- No template store/versioning.
-- No limiter state store.
-- No device-token/contact-point store.
-- No explicit status update event stream.
-- No end-to-end flow in `finalDesign.flows`.
+This is exactly the kind of final flow a learner can repeat in an interview.
 
-The final diagram is still credible for a 45-minute interview, but a flagship
-book case should likely show one final sequence flow:
+Remaining final-design polish:
 
-1. Producer calls API with idempotency key.
-2. API claims key and stores logical notification.
-3. Fanout expands recipients in chunks.
-4. Queue partition receives delivery jobs.
-5. Worker checks preferences.
-6. Worker checks limiter/digest rules.
-7. Worker renders template.
-8. Router sends through provider adapter.
-9. Worker records sent/failed/suppressed.
-10. Provider callback later updates final delivery status.
-
-This single flow would make the final design feel less like a component
-inventory and more like an operational system.
+- Update `satisfies` so the final receipt path is reflected.
+- Consider representing normal lane or state that the diagram omits it for
+  brevity.
+- Add observability signals: queue age, callback lag, provider error rate,
+  DLQ count, duplicate suppression count, and over-limit/digest count.
 
 ## Concept Introduction and Learning Flow
 
-Concepts are introduced at the right time. The dataset does not front-load a
-large glossary. Instead, it gives the learner concepts exactly when they need
-them:
+The concept staging is now excellent. Concepts still arrive just in time:
 
-- Provider and sent-vs-delivered in the baseline.
-- At-least-once, backoff, and DLQ when queues appear.
-- Idempotency and dedup window when retries create duplicates.
-- Fanout write/read when broadcasts appear.
-- Quiet hours and category/channel preferences when user control appears.
-- Channel adapter and failover when multi-channel delivery appears.
-- Token bucket and digest when spam prevention appears.
-- Partitioning and fair scheduling when scale appears.
+- Provider, sent-vs-delivered, and crash window at the baseline.
+- At-least-once, backoff, DLQ, visibility timeout, retry budgets when queues
+  appear.
+- Idempotency, dedup window, and idempotent side effect when duplicates appear.
+- Fanout strategies, checkpointing, and backpressure when broadcasts appear.
+- Quiet hours, category/channel preferences, and consent/suppression when user
+  policy appears.
+- Channel adapter, provider failover, callback receipts, circuit breakers,
+  contact points, and template versioning when channels appear.
+- Token bucket, digest/collapse, and limiter scope when spam/provider quotas
+  appear.
+- Lane vs partition key, queue sharding, fair scheduling, and backpressure when
+  scale appears.
 
-This is very good pedagogy.
+This is better than a front-loaded glossary because each concept solves the
+problem the learner just encountered.
 
-Missing or underdeveloped concepts:
-
-- Visibility timeout / lease / ack.
-- Backpressure.
-- Circuit breaker.
-- Provider receipt / callback.
-- Delivery state machine.
-- Suppression list.
-- Contact point / device token lifecycle.
-- Consent vs preference.
-- Template versioning.
-- Priority lane vs partition key.
-
-The dataset does not need all of these as top-level steps. A few should be
-added as concepts or deep dives in existing steps.
+The main concept gap is now observability. The dataset references OpenTelemetry
+in `toProbeFurther`, but the walkthrough itself does not teach which metrics
+and traces make this system operable. A small observability deep dive would be
+useful, especially after step 8 or in final design.
 
 ## Step-to-Final-Design Coherence
 
-The steps mostly build cleanly toward the final design.
+The steps now build cleanly toward the final design:
 
-Good accumulation:
+- Step 2's queue/worker/DLQ becomes the delivery backbone.
+- Step 3's dedup store remains in the accept and delivery path.
+- Step 4's fanout and topic store feed the lane/partition queues.
+- Step 5's preference/consent filter remains on the worker path.
+- Step 6's router/providers/templates plus receipt loop become the final
+  channel layer.
+- Step 7's limiter sits before provider routing.
+- Step 8's priority lanes, tenant partitions, fair scheduling, and backpressure
+  become the final scaling model.
 
-- Step 2's queue/worker/DLQ become the delivery backbone.
-- Step 3's dedup store remains in the final accept path.
-- Step 4's fanout service and topic store feed the queue.
-- Step 5's preference service stays on the delivery path.
-- Step 6's template/router/provider split remains in the final design.
-- Step 7's limiter is placed before provider routing.
-- Step 8's queue shards and priority lanes replace the single queue.
-
-Potential confusion:
-
-- The diagrams often show local slices instead of cumulative context. That is
-  useful for focus, but learners may not always see how the previous pieces are
-  retained.
-- The API initially accepts explicit `recipients`, then fanout introduces
-  topics/broadcasts. The distinction between direct-recipient sends and
-  topic/segment sends should be made explicit.
-- Queue sharding and priority lanes are introduced together, but they are
-  separate axes. This can make the final scale story less crisp.
-- Delivery status is a requirement from the beginning, but it never becomes a
-  first-class architectural concern.
-
-Suggested improvement:
-
-- Add short transition text at the start of steps 4 and 8:
-  - Step 4: "Direct-recipient sends still enqueue per recipient. Broadcasts
-    add a target expansion phase."
-  - Step 8: "Priority lanes separate urgent from bulk. Partitioning inside each
-    lane isolates tenants and scales consumers."
+The only notable traceability mismatch is `satisfies.functional[]` for delivery
+status. The architecture now tells the right story; the traceability table
+should catch up.
 
 ## Realism Compared With Production Systems
 
-The case captures the main production pressures:
+The case now captures most production pressures:
 
-- Third-party provider unreliability.
-- Bursty fanout.
-- At-least-once delivery.
-- User preferences.
-- Multi-channel differences.
-- Provider quotas.
-- Tenant interference.
-- DLQ and retry operation.
+- External provider unreliability and ambiguous outcomes.
+- At-least-once queue processing.
+- Retry budgets, backoff, jitter, DLQ, and circuit breaking.
+- Provider receipt/callback reconciliation.
+- Contact-point invalidation and suppression.
+- Consent vs preference vs suppression.
+- Multi-channel templates and provider adapters.
+- Per-user/tenant/category limits and provider throttling.
+- Fanout checkpointing and downstream backpressure.
+- Priority lanes, tenant partitions, hot partitions, and fair scheduling.
 
-Production systems usually add these concerns:
+Remaining production concerns that could be added without changing the core
+architecture:
 
-- Webhook/callback ingestion from providers.
-- Status reconciliation jobs for missing callbacks.
-- Contact endpoint management: push tokens, email addresses, phone numbers.
-- Bounce/complaint/invalid-token suppression.
-- Consent and legal unsubscribe.
-- Template versioning and localization workflow.
-- Scheduled sends and local-time delivery.
-- Experimentation/analytics attribution.
-- In-app inbox consistency.
-- Auditing and data retention/deletion.
-- Provider cost optimization.
+- Observability and alerting metrics.
+- Webhook security: signature validation, replay protection, idempotent receipt
+  processing.
+- Consent audit/event history.
+- Digest accumulator state and flush workflow.
+- Provider cost optimization and routing by cost/quality.
+- In-app inbox consistency if in-app notifications become more than a channel
+  label.
 
-The dataset covers several as follow-ups, which is fine. But provider callbacks,
-contact endpoint lifecycle, and consent/suppression should probably be promoted
-into the main case because they affect the architecture directly.
+These are advanced refinements, not blockers.
 
 ## Dataset and Renderer-Facing Observations
 
-These are not major content blockers, but they are worth noting if the dataset
-is being polished.
+1. The file is JSON-valid and uses structured `view` and `sequence` data. No
+   raw Mermaid step diagrams were observed in the authored architecture steps.
 
-1. `Client` in `highLevelArchitecture.nodes` is typed as `service`, while local
-   conventions say software outside the backend boundary should use `client`.
-   Since the label is "Client / Service", this may be intentional, but the
-   renderer convention suggests `client` would be cleaner.
+2. `view.links` references resolve, and flow participants resolve to known
+   architecture node IDs or aliases in the checks performed.
 
-2. The architecture contains several semantically duplicate nodes:
-   `A` and `API`, `C` and `Client`, `D` and `DLQ`, `P` and `Provider`, `Q` and
-   `Queue`, `W` and `Worker`, `R` and `Router`. This seems driven by sequence
-   aliases and diagram slices. It works, but it can make the mental model noisy.
-   Prefer one canonical node ID per component where possible, using sequence
-   `alias` for short labels.
+3. `MultiProvider` is now present in `highLevelArchitecture.nodes`, fixing a
+   previous renderer metadata issue.
 
-3. The "Single multi-channel provider" option references `MultiProvider` without
-   a `highLevelArchitecture.nodes` entry. It will render as a generic node, but
-   adding it explicitly would improve consistency.
+4. `Client` is still typed as `service`, while local conventions say software
+   outside the backend boundary should generally use `client`. The label
+   "Client / Service" makes this somewhat defensible because the caller is an
+   internal producer service. If the intent is "upstream service", keep it. If
+   the intent is a client boundary, change the type to `client`.
 
-4. `technologyChoices` is absent. For a book flagship case, this would be high
-   value. Good candidates:
-   - Queue/stream: Kafka, SQS, Pub/Sub, RabbitMQ, Redis Streams.
-   - Dedup/idempotency: Redis, DynamoDB, Cassandra, PostgreSQL unique keys.
-   - Preference store/cache: DynamoDB/Cassandra plus Redis/CDN-like cache.
-   - Provider routing: Twilio, SendGrid, SES, APNs, FCM.
-   - Observability: OpenTelemetry, Prometheus, provider dashboards.
+5. The architecture still contains short alias-like duplicate nodes (`A`/`API`,
+   `C`/`Client`, `D`/`DLQ`, `P`/`Provider`, `Q`/`Queue`, `W`/`Worker`,
+   `R`/`Router`). This works, and it may be deliberate for sequence diagrams,
+   but one canonical node ID plus sequence `alias` fields would be cleaner.
 
-5. The final design has no `flows`. Adding one final end-to-end flow would
-   strongly improve learner comprehension.
+6. `technologyChoices` is present and substantial: 9 concerns, provider and
+   platform options, trade-off notes, and `makesIrrelevant` notes. The remaining
+   issue is label precision, especially SaaS providers listed under
+   `selfHosted` and `Cloud Functions` listed under email/SMS providers.
 
-6. The file is JSON-valid and follows the structured `view`/`sequence` approach.
-   No raw Mermaid step diagrams were observed in the authored architecture
-   steps.
+7. `toProbeFurther` links resolve from step `probeLinks`. The current source set
+   is relevant, though a provider-specific webhook/notification-provider docs
+   link could deepen step 6.
 
 ## Recommended Edits, Prioritized
 
-### P1: Add provider receipt/status handling
+### P1: Update `satisfies` for delivery status
 
-Add architecture nodes:
+Change "Track delivery status" to mention both worker updates and provider
+receipt reconciliation. Add `channels` to the related steps.
 
-- `ReceiptAPI` or `ProviderWebhook`
-- `ReceiptWorker` or `StatusUpdater`
+### P1: Soften remaining exactly-once phrasing
 
-Add data model fields:
+Keep the dedup architecture, but revise step 3's title/description/recap so the
+user-visible guarantee is "bounded duplicate control" rather than "ensure
+at-most-once notification."
 
-- `provider_message_id`
-- `provider`
-- `last_provider_status`
-- `last_provider_event_at`
+### P2: Add consent/suppression audit state
 
-Add a sequence flow:
+Add either a small `consent_events` / `suppression_entries` data-model item or a
+deep-dive note that records legal consent and provider suppression separately
+from product preferences.
 
-- Provider -> Receipt API -> Status updater -> Notifications DB.
+### P2: Add limiter/digest state shape
 
-This directly supports the "track delivery status" requirement.
+Represent token-bucket counters and digest accumulation windows, or document
+them in a step 7 deep dive. This will ground the "digest/collapse" behavior.
 
-### P1: Clarify delivery guarantees and dedup semantics
+### P2: Clarify `schedule_at` scope
 
-Update step 3 to say:
+Either remove `schedule_at` from the sample request or add a short note that
+scheduled/recurring notifications are intentionally left as a follow-up.
 
-- Producer idempotency key dedupes accepts.
-- Delivery dedup key is per intended recipient/channel.
-- The platform uses dedup to reduce duplicate side effects, but provider-level
-  exactly-once is not guaranteed.
+### P2: Add observability signals
 
-Add a trap:
+Add a small final-design or wrap-up note with key metrics:
 
-- "Claiming exactly-once delivery through third-party providers."
+- Queue depth and oldest-message age by lane/tenant.
+- Provider error/rate-limit rate.
+- Callback lag and unmatched receipts.
+- DLQ count and replay count.
+- Dedup suppression count.
+- Preference/consent/rate-limit suppression counts.
 
-Suggested instead:
+### P3: Polish `technologyChoices`
 
-- "Guarantee idempotent intent and bounded dedup; use provider idempotency keys
-  where supported and reconcile ambiguous outcomes."
-
-### P1: Expand API/data model with category, priority, tenant, and locale
-
-These fields connect multiple later decisions:
-
-- Preferences need `category`.
-- Priority lanes need `priority`.
-- Tenant isolation needs `tenant_id`.
-- Templates/localization need `locale`.
-
-Without them, the later architecture is correct but less grounded.
-
-### P2: Separate priority lanes from tenant partitioning
-
-Update step 8 language and captions:
-
-- Priority lane: urgent vs normal vs bulk.
-- Partition key: tenant or tenant hash inside a lane.
-- Scheduler: weighted fair allocation across tenants.
-
-This will make the scale story more realistic and avoid overloading `QueueA`
-and `QueueB` with two meanings.
-
-### P2: Strengthen provider routing realism
-
-In step 6:
-
-- Add provider health/circuit breaker.
-- Add callback/receipt concept if not added elsewhere.
-- Add device-token/contact endpoint lifecycle.
-- Explain failover duplicate risk.
-
-### P2: Add final-design flow
-
-Add one structured `finalDesign.flows[]` sequence covering the happy path plus
-an asynchronous receipt update. This will make the final design easier to
-understand and validates that all components have a role.
-
-### P3: Add `technologyChoices`
-
-The case is a good candidate for a Technology Choices wrap-up. It would help
-learners connect the abstract design to implementation trade-offs:
-
-- Kafka vs SQS/Pub/Sub for delivery queues.
-- Redis vs DynamoDB/Cassandra/Postgres for dedup/limiter state.
-- Managed notification platforms vs own provider adapters.
-- OpenTelemetry and metrics for queue age, provider errors, and callback lag.
-
-### P3: Add a few missing concepts
-
-High-value concepts to add:
-
-- Visibility timeout.
-- Backpressure.
-- Circuit breaker.
-- Provider receipt/callback.
-- Delivery state machine.
-- Consent vs preference.
-- Priority lane vs partition key.
+Keep the new section. Tighten labels so readers understand when a column means
+"self-hosted", "third-party SaaS", or "cloud-native service", and move compute
+glue such as `Cloud Functions` out of provider-specific rows unless it is
+explained as integration glue.
 
 ## What Not To Change
 
-Do not collapse the step sequence. The current progression is the dataset's
-main strength.
+Do not collapse the step sequence. The baseline-first progression is the
+dataset's main strength.
 
-Do not start with the full final architecture. The baseline-first approach is
-pedagogically better because each added component has a reason.
+Do not remove the non-default options. They teach trade-offs and common
+interview mistakes.
 
-Do not remove the "bad options". The non-default options are useful because
-they teach trade-offs, not just the answer.
+Do not overbuild scheduled delivery, in-app inbox consistency, experimentation,
+or provider-cost optimization into the main flow. They are good follow-ups; the
+core walkthrough is already dense.
 
-Do not overcorrect into a huge production architecture. This should remain a
-system-design interview case. The right target is to add enough realism that
-the major claims are defensible, not to model every notification-platform
-subsystem.
+Do not remove the provider receipt path. It is now central to the correctness of
+the "track delivery status" requirement.
 
 ## Bottom Line
 
-This dataset is already strong as a teaching walkthrough. Its step order,
-decision prompts, traps, and recaps make it easy for a learner to understand
-why each component appears.
+The recent changes moved this dataset from "strong but missing several
+production loops" to "strong and mostly production-realistic." The final design
+now has the right operational spine: accept, dedupe, fan out, enqueue by lane
+and tenant, filter, limit, template, route, record sent state, ingest provider
+receipts, and reconcile final delivery status.
 
-To make it excellent, add the missing production loop around provider receipts
-and delivery status, make the data model reflect the later design choices, and
-word the delivery guarantees with more precision. Those changes would preserve
-the current pedagogy while making the system design more realistic and
-interview-defensible.
+The remaining work is mostly alignment and polish: update `satisfies`, soften
+the last exactly-once wording, add consent/digest state, clarify scheduled-send
+scope, and add technology choices. The case is now credible as a flagship book
+example.

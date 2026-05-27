@@ -424,6 +424,9 @@ when absent, so the `examples` datasets are unaffected):
   makesIrrelevant? }` — self-hosted vs cloud-native/SaaS options by provider, a
   self-host-vs-managed trade-off, and a note on what a given choice can make
   unnecessary (e.g. a managed autoscaling DB removing the need to hand-shard).
+  `tradeoff` and `makesIrrelevant` are each a string **or** an array of strings;
+  both render as a bulleted list under a label (a string is sentence-split into
+  bullets via `bulletsFrom`, so prefer an array for clean, deliberate bullets).
   `steps[]` cross-links to the steps it relates to (clickable chips). Each tech
   chip in `selfHosted`/`cloud.*` is a bare string **or** `{ name, icon }`, where
   `icon` is a dataset-relative path shown to the left of the name.

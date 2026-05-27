@@ -1995,7 +1995,7 @@
         els.visualTabs.hidden = false;
         [
             {id: "diagram", label: "Diagram"},
-            {id: "ai", label: "AI Visual"},
+            {id: "ai", label: "Alternative Visual (AI-generated)"},
         ].forEach((v) => {
             const btn = document.createElement("button");
             btn.type = "button";
@@ -2695,7 +2695,7 @@
 
         const views = [
             {id: "diagram", label: "Diagram", el: diagramEl},
-            {id: "ai", label: "AI Visual", el: img},
+            {id: "ai", label: "Alternative Visual (AI-generated)", el: img},
         ];
         let mode = "diagram";
         const buttons = [];
@@ -3159,8 +3159,14 @@
                 // dataset-relative path assigned by assign_tech_icons.py).
                 const name = typeof v === "string" ? v : (v && v.name) || "";
                 const iconPath = v && typeof v === "object" ? v.icon : "";
-                const chip = document.createElement("span");
+                // The chip is a link that opens a Google search for the tech in
+                // a new tab (rel=noopener so the new tab can't reach window.opener).
+                const chip = document.createElement("a");
                 chip.className = "tech-chip";
+                chip.href = "https://www.google.com/search?q=" + encodeURIComponent(String(name));
+                chip.target = "_blank";
+                chip.rel = "noopener noreferrer";
+                chip.title = "Search Google for " + String(name);
                 if (iconPath) {
                     const img = document.createElement("img");
                     img.className = "tech-chip-icon";
@@ -3215,24 +3221,22 @@
                 card.appendChild(cloudWrap);
             }
 
-            if (item.tradeoff) {
-                const t = document.createElement("p");
-                t.className = "tech-tradeoff";
-                const b = document.createElement("strong");
-                b.textContent = "When to self-host vs. managed: ";
-                t.appendChild(b);
-                t.appendChild(document.createTextNode(String(item.tradeoff)));
-                card.appendChild(t);
+            const irrelevantBullets = bulletsFrom(item.makesIrrelevant);
+            if (irrelevantBullets.length > 0) {
+                const label = document.createElement("div");
+                label.className = "tech-note-label";
+                label.textContent = "What technology can make irrelevant";
+                card.appendChild(label);
+                card.appendChild(makeBulletList(irrelevantBullets, "tech-irrelevant bullets"));
             }
 
-            if (item.makesIrrelevant) {
-                const m = document.createElement("p");
-                m.className = "tech-irrelevant";
-                const b = document.createElement("strong");
-                b.textContent = "What technology can make irrelevant: ";
-                m.appendChild(b);
-                m.appendChild(document.createTextNode(String(item.makesIrrelevant)));
-                card.appendChild(m);
+            const tradeoffBullets = bulletsFrom(item.tradeoff);
+            if (tradeoffBullets.length > 0) {
+                const label = document.createElement("div");
+                label.className = "tech-note-label";
+                label.textContent = "When to self-host vs. managed";
+                card.appendChild(label);
+                card.appendChild(makeBulletList(tradeoffBullets, "tech-tradeoff bullets"));
             }
 
             wrap.appendChild(card);

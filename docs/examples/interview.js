@@ -83,10 +83,12 @@
         levelVariants: "by-level",
         followUps: "follow-ups",
         toProbeFurther: "to-probe-further",
+        explainerComic: "explainer-comic",
     };
 
     // Slugs that belong in the bottom "Wrap-up" sidebar group, in order.
     const WRAPUP_ORDER = [
+        INTRO_SLUGS.explainerComic,
         INTRO_SLUGS.satisfies,
         INTRO_SLUGS.technologyChoices,
         INTRO_SLUGS.apiFlows,
@@ -838,6 +840,9 @@
         }
         if (Array.isArray(data.steps)) {
             for (const step of data.steps) entries.push({kind: "step", id: step.id, title: step.title, payload: step});
+        }
+        if (typeof data.explainerComic === "string" && data.explainerComic.trim() !== "") {
+            entries.push({kind: "intro", id: INTRO_SLUGS.explainerComic, title: "Explainer Comic", payload: data.explainerComic});
         }
         if (data.satisfies && typeof data.satisfies === "object" && (
             (Array.isArray(data.satisfies.functional) && data.satisfies.functional.length > 0) ||
@@ -3251,6 +3256,41 @@
         return wrap;
     }
 
+    // The Explainer Comic entry: a generated comic-strip image summarizing the
+    // whole interview (path is dataset-relative, written by
+    // generate_interview_comic.py). Shows the image, with a "open full size"
+    // link to the same asset in a new tab.
+    function renderIntroExplainerComic(path) {
+        const wrap = document.createElement("div");
+        wrap.className = "explainer-comic";
+        const src = assetUrl(path);
+        if (!src) {
+            wrap.textContent = "(no explainer comic)";
+            return wrap;
+        }
+        const link = document.createElement("a");
+        link.href = src;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.className = "explainer-comic-link";
+        const img = document.createElement("img");
+        img.className = "explainer-comic-img";
+        img.src = src;
+        img.alt = "Explainer comic for this interview";
+        img.loading = "lazy";
+        img.decoding = "async";
+        img.addEventListener("error", () => {
+            wrap.textContent = "(explainer comic image failed to load)";
+        });
+        link.appendChild(img);
+        wrap.appendChild(link);
+        const caption = document.createElement("div");
+        caption.className = "explainer-comic-caption muted";
+        caption.textContent = "A comic-strip walkthrough of this interview. Click to open full size.";
+        wrap.appendChild(caption);
+        return wrap;
+    }
+
     function renderProbeFurtherLinkList(links) {
         const list = document.createElement("ul");
         list.className = "probe-links";
@@ -3777,6 +3817,9 @@
             case INTRO_SLUGS.toProbeFurther:
                 node = renderIntroToProbeFurther(entry.payload);
                 break;
+            case INTRO_SLUGS.explainerComic:
+                node = renderIntroExplainerComic(entry.payload);
+                break;
             default:
                 node = document.createElement("div");
                 node.textContent = "(no renderer for this section)";
@@ -3995,6 +4038,8 @@
             }
             validateAssetPath(d.assets.icon, `Dataset ${path} assets.icon`);
         }
+        // Optional generated comic-strip summary (Wrap-up "Explainer Comic").
+        validateAssetPath(d.explainerComic, `Dataset ${path} explainerComic`);
         // Optional AI-generated visuals (path-based, relative to the dataset dir).
         // Top-level `aiVisuals` carries the requirements/capacity visuals; per-step,
         // per-option, and finalDesign visuals live in their own `aiVisual` field.

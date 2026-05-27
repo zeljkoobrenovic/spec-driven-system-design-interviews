@@ -370,7 +370,9 @@ All fields below are optional except `highLevelArchitecture` and either
     {
       "concern": "Relational database",
       "steps": ["database", "replication", "sharding"], // optional; clickable cross-links
-      "selfHosted": ["PostgreSQL", "MySQL", "Vitess", "..."],
+      // each chip is a string OR { name, icon }; assign_tech_icons.py rewrites
+      // strings into { name, icon } with a copied assets/tech-icons/<file> path
+      "selfHosted": [{ "name": "PostgreSQL", "icon": "assets/tech-icons/postgresql.png" }, "MySQL", "Vitess"],
       "cloud": { "aws": ["RDS", "Aurora"], "gcp": ["Cloud SQL", "Spanner"], "azure": ["SQL Database", "Cosmos DB"] },
       "tradeoff": "self-host when ...; managed when ...",
       "makesIrrelevant": "A managed autoscaling/distributed SQL engine can absorb growth so you never hand-shard."

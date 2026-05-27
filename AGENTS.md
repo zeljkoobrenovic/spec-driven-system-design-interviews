@@ -424,7 +424,24 @@ when absent, so the `examples` datasets are unaffected):
   makesIrrelevant? }` — self-hosted vs cloud-native/SaaS options by provider, a
   self-host-vs-managed trade-off, and a note on what a given choice can make
   unnecessary (e.g. a managed autoscaling DB removing the need to hand-shard).
-  `steps[]` cross-links to the steps it relates to (clickable chips).
+  `steps[]` cross-links to the steps it relates to (clickable chips). Each tech
+  chip in `selfHosted`/`cloud.*` is a bare string **or** `{ name, icon }`, where
+  `icon` is a dataset-relative path shown to the left of the name.
+  `_scripts/assign_tech_icons.py <interview.json>` assigns those icons from a
+  curated mapping in **`_media/index.yaml`** (a list of `{ icon, terms }`;
+  terms match case-insensitively, with parenthetical qualifiers stripped, a
+  longest-leading-prefix fallback, and a `/`-segment fallback so "IPVS/LVS",
+  "Aurora (PostgreSQL/MySQL)", etc. resolve). It copies each matched icon (or
+  `_media/tech.png` for unmatched terms) into `<interview>/assets/tech-icons/`,
+  rewrites the chips to `{ name, icon }`, and keeps **`_media/missing.yaml`** in
+  sync as the list of **every term that uses the `tech.png` fallback** (no match,
+  family-rejected, or mapped file absent) — adding new fallbacks and pruning
+  terms that now resolve. **Provider rule (enforced):** an AWS-column chip may
+  only use an icon under `aws-icons/`, GCP only `gcp-icons/` (per-category
+  icons), Azure only `azure-icons/` (per-service SVGs); a cross-family mapping
+  is rejected and falls back to `tech.png`. Self-hosted chips may use any
+  directory (usually `general-icons/`). To fix a chip's icon, edit
+  `_media/index.yaml` (and remove the term from `missing.yaml`) and re-run.
 - `interviewScript` (dataset) → Wrap-up "Interview Script" entry. Each
   `{ phase, time?, say }` (`say` is a string or array).
 - `levelVariants` (dataset) → Wrap-up "By Level" entry. Each

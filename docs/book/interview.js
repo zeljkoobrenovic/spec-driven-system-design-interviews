@@ -2013,6 +2013,20 @@
         });
     }
 
+    // Open an image's current `src` in a new tab. Wires the click once per
+    // <img> (idempotent — re-callable on the same element). rel=noopener so the
+    // opened tab can't reach window.opener.
+    function makeImageOpenable(img, titleHint) {
+        if (!img || img.dataset.openableWired === "1") return;
+        img.dataset.openableWired = "1";
+        img.style.cursor = "zoom-in";
+        if (titleHint) img.title = titleHint;
+        img.addEventListener("click", () => {
+            const src = img.currentSrc || img.src;
+            if (src) window.open(src, "_blank", "noopener,noreferrer");
+        });
+    }
+
     // Show either the Mermaid diagram or the AI-visual image in the diagram
     // container, per state.visualMode. `aiVisualPath` is dataset-relative.
     function applyVisualMode(aiVisualPath) {
@@ -2023,6 +2037,7 @@
                 const src = assetUrl(aiVisualPath);
                 if (els.diagramImage.getAttribute("src") !== src) els.diagramImage.src = src;
                 els.diagramImage.hidden = false;
+                makeImageOpenable(els.diagramImage, "Open AI visual in a new tab");
             } else {
                 els.diagramImage.hidden = true;
             }
@@ -2697,6 +2712,7 @@
         img.loading = "lazy";
         img.decoding = "async";
         img.hidden = true;
+        makeImageOpenable(img, "Open AI visual in a new tab");
 
         const views = [
             {id: "diagram", label: "Diagram", el: diagramEl},
@@ -2741,6 +2757,7 @@
         img.alt = alt || "AI-generated visual";
         img.loading = "lazy";
         img.decoding = "async";
+        makeImageOpenable(img, "Open AI visual in a new tab");
         return img;
     }
 

@@ -49,7 +49,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL = "gemini-3-pro-image-preview"
-DEFAULT_ASPECT_RATIO = "16:9"
+DEFAULT_ASPECT_RATIO = "2:3"
 DEFAULT_IMAGE_SIZE = "2K"
 DEFAULT_OUTPUT = Path("assets/generated/comic/interview-comic.png")
 DEFAULT_COLUMNS = 2
@@ -649,6 +649,7 @@ def build_comic_prompt(data: dict[str, Any], panels: list[Panel], user_prompt: s
         "Use short labels only, with correct spelling. Keep labels horizontal, legible, and inside their shapes. If a label would be too small or uncertain, omit it.",
         "Do not include tiny paragraphs, code blocks, terminal windows, UI chrome, watermarks, logos, photorealism, 3D render styling, neon cyberpunk styling, or fantasy elements.",
         "Make the panels feel connected with arrows, recurring characters or icons, and visual escalation of complexity.",
+        "Minimize long blocks of text, keep comic primary visual.",
         f"Interview title: {compact(title, 180)}",
         f"Interview description: {compact(data.get('description'), 480)}",
     ]

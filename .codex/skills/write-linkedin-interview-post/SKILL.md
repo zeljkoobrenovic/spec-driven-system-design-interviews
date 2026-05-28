@@ -1,6 +1,6 @@
 ---
 name: write-linkedin-interview-post
-description: Draft engaging weekly LinkedIn posts for the Spec-Driven System Design project from local interview datasets or published interview URLs. Use when Codex is asked to promote a System Design Interview of the week, write a LinkedIn/social post for an interview such as data/<group>/<id>/interview.json, turn a spec-driven system design case into marketing/educational copy, or reuse the project's public links and GitHub source link in a post.
+description: Draft engaging daily LinkedIn posts for the Spec-Driven System Design project from local interview datasets or published interview URLs. Use when Codex is asked to promote a System Design Interview of the day, write a LinkedIn/social post for an interview such as data/<group>/<id>/interview.json, turn a spec-driven system design case into marketing/educational copy, or reuse the project's public links and GitHub source link in a post.
 ---
 
 # Write LinkedIn Interview Post
@@ -59,7 +59,7 @@ When the interview lives in `book`, describe the index link as the project/book 
 Use this shape unless the user requests a different style:
 
 ```text
-This week's System Design Interview: <interview title>.
+Today's Spec-Driven System Design Interview: <interview title>.
 
 <Hook that names the lesson.>
 

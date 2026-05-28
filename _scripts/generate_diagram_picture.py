@@ -68,7 +68,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 DEFAULT_MODEL = "gemini-3-pro-image-preview"
 DEFAULT_ASPECT_RATIO = "16:9"
-DEFAULT_IMAGE_SIZE = "2K"
+DEFAULT_IMAGE_SIZE = "4K"
 DEFAULT_BATCH_OUTPUT_DIR = Path("assets/generated/ai-visuals")
 
 STYLE_NOTES = {
@@ -639,9 +639,11 @@ def build_prompt(
     parts: list[str] = [
         "Create a high-quality visually appealing diagram picture for a system-design interview walkthrough.",
         "The output should feel like a professional technical explainer illustration, not a Mermaid diagram, not a screenshot, and not a dense whiteboard sketch.",
-        "Use a refined flat-vector visual language: crisp outlines, restrained blue/teal/green/orange accents, white background, subtle depth.",
+        "Use a refined flat-vector visual language: crisp outlines, restrained blue/teal/green/orange accents, white background.",
         "Prioritize readability, visual hierarchy, and composition quality over exhaustive completeness.",
         "Use short labels only. Keep labels horizontal, legible, correctly spelled, and inside their shapes. If a label would be too small or uncertain, omit it rather than inventing text.",
+        "Do not show title of the diagram as text in the image.",
+        "Use icons in note if appropriate and recognizable, but do not use icons as a crutch for missing labels. Do not use decorative or generic icons that don't clearly relate to the specific component or concept.",
         "Do not include the article title as visible text. Do not include watermarks, code blocks, terminal windows, UI chrome, photorealism, 3D render styling, fantasy elements, neon cyberpunk styling, or cluttered decoration.",
     ]
     parts.extend(STYLE_NOTES[mode])

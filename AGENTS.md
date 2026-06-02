@@ -488,6 +488,19 @@ when absent, so the `examples` datasets are unaffected):
   these (one image per option) under `assets/generated/ai-visuals/` and writes
   the `aiVisual`/`aiVisuals` paths back into `interview.json`. (The old
   final-design-only `finalDesign.image` field was removed.)
+- **Design-vs-Requirements illustrations**: each `satisfies.functional[]` and
+  `satisfies.nonFunctional[]` item may carry its own optional `aiVisual` (a
+  string path) — a per-requirement illustration of *how the design meets that
+  requirement*, rendered inline (click-to-open-full-size) inside that
+  requirement's card in the Wrap-up **"Design vs. Requirements"** entry. Unlike
+  the AI Visuals above there is **no Diagram|AI Visual toggle** — it always
+  shows when present and renders nothing when absent.
+  `_scripts/generate_design_vs_requirements_pictures.py` generates one image per
+  requirement (built from the item's `requirement`/`how`/`steps`) under
+  `assets/generated/design-vs-requirements/` and writes the
+  `satisfies.<column>[<i>].aiVisual` paths back into `interview.json`
+  (`--include functional|nonFunctional`, `--force`, `--dry-run` like the diagram
+  script). It does not rebuild `docs/`.
 - `explainerComic` (dataset, string path) → Wrap-up **"Explainer Comic"** entry,
   rendered **first** in the Wrap-up group (it leads `WRAPUP_ORDER`). A single
   generated comic-strip image summarizing the whole interview, shown full-width

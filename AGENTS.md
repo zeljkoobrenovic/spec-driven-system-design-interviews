@@ -160,7 +160,9 @@ The explorer (`interview.js`). One IIFE. Top to bottom:
    wrap-up intros). The order here matters: it's exactly the display order.
 7. **`renderNav` / `updateNavActive`** — renders the three sidebar groups
    (`Overview`, `Architecture`, `Wrap-up`). Groups are populated by
-   filtering `INTRO_SLUGS` membership in `WRAPUP_SLUGS`.
+   filtering `INTRO_SLUGS` membership in `WRAPUP_SLUGS`. `renderNav` also
+   appends a **Settings** section (`renderSettings`) pinned at the bottom of
+   the sidebar — see "Settings" below.
 8. **Step rendering** — `effectiveDiagramFor`, `renderDiagram`,
    `renderOptionTabs`, `renderProsCons`, `renderStepExtras`. The diagram
    highlight pipeline is described below.
@@ -347,6 +349,26 @@ There are exactly three groups: **Overview**, **Architecture**, **Wrap-up**.
 To move a section between Overview and Wrap-up, add/remove its slug from
 `WRAPUP_SLUGS` and adjust `WRAPUP_ORDER`. The builder still pushes intros
 to the same `entries` array; the grouping is purely a render-time filter.
+
+### Settings section (pinned at the sidebar bottom)
+
+Below the three nav groups, `renderSettings()` appends a `.nav-settings`
+block (CSS `margin-top: auto` pins it to the bottom; `.nav-list` is a flex
+column with `min-height: 100%`). It currently holds one preference,
+**Default visual**, a `<select>` of `Diagram` / `Alternative Visual
+(AI-generated)`.
+
+The preference lives in `state.defaultVisual` (`"diagram" | "ai"`), persisted
+to `localStorage` under `SETTINGS_KEY` via `loadSettings` / `saveSettings`
+(loaded in `init`). It seeds the per-entry `state.visualMode` (reset in
+`selectEntry`/`loadDataset` to `state.defaultVisual` instead of hardcoded
+`"diagram"`) and the local default of the intro `makeVisualSwitcher`
+(requirements/capacity). It only has a visible effect where an AI visual
+actually exists for the entry — `renderVisualTabs(false)` still falls the
+mode back to `diagram` when there's no visual. Changing it
+(`setDefaultVisual`) persists, snaps the current `visualMode`, and
+re-renders. To add another setting, extend `renderSettings` and the
+`SETTINGS_KEY` payload.
 
 ### Decision Tree (auto-generated, lives on the Final Design entry)
 

@@ -53,13 +53,13 @@
       },
       {
         "id": "Presence",
-        "label": "Presence Service",
+        "label": "In-Memory Presence",
         "type": "cache",
         "category": "state",
         "traits": [
           "stateful"
         ],
-        "description": "Live cursors, selections, and who-is-editing per document."
+        "description": "Live cursors, selections, and who-is-editing per document — ephemeral in-memory state on the owning doc server, not a durable store. A dedicated pub/sub tier is an alternative for cross-doc aggregation."
       },
       {
         "id": "Persistence",
@@ -93,13 +93,13 @@
       },
       {
         "id": "Offline",
-        "label": "Offline Sync Buffer",
-        "type": "queue",
-        "category": "async",
+        "label": "Client Local Pending Ops",
+        "type": "client",
+        "category": "boundary",
         "traits": [
           "stateful"
         ],
-        "description": "Holds ops made while a client was disconnected, replayed on reconnect."
+        "description": "Client-local (on-device) pending-op buffer — local storage inside the editor app, not a reachable backend queue. Holds optimistic ops (acked or not) and survives reload/restart; replayed to the owning server on reconnect."
       }
     ],
     "links": [
@@ -179,7 +179,7 @@
         "id": "client-offline",
         "from": "Client",
         "to": "Offline",
-        "label": "buffer offline ops"
+        "label": "buffer locally (on-device)"
       },
       {
         "id": "offline-docserver",
@@ -234,7 +234,7 @@
     "functional": [
       "Multiple users edit the same document at the same time.",
       "Every user's edits appear to others in real time.",
-      "All clients converge on an identical final document regardless of edit order.",
+      "All clients converge on the same state for the same accepted operation set under the server's ordering/merge rules.",
       "Show presence: live cursors, selections, and who's editing.",
       "Support offline edits that merge on reconnect; keep version history."
     ],
@@ -248,38 +248,78 @@
   },
   "capacity": [
     {
-      "label": "Concurrent editors / doc",
-      "value": "tens",
-      "note": "Bounded; the hard part is correctness, not editor count."
+      "label": "Peak editors / hot doc",
+      "value": "~50",
+      "note": "Bounded by product; the hard part is correctness, not editor count. A '50 concurrent' cap is enforced and is why one owning server per doc is sufficient."
     },
     {
-      "label": "Op rate while typing",
-      "value": "high per editor",
-      "note": "Each keystroke can be an op; batched."
+      "label": "Active docs (peak)",
+      "value": "~2M",
+      "note": "Concurrently open editing sessions out of billions of stored docs, sharded across owning servers. Most are NOT hot — see the editors-per-doc distribution below; fleet sizing is based on that distribution, not on 2M docs all at the 50-editor cap."
     },
     {
-      "label": "Documents",
-      "value": "billions",
-      "note": "Sharded; each active doc owned by one server."
+      "label": "Editors / typical active doc",
+      "value": "~1–3",
+      "note": "The common case: a doc open by one author or a couple of collaborators. Op rate per doc is a handful/sec, fanout is trivial."
+    },
+    {
+      "label": "Editors / p95 active doc",
+      "value": "~8–10",
+      "note": "Busier shared docs (a team doc in a meeting). Still far below the hot-doc cap; one owner server handles many of these concurrently."
+    },
+    {
+      "label": "Ops/editor/sec while typing",
+      "value": "~5/s",
+      "note": "Keystrokes batched (debounced ~50–100ms) into ops; ~5 ops/s is a typical sustained typing rate after batching."
     },
     {
       "label": "Op size",
-      "value": "tiny",
-      "note": "Insert/delete at a position."
+      "value": "~100 bytes",
+      "note": "Insert/delete + position/id + client metadata (clientOpId, baseVersion, session). Small but not free at fanout scale."
     },
     {
-      "label": "Convergence",
-      "value": "guaranteed",
-      "note": "All replicas reach the same state."
+      "label": "Edit fanout / hot doc",
+      "value": "~12.5K msg/s",
+      "note": "accepted ops/s × connected editors = (5 ops/s × 50 editors) × 50 editors = 12.5K broadcast messages/s on a full hot doc. This is the per-owner-server hot path."
+    },
+    {
+      "label": "Presence updates/editor/sec",
+      "value": "~10/s, throttled",
+      "note": "Cursor/selection moves are far more frequent than edits; throttled to ~10/s. Presence fanout on a hot doc ≈ 10 × 50 × 50 = 25K msg/s — which is why it bypasses the durable op log."
+    },
+    {
+      "label": "Op-log write rate / hot doc",
+      "value": "~250 ops/s",
+      "note": "5 ops/s × 50 editors. Durable append-before-ack must keep up with this per owning doc server."
+    },
+    {
+      "label": "Op throughput / hot doc",
+      "value": "~25 KB/s raw",
+      "note": "Worst case only: 250 ops/s × 100 bytes. A typical 1–3-editor doc is a tiny fraction of this. Sustained 24h at the hot rate would be ~2 GB/day before overhead — but no doc is edited flat-out at the cap all day."
+    },
+    {
+      "label": "Storage / hot doc / active hour",
+      "value": "~90 MB",
+      "note": "25 KB/s × 3600s, hot-doc worst case, before snapshot/index/retention overhead. Real docs accrue far less: editing happens in bursts of minutes, not sustained hours, and most docs are not hot. Snapshots + op compaction bound long-term growth; archived history is kept for version browsing."
+    },
+    {
+      "label": "Snapshot cadence",
+      "value": "every ~1–5K ops",
+      "note": "Tuning knob: bounds the tail to replay on attach/failover. ~1–5K ops keeps reload < ~1s while not snapshotting wastefully."
+    },
+    {
+      "label": "Acceptable broadcast latency",
+      "value": "< ~100ms p99",
+      "note": "Remote edits should appear near-instantly; local edits are already optimistic so they feel instant regardless."
     }
   ],
   "api": [
     {
       "method": "WS",
       "path": "/doc/{id}/connect",
-      "description": "Attach to a document's live session; receive current state (snapshot + tail ops) and a baseline version.",
-      "request": "Upgrade: websocket (doc id, auth)",
-      "response": "{ \"snapshot\": \"...\", \"version\": 412 }",
+      "description": "Attach to a document's live session; authorize, then receive current state (snapshot + tail ops), head version, a session identity, and the current owner epoch.",
+      "request": "Upgrade: websocket (doc id, auth token, lastSeenVersion?)",
+      "response": "{ \"snapshotVersion\": 400, \"tail\": [/* ops 401..412 */], \"headVersion\": 412, \"sessionId\": \"s-7f3\", \"ownerEpoch\": 9, \"aclVersion\": 3, \"collaborators\": [/* presence seed */] }",
       "sequence": {
         "participants": [
           {
@@ -339,9 +379,9 @@
     {
       "method": "WS",
       "path": "send-op",
-      "description": "Client sends an edit op against the version it last saw; server orders and rebroadcasts.",
-      "request": "{ \"op\": { \"insert\": \"x\", \"pos\": 12 }, \"baseVersion\": 412 }",
-      "response": "{ \"ack\": true, \"version\": 413 }",
+      "description": "Client sends an edit op against the version it last saw, tagged with a durable clientOpId (UUID) plus a per-session monotonic clientSeq so the server can dedupe retries. Before appending, the server re-checks the caller's ACL (via aclVersion) and that it still holds the active owner epoch for the doc — a revoked editor or a stale owner is rejected, not appended. Server transforms, orders, durably appends, and acks with the assigned version. Resending the same clientOpId after a lost ack returns the original ack without reapplying. The owner epoch is attached server-side at append time after routing, so the client never sends it.",
+      "request": "{ \"clientId\": \"c-12\", \"sessionId\": \"s-7f3\", \"clientOpId\": \"d4e1-…\", \"clientSeq\": 87, \"baseVersion\": 412, \"op\": { \"type\": \"insert\", \"pos\": 12, \"text\": \"x\" } }",
+      "response": "{ \"ack\": true, \"serverVersion\": 413, \"clientSeq\": 87, \"transformedOp\": { \"type\": \"insert\", \"pos\": 13, \"text\": \"x\" } }  // or { \"reject\": \"stale-base-too-old\" | \"needs-snapshot\" | \"permission-denied\" | \"owner-moved\" | \"malformed\" }",
       "sequence": {
         "participants": [
           {
@@ -383,12 +423,96 @@
           }
         ]
       }
+    },
+    {
+      "method": "WS",
+      "path": "presence-update",
+      "description": "Best-effort cursor/selection update multiplexed on the same WebSocket. Throttled (~10/s), lossy, never persisted to the op log. Carries the document version it was anchored to so the server can transform it against ops that landed since.",
+      "request": "{ \"sessionId\": \"s-7f3\", \"cursor\": { \"pos\": 12 }, \"selection\": { \"from\": 8, \"to\": 12 }, \"atVersion\": 412 }",
+      "response": "(no ack — fire-and-forget; server fans out others' cursors on the same channel)"
+    },
+    {
+      "method": "WS",
+      "path": "reconnect",
+      "description": "Resume a session after a disconnect (network flap or offline gap, including a full app restart). The client persists its sessionId alongside the pending-op queue, so it reconnects under the same sessionId and resends pending ops with their original clientOpId/clientSeq — that durable identity is what lets the server dedupe even after a multi-day gap. Server returns the missed ops or asks for a full snapshot resync, then accepts the pending ops idempotently.",
+      "request": "{ \"sessionId\": \"s-7f3\", \"lastSeenVersion\": 412, \"pending\": [ { \"clientOpId\": \"d4e1-…\", \"clientSeq\": 87, \"baseVersion\": 412, \"op\": {} } ] }",
+      "response": "{ \"missedOps\": [/* 413..head */], \"headVersion\": 460, \"accepted\": [\"d4e1-…\"] }  // or { \"needsSnapshot\": true, \"snapshotVersion\": 455 }",
+      "sequence": {
+        "participants": [
+          {
+            "id": "Client"
+          },
+          {
+            "id": "DocServer",
+            "label": "Doc Server"
+          },
+          {
+            "id": "OpLog",
+            "label": "Op Log"
+          }
+        ],
+        "messages": [
+          {
+            "from": "Client",
+            "to": "DocServer",
+            "arrow": "->>",
+            "label": "reconnect: lastSeen 412 + pending [seq 87]"
+          },
+          {
+            "type": "alt",
+            "label": "baseline still within retained tail",
+            "messages": [
+              {
+                "from": "DocServer",
+                "to": "OpLog",
+                "arrow": "->>",
+                "label": "read missed ops 413..head"
+              },
+              {
+                "from": "DocServer",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "missed ops 413..460"
+              },
+              {
+                "from": "DocServer",
+                "to": "DocServer",
+                "arrow": "->>",
+                "label": "dedupe pending by clientOpId; transform vs 413..460"
+              },
+              {
+                "from": "DocServer",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "accepted [87] @ versions"
+              }
+            ],
+            "else": {
+              "label": "baseline older than retained tail",
+              "messages": [
+                {
+                  "from": "DocServer",
+                  "to": "Client",
+                  "arrow": "-->>",
+                  "label": "needsSnapshot @ v455"
+                },
+                {
+                  "from": "Client",
+                  "to": "DocServer",
+                  "arrow": "->>",
+                  "label": "rebase pending onto snapshot, resubmit"
+                }
+              ]
+            }
+          }
+        ]
+      }
     }
   ],
   "dataModel": [
     {
       "name": "operations",
-      "note": "Append-only ordered op log per document — the source of truth.",
+      "note": "Append-only ordered op log per document — the source of truth. The canonical dedupe key is client-op-scoped: (doc_id, client_id, client_op_id) is unique, so a retry is idempotent even if the editing session was regenerated (reload/restart/long offline gap). (session_id, client_seq) is also stored to reconcile a client's pending queue in order. (doc_id, version) is monotonic under the active owner epoch.",
       "fields": [
         {
           "name": "doc_id",
@@ -396,25 +520,57 @@
         },
         {
           "name": "version",
-          "type": "bigint (server sequence, monotonic)"
+          "type": "bigint (server sequence, monotonic per doc)"
+        },
+        {
+          "name": "owner_epoch",
+          "type": "bigint (fences appends from a stale owner)"
         },
         {
           "name": "op",
-          "type": "json (insert/delete + position or CRDT id)"
+          "type": "json OT op: { type, pos|range, text|attributes }"
+        },
+        {
+          "name": "base_version",
+          "type": "bigint (version the client wrote against)"
         },
         {
           "name": "author_id",
           "type": "bigint"
         },
         {
+          "name": "client_id",
+          "type": "string (stable device/install identity)"
+        },
+        {
+          "name": "client_op_id",
+          "type": "uuid (durable per-op id; survives session change)"
+        },
+        {
+          "name": "session_id",
+          "type": "string (editing session; persisted with pending queue)"
+        },
+        {
+          "name": "client_seq",
+          "type": "bigint (monotonic per session; orders the pending queue)"
+        },
+        {
+          "name": "op_schema_version",
+          "type": "smallint (op format/migration; e.g. v1 text, v2 attributes/ranges, v3 comments)"
+        },
+        {
           "name": "created_at",
           "type": "timestamp"
+        },
+        {
+          "name": "uniq (doc_id, client_id, client_op_id)",
+          "type": "unique constraint (idempotent retry, session-independent)"
         }
       ]
     },
     {
       "name": "snapshots",
-      "note": "Periodic materialized document state to bound replay.",
+      "note": "Periodic materialized document state to bound replay. Written atomically; a checksum guards against a half-written snapshot after a worker crash.",
       "fields": [
         {
           "name": "doc_id",
@@ -427,12 +583,24 @@
         {
           "name": "content",
           "type": "blob"
+        },
+        {
+          "name": "format_version",
+          "type": "smallint"
+        },
+        {
+          "name": "checksum",
+          "type": "string (validated on load; reject partial writes)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp"
         }
       ]
     },
     {
       "name": "documents",
-      "note": "Ownership, ACLs, and current version marker.",
+      "note": "Ownership lease, ACLs, and current version markers. owner_epoch + lease_expires_at fence ownership so only one active writer can stamp versions.",
       "fields": [
         {
           "name": "doc_id",
@@ -443,12 +611,28 @@
           "type": "string (current session owner)"
         },
         {
+          "name": "owner_epoch",
+          "type": "bigint (bumped on each ownership transfer)"
+        },
+        {
+          "name": "lease_expires_at",
+          "type": "timestamp (owner must renew or lose the lease)"
+        },
+        {
           "name": "acl",
           "type": "json"
         },
         {
+          "name": "acl_version",
+          "type": "bigint (bumped on permission change; checked on op)"
+        },
+        {
           "name": "head_version",
           "type": "bigint"
+        },
+        {
+          "name": "snapshot_version",
+          "type": "bigint (latest retained snapshot)"
         }
       ]
     }
@@ -516,7 +700,8 @@
       "description": [
         "Start with the simplest thing that works. Each client edits its own copy and periodically saves the whole document back with PUT /doc/{id}; the server stores whatever blob it last received. To see others' changes, a client reloads the document.",
         "This works for a single editor and immediately falls apart with two. Because each save overwrites the entire document, the last writer wins: if Alice and Bob both load v5, Alice saves her paragraph, then Bob saves his (built on the stale v5), Bob's save clobbers Alice's work entirely — the classic lost-update problem. There's no merge, no notion of concurrent edits, and edits feel laggy because nothing appears until a save+reload round trip.",
-        "So the baseline motivates the whole design: apply edits optimistically and locally for instant feedback, express them as fine-grained operations against a known baseline version, give one authority a total order, and reconcile concurrent ops with OT or a CRDT so no edit is ever silently lost."
+        "So the baseline motivates the whole design: apply edits optimistically and locally for instant feedback, express them as fine-grained operations against a known baseline version, give one authority a total order, and reconcile concurrent ops with OT or a CRDT so no edit is ever silently lost.",
+        "(The API evolves with the design: this baseline's blob-style PUT /doc/{id} is replaced by the WebSocket op stream — connect, send-op, reconnect — once edits become fine-grained operations, so the API section lists the op-stream contract, not the discarded PUT.)"
       ],
       "view": {
         "nodes": [
@@ -566,6 +751,8 @@
       "description": [
         "Typing must feel instant, so the client applies its own edits to its local copy immediately rather than waiting for a server round trip. Each edit is an operation (insert/delete at a position) sent to the server in the background.",
         "The client tracks the version it last synced from the server; ops it sends are relative to that baseline. The local copy is provisional until the server orders and acks.",
+        "Concretely the client keeps a pending-op queue: the acked server version plus the ops it has sent but not yet had acked. Each op gets a monotonic clientSeq (which orders the queue) and a durable, client-generated clientOpId (a UUID — the dedupe key the server keys on). The queue is persisted to local storage before an op is considered locally accepted, so it survives a tab reload, app restart, or a multi-day offline gap; on resend, the clientOpId is unchanged, so the server recognizes the op as a duplicate even if the editing session was regenerated.",
+        "When a remote op arrives before its own pending ops are acked, the client rebases its pending ops over that remote op (the same transform machinery it uses on the server). This persisted pending queue is exactly what makes later retry, dedupe, and offline replay work — a lost ack just means resending ops under their original clientOpId.",
         "This optimistic model is what makes collaborative editors usable — but it means clients can produce edits concurrently against the same baseline, which must be reconciled."
       ],
       "view": {
@@ -596,6 +783,20 @@
           "whyItMatters": "Removes input latency; the network round trip never blocks typing.",
           "example": "You see your character instantly; the op syncs in the background.",
           "group": "Optimistic Local Editing"
+        },
+        {
+          "term": "Client pending-op queue",
+          "definition": "The ordered list of sent-but-unacked ops the client holds, rebasing them over any remote op that arrives before they're acked.",
+          "whyItMatters": "It's the substrate for retry, dedupe, and offline replay — a lost ack just means resending the queue.",
+          "example": "Pending [seq 87, 88]; a remote insert lands, so both are transformed before re-sending.",
+          "group": "Optimistic Local Editing"
+        },
+        {
+          "term": "Durable op identity",
+          "definition": "The pending queue (with its sessionId) is persisted to local storage before an op is locally accepted, and each op carries a client-generated clientOpId (UUID).",
+          "whyItMatters": "It makes dedupe survive reloads, app restarts, and multi-day offline gaps — the buffered op resubmits under the same identity instead of evading the dedupe key as a 'new' op.",
+          "example": "Reload after editing offline; the same clientOpId d4e1-… resubmits and the server returns the original ack.",
+          "group": "Optimistic Local Editing"
         }
       ],
       "probeLinks": [
@@ -622,7 +823,9 @@
       "description": [
         "Convergence requires a single source of truth for order. Assign each active document to one collab server that receives all ops for it, assigns a monotonic version number, appends to the op log, and broadcasts to all editors.",
         "Every client replays ops in this server-assigned order, so all replicas converge. The op log is durable and authoritative; the live in-memory document is derived from it.",
-        "A document router maps doc id -> owning server (sharding by doc). Bounded editors-per-doc means one server per doc is fine; documents scale horizontally across servers."
+        "A document router maps doc id -> owning server (sharding by doc). Bounded editors-per-doc means one server per doc is fine; documents scale horizontally across servers.",
+        "Single-owner ordering is only correct if there is exactly one active writer. The dangerous case is an old owner that pauses (GC pause, network partition) rather than dying, then resumes after the router has handed the doc to a new owner — now two servers could both stamp versions. The fix is fencing: each ownership is an epoch (a lease). The owner includes its owner_epoch in every op-log append, and the log rejects any append from a stale epoch. A resumed old owner's writes are fenced out, so the (doc_id, version) sequence stays monotonic under exactly one epoch.",
+        "Lease mechanics in practice: the owner holds a short lease (say ~10s TTL) and renews it roughly every TTL/3 (~3s) against the lease store. Failure detection waits for the lease to expire, so failover time is bounded by the TTL (~10s here) rather than being instantaneous. The new owner only takes the bumped epoch after the old lease has provably expired, so the active windows of the two owners never overlap. A 'false failover' — the owner was merely slow, not dead — is harmless: fencing rejects the slow owner's stale-epoch appends instead of corrupting order, and it just reconnects. The TTL is the knob: short enough to fail over quickly, long enough not to flap on a normal GC pause."
       ],
       "view": {
         "nodes": [
@@ -634,7 +837,11 @@
         ],
         "caption": "The document router consults the metadata store for ownership and ACL, then the single owning collab server serializes ops into the operation log and broadcasts them.",
         "links": [
-          "lb-router",
+          {
+            "from": "Client",
+            "to": "DocRouter",
+            "label": "which server owns doc?"
+          },
           "router-meta",
           "client-docserver",
           "docserver-oplog",
@@ -661,7 +868,7 @@
           "cons": [
             "The owning server is a per-document single point of failure; a crash needs failover and reload from snapshot+tail.",
             "All ops for a hot document funnel through one server's throughput.",
-            "Router/ownership state must stay correct or two servers could both think they own a doc."
+            "Router/ownership state must stay correct or two servers could both think they own a doc — addressed by leasing ownership with a monotonic epoch and fencing stale-epoch appends at the op log."
           ],
           "view": {
             "nodes": [
@@ -815,6 +1022,13 @@
           "whyItMatters": "A single authoritative sequence is the simplest way to guarantee all replicas converge.",
           "example": "Doc 9 -> server S3; S3 stamps versions 412, 413, ... and everyone replays in that order.",
           "group": "One Authoritative Order per Document"
+        },
+        {
+          "term": "Owner lease / fencing epoch",
+          "definition": "Ownership is a leased epoch; the owner stamps owner_epoch on every append and the op log rejects appends from a stale epoch.",
+          "whyItMatters": "It prevents split-brain: a paused old owner that resumes after failover cannot corrupt the version sequence, so single-owner ordering stays correct.",
+          "example": "Router bumps epoch 9 -> 10 on transfer; old owner's epoch-9 append is rejected.",
+          "group": "One Authoritative Order per Document"
         }
       ],
       "probeLinks": [
@@ -831,9 +1045,16 @@
       ],
       "recap": {
         "before": "Concurrent ops, no order.",
-        "after": "One server totally orders each doc's ops; clients replay it.",
+        "after": "One server totally orders each doc's ops under a fenced ownership epoch; clients replay it.",
         "newRisk": "An op was written against an old baseline — its position may be wrong relative to ops that landed first."
       },
+      "traps": [
+        {
+          "trap": "Treating ownership transfer as just a router table update with no fencing.",
+          "why": "A paused old owner can resume after the router reassigns the doc and both servers stamp versions — split brain forks the authoritative order, the one invariant the whole design rests on.",
+          "instead": "Lease ownership with a monotonic owner_epoch; stamp it on every append; have the op log reject stale-epoch writes."
+        }
+      ],
       "flows": [
         {
           "name": "Optimistic op -> single-server ordering -> broadcast",
@@ -883,6 +1104,79 @@
             "DocServer",
             "OpLog"
           ]
+        },
+        {
+          "name": "Ownership failover with fencing (no split brain)",
+          "note": "When an owner is suspected dead, the router transfers the lease by bumping the epoch. The new owner fences the old one, loads snapshot + tail, and accepts reconnects. If the old owner was only paused and resumes, its stale-epoch appends are rejected by the op log.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "OldOwner",
+                "label": "Old Owner (S3, epoch 9)"
+              },
+              {
+                "id": "DocRouter",
+                "label": "Doc Router"
+              },
+              {
+                "id": "NewOwner",
+                "label": "New Owner (S7, epoch 10)"
+              },
+              {
+                "id": "OpLog",
+                "label": "Op Log"
+              }
+            ],
+            "messages": [
+              {
+                "from": "DocRouter",
+                "to": "DocRouter",
+                "arrow": "->>",
+                "label": "S3 lease expired; bump epoch 9 -> 10"
+              },
+              {
+                "from": "DocRouter",
+                "to": "NewOwner",
+                "arrow": "->>",
+                "label": "grant doc 9 lease @ epoch 10"
+              },
+              {
+                "from": "NewOwner",
+                "to": "OpLog",
+                "arrow": "->>",
+                "label": "load snapshot + tail; resume @ epoch 10"
+              },
+              {
+                "type": "alt",
+                "label": "old owner was only paused and resumes",
+                "messages": [
+                  {
+                    "from": "OldOwner",
+                    "to": "OpLog",
+                    "arrow": "->>",
+                    "label": "append @ stale epoch 9"
+                  },
+                  {
+                    "from": "OpLog",
+                    "to": "OldOwner",
+                    "arrow": "-->>",
+                    "label": "reject: stale epoch (fenced)"
+                  }
+                ]
+              }
+            ]
+          },
+          "highlight": [
+            "NewOwner",
+            "OpLog"
+          ]
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The old owner pauses (long GC / network partition), the router assigns a new owner, then the old owner resumes and tries to append.",
+          "expectedBehavior": "The old owner's appends carry a stale owner_epoch and are rejected by the op log; only the new owner (current epoch) can stamp versions, so the (doc_id, version) sequence never forks.",
+          "mitigation": "Lease + monotonic owner_epoch fencing; epoch stamped on every append; op log enforces current-epoch-only writes."
         }
       ]
     },
@@ -892,7 +1186,9 @@
       "description": [
         "A client's op targets a position in the version it saw; by the time it reaches the server, other ops may have shifted that position. Naively applying it corrupts the text. Two families solve this.",
         "Operational Transformation (OT): the server transforms an incoming op against the concurrent ops it didn't see, adjusting positions so intent is preserved — the classic Google-Docs approach, well-suited to a central server.",
-        "CRDTs: represent the document so operations commute by design (each character gets a stable, orderable id, not a positional index), so concurrent edits merge without a central transform — better for peer-to-peer/offline. Pick one; state the tradeoff (OT is simpler centrally but transform functions are tricky; CRDTs converge easily but carry metadata overhead)."
+        "And it's not just shifting insert positions. The harder pairs are where the difficulty lives: in a delete-vs-insert, if a concurrent delete removed the range your insert was anchored inside, the insert has to reanchor to where that text went (clamp to the deletion point) rather than land among characters that no longer exist. In a delete-vs-delete, two clients deleting overlapping ranges must transform to remove only the characters still present — e.g. you meant to delete [5,10) but a concurrent [3,8) already landed, so the overlap [5,8) is gone and your op becomes deleting just the remaining [8,10) at its shifted position. Each such operation pair is a transform function you have to prove correct, which is exactly why OT is 'simple centrally but the transforms are tricky'.",
+        "CRDTs: represent the document so operations commute by design (each character gets a stable, orderable id, not a positional index), so concurrent edits merge without a central transform — better for peer-to-peer/offline. The mirror-image cost is that CRDTs converge easily but carry per-character metadata and tombstone overhead. Pick one and own its cost.",
+        "For this server-centric, Google-Docs-style case the target is OT: we already have a single owning server defining order, so transforming against concurrent ops is the natural fit and keeps the document a compact character sequence. CRDT stays the alternative for an offline-first/P2P product (and a follow-up). One caveat to name out loud: rich text (bold, links, comments) multiplies the OT transform cases — every new operation type needs its transform proven against every other — which is why formatting is left as a deliberate extension here."
       ],
       "view": {
         "nodes": [
@@ -1055,7 +1351,7 @@
       ],
       "recap": {
         "before": "Stale-position ops corrupt text.",
-        "after": "Concurrent edits transform/merge and converge.",
+        "after": "Concurrent edits converge via OT (the target); CRDT is the offline-first/P2P alternative.",
         "newRisk": "The op log grows forever — replaying from scratch gets slow; state must persist durably."
       },
       "traps": [
@@ -1152,7 +1448,8 @@
       "description": [
         "Both families converge concurrent edits, but the choice is a real fork with different costs. Operational Transformation keeps the document as a plain sequence and transforms each op against the ops it didn't see; it leans on a central server to define the order, and the transform functions are notoriously tricky to get right for every op-pair.",
         "CRDTs give each character a stable, globally-orderable id so concurrent inserts/deletes commute by construction — no central transform, which is why they shine for peer-to-peer and offline-heavy editing. The cost is per-character metadata (tombstones for deletes, id overhead) that has to be managed.",
-        "Rule of thumb: a server-centric editor (Google Docs) does well with OT; an offline-first or P2P editor (many modern local-first apps) leans CRDT. State the assumption, pick one, and own its cost."
+        "Rule of thumb: a server-centric editor (Google Docs) does well with OT; an offline-first or P2P editor (many modern local-first apps) leans CRDT. State the assumption, pick one, and own its cost.",
+        "Target choice for this case: OT. We have a single owning server per document (the ordering step), bounded editors, and no requirement for true peer-to-peer offline merge without a server — so OT's compact state and central-transform model wins, and we accept the cost of carefully-proven transform functions. CRDT is the alternative we'd reach for if the product became offline-first or P2P."
       ],
       "view": {
         "nodes": [
@@ -1192,8 +1489,8 @@
       ],
       "recap": {
         "before": "Concurrent edits converge by some mechanism.",
-        "after": "A deliberate OT-or-CRDT choice justified by topology and cost.",
-        "newRisk": "OT transform correctness or CRDT metadata growth — whichever you picked."
+        "after": "Target committed: OT for this server-centric editor; CRDT kept as the offline-first/P2P alternative.",
+        "newRisk": "OT transform correctness — every op-pair (and every future rich-text op type) must transform correctly."
       }
     },
     {
@@ -1201,7 +1498,9 @@
       "title": "5. Durability: Snapshots + Op Log",
       "description": [
         "The op log is the source of truth, but replaying millions of ops to load a document is too slow. Periodically materialize a snapshot of the document at a version; loading = latest snapshot + the tail of ops after it.",
-        "A persistence worker compacts the log into snapshots and archives history for version browsing. Acknowledge an op only after it's durably in the log, so an acked edit is never lost even if the server crashes.",
+        "A persistence worker compacts the log into snapshots and archives history for version browsing. Acknowledge an op only after it's durably in the log, so an acked edit is never lost even if the server crashes. Persist-before-ack is also what makes retries safe: because the durable append is keyed by (doc_id, client_id, client_op_id), a client that retries after a lost ack — even from a fresh session after a reload — hits the unique constraint and the server returns the original version instead of applying the op twice.",
+        "Snapshots must be written consistently: a snapshot is the materialized state up to an exact version, written atomically with a checksum and a format_version. If the worker crashes mid-write, the partial blob fails its checksum on load and the reader falls back to the previous snapshot + a longer tail — a half-written snapshot is never trusted. The documents row's snapshot_version is only advanced after the snapshot is durably committed.",
+        "Retention is a real constraint here because version history is a requirement: compaction can prune the op-log tail a recent snapshot already covers, but it cannot simply discard all old ops. So history lives in cold storage as a chain of periodic archived snapshots plus the op stream between adjacent restore points. 'Browse history' lists the archived snapshots; 'restore to version V' loads the nearest archived snapshot at or before V and replays the cold ops up to V — the same snapshot+tail mechanism, just over cold storage rather than the live op log, which after hot compaction no longer holds the old ops.",
         "On crash/failover, a new server for the doc reloads from snapshot + tail and resumes the session — the in-memory state is rebuildable."
       ],
       "view": {
@@ -1339,6 +1638,20 @@
           "whyItMatters": "Bounds load/recovery time regardless of document age.",
           "example": "Snapshot @ v400 + ops 401..413 = current state.",
           "group": "Durability: Snapshots + Op Log"
+        },
+        {
+          "term": "Idempotent op append",
+          "definition": "Durably appending keyed by (doc_id, client_id, client_op_id) so a retried op is recognized and not applied twice — even after a reload regenerates the session.",
+          "whyItMatters": "Reconnects, lost acks, tab reloads, and offline replay all resend ops; without idempotency the same insert lands twice — a correctness bug.",
+          "example": "Retry of clientOpId d4e1-… returns the original v413 instead of appending v461.",
+          "group": "Durability: Snapshots + Op Log"
+        },
+        {
+          "term": "Snapshot consistency",
+          "definition": "A snapshot is the state up to an exact version, written atomically with a checksum; a partial write is rejected on load.",
+          "whyItMatters": "A half-written snapshot adopted as truth would silently corrupt the document on the next failover.",
+          "example": "Worker dies mid-write; checksum fails; reader uses the prior snapshot + a longer tail.",
+          "group": "Durability: Snapshots + Op Log"
         }
       ],
       "probeLinks": [
@@ -1359,7 +1672,17 @@
         {
           "scenario": "The doc server crashes mid-session.",
           "expectedBehavior": "A new owner loads snapshot + tail from the durable log and clients reconnect; no acked op is lost.",
-          "mitigation": "Persist-before-ack + snapshot/tail recovery + doc router failover."
+          "mitigation": "Persist-before-ack + snapshot/tail recovery + doc router failover (with epoch fencing)."
+        },
+        {
+          "scenario": "The server appends an op durably, then the ack is lost (client reconnects and retries the same op).",
+          "expectedBehavior": "The retry carries the same clientOpId; the durable unique constraint rejects the duplicate and the server returns the original assigned version. The op is applied exactly once.",
+          "mitigation": "Idempotent appends keyed by (doc_id, client_id, client_op_id); ack returns serverVersion + clientOpId so the client reconciles its pending queue."
+        },
+        {
+          "scenario": "The persistence worker crashes while writing a snapshot.",
+          "expectedBehavior": "The partial snapshot fails its checksum on load and is ignored; the reader falls back to the previous good snapshot plus a longer op-log tail. snapshot_version is never advanced for an uncommitted snapshot.",
+          "mitigation": "Atomic snapshot write + checksum + format_version; advance documents.snapshot_version only after durable commit."
         }
       ]
     },
@@ -1368,8 +1691,9 @@
       "title": "6. Presence: Cursors and Selections",
       "description": [
         "Collaboration needs awareness: where others' cursors are, what they've selected, who's in the doc. Presence is high-frequency but ephemeral — it doesn't go in the durable op log.",
-        "The doc server tracks live cursor/selection state per editor and broadcasts it over the same connection, throttled. Cursors are transformed alongside ops (an insert before your cursor shifts it) so they stay anchored.",
-        "Presence is best-effort and lossy: missing a cursor update for a moment is harmless, so it bypasses the durability path entirely."
+        "Target design: presence is ephemeral in-memory state owned by the doc server itself, broadcast over the same WebSocket connection as edits, throttled (~10/s). There is no separate durable presence store on the hot path — the 'Presence' box in the architecture is that per-session in-memory cursor/selection state, not a standalone backend service. Cursors are transformed alongside ops (an insert before your cursor shifts it) so they stay anchored. On a failover, live cursor state is simply rebuilt as clients re-announce — it was never durable.",
+        "A dedicated pub/sub presence tier (the alternative option below) only earns its place if you need cross-document 'who is online' aggregation or presence fanout that outgrows the doc server; for the bounded-editors-per-doc case here, in-server ephemeral presence is enough.",
+        "Presence is best-effort and lossy: missing a cursor update for a moment is harmless, so it bypasses the durability path entirely. The one thing never to do is route cursor moves through the durable op log."
       ],
       "view": {
         "nodes": [
@@ -1377,7 +1701,7 @@
           "DocServer",
           "Presence"
         ],
-        "caption": "The collab server forwards cursor and selection updates to the presence service, which streams other users' cursors back to the client alongside the edit channel.",
+        "caption": "The collab server updates its in-memory presence state with each cursor/selection change and streams other users' cursors back to the client on the same edit channel — no separate presence backend.",
         "links": [
           "docserver-presence",
           "presence-client",
@@ -1410,7 +1734,7 @@
               "DocServer",
               "Presence"
             ],
-            "caption": "Cursor and selection updates flow through an ephemeral best-effort presence service that pushes other users' cursors to the client without durability.",
+            "caption": "Cursor and selection updates live in ephemeral best-effort in-memory state on the doc server, which pushes other users' cursors to the client without durability.",
             "links": [
               "docserver-presence",
               "presence-client",
@@ -1523,17 +1847,25 @@
       ],
       "recap": {
         "before": "Only document edits.",
-        "after": "Live cursors/selections, anchored through transforms, broadcast cheaply.",
+        "after": "Live cursors/selections, anchored through transforms, broadcast cheaply as ephemeral in-server state.",
         "newRisk": "Offline editing and reconnection still need to merge buffered ops correctly."
-      }
+      },
+      "traps": [
+        {
+          "trap": "Persisting cursor/selection updates through the durable op log.",
+          "why": "Cursor moves are ~10/s/editor and ephemeral; logging them floods storage and replay and incurs an fsync-class cost per twitch, starving the real edit stream.",
+          "instead": "Keep presence as throttled, best-effort, in-memory state broadcast on the live connection; never durable."
+        }
+      ]
     },
     {
       "id": "offline",
       "title": "7. Offline Editing and Reconnection",
       "description": [
-        "A client can lose connection and keep editing. It buffers ops locally against the last baseline it had; on reconnect it sends them and the server transforms/merges them against everything that happened meanwhile (the same OT/CRDT machinery).",
-        "The client also pulls the ops it missed (from its baseline to head) and reconciles, converging to the shared state. Long offline gaps may need a snapshot-based resync rather than op-by-op.",
-        "Because edits are operations against a versioned baseline, offline merge is the same problem as concurrent online editing — just with a bigger gap — so no separate mechanism is needed."
+        "A client can lose connection and keep editing. It buffers ops locally (in the client-local pending-ops store, not a backend queue) against the last baseline it had, each tagged with a monotonic clientSeq and a durable clientOpId. On reconnect it runs a precise protocol rather than just 'send everything'.",
+        "Reconnect protocol: the client sends its lastSeenVersion and its pending ops. The server (1) returns the ops the client missed (baseline -> head) so the client can rebase its pending ops over them, then (2) accepts the pending ops idempotently — duplicates from a prior partial sync are deduped by their durable clientOpId, so an op that was actually applied before the disconnect is not applied again even if the client reconnected under a fresh session. This reuses the same OT machinery as online concurrent editing, just with a bigger gap.",
+        "Edge cases that matter in production: (a) a very stale client whose baseline is older than the retained op-log tail can't be caught up op-by-op — the server replies needsSnapshot and the client resyncs from a snapshot, then rebases its pending ops onto it; (b) the document was deleted or the client's permission was revoked while it was offline — on reconnect the server checks acl_version and rejects the buffered ops (permission-denied / doc-gone) rather than silently applying stale edits; (c) the snapshot the client's baseline referenced has been compacted away — same needsSnapshot path.",
+        "Because edits are idempotent operations against a versioned baseline, offline merge is the same problem as concurrent online editing — just with a bigger gap and an explicit catch-up/dedupe/resync step — so no separate merge mechanism is needed."
       ],
       "view": {
         "nodes": [
@@ -1542,7 +1874,7 @@
           "DocServer",
           "OpLog"
         ],
-        "caption": "The client buffers edits in an offline sync buffer that replays them to the collab server on reconnect, which appends them to the operation log.",
+        "caption": "The client buffers edits in its local (on-device) pending-ops store and replays them to the collab server on reconnect, which dedupes and appends them to the operation log.",
         "links": [
           "client-offline",
           "offline-docserver",
@@ -1569,26 +1901,183 @@
       "whyNow": [
         "Offline support tests whether the conflict model truly generalizes; reusing OT/CRDT for reconnection is the elegant payoff."
       ],
+      "concepts": [
+        {
+          "term": "Reconnect catch-up + dedupe",
+          "definition": "On reconnect the client fetches missed ops, rebases its pending ops over them, and resubmits; the server dedupes by durable clientOpId.",
+          "whyItMatters": "Turns the scary 'offline for an hour' case into ordinary concurrent editing with an explicit, idempotent catch-up step.",
+          "example": "Client at v412 reconnects to head v460; rebases pending seq 87 over 413..460, resubmits, server skips already-applied ops.",
+          "group": "Offline Editing and Reconnection"
+        },
+        {
+          "term": "Snapshot resync for stale clients",
+          "definition": "If the client's baseline is older than the retained tail, the server sends needsSnapshot and the client rebases its pending ops onto a fresh snapshot.",
+          "whyItMatters": "Op-by-op catch-up is impossible once the tail is compacted; snapshot resync bounds the worst case.",
+          "example": "Offline for days; baseline v100 long compacted; resync from snapshot v455.",
+          "group": "Offline Editing and Reconnection"
+        },
+        {
+          "term": "Editing-quality SLIs",
+          "definition": "Operate the system on user-visible editing signals: op-ack latency, remote-broadcast lag, pending ops per client, transform-failure rate, snapshot age, tail replay length, owner failover time, stale-epoch rejection rate, duplicate-op retry rate, presence drop/coalesce rate, reconnect success rate, and permission-denied buffered-op count.",
+          "whyItMatters": "These map directly to how the editor feels and to the correctness invariants — a spike in stale-epoch rejections means a flapping owner; a spike in duplicate-op retries means clients aren't getting acks.",
+          "example": "Alert when broadcast lag p99 > 100ms or owner failover time p95 > one lease TTL.",
+          "group": "Observability and Operations"
+        },
+        {
+          "term": "Collab-specific runbooks",
+          "definition": "The incidents worth a runbook here aren't DLQ replays — they're stale-owner fencing storms, snapshot checksum failures, hot-doc saturation, slow-client eviction, and stuck lease renewal.",
+          "whyItMatters": "Each ties to a concrete signal and action: checksum failure -> fall back to prior snapshot + longer tail; stuck lease -> force-expire and re-grant; hot-doc saturation -> shed/queue presence first, then throttle ops.",
+          "example": "Snapshot checksum fails on attach -> automatically load prior good snapshot + replay a longer tail, page if it recurs.",
+          "group": "Observability and Operations"
+        }
+      ],
       "recap": {
         "before": "Disconnection loses work.",
-        "after": "Offline ops buffered and merged on reconnect via the same transform/merge.",
+        "after": "Offline ops buffered locally and merged on reconnect via catch-up + idempotent dedupe; snapshot resync for very stale clients.",
         "newRisk": "Very stale clients and large gaps — bounded by snapshot resync; hot docs stress one server."
       },
+      "traps": [
+        {
+          "trap": "Replaying buffered offline ops on reconnect without dedupe or a permission re-check.",
+          "why": "Ops that were already applied before the disconnect get applied twice (corruption), and edits buffered after a revoke get written despite the client no longer having access.",
+          "instead": "Dedupe by durable clientOpId, rebase over missed ops, and re-check acl_version before accepting buffered ops."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A client edits offline, then reconnects, and some of its buffered ops were actually delivered and applied before the disconnect (partial prior sync).",
+          "expectedBehavior": "The server recognizes the already-applied clientOpId entries, skips them, and applies only the genuinely new pending ops — exactly once, no duplication.",
+          "mitigation": "Idempotent appends + reconnect catch-up that returns missed ops for client-side rebase."
+        },
+        {
+          "scenario": "A client's edit permission is revoked (or the doc is deleted) while it is offline.",
+          "expectedBehavior": "On reconnect the server sees a stale acl_version and rejects the buffered ops with permission-denied / doc-gone instead of applying stale edits; the client surfaces the loss of access.",
+          "mitigation": "acl_version checked on reconnect and on each op submission; buffered ops are not privileged over live ones."
+        }
+      ],
+      "flows": [
+        {
+          "name": "Reconnect after offline editing (catch-up, rebase, idempotent replay)",
+          "note": "The client sends its last seen version and pending ops; the server returns missed ops for the client to rebase over, then accepts the pending ops idempotently. If the baseline is too old, it asks for a snapshot resync instead.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Client"
+              },
+              {
+                "id": "DocServer",
+                "label": "Doc Server"
+              },
+              {
+                "id": "OpLog",
+                "label": "Op Log"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Client",
+                "to": "DocServer",
+                "arrow": "->>",
+                "label": "reconnect: lastSeen 412, pending [seq 87,88]"
+              },
+              {
+                "from": "DocServer",
+                "to": "DocServer",
+                "arrow": "->>",
+                "label": "check acl_version (still allowed?)"
+              },
+              {
+                "type": "alt",
+                "label": "baseline within retained tail",
+                "messages": [
+                  {
+                    "from": "DocServer",
+                    "to": "OpLog",
+                    "arrow": "->>",
+                    "label": "read missed ops 413..460"
+                  },
+                  {
+                    "from": "DocServer",
+                    "to": "Client",
+                    "arrow": "-->>",
+                    "label": "missed ops 413..460"
+                  },
+                  {
+                    "from": "Client",
+                    "to": "Client",
+                    "arrow": "->>",
+                    "label": "rebase pending over 413..460"
+                  },
+                  {
+                    "from": "Client",
+                    "to": "DocServer",
+                    "arrow": "->>",
+                    "label": "resubmit pending [seq 87,88]"
+                  },
+                  {
+                    "from": "DocServer",
+                    "to": "OpLog",
+                    "arrow": "->>",
+                    "label": "append new; dedupe already-applied clientOpIds"
+                  },
+                  {
+                    "from": "DocServer",
+                    "to": "Client",
+                    "arrow": "-->>",
+                    "label": "ack accepted @ versions"
+                  }
+                ],
+                "else": {
+                  "label": "baseline older than retained tail",
+                  "messages": [
+                    {
+                      "from": "DocServer",
+                      "to": "Client",
+                      "arrow": "-->>",
+                      "label": "needsSnapshot @ v455"
+                    },
+                    {
+                      "from": "Client",
+                      "to": "Client",
+                      "arrow": "->>",
+                      "label": "rebase pending onto snapshot v455"
+                    },
+                    {
+                      "from": "Client",
+                      "to": "DocServer",
+                      "arrow": "->>",
+                      "label": "resubmit pending against v455"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "DocServer",
+            "OpLog"
+          ]
+        }
+      ],
       "bottlenecks": [
         {
           "issue": "A very popular doc concentrates load on one server.",
-          "mitigation": "Bounded editors per doc; the single-owner model is per-doc, so load spreads across docs."
+          "mitigation": "Bounded editors per doc; the single-owner model is per-doc, so load spreads across docs. Batch keystrokes into ops to cut the per-doc op rate."
         },
         {
           "issue": "A client offline for a very long time.",
           "mitigation": "Resync from a snapshot instead of replaying every missed op."
+        },
+        {
+          "issue": "A slow client can't keep up with broadcast (backpressure).",
+          "mitigation": "Cap pending unacked ops per client and per-connection send buffer; coalesce/drop redundant presence frames; if a client falls too far behind, force a snapshot resync rather than queueing unboundedly."
         }
       ]
     }
   ],
   "finalDesign": {
     "title": "Final Design — Real-Time Collaborative Editor",
-    "description": "Clients apply edits optimistically and stream ops to the single collab server that owns the document (via a doc router/sharding). That server assigns a total order, transforms concurrent ops (OT) — or merges commutative CRDT ops — appends them to a durable op log, and broadcasts the ordered ops so all clients converge. Snapshots plus the op-log tail bound load and enable crash/failover recovery; presence (cursors/selections) flows over the same connection as ephemeral, best-effort state. Offline edits buffer locally and merge on reconnect through the same conflict machinery, with snapshot resync for long gaps.",
+    "description": "Target: a single owning doc server per document + Operational Transformation + a durable op log. Clients apply edits optimistically and stream idempotent ops (clientId, sessionId, clientOpId, clientSeq, baseVersion) to the one collab server that owns the document, reached via a doc router/sharding under a fenced ownership lease. That server assigns a total order, transforms concurrent ops (OT), appends them to a durable op log (persist-before-ack, deduped by a durable (doc_id, client_id, client_op_id) key that survives reload/restart/offline gaps), and broadcasts the ordered ops so all clients converge by replaying the accepted set. Snapshots plus the op-log tail bound load and enable crash/failover recovery; ownership transfer bumps an owner_epoch and fences stale owners so there is never a second writer. Presence (cursors/selections) is ephemeral best-effort state on the doc server over the same connection. Offline edits buffer client-locally and merge on reconnect through the same OT machinery with idempotent dedupe, falling back to snapshot resync for long gaps. CRDT is the alternative we'd choose if the product shifted to offline-first/P2P. Invariants: exactly one active owner epoch per doc, durable append before ack, idempotent client op IDs, clients converge by replaying the accepted op set under the server order, presence is best-effort.",
     "view": {
       "nodes": [
         "Client",
@@ -1602,7 +2091,7 @@
         "Presence",
         "Offline"
       ],
-      "caption": "The editor client connects via the gateway and document router to the owning collab server, which orders ops into the log, broadcasts edits, tracks presence, snapshots via the persistence worker, and replays the offline buffer.",
+      "caption": "The editor client connects via the gateway and document router to the owning collab server, which orders ops into the log, broadcasts edits, tracks presence in memory, snapshots via the persistence worker, and replays the client-local pending-ops buffer on reconnect.",
       "links": [
         "client-lb",
         "lb-router",
@@ -1691,13 +2180,353 @@
       },
       {
         "requirement": "Recoverable sessions",
-        "how": "Snapshot + tail reload on failover.",
+        "how": "Snapshot + tail reload on failover, with epoch fencing so only the new owner writes.",
         "steps": [
           "durability"
+        ]
+      },
+      {
+        "requirement": "Scale to many documents",
+        "how": "Shard by doc id: one owning server per active doc, bounded editors per doc, so load spreads horizontally across documents.",
+        "steps": [
+          "ordering",
+          "durability"
+        ]
+      },
+      {
+        "requirement": "Available: brief server blips shouldn't lose work",
+        "how": "Persist-before-ack + fenced failover reload, plus client-local offline buffering and idempotent replay so a blip is just a reconnect.",
+        "steps": [
+          "ordering",
+          "durability",
+          "offline"
         ]
       }
     ]
   },
+  "technologyChoices": [
+    {
+      "concern": "WebSocket connection gateway / fanout",
+      "steps": [
+        "ordering",
+        "presence"
+      ],
+      "selfHosted": [
+        {
+          "name": "Nginx/Envoy WebSocket proxy",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "Socket.IO / ws node fleet",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Phoenix Channels (Elixir)",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "API Gateway WebSocket APIs",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          },
+          {
+            "name": "AWS AppSync (subscriptions)",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Run + WebSockets",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          },
+          {
+            "name": "Firebase Realtime Database",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Web PubSub",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Azure SignalR Service",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Self-hosting a sticky WebSocket fleet gives full control over routing to the owning doc server but you operate connection draining, autoscaling, and reconnection yourself.",
+        "Managed gateways remove that ops burden but can constrain sticky routing and message-size/duration limits that matter for doc sessions."
+      ],
+      "makesIrrelevant": [
+        "A managed pub/sub gateway can absorb the presence fanout tier, removing the need for a separate presence service."
+      ]
+    },
+    {
+      "concern": "Durable ordered op log",
+      "steps": [
+        "ordering",
+        "durability"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Postgres append-only table",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Redis Streams",
+          "icon": "assets/tech-icons/redis.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Amazon MSK",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Amazon Kinesis Data Streams",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Amazon Aurora",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Pub/Sub",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Cloud Spanner",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Event Hubs",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Azure Cosmos DB",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A log/stream system gives natural append-only ordering and replay but needs a uniqueness mechanism for idempotent (session, seq) dedupe layered on top.",
+        "A transactional DB table makes the (doc_id, client_id, client_op_id) unique constraint and monotonic (doc_id, version) trivial, at the cost of per-doc write throughput tuning."
+      ]
+    },
+    {
+      "concern": "Snapshot / document blob storage",
+      "steps": [
+        "durability"
+      ],
+      "selfHosted": [
+        {
+          "name": "MinIO",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Ceph object storage",
+          "icon": "assets/tech-icons/ceph.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Amazon S3",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Google Cloud Storage",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Blob Storage",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Object storage is cheap and durable for periodic snapshots and archived history; it is not low-latency for the hot op path, which is why the op log stays separate."
+      ]
+    },
+    {
+      "concern": "Document metadata + ownership lease",
+      "steps": [
+        "ordering"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "etcd / ZooKeeper (leases)",
+          "icon": "assets/tech-icons/etcd.png"
+        },
+        {
+          "name": "Redis (lease TTL)",
+          "icon": "assets/tech-icons/redis.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Amazon DynamoDB",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Amazon Aurora",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Spanner",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Firestore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Cosmos DB",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A coordination store (etcd/ZooKeeper) gives strong lease/fencing primitives for owner_epoch but is one more system to run.",
+        "A managed strongly-consistent DB can hold ownership + ACLs + lease TTL together, simplifying ops at the cost of less specialized fencing semantics."
+      ],
+      "makesIrrelevant": [
+        "A lease store with built-in fencing tokens removes the need to hand-roll split-brain detection in the router."
+      ]
+    },
+    {
+      "concern": "Conflict-resolution library (OT / CRDT)",
+      "steps": [
+        "conflict",
+        "ot-vs-crdt"
+      ],
+      "selfHosted": [
+        {
+          "name": "ShareDB (OT)",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "ot.js",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Yjs (CRDT)",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Automerge (CRDT)",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [],
+        "gcp": [
+          {
+            "name": "Firebase / Firestore merge",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Fluid Relay",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Adopting a mature OT/CRDT library avoids the notoriously hard correctness work of transform functions or tombstone GC, but ties the op/document model to that library's representation.",
+        "Rolling your own gives full control over the op schema (important for rich text) but you own every transform-correctness edge case.",
+        "Blast radius: a managed gateway/relay or hosted realtime DB lowers ops burden but a regional outage takes editing down globally and stream-retention limits cap your replay window; self-hosting spreads blast radius but you carry the on-call."
+      ]
+    },
+    {
+      "concern": "Observability and incident response",
+      "steps": [
+        "ordering",
+        "durability",
+        "offline"
+      ],
+      "selfHosted": [
+        {
+          "name": "Prometheus + Grafana",
+          "icon": "assets/tech-icons/prometheus.png"
+        },
+        {
+          "name": "OpenTelemetry traces",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Loki / ELK logs",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Amazon CloudWatch",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "AWS X-Ray",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Trace",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Application Insights",
+            "icon": "assets/tech-icons/00012-icon-service-Application-Insights.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Self-hosted metrics/tracing give full cardinality (per-doc, per-owner) for hot-doc debugging but you run the storage and alerting yourself.",
+        "Managed observability is turnkey but high-cardinality per-doc metrics get expensive — sample or aggregate to per-owner/per-shard for the firehose signals."
+      ],
+      "makesIrrelevant": [
+        "Tracking duplicate-op retry rate and stale-epoch rejection rate as first-class metrics removes the need to reconstruct split-brain or double-apply incidents from raw logs after the fact."
+      ]
+    }
+  ],
   "interviewScript": [
     {
       "phase": "Scope & requirements",
@@ -1721,9 +2550,10 @@
       "phase": "Deep dive",
       "time": "next 15 min",
       "say": [
-        "Conflict resolution: OT vs CRDT and the tradeoff.",
+        "Conflict resolution: OT (target) vs CRDT and the tradeoff.",
+        "Idempotent ops (durable clientOpId) and owner-epoch fencing for safe retries and failover.",
         "Snapshots + op log for fast load and crash recovery.",
-        "Presence as ephemeral state; offline buffering and merge."
+        "Presence as ephemeral state; offline buffering, catch-up, and dedupe on reconnect."
       ]
     },
     {
@@ -1731,8 +2561,9 @@
       "time": "final 5 min",
       "say": [
         "Map requirements to mechanisms.",
-        "Tradeoffs: OT vs CRDT, snapshot frequency, single-owner failover.",
-        "Mention rich content and access control as extensions."
+        "Tradeoffs: OT (the target) vs CRDT, snapshot frequency, single-owner failover with epoch fencing.",
+        "Name the correctness guards: idempotent client op IDs, persist-before-ack, owner-epoch fencing.",
+        "Mention observability (ack latency, broadcast lag, duplicate-op rate, failover time), backpressure, rich content, and access control as extensions."
       ]
     }
   ],
@@ -1756,9 +2587,11 @@
     {
       "level": "Staff",
       "expectations": [
-        "Reasons about OT transform correctness vs CRDT metadata cost.",
-        "Designs failover from snapshot+tail.",
-        "Discusses cursor transformation and long-offline resync precisely."
+        "Reasons about OT transform correctness vs CRDT metadata cost and commits to OT for this case.",
+        "Designs failover from snapshot+tail with owner-epoch fencing to prevent split brain.",
+        "Specifies idempotent ops (durable clientOpId dedupe surviving reload/restart), persist-before-ack, and backpressure limits.",
+        "Discusses cursor transformation and long-offline resync (catch-up, rebase, snapshot resync) precisely.",
+        "Names observability signals and per-op authorization / ACL revocation handling."
       ]
     }
   ],
@@ -1767,7 +2600,9 @@
     "How do you transform a cursor position when concurrent edits land before it?",
     "How do you fail over a document's owning server without losing in-flight ops?",
     "How would you support rich text (formatting), not just plain characters?",
-    "How do you resync a client that's been offline for days?"
+    "How do you resync a client that's been offline for days?",
+    "What metrics and alerts would you watch — op-ack latency, broadcast lag, pending ops per client, transform failures, snapshot age, tail replay length, failover time, duplicate-op rate, presence fanout?",
+    "How do you authorize each op (not just the connect), and handle a permission revocation mid-session?"
   ],
   "toProbeFurther": {
     "links": [

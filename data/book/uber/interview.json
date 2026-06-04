@@ -54,10 +54,10 @@
       {
         "id": "Driver",
         "label": "Driver App",
-        "type": "service",
-        "category": "compute",
+        "type": "client",
+        "category": "boundary",
         "traits": [],
-        "description": "Driver App: Synchronous application component that owns request-time business logic."
+        "description": "Driver App: Software client outside the backend boundary that streams location and receives trip offers."
       },
       {
         "id": "ETA",
@@ -205,6 +205,22 @@
         "description": "Push Notifications: Third-party or separately managed system outside the design's operational ownership boundary."
       },
       {
+        "id": "Obs",
+        "label": "Observability",
+        "type": "observability",
+        "category": "operations",
+        "traits": [],
+        "description": "Observability: Metrics, logs, and traces — location-stream lag, geo-query latency, offer timeout/acceptance rate, CAS conflict rate, hot-cell cardinality, and per-region error-budget burn."
+      },
+      {
+        "id": "Risk",
+        "label": "Location Auth / Risk",
+        "type": "service",
+        "category": "compute",
+        "traits": [],
+        "description": "Location Auth / Risk: Authenticates and validates driver pings (device identity, ping timestamp, monotonic sequence) and runs anti-spoofing checks before a location reaches the index."
+      },
+      {
         "id": "Pricing",
         "label": "Pricing Service",
         "type": "service",
@@ -243,10 +259,10 @@
       {
         "id": "Rider",
         "label": "Rider App",
-        "type": "service",
-        "category": "compute",
+        "type": "client",
+        "category": "boundary",
         "traits": [],
-        "description": "Rider App: Synchronous application component that owns request-time business logic."
+        "description": "Rider App: Software client outside the backend boundary that requests trips and shows live ETA."
       },
       {
         "id": "Router",
@@ -640,6 +656,40 @@
         "from": "Trip",
         "to": "Idem",
         "label": "CAS"
+      },
+      {
+        "id": "locingest-risk-validate",
+        "from": "LocIngest",
+        "to": "Risk",
+        "label": "auth + anti-spoof"
+      },
+      {
+        "id": "risk-locstream-validated",
+        "from": "Risk",
+        "to": "LocStream",
+        "label": "validated pings",
+        "arrow": "-.-"
+      },
+      {
+        "id": "regiona-obs",
+        "from": "RegionA",
+        "to": "Obs",
+        "label": "metrics",
+        "arrow": "-.-"
+      },
+      {
+        "id": "locstream-obs",
+        "from": "LocStream",
+        "to": "Obs",
+        "label": "lag / freshness",
+        "arrow": "-.-"
+      },
+      {
+        "id": "dispatch-obs",
+        "from": "Dispatch",
+        "to": "Obs",
+        "label": "offer / accept rate",
+        "arrow": "-.-"
       }
     ],
     "types": []
@@ -681,7 +731,9 @@
       "Each trip request matches at most one driver; a driver takes one trip at a time.",
       "Fresh location data: 'nearby' must reflect where drivers are now, not minutes ago.",
       "Scale to many cities with wildly uneven density (a few hot cities dominate).",
-      "Graceful degradation: widen search or queue rather than fail a request outright."
+      "Graceful degradation: widen search or queue rather than fail a request outright.",
+      "Location privacy & abuse resistance: driver pings are authenticated and validated (no spoofed/replayed positions reach the index); latest location has a TTL and any history has a bounded retention policy.",
+      "Operability: the system exposes the freshness, latency, acceptance, and conflict signals needed to detect degradation per city before it becomes an outage."
     ]
   },
   "capacity": [
@@ -714,14 +766,34 @@
       "label": "Density skew",
       "value": "extreme",
       "note": "A handful of cities hold most drivers and requests at once."
+    },
+    {
+      "label": "Hot-city ingest",
+      "value": "~150k–250k pings/sec",
+      "note": "A top city with ~600k–1M online drivers at ~1 ping/4s. At ~100 bytes/event that's ~15–25 MB/s — sized into ~32–64 stream partitions keyed by geo cell so one cell can't hot-spot a partition."
+    },
+    {
+      "label": "Geo-query fanout",
+      "value": "cell + 8 neighbors, cap ~50",
+      "note": "Each ride request reads ~9 cells and caps to ~50 candidates; downtown cells are split to a finer level so a single cell stays bounded."
+    },
+    {
+      "label": "Routing QPS",
+      "value": "~20x ride QPS (pre-batch)",
+      "note": "Ranking ~20 candidates by routed ETA per request means ETA calls dominate — hence ETA caching, contraction hierarchies, or a coarse geo pre-filter before precise routing."
+    },
+    {
+      "label": "Geo-index memory",
+      "value": "~1–2 GB/region",
+      "note": "~1M drivers x ~1–2 KB (id, cell, product, freshness) per region; cheap to hold in memory, replicated for failover."
     }
   ],
   "api": [
     {
       "method": "POST",
       "path": "/v1/rides",
-      "description": "Request a ride. Idempotency-Key dedupes retries so a rider isn't matched twice.",
-      "request": "Idempotency-Key: rq_8f\n{ \"pickup\": {\"lat\":37.77,\"lng\":-122.41}, \"dropoff\": {...}, \"product\": \"x\" }",
+      "description": "Request a ride. Authenticated rider; Idempotency-Key dedupes retries so a rider has at most one active matching trip. Carries the quote the rider accepted (with its frozen surge multiplier) and the chosen product.",
+      "request": "Authorization: Bearer <rider-token>\nIdempotency-Key: rq_8f\n{ \"pickup\": {\"lat\":37.77,\"lng\":-122.41}, \"dropoff\": {...}, \"product\": \"x\", \"quote_id\": \"q_1a\" }",
       "response": "202 Accepted\n{ \"trip_id\": \"trip_9\", \"status\": \"matching\" }",
       "sequence": {
         "participants": [
@@ -790,16 +862,16 @@
     {
       "method": "POST",
       "path": "/v1/drivers/{id}/location",
-      "description": "High-frequency driver location update. Fire-and-forget; ingested asynchronously into the geo index.",
-      "request": "{ \"lat\": 37.776, \"lng\": -122.414, \"status\": \"available\", \"ts\": 1710000000 }",
-      "response": "200 OK (ack)"
+      "description": "High-frequency driver location update. Fire-and-forget; ingested asynchronously into the geo index. The ping carries authenticated device identity and a monotonic sequence number; the ingest path rejects stale, out-of-order, or replayed pings and runs anti-spoofing checks before the position reaches the index. Latest location is held with a TTL; only bounded history is retained.",
+      "request": "Authorization: Bearer <device-token>\n{ \"lat\": 37.776, \"lng\": -122.414, \"status\": \"available\", \"ts\": 1710000000, \"seq\": 48213 }",
+      "response": "200 OK (ack) — or 409 if seq is stale / out of order"
     },
     {
       "method": "POST",
       "path": "/v1/trips/{id}/accept",
-      "description": "Driver accepts an offered trip. First acceptance wins; the trip transitions to matched.",
-      "request": "{ \"driver_id\": \"drv_3\" }",
-      "response": "200 OK { \"status\": \"matched\" } — or 409 if already taken",
+      "description": "Driver accepts a specific offer. The accept names the offer it is answering, so a late retry, a duplicate tap, or an accept of an already-expired offer is rejected rather than racing. First valid acceptance wins: the offer CASes offered->accepted and the driver/trip is claimed atomically; the trip transitions to matched.",
+      "request": "Idempotency-Key: acc_5c\n{ \"offer_id\": \"off_7\", \"driver_id\": \"drv_3\" }",
+      "response": "200 OK { \"status\": \"matched\" } — 409 if already taken, or 410 Gone if the offer expired",
       "sequence": {
         "participants": [
           {
@@ -900,7 +972,7 @@
     },
     {
       "name": "driver_locations",
-      "note": "Latest location per driver, updated at high frequency. Often a key-value/in-memory store keyed by driver_id; projected into the geo index.",
+      "note": "Latest location per driver, updated at high frequency. Often a key-value/in-memory store keyed by driver_id; projected into the geo index. Holds only the latest position with a short TTL — a driver whose app stops pinging falls out of 'available' as the entry expires. Retained location history (for safety, support, fraud, or legal/audit) lives in a separate, access-controlled store with a bounded retention policy, never here.",
       "fields": [
         {
           "name": "driver_id",
@@ -919,8 +991,12 @@
           "type": "varchar (geohash / S2 cell)"
         },
         {
+          "name": "seq",
+          "type": "bigint (monotonic; drops stale/replayed pings)"
+        },
+        {
           "name": "updated_at",
-          "type": "timestamptz"
+          "type": "timestamptz (TTL: stale entries expire out of 'available')"
         }
       ]
     },
@@ -942,7 +1018,7 @@
         },
         {
           "name": "status",
-          "type": "enum(matching, matched, en_route, in_progress, completed, cancelled)"
+          "type": "enum(matching, matched, en_route, in_progress, completed, cancelled, expired)"
         },
         {
           "name": "pickup",
@@ -953,8 +1029,80 @@
           "type": "geopoint"
         },
         {
+          "name": "quote_id",
+          "type": "uuid (frozen fare + surge multiplier at acceptance)"
+        },
+        {
+          "name": "surge_multiplier",
+          "type": "float (snapshot at quote time)"
+        },
+        {
           "name": "fare",
           "type": "bigint null"
+        },
+        {
+          "name": "cancel_reason",
+          "type": "enum null (rider_cancel, driver_cancel, no_drivers, offer_timeout, expired)"
+        }
+      ]
+    },
+    {
+      "name": "trip_events",
+      "note": "Append-only audit of every state transition (who/what/when), so the trip lifecycle is reconstructable and illegal transitions are detectable after the fact.",
+      "fields": [
+        {
+          "name": "trip_id",
+          "type": "uuid"
+        },
+        {
+          "name": "from_state",
+          "type": "varchar"
+        },
+        {
+          "name": "to_state",
+          "type": "varchar"
+        },
+        {
+          "name": "actor",
+          "type": "enum(rider, driver, system)"
+        },
+        {
+          "name": "at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "dispatch_offers",
+      "note": "The unit of dispatch: one short-lived offer of a trip to one driver. Accept names the offer it answers, so late/duplicate accepts and accepts of expired offers are rejected. Accept CASes offer offered->accepted and driver available->busy together; fall-through accounting walks attempt_number.",
+      "fields": [
+        {
+          "name": "offer_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "trip_id",
+          "type": "uuid"
+        },
+        {
+          "name": "driver_id",
+          "type": "uuid"
+        },
+        {
+          "name": "status",
+          "type": "enum(offered, accepted, declined, expired)"
+        },
+        {
+          "name": "attempt_number",
+          "type": "int (1, 2, 3 … fall-through order)"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamptz (offer TTL)"
+        },
+        {
+          "name": "idempotency_key",
+          "type": "varchar (dedupes accept retries)"
         }
       ]
     },
@@ -1112,7 +1260,8 @@
       ],
       "talkingPoints": [
         "Name the two hard parts up front: ingesting location at scale, and querying nearby fast.",
-        "Point out a full scan per request is O(N drivers) — the whole design replaces it."
+        "Point out a full scan per request is O(N drivers) — the whole design replaces it.",
+        "State the first invariant: a request creates at most one active matching trip per rider (enforced by the idempotency key), so a retry never spawns a second match."
       ],
       "traps": [
         {
@@ -1175,7 +1324,8 @@
         "kafka-design",
         "postgis-docs",
         "uber-h3",
-        "h3-docs"
+        "h3-docs",
+        "sre-monitoring"
       ],
       "decisionPrompt": "10M drivers ping every 4 seconds. How do you absorb ~2.5M writes/sec without melting your database?",
       "concepts": [
@@ -1257,11 +1407,21 @@
           "instead": "Ack the ping immediately; update the index asynchronously off the stream."
         }
       ],
+      "deepDives": [
+        {
+          "title": "Latest-for-matching vs. retained history, and stale drivers",
+          "points": [
+            "Keep two separate stores: a fast latest-location store (last-write-wins, TTL'd) that feeds matching, and a separate, access-controlled history store for safety, support, fraud, and legal/audit — never matched against the hot path.",
+            "Give the latest entry a TTL: a driver whose app stops pinging falls out of 'available' automatically rather than being offered a trip from a minutes-old position.",
+            "Validate pings before they update the store — authenticated device identity and a monotonic sequence number drop stale, out-of-order, and replayed pings (covered as a requirement; the auth/risk check sits on the ingest path)."
+          ]
+        }
+      ],
       "failureDrills": [
         {
           "scenario": "The ingest stream backs up during a spike.",
           "expectedBehavior": "Location goes a bit staler; the system doesn't drop drivers or crash.",
-          "mitigation": "Bounded lag with last-write-wins means catching up just means newer pings; matching tolerates seconds of staleness."
+          "mitigation": "Bounded lag with last-write-wins means catching up just means newer pings; matching tolerates seconds of staleness, and a freshness metric/alert flags when a city is matching from stale positions."
         }
       ],
       "interviewerSignals": {
@@ -1287,20 +1447,23 @@
           "Driver",
           "API",
           "LocIngest",
+          "Risk",
           "LocStream",
           "LocStore",
           "GeoIndex"
         ],
-        "caption": "Driver apps ping the gateway every few seconds into the location ingest service, which publishes to a location stream that updates the latest-location store and the geo index cells.",
+        "caption": "Driver apps ping the gateway every few seconds into the location ingest service, which authenticates and anti-spoof-validates each ping before publishing to a location stream that updates the latest-location store and the geo index cells.",
         "links": [
           "driver-api-ping-every-4s",
           "api-locingest",
-          "locingest-locstream-publish",
+          "locingest-risk-validate",
+          "risk-locstream-validated",
           "locstream-locstore-update-latest",
           "locstream-geoindex-update-cell"
         ],
         "highlight": [
           "LocIngest",
+          "Risk",
           "LocStream",
           "LocStore"
         ]
@@ -1517,7 +1680,7 @@
     {
       "id": "matching",
       "title": "4. Matching & Dispatch",
-      "description": "Given nearby candidates, the matching service ranks them (distance/ETA, rating, acceptance likelihood) and dispatches an offer to the best one. Offers are time-boxed; if declined or unanswered, it moves to the next candidate. Idempotency stops duplicate requests creating duplicate matches.",
+      "description": "Given nearby candidates, the matching service ranks them (distance/ETA, rating, acceptance likelihood) and dispatches an offer to the best one. The offer is the unit of dispatch: a short-lived record with its own offer_id, expiry, attempt number, and status, delivered via push. Acceptance names the offer it answers, so a late accept, a duplicate tap, or an accept of an already-expired offer is rejected instead of racing. If declined, unanswered, or expired, dispatch falls through to the next candidate. Idempotency stops duplicate requests creating duplicate matches.",
       "patterns": [
         "Matching / assignment",
         "Idempotency key"
@@ -1539,6 +1702,12 @@
           "term": "Ranking",
           "definition": "Ordering candidates by ETA, rating, and likelihood to accept.",
           "whyItMatters": "Good ranking cuts time-to-match and improves both sides' experience.",
+          "group": "Matching & Dispatch"
+        },
+        {
+          "term": "Dispatch offer record",
+          "definition": "A short-lived offer of one trip to one driver, with offer_id, expiry, attempt number, and status (offered/accepted/declined/expired).",
+          "whyItMatters": "Making the offer a first-class entity is what lets accept prove it answers the current valid offer — late, duplicate, and expired accepts become trivial to reject and fall-through is auditable.",
           "group": "Matching & Dispatch"
         }
       ],
@@ -1606,6 +1775,11 @@
           "trap": "Non-idempotent ride requests",
           "why": "A mobile retry creates a second trip and a second match.",
           "instead": "Idempotency key collapses retries to one trip."
+        },
+        {
+          "trap": "Accepting on trip_id + driver_id alone, with no offer identity",
+          "why": "A driver can accept a trip without proving they're answering the current valid offer — late accepts, duplicate taps, and accepts of an already-expired offer all race.",
+          "instead": "Make the offer a record with its own id and TTL; accept names the offer_id and CASes it offered->accepted alongside the driver claim."
         }
       ],
       "failureDrills": [
@@ -1613,6 +1787,11 @@
           "scenario": "The top candidate's app is offline and never answers the offer.",
           "expectedBehavior": "The rider still gets matched promptly.",
           "mitigation": "Offer timeout advances to the next ranked candidate; widen the radius if the list is exhausted."
+        },
+        {
+          "scenario": "The push notification carrying an offer is dropped or delayed.",
+          "expectedBehavior": "No driver is silently held; the rider isn't stuck waiting on a lost offer.",
+          "mitigation": "Offers have a short TTL and require an explicit ack; an unacked offer expires and dispatch falls through to the next candidate, with a backup channel (in-app long-poll/websocket) so delivery doesn't depend on push alone."
         }
       ],
       "interviewerSignals": {
@@ -1776,17 +1955,17 @@
       },
       "options": [
         {
-          "name": "Greedy nearest-driver (default)",
-          "description": "Each rider is assigned the closest available driver the instant they request, with no batching window or assignment solver.",
+          "name": "Market-density adaptive policy (default): greedy when sparse, batched when dense",
+          "description": "The matcher chooses by local density: greedy nearest-driver where there's nothing to batch (sparse markets), and short-window batched optimization where the global gain is worth a 1–2s window (dense markets). One policy, two regimes — not a single global default.",
           "pros": [
-            "Assigns each rider to the closest available driver the instant they request — lowest latency to an offer.",
-            "Simple to implement and reason about; no batching window or solver.",
-            "Effectively optimal in sparse markets where there's no batch to optimize over."
+            "Lowest latency to an offer where it matters: sparse markets fall straight through to greedy with no batching delay.",
+            "Captures the global-efficiency win of batching exactly where density makes it pay off.",
+            "Avoids teaching a single global default — the policy adapts to the market it's running in."
           ],
           "cons": [
-            "Locally optimal only — can strand a rider when a slightly-further driver was a better global fit.",
-            "Greedy assignment in dense areas leaves worse overall wait times than a batch solution.",
-            "No room to balance fairness or driver utilization across many simultaneous requests."
+            "Needs a per-cell density signal and a threshold to switch regimes, plus tuning of the batch window.",
+            "Two code paths to operate and test rather than one.",
+            "The dense-market path still pays the batch window's added latency and solver cost."
           ],
           "view": {
             "nodes": [
@@ -1794,7 +1973,7 @@
               "GeoIndex",
               "Dispatch"
             ],
-            "caption": "The matching service greedily picks the nearest driver from the geo index cells and forwards it to dispatch immediately.",
+            "caption": "The matching service reads density from the geo index cells and picks regime per cell — greedy nearest-driver when sparse, batched optimization when dense — before forwarding to dispatch.",
             "links": [
               "match-geoindex-cell-neighbors",
               "match-dispatch"
@@ -1863,21 +2042,21 @@
       ],
       "traps": [
         {
-          "trap": "Always assigning the single nearest driver instantly.",
-          "why": "Locally-greedy choices strand riders and raise overall wait in dense conditions.",
-          "instead": "Batch and optimize where density warrants; greedy only when there's nothing to batch."
+          "trap": "Picking one global strategy — always greedy, or always batched.",
+          "why": "Always-greedy strands riders and raises wait in dense conditions; always-batched adds pointless latency in sparse markets where each window holds one request.",
+          "instead": "Adapt by density: batch and optimize where it pays off, fall through to greedy where there's nothing to batch."
         }
       ],
       "recap": {
         "before": "Nearby drivers are found.",
-        "after": "A greedy-or-batched matching policy chosen by market density.",
+        "after": "A density-adaptive matching policy — greedy when sparse, batched when dense.",
         "newRisk": "Batching adds latency and needs the atomic-assignment guarantee to avoid double-dispatch."
       }
     },
     {
       "id": "trip-state",
       "title": "5. Trip State Machine & Atomic Assignment",
-      "description": "Model the trip as a state machine (matching -> matched -> en route -> in progress -> completed) and make the matching->matched transition an atomic claim so two riders can't grab the same driver. Acceptance is idempotent and first-writer-wins.",
+      "description": "Model the trip as a state machine (matching -> matched -> en route -> in progress -> completed) and make the matching->matched transition an atomic claim so two riders can't grab the same driver. There are really three coupled states: trip state, driver availability (available/busy), and offer state (offered/accepted/expired) — accept advances all three together. Acceptance is idempotent and first-writer-wins. Cancellation and expiry are first-class transitions: a rider can cancel while matching, a driver can cancel after accept (releasing the driver and re-matching), an unanswered trip expires, and fare is finalized only after completion.",
       "patterns": [
         "State machine",
         "Distributed lock / CAS",
@@ -1987,6 +2166,11 @@
           "trap": "No state guards on transitions",
           "why": "A late 'accept' on an already-cancelled trip corrupts state.",
           "instead": "Guard each transition (only matching->matched, etc.); reject illegal ones."
+        },
+        {
+          "trap": "Treating cancellation/expiry as an afterthought outside the state machine",
+          "why": "A driver who cancels after accept can be left busy, or a cancelled trip's driver never returns to the pool — supply silently leaks.",
+          "instead": "Model rider-cancel, driver-cancel, and expiry as guarded transitions that release the driver (busy->available) and record a cancel_reason; finalize fare only on completion."
         }
       ],
       "failureDrills": [
@@ -2189,7 +2373,9 @@
           "points": [
             "Compute the ratio over a sliding window and smooth it so prices don't oscillate second to second.",
             "Lock the multiplier into the quote the rider accepts; never change it mid-trip.",
-            "Cap surge and be transparent — runaway multipliers erode trust and invite regulation."
+            "Cap surge and be transparent — runaway multipliers erode trust and invite regulation.",
+            "Drive surge from validated supply only: a cluster of spoofed or idle drivers shouldn't suppress (or be used to manipulate) the multiplier — reuse the same anti-spoofing signal that gates the geo index.",
+            "Keep an audit trail of the demand/supply inputs and multiplier per cell/window; pricing trust and regulation make surge decisions reviewable after the fact."
           ]
         }
       ],
@@ -2258,6 +2444,16 @@
         "google-routes"
       ],
       "decisionPrompt": "Why is straight-line distance a bad way to pick the 'nearest' driver, and how do you scale ETA computation?",
+      "deepDives": [
+        {
+          "title": "Routing is the QPS multiplier — size it",
+          "points": [
+            "If each match ranks ~20 candidate drivers by routed ETA, routing QPS is ~20x ride-request QPS — routing, not matching, is the load that dominates.",
+            "Cut it with a coarse geo-distance pre-filter (rank ~20, route only the top few), ETA caching keyed by (origin cell, dest cell), or precomputed contraction hierarchies so each query is a lookup, not a full Dijkstra.",
+            "Batched routing (one call over many origin/dest pairs) amortizes graph traversal across a window of requests in a dense cell."
+          ]
+        }
+      ],
       "concepts": [
         {
           "term": "Road-graph routing",
@@ -2457,7 +2653,8 @@
         "postgis-docs",
         "uber-h3",
         "h3-docs",
-        "google-routes"
+        "google-routes",
+        "sre-monitoring"
       ],
       "decisionPrompt": "New Year's Eve makes one city 50x its normal load. How do you keep it from degrading every other city?",
       "concepts": [
@@ -2532,6 +2729,26 @@
             "Riders/drivers near a region boundary may need to query two adjacent region shards.",
             "Promote a city to its own dedicated shard when its load crosses a threshold; rebalance with care."
           ]
+        },
+        {
+          "title": "Region ownership, handoff, and failover",
+          "points": [
+            "A driver's pings are routed to its current region by the region router (keyed on the driver's geo cell), so the region owning a cell also owns the drivers in it.",
+            "When a driver crosses a region boundary, ownership hands off: the new region starts indexing the driver and the old region's stale entry expires via TTL — no driver is double-counted as available.",
+            "Region failover rebuilds the geo index from the location stream (it's derived, so it's cheap to reconstruct) while authoritative trip state lives in the durable trips DB — a region can drop and recover without losing trips or stranding drivers as permanently busy.",
+            "While a region is degraded, the router can shed it (queue or widen to a neighbor) rather than let its backlog corrupt driver availability elsewhere."
+          ]
+        },
+        {
+          "title": "Degradation tiers (one policy across the system)",
+          "points": [
+            "Ingest lag high (stale-location % climbs): keep matching but prefer fresher pings and surface a freshness alert; never match from minutes-old positions.",
+            "No candidates in cell+neighbors: widen the search radius, then relax filters (product), then queue the request briefly, and only then return 'no drivers available'.",
+            "Routing brownout: fall back to geo-distance ranking and show an approximate ETA until routing recovers (Step 7).",
+            "Push delivery failing: rely on offer TTL + ack and the in-app backup channel; fall through faster (Step 4).",
+            "Lock/CAS contention in a hot cell: back off and re-offer; the loser re-matches rather than blocking (Step 5).",
+            "Region overload: shed load at the router (queue/widen to neighbor) so one city's spike doesn't degrade the rest. Each tier has a trigger metric, a fallback action, a user-visible behavior, and a recovery condition — all watched by observability."
+          ]
         }
       ],
       "traps": [
@@ -2546,10 +2763,18 @@
           "instead": "Shard by region/city so a query's candidates live on one shard."
         }
       ],
+      "failureDrills": [
+        {
+          "scenario": "A whole region's matching/index goes down mid-evening.",
+          "expectedBehavior": "Trips in flight aren't lost; drivers aren't permanently stuck busy; other regions are unaffected.",
+          "mitigation": "Authoritative trip state is in the durable trips DB; the geo index is derived and rebuilds from the location stream on a standby. The router sheds the region (queue/widen) until it recovers, and driver availability is reconciled from fresh pings rather than stale pre-outage state."
+        }
+      ],
       "interviewerSignals": {
         "strong": [
           "Shards by region for locality and hot-city isolation.",
-          "Handles cross-region trips and boundary queries explicitly."
+          "Handles cross-region trips and boundary queries explicitly.",
+          "Explains region handoff at boundaries and failover that doesn't corrupt driver availability."
         ],
         "weak": [
           "Keeps one global index.",
@@ -2593,13 +2818,14 @@
   ],
   "finalDesign": {
     "title": "Final Design",
-    "description": "End-to-end: drivers stream location through an async ingest pipeline into a per-region geo index; a region router directs ride requests to the right regional matching service, which queries nearby candidates, ranks them by routed ETA, and dispatches time-boxed offers; the trip is an atomically-claimed state machine; surge pricing balances each cell; ETA/routing feeds both ranking and rider estimates.",
+    "description": "End-to-end: drivers stream location through an authenticated, anti-spoof-validated async ingest pipeline into a per-region geo index; a region router directs ride requests to the right regional matching service, which queries nearby candidates, ranks them by routed ETA, and dispatches time-boxed offers (delivered via push with ack/expiry); the trip is an atomically-claimed state machine; surge pricing balances each cell; ETA/routing feeds both ranking and rider estimates; observability tracks freshness, latency, acceptance, and conflict signals per region so degradation is caught before it becomes an outage.",
     "view": {
       "nodes": [
         "Rider",
         "Driver",
         "API",
         "LocIngest",
+        "Risk",
         "LocStream",
         "LocStore",
         "Router",
@@ -2615,13 +2841,15 @@
         "SurgeStore",
         "ETA",
         "MapData",
-        "Notify"
+        "Notify",
+        "Obs"
       ],
-      "caption": "Driver pings flow through ingest into the location stream, latest store, and regional geo indexes; rider requests are region-routed to matching, which uses ETA, pricing, and dispatch (via push) to assign drivers and persist atomic trip state.",
+      "caption": "Driver pings flow through ingest and an auth/risk check into the location stream, latest store, and regional geo indexes; rider requests are region-routed to matching, which uses ETA, pricing, and dispatch (via push) to assign drivers and persist atomic trip state; observability watches lag, offer/accept, and conflict rates.",
       "links": [
         "driver-api-location-pings",
         "api-locingest",
-        "locingest-locstream",
+        "locingest-risk-validate",
+        "risk-locstream-validated",
         "locstream-locstore",
         "locstream-geoa-update-cells",
         "locstream-geob",
@@ -2640,7 +2868,10 @@
         "notify-driver",
         "dispatch-trip",
         "trip-idem-cas",
-        "trip-tripdb"
+        "trip-tripdb",
+        "regiona-obs",
+        "locstream-obs",
+        "dispatch-obs"
       ]
     }
   },
@@ -2726,10 +2957,26 @@
       },
       {
         "requirement": "Graceful degradation",
-        "how": "Widen radius / advance candidates on decline; geo-distance fallback when routing degrades.",
+        "how": "A single degradation policy with explicit tiers: widen radius / advance candidates on decline, geo-distance fallback when routing degrades, offer TTL + backup channel when push fails, back-off + re-offer under lock contention, and router load-shedding under regional overload.",
         "steps": [
           "matching",
-          "eta"
+          "eta",
+          "scale"
+        ]
+      },
+      {
+        "requirement": "Location privacy & abuse resistance",
+        "how": "Authenticated, sequence-numbered pings validated by an auth/risk check before they reach the index; TTL on latest location and bounded retention for any history, kept separate from the matching hot path.",
+        "steps": [
+          "location-ingest"
+        ]
+      },
+      {
+        "requirement": "Operability",
+        "how": "Observability tracks location-stream lag, geo-query latency, offer timeout/acceptance rate, CAS conflict rate, hot-cell cardinality, and per-region error-budget burn, tied to user-visible SLOs (time-to-match, location freshness, ETA error).",
+        "steps": [
+          "location-ingest",
+          "scale"
         ]
       }
     ]

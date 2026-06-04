@@ -127,14 +127,14 @@
       },
       {
         "id": "Idem",
-        "label": "Idempotency Store",
+        "label": "Idempotency / Claim Store",
         "type": "database",
         "category": "state",
         "traits": [
           "stateful",
           "authoritative"
         ],
-        "description": "Idempotency Store: Authoritative operational state store for structured records or correctness-critical state."
+        "description": "Idempotency / Claim Store: Fast authoritative store for accept-idempotency keys and the live driver-availability lease — one active claim per driver (driver_id -> trip_id, offer_id, version, expires_at) — so accept can flip offer, driver, and trip in one guarded transition and a crashed claim auto-releases via TTL."
       },
       {
         "id": "L",
@@ -302,7 +302,47 @@
           "stateful",
           "authoritative"
         ],
-        "description": "Trips DB: Authoritative operational state store for structured records or correctness-critical state."
+        "description": "Trips DB: Authoritative store for trips, trip_events, and dispatch_offers — the durable trip lifecycle and offer records."
+      },
+      {
+        "id": "BatchSolver",
+        "label": "Batch Assignment Solver",
+        "type": "worker",
+        "category": "compute",
+        "traits": [],
+        "description": "Batch Assignment Solver: Collects a short window of requests and drivers and solves the assignment that minimizes total ETA (bounding worst-case wait) before dispatch."
+      },
+      {
+        "id": "DriverLock",
+        "label": "Driver Lock",
+        "type": "database",
+        "category": "state",
+        "traits": [
+          "stateful",
+          "authoritative"
+        ],
+        "description": "Driver Lock: Short-lived per-driver distributed lock acquired before assignment, auto-releasing on crash via TTL."
+      },
+      {
+        "id": "DriverQ",
+        "label": "Per-Driver Claim Queue",
+        "type": "queue",
+        "category": "async",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Per-Driver Claim Queue: Single-writer partition that serializes all claims for a driver so the first message wins by ordering, no lock needed."
+      },
+      {
+        "id": "CH",
+        "label": "Contraction Hierarchies",
+        "type": "index",
+        "category": "state",
+        "traits": [
+          "stateful",
+          "derived"
+        ],
+        "description": "Contraction Hierarchies: Road graph preprocessed so each ETA query is a fast lookup instead of a full shortest-path search."
       }
     ],
     "links": [
@@ -791,10 +831,17 @@
   "api": [
     {
       "method": "POST",
+      "path": "/v1/quotes",
+      "description": "Create a fare quote before requesting a ride. The quote binds product, pickup, dropoff, the routed-ETA estimate, and the surge multiplier read at this instant, and returns a short-lived quote_id with an expires_at. The rider must request the ride with a live quote_id; an expired quote is rejected (the client re-quotes) so the charged fare can never drift from the displayed one or ride on stale surge.",
+      "request": "Authorization: Bearer <rider-token>\n{ \"pickup\": {\"lat\":37.77,\"lng\":-122.41}, \"dropoff\": {...}, \"product\": \"x\" }",
+      "response": "200 OK\n{ \"quote_id\": \"q_1a\", \"product\": \"x\", \"surge_multiplier\": 1.4, \"estimated_fare\": 1850, \"expires_at\": 1710000120 }"
+    },
+    {
+      "method": "POST",
       "path": "/v1/rides",
-      "description": "Request a ride. Authenticated rider; Idempotency-Key dedupes retries so a rider has at most one active matching trip. Carries the quote the rider accepted (with its frozen surge multiplier) and the chosen product.",
+      "description": "Request a ride. Authenticated rider; Idempotency-Key dedupes retries so a rider has at most one active matching trip. Carries the quote_id the rider accepted (which froze the surge multiplier and fare); the request is rejected with 410 Gone if that quote has expired, so the trip is always created against a live, binding price.",
       "request": "Authorization: Bearer <rider-token>\nIdempotency-Key: rq_8f\n{ \"pickup\": {\"lat\":37.77,\"lng\":-122.41}, \"dropoff\": {...}, \"product\": \"x\", \"quote_id\": \"q_1a\" }",
-      "response": "202 Accepted\n{ \"trip_id\": \"trip_9\", \"status\": \"matching\" }",
+      "response": "202 Accepted\n{ \"trip_id\": \"trip_9\", \"status\": \"matching\" } — or 410 Gone if quote_id expired",
       "sequence": {
         "participants": [
           {
@@ -893,23 +940,23 @@
             "from": "D",
             "to": "Trip",
             "arrow": "->>",
-            "label": "accept(trip, driver)"
+            "label": "accept(offer_id, driver_id, Idem-Key)"
           },
           {
             "from": "Trip",
             "to": "I",
             "arrow": "->>",
-            "label": "claim trip (CAS matching->matched)"
+            "label": "CAS offer offered->accepted, driver available->busy, trip matching->matched"
           },
           {
             "type": "alt",
-            "label": "won",
+            "label": "offer still valid (not expired)",
             "messages": [
               {
                 "from": "I",
                 "to": "Trip",
                 "arrow": "-->>",
-                "label": "ok"
+                "label": "ok (all three flipped)"
               },
               {
                 "from": "Trip",
@@ -919,19 +966,19 @@
               }
             ],
             "else": {
-              "label": "already matched",
+              "label": "offer taken / expired",
               "messages": [
                 {
                   "from": "I",
                   "to": "Trip",
                   "arrow": "-->>",
-                  "label": "taken"
+                  "label": "conflict / expired"
                 },
                 {
                   "from": "Trip",
                   "to": "D",
                   "arrow": "-->>",
-                  "label": "409 Conflict"
+                  "label": "409 taken or 410 Gone"
                 }
               ]
             }
@@ -950,7 +997,7 @@
   "dataModel": [
     {
       "name": "drivers",
-      "note": "Driver profile and current availability. Location is hot and lives in a fast store, not here.",
+      "note": "Driver profile and coarse session status. Location is hot and lives in a fast store, not here; the live, correctness-critical 'is this driver claimable right now?' answer lives in driver_claims (the claim store), not in this row. status here is the slow, eventually-consistent session state for UI/ops, not the matching invariant.",
       "fields": [
         {
           "name": "driver_id",
@@ -958,7 +1005,7 @@
         },
         {
           "name": "status",
-          "type": "enum(offline, available, on_trip)"
+          "type": "enum(offline, available, on_trip) — coarse session state, not the live claim"
         },
         {
           "name": "product",
@@ -1107,6 +1154,74 @@
       ]
     },
     {
+      "name": "driver_claims",
+      "note": "The live availability lease — exactly one active claim per driver. This is the authoritative answer to 'is this driver free right now?', kept in the fast claim/lock store (Idem), not the driver profile row. Accept does a single guarded transition: only an available driver can be claimed; the lease carries the offer/trip it belongs to and an expires_at, so a crash after claim auto-releases the driver (busy->available) when the lease lapses without trip confirmation.",
+      "fields": [
+        {
+          "name": "driver_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "status",
+          "type": "enum(available, busy)"
+        },
+        {
+          "name": "trip_id",
+          "type": "uuid null (the trip currently holding the driver)"
+        },
+        {
+          "name": "offer_id",
+          "type": "uuid null (the offer the claim answered)"
+        },
+        {
+          "name": "version",
+          "type": "bigint (CAS guard; bumps on each transition)"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamptz (lease TTL; lapses -> driver released)"
+        }
+      ]
+    },
+    {
+      "name": "quotes",
+      "note": "A short-lived fare quote bound to product/pickup/dropoff and a frozen surge multiplier. The rider must request a ride against a live quote_id; an expired quote is rejected so displayed and charged fare can't diverge and surge can't drift post-acceptance.",
+      "fields": [
+        {
+          "name": "quote_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "rider_id",
+          "type": "uuid"
+        },
+        {
+          "name": "pickup",
+          "type": "geopoint"
+        },
+        {
+          "name": "dropoff",
+          "type": "geopoint"
+        },
+        {
+          "name": "product",
+          "type": "varchar"
+        },
+        {
+          "name": "surge_multiplier",
+          "type": "float (frozen at quote time)"
+        },
+        {
+          "name": "estimated_fare",
+          "type": "bigint"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamptz (quote TTL)"
+        }
+      ]
+    },
+    {
       "name": "geo_index",
       "note": "Spatial index mapping geo cells -> available drivers, enabling fast 'nearby' queries over moving points.",
       "fields": [
@@ -1234,7 +1349,7 @@
     {
       "id": "request-ride",
       "title": "1. Request a Ride (the naive baseline)",
-      "description": "Start simple: a rider posts a request, and the service scans all available drivers to find the nearest one. With a few drivers this is fine; the design exists because there are millions of moving drivers and you can't scan them per request.",
+      "description": "Start simple: a rider posts a request, and the service scans every available driver to find the nearest one. With a handful of drivers that's fine — the rest of this design exists precisely because there are millions of moving drivers and you can't scan them all on every request.",
       "patterns": [
         "Synchronous request/response"
       ],
@@ -1483,6 +1598,10 @@
                 "label": "Location Ingest"
               },
               {
+                "id": "Risk",
+                "label": "Location Auth / Risk"
+              },
+              {
                 "id": "LocStream",
                 "label": "Location Stream"
               },
@@ -1500,25 +1619,37 @@
                 "from": "Driver",
                 "to": "LocIngest",
                 "arrow": "->>",
-                "label": "ping(lat,lng) every few s"
+                "label": "ping(lat,lng,ts,seq) every few s"
               },
               {
                 "from": "LocIngest",
-                "to": "LocStream",
+                "to": "Risk",
                 "arrow": "->>",
-                "label": "publish location event"
+                "label": "auth device + check seq / anti-spoof"
+              },
+              {
+                "from": "Risk",
+                "to": "LocIngest",
+                "arrow": "-->>",
+                "label": "ok (or drop stale/spoofed)"
               },
               {
                 "from": "LocIngest",
                 "to": "Driver",
                 "arrow": "-->>",
-                "label": "202 accepted"
+                "label": "200 ack (or 409 stale seq)"
+              },
+              {
+                "from": "LocIngest",
+                "to": "LocStream",
+                "arrow": "->>",
+                "label": "publish validated location event"
               },
               {
                 "from": "LocStream",
                 "to": "LocStore",
                 "arrow": "->>",
-                "label": "upsert latest location"
+                "label": "upsert latest location (TTL)"
               },
               {
                 "from": "LocStream",
@@ -1529,6 +1660,7 @@
             ]
           },
           "highlight": [
+            "Risk",
             "LocStream"
           ]
         }
@@ -1884,39 +2016,39 @@
                 "from": "Dispatch",
                 "to": "Driver",
                 "arrow": "->>",
-                "label": "ride offer (time-boxed)"
+                "label": "offer(offer_id, expires_at) status=offered"
               },
               {
                 "type": "alt",
-                "label": "driver accepts in time",
+                "label": "accept before expires_at",
                 "messages": [
                   {
                     "from": "Driver",
                     "to": "Dispatch",
                     "arrow": "->>",
-                    "label": "accept"
+                    "label": "accept(offer_id)"
                   },
                   {
                     "from": "Dispatch",
                     "to": "Trip",
                     "arrow": "->>",
-                    "label": "claim driver, create trip"
+                    "label": "offer offered->accepted, claim driver, create trip"
                   }
                 ],
                 "else": {
-                  "label": "decline / timeout -> next candidate",
+                  "label": "decline / TTL expires -> next candidate",
                   "messages": [
                     {
                       "from": "Driver",
                       "to": "Dispatch",
                       "arrow": "-->>",
-                      "label": "decline / no answer"
+                      "label": "decline / no answer (offer expired)"
                     },
                     {
                       "from": "Dispatch",
                       "to": "Match",
                       "arrow": "->>",
-                      "label": "offer next candidate"
+                      "label": "attempt_number++, offer next candidate"
                     }
                   ]
                 }
@@ -1936,7 +2068,7 @@
       "description": [
         "Given nearby drivers, how you actually match is a real choice. Greedy matching assigns each rider to the closest available driver the instant they request — simple and low-latency, but locally optimal: it can strand a rider when a slightly-further driver would have been a better global fit.",
         "Batched matching collects requests and drivers over a short window (a few seconds) and solves an assignment problem over the batch, minimizing total wait/ETA — better global outcomes (especially in dense areas) at the cost of a small added delay and more complexity.",
-        "Real dispatch leans batched in dense markets (the global gain is worth a 1-2s window) and effectively greedy in sparse ones (no batch to optimize). Either way, the offer is time-boxed and re-offered on decline, and assignment is atomic so two riders never get the same driver."
+        "Real dispatch leans batched in dense markets (the global gain is worth a 1–2s window) and effectively greedy in sparse ones (no batch to optimize). The batched objective is usually to minimize total rider ETA subject to bounding the worst rider's wait, weighted by driver fairness/utilization and predicted cancellation risk — solved under a hard solver-time budget so the window stays short. Either way, the offer is time-boxed and re-offered on decline, and assignment is atomic so two riders never get the same driver."
       ],
       "view": {
         "nodes": [
@@ -1993,7 +2125,7 @@
             "Can fold in fairness and driver-utilization objectives the greedy path can't."
           ],
           "cons": [
-            "Adds a batching delay (1-2s) before any offer goes out.",
+            "Adds a batching delay (1–2s) before any offer goes out.",
             "Solving the assignment problem per window is more complex and compute-heavy.",
             "Pointless in sparse markets where each window holds one request — extra latency for no gain."
           ],
@@ -2056,7 +2188,7 @@
     {
       "id": "trip-state",
       "title": "5. Trip State Machine & Atomic Assignment",
-      "description": "Model the trip as a state machine (matching -> matched -> en route -> in progress -> completed) and make the matching->matched transition an atomic claim so two riders can't grab the same driver. There are really three coupled states: trip state, driver availability (available/busy), and offer state (offered/accepted/expired) — accept advances all three together. Acceptance is idempotent and first-writer-wins. Cancellation and expiry are first-class transitions: a rider can cancel while matching, a driver can cancel after accept (releasing the driver and re-matching), an unanswered trip expires, and fare is finalized only after completion.",
+      "description": "Model the trip as a state machine (matching -> matched -> en route -> in progress -> completed) and make the matching->matched transition an atomic claim so two riders can't grab the same driver. There are really three coupled states: trip state (in the Trips DB), driver availability (available/busy, held as a live lease in the claim store — not the driver profile row), and offer state (offered/accepted/expired) — accept advances all three together under one guarded transition. The live claim lease is driver_id -> trip_id, offer_id, version, expires_at, so exactly one offer can hold a driver and a crash auto-releases the lease via TTL. Acceptance is idempotent and first-writer-wins. Cancellation and expiry are first-class transitions: a rider can cancel while matching, a driver can cancel after accept (releasing the driver and re-matching), an unanswered trip expires, and fare is finalized only after completion.",
       "patterns": [
         "State machine",
         "Distributed lock / CAS",
@@ -2111,37 +2243,37 @@
                 "from": "D1",
                 "to": "Trip",
                 "arrow": "->>",
-                "label": "assign driver D"
+                "label": "accept(offer_a, driver D)"
               },
               {
                 "from": "D2",
                 "to": "Trip",
                 "arrow": "->>",
-                "label": "assign driver D"
+                "label": "accept(offer_b, driver D)"
               },
               {
                 "from": "Trip",
                 "to": "L",
                 "arrow": "->>",
-                "label": "CAS D available->busy (trip1)"
+                "label": "CAS offer_a->accepted, D available->busy, trip1->matched"
               },
               {
                 "from": "L",
                 "to": "Trip",
                 "arrow": "-->>",
-                "label": "ok"
+                "label": "ok (all three flipped)"
               },
               {
                 "from": "Trip",
                 "to": "L",
                 "arrow": "->>",
-                "label": "CAS D available->busy (trip2)"
+                "label": "CAS offer_b->accepted, D available->busy, trip2->matched"
               },
               {
                 "from": "L",
                 "to": "Trip",
                 "arrow": "-->>",
-                "label": "already busy"
+                "label": "D already busy (claim held by trip1)"
               },
               {
                 "from": "Trip",
@@ -2177,7 +2309,7 @@
         {
           "scenario": "A driver accepts, then their app crashes before the trip is persisted.",
           "expectedBehavior": "No driver is silently stuck busy; the trip is recoverable or re-matched.",
-          "mitigation": "The claim has a TTL; if the trip isn't confirmed, the driver is released and re-offered."
+          "mitigation": "The availability lease in the claim store carries an expires_at; if the trip isn't confirmed before it lapses, the lease releases the driver (busy->available) and they're re-offered. The lease (driver_id -> trip_id, offer_id, version, expires_at) is the single source of truth for live availability, so recovery never depends on the slower driver profile row."
         }
       ],
       "interviewerSignals": {
@@ -2206,7 +2338,7 @@
           "TripDB",
           "Driver"
         ],
-        "caption": "When a driver accepts via dispatch, the trip service does a compare-and-set in the idempotency store to claim the driver and persists the new state to the trips DB.",
+        "caption": "When a driver accepts via dispatch, the trip service does one guarded compare-and-set in the idempotency/claim store — flipping offer offered->accepted, driver available->busy, and trip matching->matched together — then persists the new state to the trips DB.",
         "links": [
           "driver-dispatch-accept",
           "dispatch-trip",
@@ -2222,7 +2354,7 @@
       "options": [
         {
           "name": "Atomic CAS state transition (default)",
-          "description": "Claiming a driver is a single compare-and-set on the trip's matching->matched transition, so only the first writer wins.",
+          "description": "Claiming a driver is a single guarded compare-and-set that flips offer (offered->accepted), the driver availability lease (available->busy, in the claim store), and trip (matching->matched) together, so only the first writer wins. The live availability claim lives in the fast claim store (driver_id -> trip_id, offer_id, version, expires_at), not the driver profile row, so a crash after claim auto-releases the driver when the lease TTL lapses.",
           "pros": [
             "The matching->matched transition is a single compare-and-set, so two riders can't both claim driver D.",
             "Acceptance is idempotent and first-writer-wins; the loser is re-offered the next candidate.",
@@ -2341,7 +2473,7 @@
     {
       "id": "surge",
       "title": "6. Surge Pricing",
-      "description": "When demand outstrips supply in an area, raise prices to ration demand and pull in drivers. Compute a per-cell demand/supply ratio over a sliding window into a surge multiplier, applied at quote time. It reuses the same geo cells as matching.",
+      "description": "When demand outstrips supply in an area, raise prices to ration demand and pull in more drivers. Compute a per-cell demand/supply ratio over a sliding window, turn it into a surge multiplier, and apply that multiplier at quote time — reusing the same geo cells that matching already maintains.",
       "patterns": [
         "Real-time demand pricing",
         "Geo-indexing (geohash / S2)"
@@ -2372,7 +2504,7 @@
           "title": "Keeping prices stable and fair",
           "points": [
             "Compute the ratio over a sliding window and smooth it so prices don't oscillate second to second.",
-            "Lock the multiplier into the quote the rider accepts; never change it mid-trip.",
+            "Lock the multiplier into a quote record (quote_id, product, surge_multiplier, estimated_fare, expires_at) that the rider accepts; the ride request must carry a live quote_id, and an expired quote is rejected so price never drifts post-acceptance. Never change the frozen multiplier mid-trip.",
             "Cap surge and be transparent — runaway multipliers erode trust and invite regulation.",
             "Drive surge from validated supply only: a cluster of spoofed or idle drivers shouldn't suppress (or be used to manipulate) the multiplier — reuse the same anti-spoofing signal that gates the geo index.",
             "Keep an audit trail of the demand/supply inputs and multiplier per cell/window; pricing trust and regulation make surge decisions reviewable after the fact."
@@ -2433,7 +2565,7 @@
     {
       "id": "eta",
       "title": "7. ETA & Routing",
-      "description": "Riders and matching both need ETAs. A routing service computes travel time over a road graph with live traffic, feeding match ranking (nearest by ETA, not straight-line) and rider-facing arrival estimates. ETAs are cached and refreshed, not recomputed per poll.",
+      "description": "Both matching and riders need ETAs. A routing service computes travel time over a road graph with live traffic, feeding match ranking (nearest by ETA, not straight-line distance) and rider-facing arrival estimates. ETAs are cached and refreshed rather than recomputed on every poll.",
       "patterns": [
         "Read model / cache"
       ],
@@ -2644,7 +2776,7 @@
     {
       "id": "scale",
       "title": "8. Scaling by Region (geo-sharding)",
-      "description": "Density is wildly uneven — a few cities dominate. Shard the geo index and matching by region/city so each operates locally and a hot city is isolated. A region router directs requests and pings to the right shard; cross-region trips (airport runs) are handled explicitly.",
+      "description": "Density is wildly uneven — a few cities dominate. Shard the geo index and matching by region/city so each operates locally and a hot city is isolated. A region router directs requests and pings to the right shard; cross-region trips (airport runs) are handled explicitly. The ingest backbone is one global stream partitioned by geo cell, fanned into per-region geo indexes, so region ownership is a consumer-assignment concern and failover replays from a single log. This step also turns the observability signals into a concrete operating model: per-city SLOs with page/degrade thresholds and recovery conditions.",
       "patterns": [
         "Geo-sharding by region",
         "Write-heavy ingestion pipeline"
@@ -2733,6 +2865,7 @@
         {
           "title": "Region ownership, handoff, and failover",
           "points": [
+            "Stream topology: one global ingest stream partitioned by geo cell (so a cell maps to a stable partition), fanned into per-region geo indexes. Region ownership is a consumer concern — each region consumes the partitions for the cells it owns — not a separate stream per region. This keeps replay and standby rebuild simple (one log to replay from an offset) while a boundary cell can be handed to a new region by reassigning its partition's consumer, no data migration.",
             "A driver's pings are routed to its current region by the region router (keyed on the driver's geo cell), so the region owning a cell also owns the drivers in it.",
             "When a driver crosses a region boundary, ownership hands off: the new region starts indexing the driver and the old region's stale entry expires via TTL — no driver is double-counted as available.",
             "Region failover rebuilds the geo index from the location stream (it's derived, so it's cheap to reconstruct) while authoritative trip state lives in the durable trips DB — a region can drop and recover without losing trips or stranding drivers as permanently busy.",
@@ -2748,6 +2881,20 @@
             "Push delivery failing: rely on offer TTL + ack and the in-app backup channel; fall through faster (Step 4).",
             "Lock/CAS contention in a hot cell: back off and re-offer; the loser re-matches rather than blocking (Step 5).",
             "Region overload: shed load at the router (queue/widen to neighbor) so one city's spike doesn't degrade the rest. Each tier has a trigger metric, a fallback action, a user-visible behavior, and a recovery condition — all watched by observability."
+          ]
+        },
+        {
+          "title": "Operating model: SLOs, page/degrade thresholds, and recovery (per city)",
+          "points": [
+            "Location freshness — target p95 location age < 8s; degrade when stale-location % in a city > 10% (prefer fresher pings, raise freshness alert); recover when stale % < 3% for 5 min.",
+            "Time-to-first-offer — target p99 < 3s; degrade when p99 > 6s (widen radius, relax product filter); recover when p99 < 4s.",
+            "Time-to-match — target p99 < 10s; page when p99 > 20s or 'no drivers' rate > 5% in a city; recover when both back under target.",
+            "Geo-query latency — target p99 < 50ms; degrade when p99 > 150ms (split hot cells to finer level, cap candidates harder); recover when p99 < 80ms.",
+            "Offer timeout rate — target < 15%; degrade when > 35% (shorten offer TTL, fall through faster, check push delivery); recover when < 20%.",
+            "Routing — target p99 ETA call < 80ms; fall back to geo-distance ranking when routing error budget burns or p99 > 250ms; recover when routing p99 < 120ms for 5 min.",
+            "CAS conflict rate — target < 2%; alert when > 10% on a hot driver/cell (back-off + re-offer, consider single-writer partitioning); recover when < 4%.",
+            "Regional error-budget burn — shed the region at the router when burn rate > 2x budget or geo-index lag can't be caught up; recover (stop shedding) when lag drains and burn rate < 1x for 10 min.",
+            "Each row is metric / target / degrade-or-page when / fallback / recover when — turning the observability signals into an operating model rather than just dashboards."
           ]
         }
       ],
@@ -2774,7 +2921,8 @@
         "strong": [
           "Shards by region for locality and hot-city isolation.",
           "Handles cross-region trips and boundary queries explicitly.",
-          "Explains region handoff at boundaries and failover that doesn't corrupt driver availability."
+          "Explains region handoff at boundaries and failover that doesn't corrupt driver availability.",
+          "Names the stream topology (cell-partitioned global log fanned per region) and ties observability signals to per-city SLOs with degrade/recover thresholds."
         ],
         "weak": [
           "Keeps one global index.",
@@ -2818,7 +2966,7 @@
   ],
   "finalDesign": {
     "title": "Final Design",
-    "description": "End-to-end: drivers stream location through an authenticated, anti-spoof-validated async ingest pipeline into a per-region geo index; a region router directs ride requests to the right regional matching service, which queries nearby candidates, ranks them by routed ETA, and dispatches time-boxed offers (delivered via push with ack/expiry); the trip is an atomically-claimed state machine; surge pricing balances each cell; ETA/routing feeds both ranking and rider estimates; observability tracks freshness, latency, acceptance, and conflict signals per region so degradation is caught before it becomes an outage.",
+    "description": "End-to-end: drivers stream location through an authenticated, anti-spoof-validated async ingest pipeline into a per-region geo index; a region router directs ride requests to the right regional matching service, which queries nearby candidates, ranks them by routed ETA, and dispatches time-boxed offers (delivered via push with ack/expiry); the trip is an atomically-claimed state machine. Persistence ownership: the Trips DB owns trips, trip_events, and dispatch_offers; the Idempotency/Claim store owns accept-idempotency keys and the live driver-availability lease (one claim per driver); quotes (with frozen surge) bind the fare. Surge pricing balances each cell; ETA/routing feeds both ranking and rider estimates; observability tracks freshness, latency, acceptance, and conflict signals per region against per-city SLOs so degradation is caught before it becomes an outage.",
     "view": {
       "nodes": [
         "Rider",
@@ -2844,7 +2992,7 @@
         "Notify",
         "Obs"
       ],
-      "caption": "Driver pings flow through ingest and an auth/risk check into the location stream, latest store, and regional geo indexes; rider requests are region-routed to matching, which uses ETA, pricing, and dispatch (via push) to assign drivers and persist atomic trip state; observability watches lag, offer/accept, and conflict rates.",
+      "caption": "Driver pings flow through ingest and an auth/risk check into the location stream, latest store, and regional geo indexes; rider requests are region-routed to matching, which uses ETA, pricing, and dispatch (via push) to assign drivers; accept flips offer/driver-lease/trip in one guarded CAS in the idempotency/claim store and persists atomic trip state (trips, trip_events, dispatch_offers) to the Trips DB; observability watches lag, offer/accept, and conflict rates against per-city SLOs.",
       "links": [
         "driver-api-location-pings",
         "api-locingest",
@@ -2973,7 +3121,7 @@
       },
       {
         "requirement": "Operability",
-        "how": "Observability tracks location-stream lag, geo-query latency, offer timeout/acceptance rate, CAS conflict rate, hot-cell cardinality, and per-region error-budget burn, tied to user-visible SLOs (time-to-match, location freshness, ETA error).",
+        "how": "Observability tracks location-stream lag, geo-query latency, offer timeout/acceptance rate, CAS conflict rate, hot-cell cardinality, and per-region error-budget burn. Step 8 turns these into a per-city operating model: each signal has a target SLO (e.g. p99 time-to-match < 10s, p95 location age < 8s), a degrade/page threshold, a fallback action, and a recovery condition.",
         "steps": [
           "location-ingest",
           "scale"

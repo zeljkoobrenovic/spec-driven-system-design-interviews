@@ -100,7 +100,27 @@
         "traits": [
           "stateless"
         ],
-        "description": "Drops spam/abuse before broadcast."
+        "description": "Synchronous allow/drop gate before broadcast; on timeout, fail-closed for new/low-trust users and async-quarantine the rest."
+      },
+      {
+        "id": "ReviewQueue",
+        "label": "Quarantine / Review Queue",
+        "type": "queue",
+        "category": "async",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Holds rejected or slow-to-score comments for async human/heuristic review; nothing here reaches the bus."
+      },
+      {
+        "id": "Partitioner",
+        "label": "Room Partitioner",
+        "type": "service",
+        "category": "compute",
+        "traits": [
+          "stateless"
+        ],
+        "description": "Splits a mega-room into (room_id, slice_id) slices and assigns each slice to fanout workers/gateways under a room epoch."
       },
       {
         "id": "Store",
@@ -152,13 +172,19 @@
         "id": "ingest-moderation",
         "from": "Ingest",
         "to": "Moderation",
-        "label": "screen"
+        "label": "screen (allow/drop)"
       },
       {
-        "id": "ingest-bus",
-        "from": "Ingest",
+        "id": "moderation-bus",
+        "from": "Moderation",
         "to": "Bus",
-        "label": "publish to room"
+        "label": "allow -> publish"
+      },
+      {
+        "id": "moderation-review",
+        "from": "Moderation",
+        "to": "ReviewQueue",
+        "label": "drop/quarantine"
       },
       {
         "id": "bus-fanout",
@@ -167,10 +193,34 @@
         "label": "consume room stream"
       },
       {
-        "id": "fanout-sampler",
-        "from": "Fanout",
+        "id": "bus-sampler",
+        "from": "Bus",
         "to": "Sampler",
         "label": "rate-cap firehose"
+      },
+      {
+        "id": "sampler-fanout",
+        "from": "Sampler",
+        "to": "Fanout",
+        "label": "rate-capped batches"
+      },
+      {
+        "id": "partitioner-roomreg",
+        "from": "Partitioner",
+        "to": "RoomReg",
+        "label": "write (room_id, slice_id) assignments",
+        "render": {
+          "arrow": "-.-"
+        }
+      },
+      {
+        "id": "partitioner-fanout",
+        "from": "Partitioner",
+        "to": "Fanout",
+        "label": "assign slices (control plane)",
+        "render": {
+          "arrow": "-.-"
+        }
       },
       {
         "id": "fanout-roomreg",
@@ -209,10 +259,10 @@
         "label": "viewer count / reactions"
       },
       {
-        "id": "ingest-store",
-        "from": "Ingest",
+        "id": "moderation-store",
+        "from": "Moderation",
         "to": "Store",
-        "label": "persist (for replay/VOD)"
+        "label": "persist accepted (replay/VOD)"
       }
     ],
     "types": [
@@ -230,10 +280,13 @@
         "label": "Comment Pipeline",
         "nodes": [
           "Ingest",
-          "Bus",
-          "Fanout",
           "Moderation",
-          "Sampler"
+          "ReviewQueue",
+          "Bus",
+          "Sampler",
+          "Fanout",
+          "Partitioner",
+          "Store"
         ]
       },
       {
@@ -241,8 +294,7 @@
         "label": "Presence & Reactions",
         "nodes": [
           "Presence",
-          "Reactions",
-          "Store"
+          "Reactions"
         ]
       }
     ]
@@ -280,43 +332,60 @@
       "Low latency: comments appear within a second or two of posting.",
       "Survive comment storms: when posting volume is huge, the system must not melt or overwhelm clients.",
       "Best-effort delivery is acceptable (it's a live feed; missing some comments is fine).",
-      "Approximate counts are fine (exact live viewer count isn't required)."
+      "Approximate counts are fine (exact live viewer count isn't required).",
+      "Safe + abuse-resistant: authenticated posting, per-user rate limits, retry-idempotent comments, and no unscreened content broadcast.",
+      "Operable: reconnect-tolerant, with metrics/SLOs for fanout lag, drop rate, sampled rate, and moderation/registry health."
     ]
   },
   "capacity": [
     {
-      "label": "Viewers per room",
-      "value": "millions",
-      "note": "The fanout multiplier."
+      "label": "Hot-room scenario",
+      "value": "5M viewers, 5K comments/sec",
+      "note": "One mega-room at peak (a World Cup final). 50K reactions/sec on top."
     },
     {
-      "label": "Comments per second",
-      "value": "thousands+ at peak",
-      "note": "Far more than a human can read."
+      "label": "Naive deliveries/sec",
+      "value": "5K x 5M = 25B/sec",
+      "note": "If every comment went to every viewer — the impossible number the design must avoid."
     },
     {
-      "label": "Deliveries/sec",
-      "value": "comments x viewers",
-      "note": "Can be billions — the core challenge."
+      "label": "Gateways / viewers-per-gateway",
+      "value": "~5K gateways x ~1K viewers",
+      "note": "5M viewers ÷ ~1K connections/gateway. Hot-room viewers spread across gateways, not concentrated."
     },
     {
-      "label": "Latency",
-      "value": "1-2s",
-      "note": "Live feel; not hard real-time."
+      "label": "Upstream pushes (before sampling)",
+      "value": "5K comments/sec x 5K gateways = 25M/sec",
+      "note": "Hierarchical fanout already cuts 25B -> 25M by pushing once per gateway."
     },
     {
-      "label": "Delivery",
-      "value": "best-effort",
-      "note": "Dropping/sampling comments is acceptable."
+      "label": "Upstream pushes (after sampling)",
+      "value": "~20 comments/sec x 5K gateways = ~100K/sec",
+      "note": "Cap the delivered rate to ~20 readable comments/sec/room; gateways multiply locally to their ~1K viewers."
+    },
+    {
+      "label": "Egress (sampled)",
+      "value": "~20 msg/sec x 5M x ~0.3KB ≈ ~30 GB/sec",
+      "note": "Borne at the gateway edge after local multiplication, not upstream."
+    },
+    {
+      "label": "Reactions / counts",
+      "value": "50K taps/sec in -> 1 count delta / ~2s out",
+      "note": "Aggregation makes count cost independent of tap volume."
+    },
+    {
+      "label": "Bus partitions / latency / delivery",
+      "value": "per-room (sliced for mega-rooms); 1–2s; best-effort",
+      "note": "Live feel, not hard real-time; dropping/sampling comments is acceptable."
     }
   ],
   "api": [
     {
       "method": "WS",
       "path": "/rooms/{id}/connect",
-      "description": "Join a live room; receive the broadcast comment feed.",
-      "request": "Upgrade: websocket (room id)",
-      "response": "subscribed; streamed comments + counts",
+      "description": "Join a live room and receive the broadcast feed. Carries auth/session, the current room epoch, an optional last-seen live sequence (best-effort resume — the server may skip ahead), client capabilities, and the desired feed mode (full vs sampled).",
+      "request": "Upgrade: websocket — { \"auth\": \"<token>\", \"roomEpoch\": 7, \"lastSeq\": 80120, \"caps\": [\"reactions\",\"sampled\"], \"mode\": \"sampled\" }",
+      "response": "{ \"subscribed\": true, \"roomEpoch\": 7, \"sliceId\": 3, \"startSeq\": 80432 }  // then streamed comments + count deltas",
       "sequence": {
         "participants": [
           {
@@ -366,9 +435,9 @@
     {
       "method": "POST",
       "path": "/rooms/{id}/comments",
-      "description": "Post a comment; moderated, then published to the room and fanned out.",
-      "request": "{ \"text\": \"LET'S GO\" }",
-      "response": "{ \"ok\": true }",
+      "description": "Post a comment. Authenticated (user id derived from session), idempotent on clientMessageId (retries return the same result), rate-limited per user. Moderation gates publication: only an allow verdict reaches the bus.",
+      "request": "{ \"clientMessageId\": \"c_9f3\", \"text\": \"LET'S GO\", \"replyTo\": null }",
+      "response": "{ \"status\": \"accepted\", \"serverSeq\": 80432 }   // or { \"status\": \"rejected\", \"reason\": \"spam\" } | { \"status\": \"pending_moderation\" }",
       "sequence": {
         "participants": [
           {
@@ -385,6 +454,10 @@
           {
             "id": "Bus",
             "label": "Room Bus"
+          },
+          {
+            "id": "ReviewQueue",
+            "label": "Quarantine"
           }
         ],
         "messages": [
@@ -392,25 +465,31 @@
             "from": "Viewer",
             "to": "Ingest",
             "arrow": "->>",
-            "label": "post comment"
+            "label": "post (clientMessageId, text)"
           },
           {
             "from": "Ingest",
             "to": "Moderation",
             "arrow": "->>",
-            "label": "screen"
+            "label": "screen (allow/drop)"
           },
           {
-            "from": "Ingest",
+            "from": "Moderation",
             "to": "Bus",
             "arrow": "->>",
-            "label": "publish to room stream"
+            "label": "allow -> publish (serverSeq)"
+          },
+          {
+            "from": "Moderation",
+            "to": "ReviewQueue",
+            "arrow": "->>",
+            "label": "reject/timeout -> quarantine"
           },
           {
             "from": "Ingest",
             "to": "Viewer",
             "arrow": "-->>",
-            "label": "accepted"
+            "label": "accepted | rejected | pending_moderation"
           }
         ]
       }
@@ -418,41 +497,65 @@
     {
       "method": "POST",
       "path": "/rooms/{id}/reactions",
-      "description": "Send a reaction (heart, etc.); aggregated into counts, not broadcast individually.",
-      "request": "{ \"type\": \"heart\" }",
-      "response": "{ \"ok\": true }"
+      "description": "Send reactions, aggregated into counts rather than broadcast individually. Clients batch their own taps (count + window) to cut request volume; the server rate-limits per user and folds them into the room tally. Best-effort: dropped reaction batches only nudge an approximate count.",
+      "request": "{ \"type\": \"heart\", \"count\": 12, \"clientWindowMs\": 1000, \"clientEventId\": \"r_4a1\" }",
+      "response": "{ \"status\": \"accepted\", \"throttled\": false }"
     }
   ],
   "dataModel": [
     {
       "name": "room_subscription (live)",
-      "note": "Routing: which gateways hold viewers of a room.",
+      "note": "Routing: which gateway holds a slice of a room. Lease/TTL + heartbeat lets the registry expire stale gateways after a crash. Keyed by (room_id, slice_id).",
       "fields": [
         {
           "name": "room_id",
           "type": "bigint"
         },
         {
-          "name": "gateway_ids",
-          "type": "set (gateways with this room's viewers)"
+          "name": "slice_id",
+          "type": "int (mega-room partition; 0 for small rooms)"
         },
         {
-          "name": "viewer_count",
-          "type": "approximate"
+          "name": "gateway_id",
+          "type": "bigint (one row per gateway holding this slice)"
+        },
+        {
+          "name": "connection_count",
+          "type": "int (viewers on this gateway for this slice)"
+        },
+        {
+          "name": "room_epoch",
+          "type": "int (incremented on slice reassignment)"
+        },
+        {
+          "name": "heartbeat_at",
+          "type": "timestamp (last gateway heartbeat)"
+        },
+        {
+          "name": "lease_ttl",
+          "type": "seconds (entry expires if no heartbeat)"
         }
       ]
     },
     {
       "name": "comment (optional durable)",
-      "note": "Persisted only if replay/VOD comments are needed.",
+      "note": "Persisted only if replay/VOD comments are needed; idempotent on (room_id, client_message_id).",
       "fields": [
         {
           "name": "comment_id",
-          "type": "bigint (per-room sequence)"
+          "type": "bigint"
+        },
+        {
+          "name": "client_message_id",
+          "type": "uuid (dedup; UNIQUE with room_id)"
         },
         {
           "name": "room_id",
           "type": "bigint"
+        },
+        {
+          "name": "server_seq",
+          "type": "bigint (per-room/slice order on the bus)"
         },
         {
           "name": "user_id",
@@ -463,14 +566,26 @@
           "type": "text"
         },
         {
-          "name": "ts",
+          "name": "moderation_status",
+          "type": "enum(allowed, rejected, pending)"
+        },
+        {
+          "name": "created_at",
           "type": "timestamp"
+        },
+        {
+          "name": "retention_until",
+          "type": "timestamp (TTL for live; longer if kept for VOD)"
+        },
+        {
+          "name": "redacted_at",
+          "type": "timestamp | null (post-hoc removal/redaction)"
         }
       ]
     },
     {
       "name": "reaction_tally",
-      "note": "Aggregated reaction counts per room (approximate).",
+      "note": "Aggregated reaction counts per room, bucketed by time window so deltas are pushable and versioned for freshness.",
       "fields": [
         {
           "name": "room_id",
@@ -481,8 +596,16 @@
           "type": "heart/like/..."
         },
         {
-          "name": "count",
-          "type": "approximate running total"
+          "name": "window_start",
+          "type": "timestamp (e.g. 2s bucket)"
+        },
+        {
+          "name": "approx_count",
+          "type": "approximate running total (this window)"
+        },
+        {
+          "name": "agg_version",
+          "type": "int (aggregation/window version for freshness)"
         }
       ]
     }
@@ -534,9 +657,9 @@
       "group": "Backpressure and Graceful Degradation"
     },
     {
-      "name": "Async moderation gate",
-      "what": "Screen comments before broadcast to drop spam/abuse.",
-      "whenToUse": "Public live comments.",
+      "name": "Moderation gate (before broadcast)",
+      "what": "Synchronously allow/drop each comment before it reaches the bus; quarantine rejects and fail closed for low-trust users when moderation is slow.",
+      "whenToUse": "Public live comments where unscreened content must never broadcast.",
       "steps": [
         "pipeline"
       ],
@@ -549,7 +672,7 @@
       "title": "1. Naive: Everyone Polls a Comments Table",
       "description": [
         "Start with the simplest thing that works. A viewer posts a comment with an HTTP POST that writes a row to a comments table; every viewer polls (GET /rooms/{id}/comments?since=...) every couple of seconds to pull new rows. 'Broadcast' is just everyone reading the same table.",
-        "This is trivial and collapses immediately at scale. With millions of viewers in one room, each polling every couple of seconds, the comments table faces millions of reads per second — almost all returning the same handful of rows — which no database survives. And it can't actually fan one comment out to millions of people in near-real-time: poll-driven delivery is both laggy and ruinously expensive, and a comment storm (thousands of posts a second) makes both the write and the read side melt.",
+        "This is trivial and collapses immediately at scale. Put numbers on it: 5M viewers polling every 2s is ~2.5M reads/sec against the comments table — almost all returning the same handful of rows — before any write load, which no database survives. And it can't actually fan one comment out to millions of people in near-real-time: poll-driven delivery is both laggy and ruinously expensive, and a comment storm (thousands of posts a second) makes both the write and the read side melt.",
         "So the baseline motivates the real design: decouple posting from delivery with a per-room broadcast bus, and push comments out through a gateway fanout tier (one send per gateway, local multiplication to its viewers) instead of having millions of clients hammer a database."
       ],
       "view": {
@@ -558,10 +681,14 @@
           "Ingest",
           "Store"
         ],
-        "caption": "The viewer client posts a comment to the Comment Ingest Service, which persists it to the Comment Store for replay and VOD.",
+        "caption": "The viewer client posts a comment to the Comment Ingest Service, which writes it straight to the Comment Store that every viewer then polls — no moderation, bus, or fanout yet.",
         "links": [
           "viewer-ingest",
-          "ingest-store"
+          {
+            "from": "Ingest",
+            "to": "Store",
+            "label": "write row"
+          }
         ],
         "highlight": [
           "Ingest",
@@ -587,33 +714,37 @@
           "why": "Millions of pollers per room create millions of mostly-redundant reads per second and still deliver comments seconds late — the DB becomes the bottleneck.",
           "instead": "Publish each room's comments to a broadcast bus and fan out through a gateway tier that pushes once per gateway and multiplies locally."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/01-naive.jpg"
     },
     {
       "id": "pipeline",
       "title": "2. Ingest and the Per-Room Broadcast Bus",
       "description": [
-        "Separate posting from delivery. Viewers post comments to an ingest service that validates, rate-limits per user, and moderates (drops spam/abuse). Accepted comments are published to a per-room broadcast bus — one ordered stream per room.",
-        "Decoupling posting from fanout via the bus means ingest stays fast and the (expensive) delivery scales independently. The bus gives a consistent room ordering and a single thing for the delivery tier to subscribe to.",
-        "Optionally persist comments (for replay on the VOD), but the live path's source of truth is the bus, not a database write per comment."
+        "Separate posting from delivery. Viewers post comments to an ingest service that authenticates the user, deduplicates retries by clientMessageId, and rate-limits per user. Moderation is a real gate: a comment only reaches the per-room broadcast bus if moderation returns allow. Rejected (or slow-to-score) comments go to a quarantine/review queue and never broadcast — this enforces the safety requirement rather than screening asynchronously while publishing anyway.",
+        "Moderation runs on a tight latency budget (say ~150ms). If the model is slow or unavailable, fail closed for new/low-trust users (hold them in quarantine) and let only already-trusted users through, so a moderation outage degrades to stricter filtering, not an open firehose.",
+        "The bus is what decouples cheap posting from expensive delivery: ingest stays fast, the delivery tier scales independently, and one ordered stream per room gives the delivery tier a single consistent thing to subscribe to.",
+        "Persistence is accepted-only and happens after the allow verdict: the comment store that powers VOD replay contains only comments that passed moderation. Rejected/quarantined content lives in the separate review queue under its own audit retention and access-control policy — it is never written to the replay store. The live path's source of truth is the bus, not a database write per comment, so persistence is optional and off the hot path."
       ],
       "view": {
         "nodes": [
           "Viewer",
           "Ingest",
           "Moderation",
+          "ReviewQueue",
           "Bus",
           "Store"
         ],
-        "caption": "The viewer client posts to the Comment Ingest Service, which screens via the Moderation Filter, publishes to the Per-Room Broadcast Bus, and persists to the Comment Store.",
+        "caption": "The viewer client posts to the Comment Ingest Service, which screens via the Moderation Filter; only allowed comments publish to the Per-Room Broadcast Bus and persist (accepted-only) to the Comment Store, while rejected ones go to the Quarantine / Review Queue.",
         "links": [
           "viewer-ingest",
           "ingest-moderation",
-          "ingest-bus",
-          "ingest-store"
+          "moderation-bus",
+          "moderation-review",
+          "moderation-store"
         ],
         "highlight": [
-          "Ingest",
+          "Moderation",
           "Bus"
         ],
         "groups": [
@@ -626,7 +757,7 @@
           "term": "Per-room broadcast bus",
           "definition": "One ordered stream per room that ingest publishes to and the delivery tier consumes.",
           "whyItMatters": "Decouples cheap posting from expensive fanout and gives consistent room ordering.",
-          "example": "Comment -> moderate -> publish to room R's stream -> fanout reads it.",
+          "example": "Comment -> moderate (allow) -> publish to room R's stream -> fanout reads it; reject -> quarantine.",
           "group": "Ingest and the Per-Room Broadcast Bus"
         }
       ],
@@ -638,16 +769,82 @@
       ],
       "patterns": [
         "Per-room broadcast bus",
-        "Async moderation gate"
+        "Moderation gate (before broadcast)"
       ],
       "whyNow": [
         "Decoupling ingest from delivery via the bus is the structural foundation; the fanout problem is solved against this stream."
       ],
       "recap": {
-        "before": "Nothing.",
-        "after": "Moderated comments on a per-room ordered stream.",
+        "before": "Comments polled from one table.",
+        "after": "Authenticated, idempotent ingest with a moderation gate; allowed comments on a per-room ordered stream.",
         "newRisk": "One room may have millions of viewers — delivering each comment to all of them is the hard part."
-      }
+      },
+      "flows": [
+        {
+          "name": "Moderation gate: allow publishes, reject quarantines",
+          "note": "A comment reaches the bus only on an allow verdict. Rejected or slow-to-score comments are diverted to the quarantine queue and never broadcast; on a moderation timeout, ingest fails closed for low-trust users.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Viewer"
+              },
+              {
+                "id": "Ingest",
+                "label": "Ingest"
+              },
+              {
+                "id": "Moderation",
+                "label": "Moderation"
+              },
+              {
+                "id": "Bus",
+                "label": "Room Bus"
+              },
+              {
+                "id": "ReviewQueue",
+                "label": "Quarantine"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Viewer",
+                "to": "Ingest",
+                "arrow": "->>",
+                "label": "post (clientMessageId, auth)"
+              },
+              {
+                "from": "Ingest",
+                "to": "Moderation",
+                "arrow": "->>",
+                "label": "screen within ~150ms"
+              },
+              {
+                "from": "Moderation",
+                "to": "Bus",
+                "arrow": "->>",
+                "label": "allow -> publish (server_seq)"
+              },
+              {
+                "from": "Moderation",
+                "to": "ReviewQueue",
+                "arrow": "->>",
+                "label": "reject/timeout -> quarantine"
+              },
+              {
+                "from": "Ingest",
+                "to": "Viewer",
+                "arrow": "-->>",
+                "label": "accepted | rejected | pending_moderation"
+              }
+            ]
+          },
+          "highlight": [
+            "Moderation",
+            "ReviewQueue"
+          ]
+        }
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/02-pipeline.jpg"
     },
     {
       "id": "fanout",
@@ -655,7 +852,7 @@
       "description": [
         "The core challenge: one comment must reach millions of viewers in a room. Viewers hold persistent WebSocket connections spread across many gateway nodes; a room registry tracks which gateways have viewers of each room.",
         "Fanout is hierarchical: a comment on the room bus is read by fanout workers, which push it once to each gateway holding that room's viewers; each gateway then locally broadcasts to all its connected viewers of that room. So a comment is delivered to a gateway once, not per-viewer over the network upstream — the gateway does the local multiplication.",
-        "This gateway-tier fanout is what makes millions-of-viewers feasible: the upstream system sends O(gateways) messages, and each gateway fans out to O(its viewers) locally."
+        "This gateway-tier fanout is what makes millions-of-viewers feasible: the upstream system sends O(gateways) messages, and each gateway fans out to O(its viewers) locally. Concretely, 5K comments/sec to a 5M-viewer room would be 25B deliveries/sec if done per-viewer upstream; with ~5K gateways it becomes 5K x 5K ≈ 25M upstream pushes/sec, and each gateway multiplies locally to its ~1K viewers. (Step 4's sampling then cuts the 25M further.)"
       ],
       "view": {
         "nodes": [
@@ -671,7 +868,6 @@
           "fanout-roomreg",
           "fanout-gateway",
           "gateway-viewer",
-          "lb-gateway",
           "gateway-roomreg"
         ],
         "highlight": [
@@ -721,7 +917,8 @@
               "pipeline",
               "connections"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-fanout-opt1.jpg"
         },
         {
           "name": "Direct per-viewer pub/sub subscription",
@@ -761,7 +958,8 @@
             "highlight": [
               "Broker"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-fanout-opt2.jpg"
         },
         {
           "name": "Client long-poll / pull from a room log",
@@ -804,7 +1002,8 @@
             "groups": [
               "connections"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-fanout-opt3.jpg"
         }
       ],
       "decisionPrompt": "A comment is posted to a room with 5M viewers. How does it reach all of them without 5M upstream sends?",
@@ -899,18 +1098,21 @@
       "title": "4. Taming the Firehose: Sampling",
       "description": [
         "At peak (a goal in a World Cup final), comments arrive faster than anyone can read — thousands per second. Delivering all of them to every viewer is pointless (a human reads a few per second) and ruinously expensive.",
-        "Sample the stream: when volume exceeds a readable rate, show each viewer a representative sample rather than every comment. The rate controller caps the delivered comment rate per room; the feed stays lively without flooding clients or the network.",
-        "Sampling can be smart (prioritize comments from followed users, highlight high-engagement ones) but the key insight is that full delivery is neither needed nor feasible for a firehose room — best-effort sampling is correct, not a compromise."
+        "Sample the stream: when volume exceeds a readable rate, show each viewer a representative sample rather than every comment. The rate controller caps the delivered rate per room to something readable — say ~20 comments/sec — which is what turns the 25M upstream pushes/sec from Step 3 into ~100K/sec (20 x 5K gateways) before local multiplication. The feed stays lively without flooding clients or the network.",
+        "Placement matters: sampling sits after moderation (only allowed comments are eligible) and before fanout, so the sampler reads the moderated bus and emits rate-capped batches that fanout delivers. Persist all accepted comments for VOD if needed, but deliver only the sample live. Keep the sample shared per room — a single capped stream everyone sees; per-viewer personalized samples (followed users, high engagement) multiply fanout work, so reserve them for a small bounded slice rather than re-sampling for every viewer.",
+        "The key insight: full delivery is neither needed nor feasible for a firehose room, so best-effort sampling is the right design, not a compromise."
       ],
       "view": {
         "nodes": [
-          "Fanout",
+          "Bus",
           "Sampler",
+          "Fanout",
           "Gateway"
         ],
-        "caption": "Fanout Workers route the firehose through the Sampling / Rate Controller before pushing rate-capped batches to the WebSocket Gateway.",
+        "caption": "The Sampling / Rate Controller reads the moderated Per-Room Broadcast Bus and emits rate-capped batches; Fanout Workers push those to the WebSocket Gateway — sampling reduces the stream before fanout multiplies it.",
         "links": [
-          "fanout-sampler",
+          "bus-sampler",
+          "sampler-fanout",
           "fanout-gateway"
         ],
         "highlight": [
@@ -936,13 +1138,15 @@
           ],
           "view": {
             "nodes": [
-              "Fanout",
+              "Bus",
               "Sampler",
+              "Fanout",
               "Gateway"
             ],
-            "caption": "Fanout Workers pass the firehose through the Sampling / Rate Controller, which drops comments uniformly at random before batches reach the WebSocket Gateway.",
+            "caption": "The Sampling / Rate Controller reads the moderated bus and drops comments uniformly at random down to the cap; Fanout Workers push the rate-capped batches to the WebSocket Gateway.",
             "links": [
-              "fanout-sampler",
+              "bus-sampler",
+              "sampler-fanout",
               "fanout-gateway"
             ],
             "highlight": [
@@ -951,7 +1155,8 @@
             "groups": [
               "pipeline"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-sampling-opt1.jpg"
         },
         {
           "name": "Priority / quality-ranked sampling",
@@ -968,18 +1173,19 @@
           ],
           "view": {
             "nodes": [
-              "Fanout",
+              "Bus",
               {
                 "id": "Ranker",
                 "label": "Priority Ranker"
               },
               "Sampler",
+              "Fanout",
               "Gateway"
             ],
-            "caption": "Fanout Workers send comments to the Priority Ranker, which picks the top-K by score for the Sampling / Rate Controller before batches reach the WebSocket Gateway.",
+            "caption": "The Priority Ranker scores comments off the moderated bus and the Sampling / Rate Controller keeps the top-K within the rate cap; Fanout Workers then push the rate-capped batches to the WebSocket Gateway.",
             "links": [
               {
-                "from": "Fanout",
+                "from": "Bus",
                 "to": "Ranker",
                 "label": "score comments"
               },
@@ -988,6 +1194,7 @@
                 "to": "Sampler",
                 "label": "top-K by score"
               },
+              "sampler-fanout",
               "fanout-gateway"
             ],
             "highlight": [
@@ -996,7 +1203,8 @@
             "groups": [
               "pipeline"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-sampling-opt2.jpg"
         },
         {
           "name": "Deliver everything (no sampling)",
@@ -1029,7 +1237,8 @@
               "pipeline",
               "connections"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-sampling-opt3.jpg"
         }
       ],
       "decisionPrompt": "A room gets 5,000 comments/second. Do you deliver all 5,000 to every viewer? What should they see?",
@@ -1064,9 +1273,9 @@
       "id": "presence",
       "title": "5. Presence and Reaction Counts (Approximate)",
       "description": [
-        "Live UIs show a viewer count and reaction tallies (hearts streaming up). These are extremely high-volume and don't need exactness — an approximate count is fine.",
-        "Reactions are aggregated, not broadcast individually: a reaction aggregator tallies them into counts pushed to the room periodically (e.g. '+1,240 hearts in the last 2s'), instead of pushing each heart to millions. Viewer count is derived approximately from the room registry / connection counts, also pushed periodically.",
-        "This trades exactness for massive efficiency: counts update every couple seconds via a single small broadcast, regardless of how many reactions arrived."
+        "Live UIs show a viewer count and reaction tallies (hearts streaming up). These are extremely high-volume and don't need exactness: a useful target is 'viewer count refreshed every ~2s, within a few percent', not just 'approximate'.",
+        "Reactions are aggregated, not broadcast individually: a reaction aggregator tallies them into time-windowed counts (e.g. '+1,240 hearts in the last 2s') pushed to the room periodically, instead of pushing each heart to millions. Viewer count comes from summing per-gateway connection counts in the room registry. Note that's concurrent connections, not unique viewers — for a true unique-viewer estimate use an HLL sketch bounded by a session/heartbeat window, so a connection that hasn't sent a heartbeat in N seconds drops out of the estimate.",
+        "This trades exactness for massive efficiency: each count is a single small broadcast every couple seconds carrying a window delta and an aggregation version, regardless of how many reactions arrived — so cost is independent of tap volume."
       ],
       "view": {
         "nodes": [
@@ -1123,7 +1332,8 @@
             "groups": [
               "aggregates"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-presence-opt1.jpg"
         },
         {
           "name": "Exact per-event reaction broadcast",
@@ -1157,7 +1367,8 @@
             "highlight": [
               "Reactions"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-presence-opt2.jpg"
         },
         {
           "name": "Probabilistic sketch for viewer count (HLL)",
@@ -1202,7 +1413,8 @@
             "groups": [
               "aggregates"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-presence-opt3.jpg"
         }
       ],
       "decisionPrompt": "A million viewers tap the heart button at once. Do you broadcast a million reaction events?",
@@ -1293,21 +1505,21 @@
       "title": "6. Backpressure and Graceful Degradation",
       "description": [
         "Live events spike unpredictably. Because delivery is best-effort, the system degrades by dropping/coalescing rather than buffering unboundedly or failing. Apply backpressure at each tier: ingest rate-limits posting, the sampler caps delivery, gateways drop/coalesce if a slow client can't keep up.",
-        "A slow or disconnected viewer must not back up the gateway: per-connection bounded buffers, drop-oldest on overflow. The room bus has bounded retention (it's a live feed, not durable chat) so it never grows without limit.",
-        "The principle: under overload, shed load cleanly (fewer comments shown, coarser counts) so the experience degrades gradually for everyone instead of the system collapsing."
+        "A slow or disconnected viewer must not back up the gateway. Make the policies concrete: a per-connection send buffer bounded at, say, ~256 messages; on overflow drop-oldest for comments (newest comments matter more on a live feed) but coalesce for counts (keep only the latest tally). Coalesce count pushes to one per ~2s. The room bus keeps a bounded retention window (e.g. last ~30s — it's a live feed, not durable chat) so it never grows without limit. If a connection's buffer stays full past a threshold, disconnect it and let the client reconnect rather than letting one laggard hold memory.",
+        "The principle: under overload, shed load cleanly (fewer comments shown, coarser counts) so the experience degrades gradually for everyone instead of the system collapsing — and emit metrics (drop rate, buffer depth, coalesce ratio) so shedding is observably deliberate, not silent loss."
       ],
       "view": {
         "nodes": [
-          "Ingest",
+          "Bus",
           "Sampler",
           "Fanout",
           "Gateway",
           "Viewer"
         ],
-        "caption": "The Comment Ingest Service publishes to the bus and Fanout Workers feed the Sampling / Rate Controller, shedding load before pushing capped batches to the WebSocket Gateway and on to viewer clients.",
+        "caption": "The Sampling / Rate Controller caps the Per-Room Broadcast Bus and Fanout Workers push capped batches to the WebSocket Gateway, which drops-oldest / coalesces into bounded per-connection buffers before delivering to viewer clients.",
         "links": [
-          "ingest-bus",
-          "fanout-sampler",
+          "bus-sampler",
+          "sampler-fanout",
           "fanout-gateway",
           "gateway-viewer"
         ],
@@ -1346,33 +1558,40 @@
         "before": "Unbounded buffering / hard failure.",
         "after": "Bounded, drop-on-overload, graceful degradation.",
         "newRisk": "Gateways and rooms must scale and survive failures at event scale."
-      }
+      },
+      "aiVisual": "assets/generated/ai-visuals/steps/06-backpressure.jpg"
     },
     {
       "id": "scale",
       "title": "7. Scaling Rooms and Gateways",
       "description": [
-        "Scale the gateway fleet by connection count; the room registry (which gateways hold a room) is rebuildable from gateways re-registering. A mega-room (one stream, millions of viewers) is the hard case: its bus and fanout must scale, possibly partitioning the room's viewers across many fanout workers/gateways that each handle a slice.",
-        "Most rooms are small; a few are enormous — provision elastically and route mega-rooms to dedicated capacity. Prewarm for scheduled big events. Comment persistence (for VOD replay) is async and off the live path.",
-        "Gateway failure is a brief reconnect: viewers reconnect to another gateway and re-subscribe to the room; since delivery is best-effort, they simply resume the live feed (no catch-up needed for a live stream). Presence/counts re-derive on reconnect."
+        "Scale the gateway fleet by connection count; the room registry is rebuildable from gateways re-registering (each entry carries a lease/TTL, so stale gateways expire after a missed heartbeat). A mega-room (one stream, millions of viewers) is the hard case: its bus and fanout must scale by partitioning the room into slices.",
+        "Concretely, a room partitioner splits a mega-room into (room_id, slice_id) slices and assigns each slice its own fanout workers, recording the ownership in the registry. The single sampled comment stream is replicated to every slice, so each slice delivers the same shared sample to its viewers; reactions tally per slice and roll up to a room total. This works because sampled live comments need only per-slice (event-time) ordering, not a global total order across slices — which is what makes slicing safe. A room epoch versions each assignment: when slices are reassigned, the epoch bumps and gateways/workers ignore stale-epoch pushes, so reassignment never duplicates or drops delivery.",
+        "Most rooms are small (slice 0 only); a few are enormous — provision elastically and route mega-rooms to dedicated capacity. Prewarm for scheduled big events. Comment persistence (for VOD replay) is async and off the live path.",
+        "Gateway failure is a brief reconnect: viewers reconnect to another gateway and re-subscribe to the room/slice; since delivery is best-effort, they simply resume the live feed (no catch-up needed). Presence/counts re-derive on reconnect."
       ],
       "view": {
         "nodes": [
           "Gateway",
           "RoomReg",
           "Bus",
+          "Sampler",
           "Fanout",
+          "Partitioner",
           "LB"
         ],
-        "caption": "The Connection Gateway assigns each viewer to a WebSocket Gateway that registers its room subscription in the Room / Subscription Registry, which Fanout Workers consult when consuming the Per-Room Broadcast Bus.",
+        "caption": "Control plane (dashed): the Room Partitioner writes (room_id, slice_id) assignments to the Room / Subscription Registry and hands slice ownership to Fanout Workers. Data path: the Sampler rate-caps the Per-Room Broadcast Bus and Fanout Workers read current slice assignments from the registry to push per-slice to the WebSocket Gateways behind the Connection Gateway.",
         "links": [
           "lb-gateway",
           "gateway-roomreg",
-          "bus-fanout",
+          "bus-sampler",
+          "sampler-fanout",
+          "partitioner-roomreg",
+          "partitioner-fanout",
           "fanout-roomreg"
         ],
         "highlight": [
-          "Gateway",
+          "Partitioner",
           "RoomReg"
         ],
         "groups": [
@@ -1381,6 +1600,29 @@
         ]
       },
       "decisionPrompt": "A single live room has 10M viewers. How do you fan out to all of them, and what happens when a gateway dies?",
+      "deepDives": [
+        {
+          "title": "Partitioning one mega-room across fanout capacity",
+          "points": [
+            "Control plane, not hot path: the partitioner decides (room_id, slice_id) assignments and writes them to the registry; fanout workers and gateways read the current assignment. No comment batch flows through the partitioner per message.",
+            "Slice key (room_id, slice_id): viewers are assigned a slice at connect, and the registry maps each slice to its gateways — so no single bus/worker/gateway owns all 10M.",
+            "One shared sample, replicated: sample once per room, then fan the same rate-capped stream to every slice — don't re-sample per slice (that diverges the feed) or per viewer (that explodes fanout).",
+            "Ordering: per-slice event-time order is sufficient; global total order across slices is not required for a best-effort live feed, which is what makes slicing safe.",
+            "Room epoch: reassigning a slice bumps the epoch; workers/gateways drop stale-epoch pushes so reassignment doesn't duplicate or miss messages.",
+            "Counts: each slice tallies locally and the presence service rolls slice tallies into an approximate, time-windowed room total."
+          ]
+        },
+        {
+          "title": "What to put on the dashboard (SLOs & shed signals)",
+          "points": [
+            "Fanout lag per (room, slice): time from bus publish to gateway push — the primary live-feel SLO.",
+            "Gateway send-buffer depth and per-connection drop rate, so load-shedding is observably deliberate, not silent loss.",
+            "Sampled delivery rate vs. cap and the raw comment rate (the sampling ratio that proves the firehose is being tamed).",
+            "Reconnect rate and registry staleness (entries past their lease/TTL).",
+            "Moderation decision latency and quarantine backlog; counter freshness (age of the latest pushed count window)."
+          ]
+        }
+      ],
       "whyNow": [
         "Closing on mega-room scaling + gateway failover shows the design handles the extreme case (one giant room) and degrades gracefully."
       ],
@@ -1398,25 +1640,44 @@
       "bottlenecks": [
         {
           "issue": "A single mega-room's fanout.",
-          "mitigation": "Partition the room's viewers across many fanout workers/gateways; dedicate capacity; prewarm."
+          "mitigation": "Partition into (room_id, slice_id) slices across dedicated fanout workers/gateways; replicate one shared sample to each slice; prewarm for scheduled events."
         },
         {
           "issue": "Gateway loss drops many connections.",
-          "mitigation": "Thin gateways + rebuildable room registry + client reconnect (resume live, no catch-up)."
+          "mitigation": "Thin gateways + lease/TTL room registry + client reconnect (resume live, no catch-up)."
+        },
+        {
+          "issue": "Stale registry entries after a gateway dies.",
+          "mitigation": "Lease/TTL + heartbeat: an entry that misses heartbeats expires, so fanout stops pushing to a dead gateway slice."
+        },
+        {
+          "issue": "Moderation backlog during a spike.",
+          "mitigation": "Bounded moderation latency budget; fail closed for low-trust users; quarantine overflow for async review rather than letting unscreened comments through."
         }
       ],
       "failureDrills": [
         {
           "scenario": "A gateway holding many viewers of a mega-room crashes.",
-          "expectedBehavior": "Those viewers reconnect to other gateways and re-subscribe; they resume the live feed (best-effort, no replay).",
-          "mitigation": "Rebuildable registry + reconnect; best-effort delivery means no catch-up burden."
+          "expectedBehavior": "Those viewers reconnect to other gateways and re-subscribe to their slice; they resume the live feed (best-effort, no replay).",
+          "mitigation": "Lease/TTL registry expires the dead gateway + reconnect; best-effort delivery means no catch-up burden."
+        },
+        {
+          "scenario": "Fanout lags on one room slice while others are healthy.",
+          "expectedBehavior": "That slice's viewers see a slightly staler/thinner feed; other slices and rooms are unaffected.",
+          "mitigation": "Per-slice isolation + autoscale that slice's workers; shed via the sampler cap before lag grows."
+        },
+        {
+          "scenario": "Moderation backlogs during a goal-moment spike.",
+          "expectedBehavior": "Comments from trusted users still flow; new/low-trust comments are held (pending_moderation) rather than broadcast unscreened.",
+          "mitigation": "Latency budget + fail-closed + quarantine; alert on quarantine backlog growth."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/07-scale.jpg"
     }
   ],
   "finalDesign": {
     "title": "Final Design — Live Comments & Presence",
-    "description": "Viewers hold WebSocket connections to gateways (room registry tracks which gateways hold each room). Posted comments are moderated by an ingest service and published to a per-room broadcast bus. Fanout workers read the bus and push each comment once per gateway holding that room's viewers; each gateway broadcasts locally to its viewers (O(gateways) upstream, local multiplication). In firehose rooms a rate controller delivers a representative sample, not every comment; reactions and viewer counts are aggregated into approximate tallies pushed periodically rather than per-event. Delivery is best-effort with backpressure (bounded buffers, drop-on-overload); mega-rooms partition across dedicated fanout capacity, the registry is rebuildable, and gateway failures are brief reconnects that resume the live feed.",
+    "description": "Viewers hold WebSocket connections to gateways (a lease/TTL room registry tracks which gateways hold each room slice). Posted comments are authenticated, deduplicated by clientMessageId, and rate-limited at ingest; moderation is a real gate — only an allow verdict reaches the per-room broadcast bus (and the accepted-only replay store), while rejects and slow scores go to a quarantine queue and a moderation timeout fails closed for low-trust users. The sampler reads the bus and emits rate-capped batches; fanout workers push each batch once per gateway holding that room's viewers and each gateway broadcasts locally (O(gateways) upstream, local multiplication). Reactions and viewer counts are aggregated into approximate, time-windowed tallies pushed periodically rather than per-event. Delivery is best-effort with backpressure (bounded per-connection buffers, drop-oldest comments / coalesce counts); a room partitioner (a control-plane component, not on the per-comment path) slices mega-rooms into (room_id, slice_id) under a room epoch and writes the assignments fanout reads, the registry is rebuildable, and gateway failures are brief reconnects that resume the live feed.",
     "view": {
       "nodes": [
         "Viewer",
@@ -1425,24 +1686,29 @@
         "RoomReg",
         "Ingest",
         "Moderation",
+        "ReviewQueue",
         "Bus",
-        "Fanout",
         "Sampler",
+        "Fanout",
+        "Partitioner",
         "Presence",
         "Reactions",
         "Store"
       ],
-      "caption": "Viewer clients connect through the Connection Gateway to WebSocket Gateways tracked in the Room / Subscription Registry; comments flow through the Comment Ingest Service, Moderation Filter, Per-Room Broadcast Bus, and Fanout Workers (rate-capped by the sampler) to gateways, while reactions aggregate into presence counts and comments persist to the Comment Store.",
+      "caption": "Viewer clients connect through the Connection Gateway to WebSocket Gateways tracked in the Room / Subscription Registry; comments flow through the Comment Ingest Service and the Moderation Filter (allow -> bus + accepted-only Store, reject -> quarantine), then the Sampler rate-caps the Per-Room Broadcast Bus and Fanout Workers push to gateways reading current slice assignments. The Room Partitioner is control plane (dashed): it writes (room_id, slice_id) assignments to the registry and hands slices to fanout, off the per-comment path. Reactions aggregate into presence counts.",
       "links": [
         "viewer-lb",
         "lb-gateway",
         "gateway-roomreg",
         "viewer-ingest",
         "ingest-moderation",
-        "ingest-bus",
-        "ingest-store",
-        "bus-fanout",
-        "fanout-sampler",
+        "moderation-bus",
+        "moderation-review",
+        "moderation-store",
+        "bus-sampler",
+        "sampler-fanout",
+        "partitioner-roomreg",
+        "partitioner-fanout",
         "fanout-roomreg",
         "fanout-gateway",
         "gateway-viewer",
@@ -1455,7 +1721,8 @@
         "pipeline",
         "aggregates"
       ]
-    }
+    },
+    "aiVisual": "assets/generated/ai-visuals/final-design.jpg"
   },
   "satisfies": {
     "functional": [
@@ -1465,7 +1732,8 @@
         "steps": [
           "pipeline",
           "fanout"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-01-join-room-receive-comments.jpg"
       },
       {
         "requirement": "Post comment/reaction",
@@ -1473,28 +1741,32 @@
         "steps": [
           "pipeline",
           "presence"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-02-post-comment-reaction.jpg"
       },
       {
         "requirement": "Viewer count / tallies",
         "how": "Approximate aggregated counts pushed periodically.",
         "steps": [
           "presence"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-03-viewer-count-tallies.jpg"
       },
       {
         "requirement": "Moderation",
         "how": "Screen before publishing to the bus.",
         "steps": [
           "pipeline"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-04-moderation.jpg"
       },
       {
         "requirement": "Replay for VOD",
         "how": "Async durable comment store off the live path.",
         "steps": [
           "pipeline"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-05-replay-for-vod.jpg"
       }
     ],
     "nonFunctional": [
@@ -1504,7 +1776,8 @@
         "steps": [
           "fanout",
           "scale"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-01-millions-of-viewers-fanout.jpg"
       },
       {
         "requirement": "Survive comment storms",
@@ -1512,21 +1785,24 @@
         "steps": [
           "sampling",
           "backpressure"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-02-survive-comment-storms.jpg"
       },
       {
         "requirement": "Efficient high-volume counts",
         "how": "Aggregate, don't per-event broadcast.",
         "steps": [
           "presence"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-03-efficient-high-volume-counts.jpg"
       },
       {
         "requirement": "Low latency / live feel",
         "how": "Stream + push, best-effort.",
         "steps": [
           "fanout"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-04-low-latency-live-feel.jpg"
       },
       {
         "requirement": "Graceful degradation",
@@ -1534,7 +1810,24 @@
         "steps": [
           "backpressure",
           "scale"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-05-graceful-degradation.jpg"
+      },
+      {
+        "requirement": "Safe + abuse-resistant",
+        "how": "Auth + per-user rate limit + idempotent clientMessageId; moderation gate before broadcast with fail-closed.",
+        "steps": [
+          "pipeline"
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-06-safe-abuse-resistant.jpg"
+      },
+      {
+        "requirement": "Operable at event scale",
+        "how": "Lease/TTL registry, room epochs, and SLO metrics (fanout lag, drop/sampled rate, moderation/registry health).",
+        "steps": [
+          "scale"
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-07-operable-at-event-scale.jpg"
       }
     ]
   },
@@ -1545,25 +1838,26 @@
       "say": [
         "Confirm one-to-many: millions of viewers per room, best-effort live feed.",
         "Pin extreme fanout and storm survival as the goals.",
-        "Establish that approximate counts and dropped comments are acceptable."
+        "Establish that approximate counts and dropped comments are acceptable.",
+        "Name safety up front: authenticated posting, per-user rate limits, and no unscreened content broadcast."
       ]
     },
     {
       "phase": "High-level design",
       "time": "next 10 min",
       "say": [
-        "Ingest + moderation -> per-room broadcast bus.",
-        "Gateway-tier hierarchical fanout to millions.",
-        "Sampling to tame the firehose."
+        "Authenticated, idempotent (clientMessageId) ingest -> moderation gate (allow -> bus, reject -> quarantine) -> per-room broadcast bus.",
+        "Sampler reads the moderated bus and emits rate-capped batches before fanout (Bus -> Sampler -> Fanout).",
+        "Gateway-tier hierarchical fanout to millions."
       ]
     },
     {
       "phase": "Deep dive",
       "time": "next 15 min",
       "say": [
-        "Approximate aggregated reaction/viewer counts.",
-        "Backpressure and best-effort dropping.",
-        "Mega-room partitioning and gateway failover."
+        "Approximate aggregated reaction/viewer counts (time-windowed; concurrent connections vs unique viewers).",
+        "Backpressure and best-effort dropping with explicit shed policies.",
+        "Mega-room slicing as a control-plane assignment (room epochs), gateway failover, and lease/TTL registry recovery."
       ]
     },
     {
@@ -1572,6 +1866,7 @@
       "say": [
         "Map requirements to mechanisms.",
         "Tradeoffs: sampling rate vs completeness, count accuracy, dedicated mega-room capacity.",
+        "Operability and safety: moderation fail-closed, idempotent retries, lease/TTL registry, room epochs, and SLOs (fanout lag, drop rate, sampling ratio, moderation backlog, counter freshness).",
         "Mention smart sampling and replay-for-VOD as extensions."
       ]
     }
@@ -1587,17 +1882,18 @@
     {
       "level": "Senior",
       "expectations": [
-        "Designs gateway-tier hierarchical fanout + per-room bus.",
+        "Designs gateway-tier hierarchical fanout + per-room bus, sampling before fanout.",
         "Samples the firehose; aggregates counts.",
-        "Best-effort + backpressure."
+        "Best-effort + backpressure; moderation as a real gate with idempotent ingest."
       ]
     },
     {
       "level": "Staff",
       "expectations": [
         "Reasons about O(gateways) vs O(viewers) fanout precisely.",
-        "Designs mega-room partitioning and bounded-buffer backpressure.",
-        "Discusses sampling strategy and approximate counts deliberately."
+        "Designs mega-room slicing as a control-plane assignment (room epochs) and bounded-buffer backpressure.",
+        "Discusses sampling strategy and approximate counts deliberately.",
+        "Operates under event spikes with explicit shed signals and SLOs: fanout lag, gateway buffer depth, drop/sampling ratio, registry staleness, moderation backlog, and counter freshness."
       ]
     }
   ],
@@ -1686,5 +1982,10 @@
   },
   "assets": {
     "icon": "icon.png"
-  }
+  },
+  "aiVisuals": {
+    "requirements": "assets/generated/ai-visuals/requirements.jpg",
+    "capacity": "assets/generated/ai-visuals/capacity.jpg"
+  },
+  "explainerComic": "assets/generated/comic/interview-comic.jpg"
 }

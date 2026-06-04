@@ -349,6 +349,12 @@
         "label": "load payload"
       },
       {
+        "id": "batch-snap",
+        "from": "Batch",
+        "to": "Snapshot",
+        "label": "publish compiled payload"
+      },
+      {
         "id": "snap-api",
         "from": "Snapshot",
         "to": "ApiLayer",
@@ -442,7 +448,7 @@
       "Let SEO experts create, edit, publish, and archive SEO context configurations through a UI, without a code change or deployment.",
       "Manage LinkBox clusters (groupings of contexts) and per-context text config, WhiteLabel URLs, and search queries.",
       "Validate input on the write path so a bad SEO parameter can never crash the daily batch.",
-      "Record a granular audit trail: who changed which field, from what value to what value, and when.",
+      "Record a granular audit trail (best-effort in v1): who changed which field, from what value to what value, and when. v1 trades guaranteed durability for simplicity (no multi-doc transaction); the outbox/SQS path is the upgrade if audit becomes compliance-critical.",
       "Keep serving the live application from the daily-compiled config exactly as before (parity)."
     ],
     "nonFunctional": [
@@ -455,34 +461,49 @@
   },
   "capacity": [
     {
+      "label": "Contexts / clusters",
+      "value": "~60k contexts, ~2k clusters (est.)",
+      "note": "Across all brands; contextId=58640 in the sample implies a keyspace in the tens of thousands. MUST be measured before approval."
+    },
+    {
+      "label": "Published working set",
+      "value": "~40k docs, ~3KB avg (~120 MB)",
+      "note": "What the batch reads and the FrozenDictionary holds in RAM; well under DocumentDB's 16MB/doc limit. MUST be measured."
+    },
+    {
       "label": "Write actors",
-      "value": "a handful",
-      "note": "SEO experts editing admin config \u2014 not a high-volume write workload"
+      "value": "< ~20 experts, < ~100 edits/day",
+      "note": "Admin config workload, not high-volume. Bounds Toolbox API concurrency and audit-write rate (~100 audit inserts/day)."
     },
     {
       "label": "Read volume",
       "value": "millions/day",
-      "note": "served entirely from the in-memory FrozenDictionary"
+      "note": "Served entirely from the in-memory FrozenDictionary \u2014 zero DocumentDB reads on the hot path, so read volume does NOT size the DB."
+    },
+    {
+      "label": "Daily batch read",
+      "value": "~120 MB, target < ~5 min",
+      "note": "Full scan of published docs (parallel Task.WhenAll) + enrichment. Sets the batch deadline and retry budget; the cache serves the last good payload if it overruns."
+    },
+    {
+      "label": "Connection pool",
+      "value": "maxPoolSize ~50",
+      "note": "Sized for batch parallelism + a handful of Toolbox editors + the refresher poller; must stay under DocumentDB's per-instance connection limit. Tune by load test."
     },
     {
       "label": "Propagation SLA",
-      "value": "up to 24h",
-      "note": "Toolbox save \u2192 next daily batch \u2192 cache swap (v1)"
-    },
-    {
-      "label": "Refresher poll",
-      "value": "every 5 min",
-      "note": "background poll of the version pointer; atomic cache swap on change"
+      "value": "up to 24h + 5 min",
+      "note": "Toolbox save \u2192 next daily batch bumps the version \u2192 refresher poll (\u22645 min) \u2192 atomic cache swap (v1)."
     },
     {
       "label": "DocumentDB cost",
       "value": "~$150\u2013300 / env / mo",
-      "note": "Multi-AZ db.t3.medium (staging) to db.r5.large (prod)"
+      "note": "Multi-AZ db.t3.medium (staging) to db.r5.large (prod). The working set (~120 MB) should fit instance RAM; sizing is PROVISIONAL until the counts above are measured."
     },
     {
-      "label": "Missing estimates",
-      "value": "flagged",
-      "note": "doc count, published-doc size, batch read throughput \u2014 needed to justify instance sizing"
+      "label": "Approval gate",
+      "value": "measure first",
+      "note": "The estimates above are order-of-magnitude. This ADR is not approved until document counts, published-payload size, and batch read time are measured against staging data and confirm the chosen instance class."
     }
   ],
   "api": [
@@ -496,23 +517,30 @@
     {
       "method": "PUT",
       "path": "/contexts/{brandId}/{contextId}",
-      "description": "Save edits with optimistic concurrency control. Validates schema; inserts an audit record (best-effort).",
-      "request": "{ ...fields..., version: 1 }",
-      "response": "200 OK { version: 2 } | 409 Conflict (stale version)"
+      "description": "Save edits with optimistic concurrency control. Validates schema; inserts an audit record (best-effort). Actor identity comes from the auth session (not the body); reason and correlationId travel with the change so they land in the audit log.",
+      "request": "{ ...fields..., version: 1, reason?: \"...\", correlationId: \"...\" }  (actor from auth)",
+      "response": "200 OK { version: 2 } | 409 Conflict { currentVersion: 2, conflictingFields: [\"textConfig.title\"], lastModifiedBy } | 422 Validation { errors: [...] }"
     },
     {
       "method": "POST",
       "path": "/contexts/{brandId}/{contextId}/publish",
-      "description": "Transition draft \u2192 published (or unpublish with explicit confirmation).",
-      "request": "{ status: \"published\" }",
-      "response": "200 OK"
+      "description": "Transition draft \u2192 published, or unpublish/archive. Unpublish and archive require explicit confirmation and run a referential-integrity preflight first (see below).",
+      "request": "{ status: \"published\" | \"draft\" | \"archived\", confirmImpact?: true }",
+      "response": "200 OK | 409 Conflict (referenced by clusters and confirmImpact not set)"
+    },
+    {
+      "method": "GET",
+      "path": "/contexts/{brandId}/{contextId}/archive-impact",
+      "description": "Preflight before archive/unpublish: which clusters still reference this context, so the UI can warn and require confirmation instead of silently shrinking link boxes.",
+      "request": "(brandId, contextId in path)",
+      "response": "{ referencingClusters: [{ clusterCode, clusterType }], canArchiveSilently: false }"
     },
     {
       "method": "PUT",
       "path": "/clusters/{brandId}/{clusterCode}",
-      "description": "Save a LinkBox cluster; writes currentContextIds and targetedContextIds together.",
-      "request": "{ clusterType, order, headLine, contextIds: [...], version }",
-      "response": "200 OK { version } | 409 Conflict"
+      "description": "Save a LinkBox cluster; writes currentContextIds and targetedContextIds together. Validates that referenced contexts exist and belong to the same brand.",
+      "request": "{ clusterType, order, headLine, contextIds: [...], version, correlationId }",
+      "response": "200 OK { version } | 409 Conflict { currentVersion } | 422 Validation { unresolvedContextIds: [...] }"
     }
   ],
   "dataModel": [
@@ -642,6 +670,14 @@
       "steps": [
         "normalize"
       ]
+    },
+    {
+      "name": "Application-level referential integrity",
+      "what": "When the store has no foreign keys, enforce cross-document references in the app: validate on write, surface dangling references in the UI, reconcile in a batch report, and filter at read time as a fallback.",
+      "whenToUse": "Document/NoSQL stores that reference other documents by id and can't constrain that the target exists.",
+      "steps": [
+        "normalize"
+      ]
     }
   ],
   "steps": [
@@ -675,7 +711,7 @@
           "geo-batch",
           "dynamo-batch",
           "pg-batch",
-          "docloader-snap",
+          "batch-snap",
           "snap-api",
           "api-client"
         ],
@@ -716,7 +752,8 @@
       "description": [
         "Add a managed document database (AWS DocumentDB 5.0) as the new write-side Single Source of Truth, and a Toolbox (UI + API) on top of it. SEO experts edit through the UI; the API validates and writes to DocumentDB. This is the strict prerequisite that makes a self-service Toolbox possible.",
         "Crucially, DocumentDB is NEVER on the client request hot path. We are extending the existing CQRS-lite split: the write path becomes transactional and database-backed; the read path stays the untouched in-memory cache.",
-        "Why DocumentDB over the company defaults? The data is deeply nested (searchQuery params, openedLevels arrays) so a relational JSONB store fights the POCO models; and because the Toolbox UI's query/filter/sort patterns are new and will evolve fast, DynamoDB's upfront-access-pattern rigidity is a poor fit. (Note the reviewer's fair pushback: at this tiny write volume DynamoDB's Scan/PartiQL would be fine and its conditional writes are a clean OCC primitive \u2014 so OCC is not a true differentiator. The honest deciding factor is flexible ad-hoc querying for an evolving admin UI.)"
+        "Why DocumentDB over the company defaults? The data is deeply nested (searchQuery params, openedLevels arrays) so a relational JSONB store fights the POCO models; and because the Toolbox UI's query/filter/sort patterns are new and will evolve fast, DynamoDB's upfront-access-pattern rigidity is a poor fit. (Note the reviewer's fair pushback: at this tiny write volume DynamoDB's Scan/PartiQL would be fine and its conditional writes are a clean OCC primitive \u2014 so OCC is not a true differentiator. The honest deciding factor is flexible ad-hoc querying for an evolving admin UI.)",
+        "State plainly what would flip this decision, so it stays falsifiable: if the Toolbox's query patterns stabilize into a small fixed set, or measured document counts/cost make a managed DynamoDB materially cheaper, or the team already runs MongoDB-compatible infra it would reuse \u2014 then DynamoDB (or PostgreSQL JSONB) becomes the better call. The choice is 'best fit for an unknown, evolving admin UI today,' not 'DocumentDB is categorically superior.'"
       ],
       "view": {
         "nodes": [
@@ -732,7 +769,6 @@
           "expert-ui",
           "ui-api",
           "api-docdb",
-          "docloader-snap",
           "snap-api",
           "api-client"
         ],
@@ -745,7 +781,7 @@
           "write-path",
           "read-path"
         ],
-        "caption": "A new write surface (Toolbox UI/API \u2192 DocumentDB) sits beside the untouched read path."
+        "caption": "A new write surface (Toolbox UI/API \u2192 DocumentDB) sits beside the untouched read path. The cache is still code-fed here; the bridge step (next) repoints it at DocumentDB."
       },
       "decisionPrompt": "Why a document DB here, and how do you keep it off the read hot path?",
       "patterns": [
@@ -844,6 +880,23 @@
       "whyNow": [
         "A write store is useless to the live app until its data can reach the read cache safely."
       ],
+      "failureDrills": [
+        {
+          "scenario": "Batch builds the payload successfully but crashes before bumping the version pointer.",
+          "expectedBehavior": "The pointer is unchanged, so the refresher keeps serving the last good cache — no partial publish.",
+          "mitigation": "Bump the pointer as the last step, only on full success (commit-after-build); next batch run re-publishes. Alert on batch failure via Datadog."
+        },
+        {
+          "scenario": "Version bumped, but the refresher's payload load fails midway.",
+          "expectedBehavior": "Replace() is never called, so the old snapshot stays live; the half-loaded payload is discarded.",
+          "mitigation": "Build the new payload fully off to the side and swap only on success; the next 5-min poll retries the load."
+        },
+        {
+          "scenario": "Two API instances poll and detect the version change at once.",
+          "expectedBehavior": "Both load and both swap to the same payload — idempotent; readers always see a complete snapshot.",
+          "mitigation": "Swaps are a single volatile reference assignment; duplicate work is wasteful but harmless. No distributed lock needed at this volume."
+        }
+      ],
       "flows": [
         {
           "sequence": {
@@ -938,7 +991,8 @@
       "title": "4. Make Concurrent Edits Safe (OCC)",
       "description": [
         "The Toolbox is the first time multiple SEO experts can edit the same context at once. Without protection, the lost-update problem appears: A and B both open a context; B saves last and silently clobbers A's unseen changes.",
-        "Solve it with optimistic concurrency control. Each primary document carries a version integer. The UI reads the version on load. The save executes a conditional atomic update \u2014 UpdateOne({ _id, version: N }, { $set: {...}, $inc: { version: 1 } }). If another save already bumped the version, the condition matches zero documents (ModifiedCount == 0) and the API returns 409 Conflict, prompting a refresh.",
+        "Solve it with optimistic concurrency control. Each primary document carries a version integer. The UI reads the version on load. The save executes a conditional atomic update \u2014 UpdateOne({ _id, version: N }, { $set: {...}, $inc: { version: 1 } }). If another save already bumped the version, the condition matches zero documents (ModifiedCount == 0) and the API returns 409 Conflict.",
+        "Make the 409 usable, not a dead end. The conflict response carries the current version, who last modified it, and which fields changed, so the UI can do better than 'reload and lose your work': show a field-level diff, let the editor keep non-conflicting edits and re-apply or discard the conflicting ones, then resubmit against the new version. A bare 'please refresh' is the floor, not the goal.",
         "(OCC could equally be done with DynamoDB conditional writes \u2014 it's not unique to DocumentDB.)"
       ],
       "view": {
@@ -1067,7 +1121,7 @@
                       "from": "ToolboxApi",
                       "to": "ToolboxUI",
                       "arrow": "-->>",
-                      "label": "409 Conflict \u2014 refresh"
+                      "label": "409 { currentVersion, conflictingFields } \u2014 show diff"
                     }
                   ]
                 }
@@ -1089,7 +1143,7 @@
       ],
       "recap": {
         "before": "Concurrent saves silently clobber each other.",
-        "after": "Stale saves get a 409 and re-fetch; no silent loss.",
+        "after": "Stale saves get a 409 with a field-level diff so the editor can merge and resubmit; no silent loss.",
         "newRisk": "Embedding everything in one document would still let one big edit lock/duplicate data \u2014 model the collections carefully."
       }
     },
@@ -1099,7 +1153,8 @@
       "description": [
         "Don't dump everything into one giant document. To avoid DocumentDB's 16MB BSON limit and the unbounded-array anti-pattern (one expert's edit locking a whole brand), use four collections: seo_contexts (same-lifecycle text/URL/query embedded), seo_link_box_clusters (referencing contexts by numeric id to avoid duplication), seo_config_metadata (the single version pointer), and seo_audit_log.",
         "Add the validation that code-embedded config never could: schema/syntax checks on the write path so a malformed parameter is rejected at entry instead of crashing the daily batch. Required indexes back the access patterns \u2014 {brandId,status} for the batch read, {brandId,contextId} unique for Toolbox lookups.",
-        "Capture the audit trail as a best-effort side-write: update the context first, then insert an audit record of { field, before, after }. If the audit insert fails, log/alert to Datadog but still return 200 \u2014 the primary write is preserved. A TTL index purges audit records older than ~90 days. Cluster referential integrity is 'tolerate silently': archived context ids are filtered at read time rather than blocking the archive."
+        "Capture the audit trail as a best-effort side-write: update the context first, then insert an audit record of { field, before, after }. If the audit insert fails, log/alert to Datadog but still return 200 \u2014 the primary write is preserved. A TTL index purges audit records older than ~90 days. Be explicit that this trades durability for simplicity: v1 can lose an audit record. If audit becomes compliance-critical, the upgrade is an outbox/SQS path \u2014 write the context, enqueue the audit event (FIFO, MessageGroupId = brandId:documentId for ordering, MessageDeduplicationId = a hash of the change for idempotency), and a consumer inserts it with retries and a dead-letter queue. That guarantees the record without putting transaction cost on the request.",
+        "Referential integrity without foreign keys: DocumentDB has no FK constraints, so a context can be archived while a cluster still references its id. v1's baseline is 'tolerate silently' \u2014 readers filter missing ids at read time \u2014 but for a self-service admin tool that's too quiet: an expert can silently shrink a link box. So add guardrails: (1) a write-path preflight on archive/unpublish that lists impacted clusters and requires explicit confirmation; (2) a Toolbox warning badge on clusters with unresolved ids; (3) a daily batch validation report (references to non-published contexts, orphaned/duplicate/brand-mismatched ids). Silent filtering remains the runtime fallback, not the only line of defense."
       ],
       "view": {
         "nodes": [
@@ -1121,9 +1176,10 @@
         ],
         "caption": "One API write touches the context + audit collections; audit failure alerts but never fails the user."
       },
-      "decisionPrompt": "How do you model this so a single edit can't lock a whole brand or blow the 16MB limit \u2014 and how do you record audit without transactions?",
+      "decisionPrompt": "How do you model this so a single edit can't lock a whole brand or blow the 16MB limit, record audit without transactions, and keep cluster references honest without foreign keys?",
       "patterns": [
-        "Best-effort side-write"
+        "Best-effort side-write",
+        "Application-level referential integrity"
       ],
       "concepts": [
         {
@@ -1135,8 +1191,14 @@
         {
           "term": "Best-effort side-write",
           "definition": "Commit the primary write; attempt the secondary write; on failure alert but don't roll back.",
-          "whyItMatters": "Avoids multi-document transaction cost while keeping the valuable-but-not-critical record.",
+          "whyItMatters": "Avoids multi-document transaction cost while keeping the valuable-but-not-critical record \u2014 at the cost of a guarantee, so it's only safe when the record is non-critical in v1.",
           "example": "Context saved \u2192 audit insert fails \u2192 CloudWatch alert, user still gets 200."
+        },
+        {
+          "term": "Referential integrity without foreign keys",
+          "definition": "When the store can't enforce that a referenced id exists, you enforce it in the application: validate on write, surface dangling references in the UI, and reconcile in a batch report.",
+          "whyItMatters": "A document store won't stop you archiving a context a cluster still points at; without app-level guardrails the breakage is silent.",
+          "example": "Archiving a context preflights the clusters that reference it and asks for confirmation; the daily batch reports orphaned ids."
         }
       ],
       "whyNow": [
@@ -1151,12 +1213,17 @@
         {
           "trap": "Wrapping context + audit writes in a multi-document transaction.",
           "why": "Adds latency and code complexity for a record that's valuable but not request-critical.",
-          "instead": "Best-effort audit insert; if stronger guarantees are needed later, route audit via SQS with retries."
+          "instead": "Best-effort audit insert; if stronger guarantees are needed later, route audit via an outbox/SQS FIFO consumer with retries, ordering, and a DLQ."
+        },
+        {
+          "trap": "Treating 'tolerate silently' as the whole answer to cluster referential integrity.",
+          "why": "An expert can archive a context and silently shrink a link box with no feedback — exactly the autonomy failure a self-service tool must avoid.",
+          "instead": "Add a write-path archive preflight, a Toolbox warning badge for unresolved ids, and a batch reconciliation report; keep silent filtering only as the runtime fallback."
         }
       ],
       "recap": {
         "before": "One-document-fits-all with no validation or history.",
-        "after": "Four purpose-built collections, write-path validation, and a best-effort audit trail.",
+        "after": "Four purpose-built collections, write-path validation, a best-effort audit trail (with a documented outbox/SQS upgrade), and app-level referential-integrity guardrails.",
         "newRisk": "The new store must provably produce the exact same payload as the code before we trust it."
       }
     },
@@ -1166,7 +1233,8 @@
       "description": [
         "Prove parity before trusting DocumentDB. Seed the collections offline (extract embedded CSVs/hardcoded values, transform to JSON, bulk-upsert via a Bastion host; create indexes after the bulk load, not before). Run a Final Delta Sync just before shadow mode to catch any code-level hotfixes made after seeding.",
         "In SeoConfigSource: shadow, the batch loads via BOTH the code loader and the DocumentDB loader and a SeoConfigComparer structurally diffs the resulting C# dictionaries. The comparer must use set-equality (order-insensitive) on list fields like DistributionTypes/EstateTypes \u2014 CSV parse order vs BSON deserialization order differ and would otherwise produce false positives. Shadow always prioritizes the code output for stability.",
-        "Success criterion: 0 discrepancy logs for 7 continuous days, with Lead Engineer + Engineering Manager sign-off, then flip the flag to docdb. Any discrepancy \u2192 fix the seed, reset the 7-day counter, re-run. Preserve the Immonet quirk (TextConfig/SearchQueries must be null, not empty) on both seed and load."
+        "Define precisely what 'zero discrepancy' means, so the bar is unambiguous and not gamed. The comparer's equality rules: set-equality (order-insensitive) on list fields; null and empty-collection treated per the documented Immonet quirk (null stays null, not coerced to empty); audit-only metadata (lastModifiedBy/At/version) excluded from the comparison since it legitimately differs between sources; whitespace/casing compared exactly (SEO text is meaningful). Anything outside these explicit allowances is a real discrepancy and resets the clock.",
+        "Success criterion: 0 real discrepancy logs for 7 continuous days, with Lead Engineer + Engineering Manager sign-off, then flip the flag to docdb. Any discrepancy \u2192 fix the seed, reset the 7-day counter, re-run. Preserve the Immonet quirk (TextConfig/SearchQueries must be null, not empty) on both seed and load."
       ],
       "view": {
         "nodes": [
@@ -1252,7 +1320,7 @@
       "description": [
         "Introducing a stateful production database raises the security bar. Network isolation: the DocumentDB cluster lives only in private subnets with no public endpoint. Zero direct developer access from local machines \u2014 all seeding/admin runs via an EC2 Bastion / AWS Session Manager / CI runners inside the VPC.",
         "Encryption: AES-256 at rest via KMS (storage, backups, snapshots); TLS 1.2+ in transit, with the .NET MongoClientSettings explicitly trusting the AWS RDS CA bundle. Credentials live in AWS Secrets Manager, rotated every 30 days with the dual-secret pattern for zero-downtime rotation (DocumentDB has no native IAM auth, so ECS tasks get read-only Secrets Manager access). Configure maxPoolSize (~50, tune by load test) so the driver doesn't exhaust DocumentDB's per-instance connection limit.",
-        "Human Toolbox access is governed by the corporate IdP with RBAC. Disaster recovery: point-in-time recovery with a 35-day window means an accidental mass UI delete can be rolled back to the second. Every document keeps lastModifiedBy/At/version for lineage."
+        "Human Toolbox access is governed by the corporate IdP with RBAC. Disaster recovery: point-in-time recovery with a 35-day window means an accidental mass UI delete can be recovered to the second. But PITR is not a one-click in-place undo — DocumentDB restores to a NEW cluster. So the real runbook is a side-restore: restore a snapshot to a temporary cluster at the timestamp just before the incident, then selectively copy back only the affected documents, so legitimate edits made after the incident aren't lost. Every document keeps lastModifiedBy/At/version for lineage, which makes that selective copy-back targetable."
       ],
       "view": {
         "nodes": [
@@ -1292,9 +1360,9 @@
         },
         {
           "term": "Point-in-time recovery (PITR)",
-          "definition": "Restore the database to any second within a retention window.",
-          "whyItMatters": "A mass accidental UI delete becomes recoverable instead of catastrophic.",
-          "example": "35-day PITR window; roll back to the second before the bad bulk delete."
+          "definition": "Restore the database to any second within a retention window — to a NEW cluster, not in place.",
+          "whyItMatters": "A mass accidental UI delete becomes recoverable; but because it restores to a side cluster, the recovery is a selective copy-back, not a one-click undo.",
+          "example": "35-day window; restore a temp cluster to the second before the bad delete, then copy back only the affected docs."
         }
       ],
       "whyNow": [
@@ -1309,8 +1377,13 @@
       "failureDrills": [
         {
           "scenario": "Mass accidental deletion via the Toolbox UI.",
-          "expectedBehavior": "Live cache keeps serving (DB not on hot path); data is recoverable.",
-          "mitigation": "Point-in-time recovery to the second before the deletion (35-day window)."
+          "expectedBehavior": "Live cache keeps serving (DB not on hot path), so there's no user-facing outage; the deletion is recoverable but not instantly.",
+          "mitigation": "Side-restore: PITR a snapshot to a temporary cluster at the timestamp just before the delete, then selectively copy back only the deleted documents (keyed by id/version) so valid post-incident edits survive. Don't restore in place over the live cluster."
+        },
+        {
+          "scenario": "PITR restore would clobber legitimate edits made after the incident.",
+          "expectedBehavior": "An in-place restore is rejected by the runbook; restore goes to a side cluster.",
+          "mitigation": "Diff the side cluster against live using lastModifiedAt/version and copy back only the affected documents."
         }
       ],
       "recap": {
@@ -1322,7 +1395,7 @@
   ],
   "finalDesign": {
     "title": "Target Final Design \u2014 SEO Toolbox on DocumentDB",
-    "description": "SEO experts edit through the Toolbox UI (RBAC via the corporate IdP). The Toolbox API validates input, enforces optimistic concurrency control on a version field, writes to AWS DocumentDB across four purpose-built collections, and records a best-effort audit trail. The daily batch reads all published documents from DocumentDB, enriches them, builds the payload, and bumps a single version pointer. The API's background refresher polls that pointer every 5 minutes and atomically swaps the in-memory FrozenDictionary snapshot \u2014 so the millions of client read requests stay zero-I/O O(1) lookups and DocumentDB is never on the hot path. The whole migration was proven via shadow-mode parity before a reversible feature-flag cutover.",
+    "description": "SEO experts edit through the Toolbox UI (RBAC via the corporate IdP). The Toolbox API validates input, enforces optimistic concurrency control on a version field, writes to AWS DocumentDB across four purpose-built collections, and records a best-effort audit trail. The daily batch reads all published documents from DocumentDB, enriches them, builds the payload, and bumps a single version pointer. The API's background refresher polls that pointer every 5 minutes and atomically swaps the in-memory FrozenDictionary snapshot \u2014 so the millions of client read requests stay zero-I/O O(1) lookups and DocumentDB is never on the hot path. The whole migration was proven via shadow-mode parity before a reversible feature-flag cutover.\n\nAccepted v1 tradeoffs and controls (the decisions that make this approvable, not just the happy path): (1) Toolbox saves do NOT bump the live version \u2014 only a successful daily batch does \u2014 so v1 accepts up to ~24h propagation (a v2 force-refresh is noted, gated to preserve the read path). (2) Audit is best-effort with alerting, not guaranteed; the outbox/SQS path is the upgrade if it becomes compliance-critical. (3) Cluster referential integrity is enforced at the application layer (archive preflight + UI warning + batch reconciliation), since the store has no foreign keys. (4) Hardening is first-class: private-subnet-only DB, KMS-at-rest + TLS-in-transit, Secrets Manager dual-secret rotation, RBAC, and 35-day point-in-time recovery for accidental mass deletes. (5) Instance sizing is provisional until document counts, published-payload size, and batch read time are measured against staging data \u2014 that measurement is the approval gate.",
     "view": {
       "nodes": [
         "SeoExpert",
@@ -1397,8 +1470,8 @@
         ]
       },
       {
-        "requirement": "Granular audit trail",
-        "how": "Best-effort audit-log inserts capturing field-level before/after, with TTL retention.",
+        "requirement": "Granular audit trail (best-effort in v1)",
+        "how": "Best-effort audit-log inserts capturing field-level before/after, with TTL retention. The context write always succeeds; a failed audit insert alerts but does not block the user — so v1 does NOT guarantee zero audit loss. Upgrade to an outbox/SQS consumer if audit becomes compliance-critical.",
         "steps": [
           "normalize"
         ]
@@ -1439,6 +1512,14 @@
         "how": "Private subnets, KMS/TLS encryption, rotating secrets, RBAC, 35-day PITR.",
         "steps": [
           "security"
+        ]
+      },
+      {
+        "requirement": "Accepted 24h propagation SLA (v1)",
+        "how": "Only the successful daily batch bumps the version pointer; the refresher swaps the cache within ≤5 min of that. This is a deliberate parity-with-current-flow constraint, not a bug; a gated v2 force-refresh is the future escape hatch.",
+        "steps": [
+          "bridge",
+          "shadow"
         ]
       }
     ]
@@ -1515,6 +1596,52 @@
       ],
       "makesIrrelevant": [
         "Per-request DB reads"
+      ]
+    },
+    {
+      "concern": "Audit durability",
+      "steps": [
+        "normalize"
+      ],
+      "selfHosted": [
+        "Best-effort side-write (v1)",
+        "Transactional outbox"
+      ],
+      "cloud": {
+        "aws": [
+          "Amazon SQS (FIFO) + consumer",
+          "DynamoDB Streams"
+        ],
+        "gcp": [
+          "Pub/Sub"
+        ],
+        "azure": [
+          "Service Bus"
+        ]
+      },
+      "tradeoff": [
+        "Best-effort: simplest, no transaction cost, but can lose an audit record — only acceptable if audit is non-compliance-critical.",
+        "Outbox/SQS FIFO: guarantees the record with ordering + idempotency + DLQ, at the cost of a consumer and eventual (not immediate) audit visibility."
+      ]
+    },
+    {
+      "concern": "Referential integrity (no foreign keys)",
+      "steps": [
+        "normalize"
+      ],
+      "selfHosted": [
+        "Write-path archive preflight",
+        "Batch reconciliation report",
+        "Read-time filtering (fallback)"
+      ],
+      "cloud": {
+        "aws": [],
+        "gcp": [],
+        "azure": []
+      },
+      "tradeoff": [
+        "Preflight + UI warning gives experts feedback before they shrink a link box; read-time filtering alone is silent and undercuts self-service.",
+        "App-level enforcement is the only option — DocumentDB/DynamoDB can't constrain that a referenced id exists."
       ]
     },
     {
@@ -1595,16 +1722,16 @@
       "phase": "Correctness & migration",
       "time": "next 10 min",
       "say": [
-        "OCC with a version field and 409 on conflict.",
-        "Four normalized collections; best-effort audit; shadow-mode parity with set-equality before a reversible cutover."
+        "OCC with a version field and a 409 that returns a field-level diff to merge, not just 'refresh'.",
+        "Four normalized collections; best-effort audit (with the outbox/SQS upgrade named); application-level referential integrity for cluster ids; shadow-mode parity with explicit comparator rules before a reversible cutover."
       ]
     },
     {
       "phase": "Harden & close",
       "time": "last 5 min",
       "say": [
-        "Private subnets, KMS/TLS, rotating secrets, RBAC, 35-day PITR.",
-        "Call out the accepted 24h propagation SLA and the v2 force-refresh idea."
+        "Private subnets, KMS/TLS, rotating secrets, RBAC, 35-day PITR — and note PITR is a side-restore + selective copy-back, not in-place undo.",
+        "Call out the accepted 24h propagation SLA, the v2 force-refresh idea, and that instance sizing is gated on measuring capacity first."
       ]
     }
   ],
@@ -1636,8 +1763,9 @@
       "level": "Staff",
       "expectations": [
         "Treats it as risk management: parity proof, rollback, brand-specific quirks (Immonet nulls), connection-pool limits.",
-        "Names the missing capacity estimates that should gate instance sizing, and the accepted SLA/cost tradeoffs.",
-        "Designs security/recovery (private subnets, KMS, dual-secret rotation, RBAC, PITR) as first-class, not an afterthought."
+        "Makes capacity an explicit approval gate (measure doc counts, payload size, batch read time before sizing) rather than assuming the instance class, and owns the accepted SLA/cost tradeoffs.",
+        "Designs security/recovery as first-class (private subnets, KMS, dual-secret rotation, RBAC) and knows PITR is a side-restore + selective copy-back, not a one-click undo.",
+        "Closes the data-integrity gaps honestly: best-effort audit vs outbox/SQS, and application-level referential integrity for cluster references."
       ]
     }
   ],

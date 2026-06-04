@@ -5,352 +5,330 @@ Review date: 2026-06-04
 
 ## Executive Summary
 
-This is a strong ride-matching walkthrough. It identifies the right core
-problems: location ingest at firehose scale, fast nearby queries over moving
-drivers, dispatch contention, state-machine correctness, surge, routing, and
-regional sharding. The step order is coherent and most options teach real
-trade-offs rather than strawmen.
+The recent dataset changes materially improve this interview. The previous
+major gaps around dispatch offers, location trust, capacity sizing,
+observability, and graceful degradation are now represented in requirements,
+API text, data model, step prose, failure drills, and the final design. This is
+now a strong ride-matching case with a credible production spine.
+
+The remaining issues are mostly coherence and precision: several sequence
+diagrams still show the older simplified flow, the driver availability claim is
+not represented as clearly as the offer record, and the operational section
+lists good signals but not concrete thresholds or playbooks.
 
 | Axis | Rating | Notes |
 | --- | --- | --- |
-| System design soundness | 4 | Core architecture is credible, but operations, privacy/security, and dispatch offer state need more substance. |
-| Production realism | 3 | Good on geo and CAS; light on live-location abuse, push delivery, cancellations, overload, and regional failover. |
-| Pedagogical flow | 4 | The baseline-to-final progression is clear and interview-friendly. |
-| Dataset/rendering fit | 4 | Structured views and references are clean; mobile app nodes use the wrong canonical type. |
-| Overall | 4 | Usable as a flagship case after a few targeted production-realism edits. |
+| System design soundness | 4 | Core architecture, API, and model are sound; driver claim ownership and quote lifecycle still need sharpening. |
+| Production realism | 4 | Stronger on offers, anti-spoofing, TTLs, failure drills, and observability; still light on exact SLOs and regional ownership mechanics. |
+| Pedagogical flow | 4 | The baseline-to-final progression is clear and the adaptive matching step is a good senior-level addition. |
+| Dataset/rendering fit | 4 | Structured views resolve cleanly; a few sequence diagrams and option-local helper nodes need alignment. |
+| Overall | 4 | Ready as a flagship case after targeted consistency edits. |
 
 ## What Works Well
 
-- The naive scan baseline makes the geo-index and ingest pipeline feel
-  necessary instead of arbitrary.
-- The dataset correctly separates high-frequency location state from durable
-  trip state.
-- Step 3's geohash/S2 discussion covers cell boundaries, adaptive resolution,
-  and hot cells, which are the right geospatial concerns.
-- Step 4 and Step 4a teach that ride matching is not just nearest-neighbor
-  lookup; it is an offer, acceptance, and optimization problem.
-- Step 5 introduces atomic assignment at the right moment, after dispatch has
-  exposed the double-booking risk.
-- `satisfies` maps requirements to real step IDs, and structural view/link
-  references resolve cleanly.
-- The final design integrates most components introduced by the steps.
+- The naive scan baseline remains useful: it makes spatial indexing and
+  high-frequency ingest feel necessary instead of arbitrary.
+- The capacity section now goes beyond headline scale: hot-city ingest,
+  stream partitions, geo-query fanout, routing-QPS amplification, and
+  geo-index memory are all concrete.
+- The API is much stronger: `POST /v1/rides` is authenticated and idempotent,
+  driver pings include device auth plus sequence numbers, and accept now names
+  `offer_id`.
+- The data model now includes TTL'd latest locations, separate bounded history
+  language, `trip_events`, `dispatch_offers`, quote/surge snapshots, and
+  cancellation reasons.
+- Step 4 correctly treats the offer as the unit of dispatch instead of
+  pretending the system force-assigns a driver.
+- Step 4a's default is now market-density adaptive, which is more realistic
+  than a single global greedy or batched policy.
+- Step 8's degradation tiers and regional failover notes are a strong
+  production-realism upgrade.
+- The final design now includes `Risk` and `Obs`, and the high-level
+  `Rider`/`Driver` app nodes are correctly typed as `client`.
 
 ## Highest-Impact Issues
 
-### 1. Dispatch needs an explicit offer/attempt model
+### 1. Sequence diagrams lag behind the updated production model
 
-Step 4 describes time-boxed offers, declines, timeouts, and fall-through to the
-next candidate, but the data model has no `offers`, `dispatch_attempts`, or
-offer lease entity. The accept API is `POST /v1/trips/{id}/accept` with only
-`driver_id`, which lets a driver accept a trip without proving they are
-accepting the current valid offer.
+The prose, API descriptions, data model, and final design now include
+location-risk validation, offer identity, offer TTLs, and idempotent accept.
+Some structured sequence diagrams still teach the older simplified flow:
 
-Why it matters: in production, the offer is the unit that prevents late accepts,
-duplicate accepts, stale mobile retries, and "accept an offer that already
-expired" bugs. A trip-level CAS alone is not enough to explain offer validity,
-offer TTLs, driver notification retries, or fall-through accounting.
+- Step 2's "Fire-and-forget location ping" flow sends `LocIngest ->
+  LocStream` directly and omits `Risk`, even though the step view and final
+  design require `LocIngest -> Risk -> LocStream`.
+- Step 4's flow says `Driver -> Dispatch: accept` and `Dispatch -> Trip:
+  claim driver, create trip`, but does not show `offer_id`, offer expiry, offer
+  status, or the accept idempotency key.
+- The API sequence for `POST /v1/trips/{id}/accept` still labels the first
+  message `accept(trip, driver)` and the CAS as `matching->matched`, while the
+  request body and description now correctly require `offer_id`.
 
-Concrete fix: add a dispatch-offer entity with `offer_id`, `trip_id`,
-`driver_id`, `status`, `expires_at`, `attempt_number`, and `idempotency_key`.
-Change the accept API to include `offer_id` and an idempotency key. Clarify
-that `POST /rides` creates a trip in `matching`, dispatch creates short-lived
-offers, and accept CASes both `offer: offered->accepted` and
-`driver: available->busy` or equivalent guarded state.
+Why it matters: these diagrams are the visual teaching path. If they stay
+simplified, the dataset simultaneously tells candidates that offer identity is
+essential and then diagrams a flow that can ignore it.
 
-### 2. Observability and operations are underrepresented
+Concrete fix: update the Step 2, Step 4, Step 5, and accept-API sequences to
+show `Risk`, `offer_id`, offer status transitions, offer TTL/expiry, and the
+driver/trip claim. Labels are enough; this does not require a new architecture
+component unless you want to make an offer store visible.
 
-The final design has no observability component, and the steps do not define
-the operational signals that would run this system: location-stream lag, stale
-location percentage, geo-query latency, candidate set size, offer timeout rate,
-acceptance rate, CAS conflict rate, hot-cell cardinality, routing degradation,
-regional error budget burn, and p99 time-to-match.
+### 2. Driver availability ownership is still implicit
 
-Why it matters: ride matching fails gradually before it fails completely.
-Without these metrics, the design cannot detect that a city is silently matching
-from stale driver positions, routing is producing bad ETAs, or a hot cell is
-causing assignment contention.
+`dispatch_offers` is now explicit, but the atomic driver claim is still
+represented mostly by prose and a generic `Idem`/lock node. The `drivers` table
+has a `status` field, but the design does not clearly say whether the live
+availability claim lives in the driver profile table, a separate availability
+store, the idempotency/lock store, or a partition-local single-writer queue.
 
-Concrete fix: add an observability node to the high-level architecture and final
-design, plus an operations/failure drill section. Tie metrics to user-visible
-SLOs: time to first offer, time to matched trip, location freshness, dispatch
-success rate, ETA error, and regional availability.
+Why it matters: exactly-once matching depends on a precise invariant:
+one active claim per driver, one accepted offer per trip, and a clear TTL/release
+path after crash or cancellation. A production system usually keeps this
+availability/lease state in a low-latency claim store, not just in the driver
+profile row.
 
-### 3. Live-location security, privacy, and fraud are scoped too far out
+Concrete fix: add either a `driver_availability` / `driver_claims` entity or a
+note that `Idem` stores `driver_id -> trip_id, offer_id, version, expires_at`.
+Then connect it explicitly to `dispatch_offers` and `trips` in Step 5: accept
+CASes `offer: offered->accepted`, `driver: available->busy`, and
+`trip: matching->matched` under one guarded transition.
 
-The dataset stores and streams millions of driver locations, but security and
-privacy appear mainly as a follow-up about GPS spoofing. The location endpoint
-does not mention authentication, replay protection, signed device telemetry,
-rate limiting, consent, location retention, or separation between latest
-location and historical/audit location.
+### 3. Operability has good signals but not enough thresholds
 
-Why it matters: live location is sensitive and adversarial. Drivers can spoof
-position to game surge or airport queues; attackers can scrape movement; stale
-or replayed pings can poison matching. These concerns materially change API
-shape and ingest validation.
+The operability requirement and `Obs` node list the right metrics:
+location-stream lag, freshness, geo-query latency, offer timeout/acceptance
+rate, CAS conflict rate, hot-cell cardinality, ETA error, and regional
+error-budget burn. Step 8 also describes degradation tiers.
 
-Concrete fix: add a non-functional requirement for location privacy and abuse
-resistance. Add fields or notes for authenticated driver/device identity,
-ping timestamp validation, monotonic sequence numbers, TTL on latest location,
-retention policy for any history, and fraud/risk checks before updating the geo
-index.
+What is missing is the concrete "when do we page or degrade?" layer. For
+example: acceptable location age, p99 time-to-first-offer, p99 time-to-match,
+max stale-location percentage per city, routing fallback trigger, offer timeout
+rate threshold, and regional shedding trigger.
 
-### 4. Capacity estimates stop before partition sizing and bottleneck math
+Concrete fix: add a small operations table in Step 8 or the wrap-up with
+`metric`, `target`, `degrade when`, `fallback`, and `recover when`. This would
+turn observability from a component into an operating model.
 
-The capacity section correctly estimates roughly 2-3M location updates/sec and
-10k-100k peak ride requests/sec, but it does not translate that into stream
-partitions, per-region skew, hot-city budget, geo-query fanout, candidate caps,
-routing QPS, index memory, or network/write volume.
+### 4. Quote and fare lifecycle is referenced but not fully introduced
 
-Why it matters: the architecture's most important decisions are partition
-decisions. "10M drivers" is useful, but an interview candidate should connect it
-to "how many pings per hot city", "how many partitions per region", "how many
-candidate drivers per query", and "how many ETA calls per ride request".
+`POST /v1/rides` now carries `quote_id`, and `trips` records a frozen surge
+multiplier and fare. Step 6 also correctly says the multiplier must be frozen
+at quote time. But there is no quote API or quote record explaining who creates
+the quote, how long it is valid, how it binds product/pickup/dropoff/surge, or
+what happens when the rider submits an expired quote.
 
-Concrete fix: add a capacity row or deep dive that sizes a hot region: online
-drivers, pings/sec, event size, stream partitions, expected cell cardinality,
-candidate cap, ETA calls per request, and write/read amplification from
-location ping to latest store plus geo index.
+Why it matters: fare correctness is a state-machine concern, not just a pricing
+calculation. Without a quote object, the design leaves room for post-acceptance
+price drift, stale surge, and mismatches between displayed and charged fare.
 
-### 5. Graceful degradation is promised but not designed end to end
-
-The non-functional requirements promise "widen search or queue rather than fail"
-and the `satisfies` section mentions geo-distance fallback when routing
-degrades. The steps do not yet define a unified degradation policy for no
-candidates, stale index data, push notification failure, region-router outage,
-surge-store staleness, lock-store contention, or a routing brownout.
-
-Why it matters: this system's normal failure mode is not a total outage; it is
-degraded match quality and longer rider wait. The design should show how the
-system chooses between widening radius, relaxing filters, queueing requests,
-falling back to approximate ETA, or returning "no drivers available".
-
-Concrete fix: add a dedicated failure drill or wrap-up subsection with
-degradation tiers. Include the trigger metric, fallback action, user-visible
-behavior, and recovery condition for ingest lag, routing degradation, no
-candidates, push failures, and regional overload.
+Concrete fix: add a minimal `POST /v1/quotes` or `GET /v1/fares/estimate`
+entry, plus a `quotes` entity with `quote_id`, `rider_id`, `pickup`,
+`dropoff`, `product`, `surge_multiplier`, `estimated_fare`, and `expires_at`.
 
 ## System Design Soundness
 
-The requirements cover the main user workflow and the core scaling challenge.
-The strongest parts are the location ingest split, geospatial indexing, atomic
-assignment, ETA ranking, and regional sharding. These map well to a real
-ride-hailing platform.
+The core architecture is coherent. A rider request enters through the API,
+matching queries a regional geo index, dispatch sends time-boxed offers,
+acceptance atomically advances trip state, ETA/routing ranks candidates, surge
+uses the same cells, and regional shards isolate hot cities.
 
-The API is plausible but underspecified for production. `POST /v1/rides` should
-include rider identity through auth, quote/fare context, pickup/dropoff
-validation, product constraints, and an idempotency key. The driver location
-endpoint needs driver/device authentication and stale/replayed ping handling.
-The accept endpoint should accept an `offer_id`, not only `trip_id` and
-`driver_id`.
+The capacity section is now a real design input. The hot-city row, candidate
+cap, routing-QPS multiplier, and geo-index memory estimate all connect directly
+to stream partitioning, cell fanout, candidate ranking, and routing-cache
+decisions.
 
-The data model supports the high-level story but misses several operational
-records: dispatch offers, idempotency records, quote snapshots, surge multiplier
-at acceptance, driver availability lease, state-transition audit, cancellation
-reason, and location TTL. These omissions are fixable without changing the
-overall design.
+The API is mostly credible. The strongest additions are rider authentication,
+idempotency on ride creation, authenticated sequence-numbered driver pings, and
+`offer_id` on accept. The remaining API gap is the missing quote/fare endpoint,
+plus minor label drift in the accept sequence.
 
-The architecture correctly avoids scanning every driver and avoids durable
-writes for every ping. The remaining soundness gap is that the final design
-looks cleaner than the real system would be: no auth/risk boundary, no
-observability path, no push delivery retry model, no location validation, and no
-explicit backpressure mechanism.
+The data model now supports the main behavior. `dispatch_offers` is the most
+important repair; `trip_events`, TTL'd `driver_locations`, cancellation
+reasons, and frozen surge fields make the model much more realistic. The
+remaining model gap is live driver availability ownership: the dataset should
+make the claim/lease store explicit enough that candidates can reason about
+crash recovery and double-book prevention.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Request a Ride (the naive baseline)
 
-This is an effective baseline. It exposes the O(drivers) scan and motivates
-spatial indexing. Improve it by explicitly naming the first invariant: a rider
-request creates at most one active matching trip for the rider/idempotency key.
+Still a good opening. It exposes the O(drivers) scan and motivates the rest of
+the design. The API already adds an idempotency key; the step could echo the
+invariant that a rider/idempotency key has at most one active matching trip.
 
 ### Step 2: Driver Location Ingestion at Scale
 
-The stream plus latest-location store is the right default. The step would be
-stronger if it separated "latest location for matching" from "retained location
-history for safety, fraud, support, or legal/audit use" and explained TTL/stale
-handling for drivers whose app stops pinging.
+Much stronger after the privacy and anti-spoofing additions. The requirement,
+API text, data model, and step view now cover authenticated device identity,
+monotonic sequence numbers, TTL, and bounded retained history. Update the flow
+diagram to include the `Risk` participant so the visual path matches the prose.
 
 ### Step 3: Geospatial Index for Nearby Drivers
 
-This is one of the best steps. It covers cell plus neighbor lookup, hot cells,
-and adaptive resolution. Add one concrete sizing example: at a chosen cell
-level, cap to N candidates, then rank by true ETA after the coarse geo filter.
+This remains one of the best steps. It covers cell-plus-neighbor lookup,
+boundary misses, hot cells, and adaptive resolution. The capacity section now
+gives enough numbers to justify candidate caps and finer cells in dense areas.
 
 ### Step 4: Matching & Dispatch
 
-The offer/accept framing is correct and avoids force assignment. The main
-improvement is to model offers explicitly. Late accept, duplicate accept,
-driver notification failure, and timeout fall-through all become much easier to
-teach once an offer has its own ID, expiry, and status.
+The step now teaches the right production abstraction: offer records, expiry,
+attempt number, status, fall-through, and idempotency. The main improvement is
+visual consistency. The flow should show `offer_id`, offer expiry, and a state
+transition on the offer, not just a generic driver accept.
 
 ### Step 4a: Matching Strategy: Greedy vs Batched
 
-The sub-step is valuable because it moves beyond "nearest driver". The text is
-strong, but the default option label says greedy is default while the prose says
-real systems lean batched in dense markets and greedy in sparse markets. Make
-the default conditional or name it "market-density adaptive policy" to avoid
-teaching a single global default.
+The revised default is realistic: greedy in sparse markets, short-window
+batched optimization in dense markets. To make it even stronger, add one line
+about objective functions, such as minimizing total ETA while bounding rider
+wait, driver fairness, cancellation risk, and solver time.
 
 ### Step 5: Trip State Machine & Atomic Assignment
 
-This is the right correctness step. The CAS/lock/single-writer options are
-useful. Tighten the model by distinguishing trip state, driver availability
-state, and offer state. Also explain cancellation transitions: rider cancels
-while matching, driver cancels after accept, trip expires, and payment/fare
-finalization after completion.
+The text now handles trip, driver, and offer state together, including
+cancellation and expiry. That is the right direction. The improvement is to
+make the claim store/entity explicit and update the sequence labels so they
+show offer state plus driver availability, not only `matching->matched`.
 
 ### Step 6: Surge Pricing
 
-The step correctly stresses smoothing, caps, and quote-time freezing. It should
-add fairness and abuse controls: surge should not update from spoofed supply,
-should use robust demand signals, and should have auditability because pricing
-trust and regulation are material concerns.
+The surge step is good: sliding windows, smoothing, caps, quote-time freezing,
+validated supply, and auditability are all present. Add a quote entity/API or a
+surge audit record if you want the data model to match the text completely.
 
 ### Step 7: ETA & Routing
 
-The step correctly rejects straight-line distance and introduces routing as a
-heavy subsystem. It would benefit from capacity math: if each match ranks 20
-candidate drivers, routing QPS is much higher than ride-request QPS unless
-batched, cached, approximated, or precomputed.
+Strong and appropriately scoped. The routing-QPS deep dive is a useful
+interview differentiator because it explains why routing, not just matching,
+can dominate cost and latency.
 
 ### Step 8: Scaling by Region (geo-sharding)
 
-The locality and blast-radius argument is correct. Add region ownership and
-handoff mechanics: how driver pings are routed to a region, what happens near a
-boundary, how a driver moves between regions, and how one region fails over or
-degrades without corrupting driver availability.
+This step improved substantially. It now covers boundaries, handoff, failover,
+degradation tiers, and router shedding. The remaining refinement is to make the
+stream topology precise: global stream with region-keyed partitions, per-region
+streams, or both. That matters for replay, standby rebuilds, and boundary
+ownership.
 
 ## Final Design Review
 
-The final design ties together ingest, regional indexes, matching, ETA, surge,
-dispatch, push notification, and atomic trip state. That is the right shape.
+The final design now integrates the major components introduced along the way:
+authenticated location ingest, `Risk`, location stream, latest store, regional
+geo indexes, region router, matching, dispatch, trip state, idempotency/lock,
+pricing, surge store, ETA/routing, push notifications, and observability.
 
-The final diagram should include observability and probably auth/risk as
-first-class production components. It should also make the offer lifecycle
-visible. `Notify` appears in the final design even though push delivery
-semantics are not taught in an earlier step; either introduce push failure in
-Step 4 or keep notification as a minor implementation detail.
+The weakest visual element is offer persistence. Dispatch offers are now a
+first-class data-model entity, but the final design does not show where they
+live. That can be acceptable if offers are stored in `TripDB`, but the diagram
+or caption should say so. Otherwise, add an `Offer Store` or make `TripDB`
+explicitly own `trips`, `trip_events`, and `dispatch_offers`.
 
 ## Concept Introduction and Learning Flow
 
-Concepts are introduced mostly just in time. The flow from proximity query to
-ingestion to geo-indexing to dispatch to atomic assignment is strong. The later
-steps are also sensible: once correctness exists, pricing and ETA improve market
-quality, then regional sharding handles global scale.
+Concepts are staged well. The learner starts with proximity and two-sided
+matching, then sees why location ingest and geo-indexing are separate problems,
+then learns dispatch offers, adaptive assignment, atomic claims, surge,
+routing, and regional sharding.
 
-The main teaching gap is that production operations arrive too late or not at
-all. Candidates need to learn that a ride-matching system is operated by
-freshness, latency, acceptance, and conflict metrics. A small operations step
-or wrap-up would make the case more realistic without bloating the core path.
+The improved failure drills also make the case feel more like a production
+system: ingest backlog, hot cells, push failure, crash after claim, routing
+brownout, and regional outage are all good interview probes.
 
 ## Step-to-Final-Design Coherence
 
-Each step contributes visible final-design components, and the `satisfies`
-mapping is coherent. The strongest transitions are:
+The step-to-final coherence is now strong:
 
-- Step 2 to Step 3: ingest feeds the geo index.
-- Step 3 to Step 4: nearby candidates become dispatch offers.
-- Step 4 to Step 5: offer races motivate atomic assignment.
-- Step 7 to final design: ETA improves both ranking and rider-facing estimates.
-- Step 8 to final design: regional shards isolate hot-city load.
+- Step 2 introduces the ingest stream, latest store, and risk validation used
+  in the final design.
+- Step 3 introduces the geo index that regional matching relies on.
+- Step 4 introduces dispatch and offer fall-through.
+- Step 5 provides the atomic state transition behind a valid accept.
+- Step 6 and Step 7 improve market quality through surge and ETA ranking.
+- Step 8 explains why the final design is regional instead of global.
 
-The weakest transition is the offer lifecycle: final design persists trip state
-and claims drivers, but the intermediate offer/attempt record is invisible.
-That makes dispatch look simpler than the prose says it is.
+The two remaining weak transitions are offer persistence and quote lifecycle.
+Both are mentioned, but neither is yet as visibly grounded as the location
+store, geo index, or trip DB.
 
 ## Realism Compared With Production Systems
 
-The dataset is credible on geospatial indexing and marketplace matching, but
-production ride-hailing systems also need:
+The dataset is now credible on the important production axes for ride matching:
+high-frequency mobile ingest, location freshness, geo indexing, marketplace
+dispatch, offer expiry, no double-booking, ETA cost, hot-city skew,
+anti-spoofing, and degraded operation.
 
-- location-authentication and anti-spoofing controls before pings affect supply;
-- explicit location retention and deletion policy;
-- push notification delivery retries, expiry, and acknowledgement;
-- operational metrics and alerting tied to city/region SLOs;
-- region failover and degraded mode;
-- quote/fare snapshots that preserve the accepted price;
-- cancellation and support/audit state transitions;
-- backpressure when a city is overloaded or routing is degraded.
-
-These do not need to dominate the interview, but at least the highest-impact
-ones should appear in requirements, the data model, or failure drills.
+The next realism layer is operational specificity. A real production review
+would ask for city-level SLOs, alert thresholds, runbooks for stale location or
+routing brownout, quote expiry behavior, driver availability reconciliation,
+and clearer ownership of stream replay per region.
 
 ## Dataset and Renderer-Facing Observations
 
 - JSON parses successfully.
-- Step and option `view.links` string references resolve to
-  `highLevelArchitecture.links`.
+- Top-level step `view.nodes`, `view.links`, final-design nodes, and
+  final-design links resolve to the high-level architecture catalog.
 - `satisfies[*].steps[*]` references resolve to real step IDs.
-- `highLevelArchitecture.types` is an empty array; this is valid for the
-  renderer but means group-level architecture type sections are unused.
-- `Rider` (`Rider App`) and `Driver` (`Driver App`) are currently typed as
-  `service`. Repo conventions say outside software such as mobile apps should
-  use canonical type `client`. Human roles should use `actor`.
-- Several option-local nodes such as `BatchSolver`, `DriverLock`, `DriverQ`,
-  and `CH` are valid because the renderer can fall back to local node metadata,
-  but they render without canonical type styling unless authored as objects with
-  type/render metadata or added to the architecture catalog.
-- Raw overview Mermaid diagrams are appropriate for requirements and capacity.
+- `Rider` and `Driver` app nodes are now correctly typed as `client`.
+- Requirements and capacity overview Mermaid diagrams are raw authored
+  diagrams, which is appropriate.
+- Option-local helper nodes `BatchSolver`, `DriverLock`, `DriverQ`, and `CH`
+  are valid local nodes, but they are not in the architecture catalog. If you
+  want canonical styling and searchable node metadata, author them as objects
+  with type/render metadata or add catalog entries.
+- The main renderer-facing issue is content drift in structured sequence
+  diagrams, especially around `Risk` and `offer_id`.
 
 ## Recommended Edits, Prioritized
 
-### P1: Add dispatch-offer state and tighten accept semantics
+### P1: Bring sequence diagrams in sync with the repaired prose
 
-Add `dispatch_offers` or `offer_attempts` to the data model, update the accept
-API to use `offer_id`, and clarify the trip/driver/offer CAS relationship in
-Step 4 and Step 5.
+Update the location-ingest, matching, trip-state, and accept-API sequences so
+they show risk validation, `offer_id`, offer expiry/status, accept idempotency,
+and the coupled offer/driver/trip transition.
 
-### P1: Add observability and degradation policy
+### P1: Make live driver availability ownership explicit
 
-Add an observability node and a failure drill that covers location lag, hot
-cells, route-service brownout, push notification failure, lock contention, and
-regional overload.
+Add a `driver_availability` / `driver_claims` entity or document that the
+`Idem` store owns the live driver claim lease. Include `driver_id`, `trip_id`,
+`offer_id`, `status`, `version`, and `expires_at`.
 
-### P1: Add location privacy, auth, and anti-spoofing requirements
+### P2: Add a quote/fare lifecycle
 
-Add a non-functional requirement plus API/data-model notes for authenticated
-driver pings, replay protection, TTL, retention, and fraud validation before
-index updates.
+Add a quote endpoint or entity so `quote_id`, frozen surge, accepted product,
+fare estimate, and quote expiry are grounded in the API and data model.
 
-### P2: Expand capacity math into partition and fanout sizing
+### P2: Convert observability signals into SLOs and playbooks
 
-Add hot-region sizing: event bytes/sec, stream partitions, geo-index memory,
-candidate cap, ETA calls/request, routing cache hit expectations, and expected
-assignment conflict rate in dense cells.
+Add an operations table with target thresholds and degradation triggers for
+location freshness, time-to-first-offer, time-to-match, routing fallback, offer
+timeout rate, CAS conflict rate, and regional shedding.
 
-### P2: Fix canonical node types
+### P2: Clarify regional stream ownership
 
-Change `Rider` and `Driver` app nodes from `service` to `client`. Keep true
-human roles as `actor`.
+State whether location events are in a global stream with region-keyed
+partitions, per-region streams, or a global ingest stream fanned into regional
+indexes. Tie that to failover rebuild and boundary handoff.
 
-### P2: Make matching strategy default conditional
+### P3: Add canonical metadata for option-local helper nodes
 
-Replace the greedy default with an adaptive policy: greedy in sparse markets,
-short-window batched optimization in dense markets.
-
-### P3: Add cancellation and quote/fare records
-
-Represent cancellation reasons, quote snapshots, accepted surge multiplier, and
-state-transition audit records.
-
-### P3: Introduce notification reliability where `Notify` appears
-
-Either add a small dispatch/push failure drill or make `Notify` less prominent
-in final design.
+Give `BatchSolver`, `DriverLock`, `DriverQ`, and `CH` local type/render
+metadata if the option diagrams should look as polished as the main diagrams.
 
 ## What Not To Change
 
 - Keep the naive baseline; it is pedagogically useful.
-- Keep geohash/S2 as the central data-structure lesson.
-- Keep the Step 4a greedy-vs-batched sub-step; it is a strong differentiator
-  for a senior-level interview.
-- Keep CAS/lock/single-writer as explicit alternatives in Step 5.
-- Keep regional sharding as the final scaling move rather than introducing it
-  at the beginning.
+- Keep geohash/S2 and cell-boundary handling as the central data-structure
+  lesson.
+- Keep the market-density adaptive matching sub-step.
+- Keep dispatch offers and atomic assignment as separate steps; that sequence
+  teaches the problem before the correctness fix.
+- Keep regional sharding as the final scale move rather than introducing it too
+  early.
 
 ## Bottom Line
 
-This is a strong dataset with the right architecture spine. The most valuable
-next edits are not more components for their own sake; they are production
-clarity around dispatch offers, live-location trust, observability, degradation,
-and region-scale operations.
+This is now a strong, production-aware ride-matching interview. The highest
+value next edit is consistency: make the diagrams and state ownership as
+precise as the updated prose, especially around risk validation, dispatch
+offers, and live driver claims.

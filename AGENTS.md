@@ -170,7 +170,8 @@ The explorer (`interview.js`). One IIFE. Top to bottom:
    `renderIntroApi`, `renderIntroDataModel`, `renderIntroPatterns`,
    `renderIntroPatternCatalog`,
    `renderIntroApiFlows`, `renderIntroSatisfies`, `renderIntroInterviewScript`,
-   `renderIntroLevelVariants`, `renderIntroFollowUps`. Each returns a DOM node;
+   `renderIntroLevelVariants`, `renderIntroFollowUps`,
+   `renderIntroStepsOverview` (the decision-tree map). Each returns a DOM node;
    `renderIntroEntry()` dispatches by slug. (`renderTraps` and
    `renderStepPatternTags` are per-step, appended in `renderStepExtras`.)
 10. **`renderCurrentEntry()`** — top-level rendering. Shows/hides
@@ -370,31 +371,32 @@ mode back to `diagram` when there's no visual. Changing it
 re-renders. To add another setting, extend `renderSettings` and the
 `SETTINGS_KEY` payload.
 
-### Decision Tree (auto-generated, lives on the Final Design entry)
+### Steps Overview / Decision Tree (auto-generated Wrap-up entry)
 
-> The Final Design entry is labelled **"Target Final Design"** in the UI (the
-> sidebar nav, the page heading, and the decision-tree's terminal node). The
-> internal slug stays `final-design` (`INTRO_SLUGS.finalDesign`) and the dataset
-> field stays `finalDesign` — only the display string changed. A dataset's
-> `finalDesign.title` is not displayed.
+> The architecture intro entry is labelled **"Final Design"** in the UI (the
+> sidebar nav and the page heading). It is pushed **after** the steps in
+> `buildEntries`, so it is the **last** item in the High-Level Architecture
+> sidebar group. The internal slug stays `final-design`
+> (`INTRO_SLUGS.finalDesign`) and the dataset field stays `finalDesign` — only
+> the display string and ordering changed. A dataset's `finalDesign.title` is
+> not displayed.
 
-The **Final Design** entry leads with a decision-tree map of the whole
-interview, rendered *above* the final-design diagram. There is no separate
-sidebar entry for it. `renderFinalDecisionTree(show)` populates (or, when
-`show` is false, clears) the dedicated `#final-decision-tree` container that
-sits between `#step-description` and `#diagram-block` in the HTML shell. It is
-called from `renderStepLikeEntry` with `entry.id === INTRO_SLUGS.finalDesign`,
-and cleared (`renderFinalDecisionTree(false)`) on the intro branch of
-`renderCurrentEntry` so it never lingers when you navigate away.
+The decision-tree map of the whole interview lives in its own **Wrap-up entry
+titled "Steps Overview"** (slug `steps-overview`, `INTRO_SLUGS.stepsOverview`),
+rendered first in `WRAPUP_ORDER`. The entry is added in `buildEntries` only when
+the dataset has `steps[]` (its payload is `null` — the tree is derived from
+`state.data`, not the payload). `renderIntroStepsOverview()` returns the DOM
+node (an intro renderer dispatched from `renderIntroEntry`), so the tree renders
+into `#intro-block` like any other Wrap-up section. It no longer lives above the
+Final Design diagram.
 
 The tree maps the journey as a flowchart: each top-level step is a node, the
 **first** (default/chosen) option labels the spine edge to the next step, and
 the remaining options become dashed-`alt` side-branch leaves. Sub-steps
 (`step.parent`) branch off their parent via a dashed-`sub` edge instead of
-sitting on the spine. The spine ends at a **Target Final Design** node. It is **fully
+sitting on the spine. The spine ends at a **Final Design** node. It is **fully
 derived** from `steps[]`/`options`/`finalDesign` — nothing is authored per
-dataset — and reads `state.data` (the Final Design entry's own payload is just
-the `finalDesign` object).
+dataset — and reads `state.data`.
 
 `buildDecisionTreeMermaid(data)` returns `{ source, nodeTargets }` where
 `nodeTargets` maps each synthetic Mermaid id (`dtStep<i>`, `dtStep<i>Opt<o>`,
@@ -403,9 +405,9 @@ the `finalDesign` object).
 via the `makeMermaidEl(..., { onRendered })` hook: `wireDecisionTreeClicks`
 walks `g.node` elements, recovers the node id from Mermaid's
 `flowchart-<id>-<n>` group id, and attaches a `selectEntry` listener (clicking
-the step nodes jumps to that step; the `dtFinal` node is a no-op since you're
-already on Final Design). If a future Mermaid upgrade changes that group-id
-format, update the regex in `wireDecisionTreeClicks`.
+any node — including the `dtFinal` node — jumps to that entry). If a future
+Mermaid upgrade changes that group-id format, update the regex in
+`wireDecisionTreeClicks`.
 
 ### Sub-steps (`step.parent`)
 

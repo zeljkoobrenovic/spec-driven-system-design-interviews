@@ -332,7 +332,7 @@
     "graph LR",
     "  W[Writes ~5K tweets/s]",
     "  R[Reads ~300K timelines/s]",
-    "  F[Fanout ~tens of M writes/s peak]",
+    "  F[Fanout ~1M writes/s avg, 10-50M per celebrity post]",
     "  W --> F",
     "  F --> R"
   ],
@@ -379,17 +379,32 @@
       "note": "A single post can mean 100M timeline writes — the fanout problem."
     },
     {
-      "label": "Fanout writes/sec (peak)",
-      "value": "tens of millions",
-      "note": "5K tweets/s x avg fanout, bursty around big accounts."
+      "label": "Fanout writes/sec (avg)",
+      "value": "~1M",
+      "note": "5K tweets/s x ~200 avg followers, before excluding celebrities from push."
+    },
+    {
+      "label": "Fanout writes (single celebrity post)",
+      "value": "10M-50M",
+      "note": "A 100M-follower post can't be pushed in a few seconds — exactly why celebrities are pulled, not pushed."
+    },
+    {
+      "label": "Timeline cache size",
+      "value": "~200B ids",
+      "note": "800 ids x 250M active users, before cache overhead — drives the timeline cache memory budget."
+    },
+    {
+      "label": "Read-side hydration",
+      "value": "~50 ids/page",
+      "note": "Per request: fetch ~50 timeline ids, batch-hydrate from the tweet cache (target >95% hit), rank a small candidate set."
     }
   ],
   "api": [
     {
       "method": "POST",
       "path": "/v1/tweets",
-      "description": "Post a new tweet. Returns immediately after persisting; fanout is async.",
-      "request": "{ \"text\": \"hello\", \"mediaIds\": [\"m_12\"] }",
+      "description": "Post a new tweet. Returns immediately after persisting; fanout is async. Carries a client-generated idempotency key so a client retry can't create a duplicate tweet.",
+      "request": "{ \"text\": \"hello\", \"mediaIds\": [\"m_12\"], \"idempotencyKey\": \"c_7f3a\" }",
       "response": "{ \"tweetId\": \"t_98\", \"createdAt\": \"...\" }",
       "sequence": {
         "participants": [
@@ -459,6 +474,10 @@
             "id": "Client"
           },
           {
+            "id": "API",
+            "label": "Timeline API"
+          },
+          {
             "id": "ReadSvc",
             "label": "Read Service"
           },
@@ -474,9 +493,15 @@
         "messages": [
           {
             "from": "Client",
-            "to": "ReadSvc",
+            "to": "API",
             "arrow": "->>",
             "label": "GET /timeline/home"
+          },
+          {
+            "from": "API",
+            "to": "ReadSvc",
+            "arrow": "->>",
+            "label": "assemble timeline"
           },
           {
             "from": "ReadSvc",
@@ -488,10 +513,10 @@
             "from": "ReadSvc",
             "to": "TweetCache",
             "arrow": "->>",
-            "label": "hydrate tweets"
+            "label": "hydrate + filter visible"
           },
           {
-            "from": "ReadSvc",
+            "from": "API",
             "to": "Client",
             "arrow": "-->>",
             "label": "200 timeline page"
@@ -501,10 +526,17 @@
     },
     {
       "method": "POST",
-      "path": "/v1/follow",
-      "description": "Follow an account. Updates the social graph; future tweets fan out to this follower.",
-      "request": "{ \"targetUserId\": \"u_42\" }",
+      "path": "/v1/follows/{targetUserId}",
+      "description": "Follow an account. Adds a graph edge; future tweets fan out to this follower, and the target's recent tweet ids are lazily backfilled (or merged on read) so the new follow shows up immediately.",
+      "request": "{}",
       "response": "{ \"following\": true }"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/follows/{targetUserId}",
+      "description": "Unfollow an account. Removes the graph edge; the author's tweets are filtered out at hydrate time against the current follow graph, and an async job lazily cleans their ids from the cached timeline.",
+      "request": "{}",
+      "response": "{ \"following\": false }"
     },
     {
       "method": "GET",
@@ -536,8 +568,28 @@
           "type": "bigint[]"
         },
         {
+          "name": "status",
+          "type": "enum (active, deleted, hidden)"
+        },
+        {
+          "name": "visibility",
+          "type": "enum (public, followers, protected)"
+        },
+        {
+          "name": "version",
+          "type": "int (bumped on edit)"
+        },
+        {
           "name": "created_at",
           "type": "timestamp"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp"
+        },
+        {
+          "name": "deleted_at",
+          "type": "timestamp (null unless tombstoned)"
         }
       ]
     },
@@ -561,15 +613,15 @@
     },
     {
       "name": "home_timeline",
-      "note": "Derived per-user list of tweet ids (in Timeline Cache, e.g. a capped Redis list).",
+      "note": "Derived per-user list of (tweet id, author id) pairs (in Timeline Cache, e.g. a capped Redis list). Carrying author_id lets the read path filter unfollows, mutes, and blocks without an extra store hit.",
       "fields": [
         {
           "name": "user_id",
           "type": "bigint (cache key)"
         },
         {
-          "name": "tweet_ids",
-          "type": "list<bigint> (newest-first, capped ~800)"
+          "name": "entries",
+          "type": "list<{tweet_id, author_id}> (newest-first, capped ~800)"
         }
       ]
     },
@@ -592,6 +644,32 @@
         {
           "name": "is_celebrity",
           "type": "bool (follower_count over threshold)"
+        },
+        {
+          "name": "is_protected",
+          "type": "bool (tweets visible to approved followers only)"
+        },
+        {
+          "name": "status",
+          "type": "enum (active, suspended, deactivated)"
+        }
+      ]
+    },
+    {
+      "name": "blocks_mutes",
+      "note": "Per-viewer relationship overrides applied at read time to filter authors out of a hydrated page.",
+      "fields": [
+        {
+          "name": "viewer_id",
+          "type": "bigint (PK part)"
+        },
+        {
+          "name": "target_id",
+          "type": "bigint (PK part)"
+        },
+        {
+          "name": "kind",
+          "type": "enum (block, mute)"
         }
       ]
     }
@@ -843,7 +921,8 @@
         "tao-paper",
         "kafka-design",
         "redis-cache",
-        "tail-at-scale"
+        "tail-at-scale",
+        "sre-monitoring"
       ],
       "patterns": [
         "Fanout-on-write",
@@ -916,6 +995,36 @@
         "after": "Reads are a single cached list lookup; posting is fast.",
         "newRisk": "A celebrity post means tens of millions of cache writes — fanout storms."
       },
+      "deepDives": [
+        {
+          "title": "Fanout queue operations",
+          "points": [
+            "Async backlog is the system's hardest operational risk: the 'within seconds' promise is governed by queue lag, not by the queue's existence.",
+            "Partition jobs by author (or follower shard) so one hot author can't head-of-line-block the rest, and large-fanout jobs are split into chunked sub-jobs.",
+            "Carry a stable tweet_id + fanout_job_id; make each timeline write idempotent by (user_id, tweet_id) so at-least-once retries can't double-insert.",
+            "Retry with exponential backoff; route poison jobs to a DLQ after N attempts instead of blocking the partition.",
+            "Cap each home_timeline atomically (e.g. LPUSH + LTRIM to ~800) so a burst can't grow a timeline unbounded.",
+            "Apply backpressure / rate-limit per author when a burst or a celebrity misclassification spikes job volume.",
+            "Alert on fanout lag (enqueue-to-push p99), queue depth, retry rate, duplicate-suppression rate, DLQ growth, and cache write errors."
+          ],
+          "view": {
+            "nodes": [
+              "WriteSvc",
+              "FanoutQ",
+              "FanoutSvc",
+              "Graph",
+              "TimelineCache"
+            ],
+            "links": [
+              "write-fanoutq",
+              "fanoutq-fanout",
+              "fanout-graph",
+              "fanout-timeline"
+            ],
+            "caption": "Fanout jobs flow write service -> queue -> workers; the workers resolve followers and push idempotently into capped timeline caches, with retries, a DLQ, and lag/queue-depth alerting around the loop."
+          }
+        }
+      ],
       "traps": [
         {
           "trap": "Storing full tweet bodies in every follower's timeline.",
@@ -926,8 +1035,13 @@
       "failureDrills": [
         {
           "scenario": "A fanout worker crashes mid-job after pushing to half the followers.",
-          "expectedBehavior": "The job is retried from the queue; pushes are idempotent (LPUSH of an id already present is deduped or capped).",
-          "mitigation": "At-least-once queue + idempotent timeline writes keyed by tweet id."
+          "expectedBehavior": "The job is retried from the queue; pushes are idempotent by (user_id, tweet_id), so the already-pushed half is deduped and only the remaining followers get the id.",
+          "mitigation": "At-least-once queue + idempotent timeline writes keyed by (user_id, tweet_id); a job that keeps failing lands in a DLQ for inspection rather than blocking its partition."
+        },
+        {
+          "scenario": "Fanout lag spikes during a major event and timelines fall minutes behind.",
+          "expectedBehavior": "Lag and queue-depth alerts fire; workers autoscale and large-fanout jobs are chunked so smaller authors aren't starved.",
+          "mitigation": "Partition by author, chunk celebrity-sized jobs, rate-limit per author, and shed/defer low-priority work under backpressure."
         }
       ]
     },
@@ -1278,7 +1392,8 @@
           "points": [
             "Threshold trades write cost (fanout) against read cost (pull + merge). Too low and reads get heavy; too high and fanout storms return.",
             "Estimate per-account fanout cost = follower_count x post_rate; flip the strategy when that exceeds the read-merge cost.",
-            "The flag can change as accounts grow; handle the transition (backfill or accept a brief gap)."
+            "The flag can change as accounts grow; handle the transition (backfill or accept a brief gap).",
+            "Across the cutoff time, the read merge must avoid duplicates and gaps: record when an author flipped to celebrity and only pull their tweets newer than that cutoff, leaving already-pushed older ids in the timeline. The merge dedups by tweet_id so an id that was both pushed and pulled appears once."
           ],
           "view": {
             "nodes": [
@@ -1308,8 +1423,9 @@
       "title": "5. Read Path: Hydrate, Rank, Paginate",
       "description": [
         "The timeline cache holds tweet ids; hydrate full tweet bodies from a shared tweet cache (cache-aside, falling back to the tweet store on miss).",
+        "Filter the hydrated candidates against current state — tombstoned/edited tweets, protected or suspended authors, and unfollowed/muted/blocked authors — then backfill if filtering shortened the page.",
         "Optionally hand candidates to a ranking service for relevance ordering instead of strict reverse-chronological.",
-        "Paginate with an opaque cursor (e.g. the last tweet's snowflake id) so infinite scroll is stable as new tweets arrive."
+        "Paginate by snowflake boundary for reverse-chronological feeds; for ranked feeds use an opaque cursor that pins a candidate snapshot plus the last (score, tweet_id) tie-breaker so infinite scroll stays stable as scores change."
       ],
       "view": {
         "nodes": [
@@ -1437,7 +1553,8 @@
               "TweetDB",
               {
                 "id": "Scorer",
-                "label": "Heuristic Scorer (recency x affinity)"
+                "label": "Heuristic Scorer (recency x affinity)",
+                "type": "service"
               }
             ],
             "caption": "The read service hydrates cached timeline ids and orders them with a lightweight recency-times-affinity heuristic instead of a full ranker.",
@@ -1483,10 +1600,46 @@
           "group": "Read Path: Hydrate, Rank, Paginate"
         }
       ],
+      "deepDives": [
+        {
+          "title": "Visibility filtering: a cached id is a candidate, not a guarantee",
+          "points": [
+            "A tweet id sitting in a timeline cache is only a candidate; the read path must check current state before rendering it.",
+            "Filter after hydration: drop tombstoned tweets (status=deleted / deleted_at set), protected or suspended authors, and authors the viewer has unfollowed, muted, or blocked.",
+            "Carry author_id in each timeline entry so unfollow/mute/block filtering is a cheap in-memory check, not an extra store hit per tweet.",
+            "Filtering can shorten a page; backfill more candidates from the next slice of timeline ids (or the pull path) until the page reaches the requested limit.",
+            "Edits show up automatically because bodies are hydrated from the shared store; the writer just invalidates TweetCache and updates Search, never the millions of cached ids.",
+            "Deletes set a tombstone and de-index from Search; the id may linger in many timelines but never renders — no synchronous delete-from-every-timeline needed."
+          ],
+          "view": {
+            "nodes": [
+              "ReadSvc",
+              "TimelineCache",
+              "TweetCache",
+              "TweetDB"
+            ],
+            "links": [
+              "read-timeline",
+              "read-tweetcache",
+              "tweetcache-tweetdb"
+            ],
+            "caption": "The read service reads candidate ids from the timeline cache, hydrates bodies from the tweet cache, then filters tombstones and denied authors before returning — backfilling more candidates if the page came up short."
+          }
+        },
+        {
+          "title": "Cursor stability for ranked vs chronological feeds",
+          "points": [
+            "Reverse-chronological: the cursor is just a snowflake boundary (return ids < lastId), which is naturally stable as new tweets arrive.",
+            "Relevance-ranked: a bare snowflake cursor isn't enough because scores reorder candidates between requests.",
+            "Use an opaque cursor that pins a candidate-window snapshot id (or version) plus the last (score, tweet_id) tie-breaker, so the next page continues the same ranking.",
+            "Pin the candidate set behind that snapshot for a short TTL; if scores are recomputed every request instead, state explicitly that the product accepts some reordering across pages."
+          ]
+        }
+      ],
       "recap": {
         "before": "Timeline is a list of ids.",
-        "after": "Reads return fully hydrated, optionally ranked, cursor-paginated tweets.",
-        "newRisk": "Tweet cache misses on cold tweets; ranker latency budget."
+        "after": "Reads return hydrated, visibility-filtered, optionally ranked, cursor-paginated tweets.",
+        "newRisk": "Tweet cache misses on cold tweets; ranker latency budget; short pages after filtering."
       },
       "flows": [
         {
@@ -1632,6 +1785,30 @@
         {
           "issue": "Losing a timeline cache shard drops those users' precomputed feeds.",
           "mitigation": "Rebuild lazily on next read via the pull path (followees' recent tweets) and resume push."
+        },
+        {
+          "issue": "Fanout lag: a burst or celebrity misclassification backs up the queue and delays the 'within seconds' promise.",
+          "mitigation": "Partition jobs by author, chunk large-fanout jobs, autoscale workers on lag, and rate-limit per author; alert on enqueue-to-push p99."
+        },
+        {
+          "issue": "Hot author shard: a high-volume author concentrates writes/reads on one tweet-store shard.",
+          "mitigation": "Range-scan recent tweets from the cache, not the store; consider per-author sub-sharding by time for the very largest accounts."
+        },
+        {
+          "issue": "Graph hot edges: a celebrity's follower list is enormous and read on every one of their posts.",
+          "mitigation": "Don't materialize the full follower set for celebrities (they're pulled, not pushed); cache the is_celebrity flag so the read path skips them quickly."
+        },
+        {
+          "issue": "Cold timeline rebuild is expensive if many shards are lost at once.",
+          "mitigation": "Cap rebuild work with a budget (rebuild only the first page on read, fill the rest in the background) so a mass eviction doesn't stampede the pull path."
+        },
+        {
+          "issue": "Timeline cache memory: ~200B ids across active users strains a single region.",
+          "mitigation": "Cap timeline length (~800), evict cold/inactive users to pull-only, and size shards to the active-user working set."
+        },
+        {
+          "issue": "Regional read availability: a region or cache tier degrades.",
+          "mitigation": "Replicate timeline/tweet caches per region for local reads; on cache loss serve a degraded pull-path feed rather than failing the read."
         }
       ],
       "failureDrills": [
@@ -1645,7 +1822,7 @@
   ],
   "finalDesign": {
     "title": "Final Design — Hybrid Fanout Timeline",
-    "description": "Posts persist to the tweet store and enqueue async fanout; normal accounts push tweet ids into follower timeline caches while celebrities are pulled at read time. Reads merge pushed + pulled ids, hydrate from the shared tweet cache, optionally rank, and paginate by snowflake id. Media is served via CDN.",
+    "description": "Posts persist to the tweet store and enqueue async fanout; normal accounts push tweet ids into follower timeline caches while celebrities are pulled at read time. Reads merge pushed + pulled ids, hydrate from the shared tweet cache, filter against current visibility and relationship state (deletes, edits, protected/suspended authors, unfollows/mutes/blocks), optionally rank, and paginate by snowflake id (ranked feeds use an opaque candidate-snapshot cursor). Media is served via CDN; search and the profile timeline are first-class extensions: the write service indexes tweets (with tombstone de-indexing) and a profile read is the author's own tweet range.",
     "view": {
       "nodes": [
         "Client",
@@ -1715,14 +1892,22 @@
       },
       {
         "requirement": "Follow / unfollow reflected in timeline",
-        "how": "Social graph edge changes which timelines a post fans out to.",
+        "how": "Follow adds a graph edge and lazily backfills (or read-merges) the author's recent tweet ids; unfollow removes the edge and is filtered at hydrate time via author_id, with async timeline cleanup.",
         "steps": [
+          "read-path",
           "graph-scale"
         ]
       },
       {
+        "requirement": "Deletes, edits, and blocks are honored",
+        "how": "Bodies hydrate from the shared store, so edits show automatically; deletes set a tombstone and de-index from search; the read path filters tombstoned/denied authors after hydration.",
+        "steps": [
+          "read-path"
+        ]
+      },
+      {
         "requirement": "Search tweets",
-        "how": "Write service indexes each tweet; search queries the inverted index.",
+        "how": "Write service indexes each tweet; search queries the inverted index. Deletes de-index via tombstone.",
         "steps": [
           "read-path"
         ]
@@ -1826,11 +2011,11 @@
     }
   ],
   "followUps": [
-    "How would you add relevance ranking without blowing the read latency budget?",
-    "How do you handle deletes and edits when a tweet id is referenced in millions of timelines?",
-    "How do you keep timelines bounded in memory (cap length, evict cold users)?",
+    "How would you make the ranker's features fresh and add a fallback when the ranking service is slow or down?",
+    "How do you keep timelines bounded in memory (cap length, evict cold users) and size cache shards to the active working set?",
     "How would you support 'see new tweets' real-time updates (push to connected clients)?",
-    "How do you backfill a user's timeline when they follow a new account?"
+    "How do you make follow backfill cheap when a user follows a very high-volume (but not celebrity) account?",
+    "How would you run this multi-region with cache replication and a degraded read mode during a regional outage?"
   ],
   "toProbeFurther": {
     "links": [

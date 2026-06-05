@@ -321,9 +321,14 @@
       "note": "Global front page aggregates top members of the most active communities, refreshed on a short cycle."
     },
     {
-      "label": "Listing-cache memory",
-      "value": "~5–10 GB",
-      "note": "~100k communities x 3 sorts x top-1000 ids (~8 bytes/member) ≈ 2.4 GB of members, plus overhead and replicas. Fits in a replicated Redis tier."
+      "label": "Listing-cache memory (raw members)",
+      "value": "~2.5 GB raw",
+      "note": "100k communities x 3 sorts x top-1000 ids x ~8 bytes ≈ 2.4 GB of bare member ids. This is the floor — it ignores everything Redis actually stores per member."
+    },
+    {
+      "label": "Listing-cache memory (realistic)",
+      "value": "~60–120 GB across replicas",
+      "note": "A real sorted set stores member string + score + skip-list/hash-index nodes + allocator overhead — call it ~60–100 bytes/member, not 8. Add top/day/week/all windows (~4x sets), global candidate sets, and 2–3 replicas: ~20–40 GB primary, 2–3x with replicas. So the design caps coverage: top-1000 for active communities, top-100 for cold ones, evict idle sort/window sets, and rebuild cold listings lazily (see Step 4)."
     },
     {
       "label": "Ranking freshness target",
@@ -474,9 +479,16 @@
     {
       "method": "POST",
       "path": "/v1/mod/{itemType}/{id}/remove",
-      "description": "Moderator removes a post or comment (itemType = post|comment). Writes authoritative status, emits an invalidation event, evicts ranked/comment caches. Restore via the mirror endpoint /restore.",
+      "description": "Moderator removes a post or comment (itemType = post|comment). Writes authoritative status, appends a moderation_actions audit record (actor, reason, prev_status), emits an invalidation event, evicts ranked/comment caches. Restore via the mirror endpoint /restore.",
       "request": "{ \"reason\": \"spam\", \"shadow\": false }",
       "response": "{ \"ok\": true, \"status\": \"removed\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/mod/{itemType}/{id}/restore",
+      "description": "Mirror of /remove: restores an item to its prev_status from the moderation_actions audit log, appends a restore audit record, re-emits events so the item re-enters listings and its subtree re-expands. Used for false-positive reversal and upheld appeals.",
+      "request": "{ \"reason\": \"appeal_overturned\" }",
+      "response": "{ \"ok\": true, \"status\": \"active\" }"
     }
   ],
   "dataModel": [
@@ -619,6 +631,70 @@
       ]
     },
     {
+      "name": "moderation_actions",
+      "note": "Append-only audit log: who moderated what, why, and the prior state for restore. Source of truth for the mirror restore endpoint and for review/appeals.",
+      "fields": [
+        {
+          "name": "action_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "item_type",
+          "type": "enum(post, comment)"
+        },
+        {
+          "name": "item_id",
+          "type": "bigint (index)"
+        },
+        {
+          "name": "actor_id",
+          "type": "bigint (moderator/admin) | null (automated)"
+        },
+        {
+          "name": "action",
+          "type": "enum(remove, spam, shadow, restore, approve)"
+        },
+        {
+          "name": "reason",
+          "type": "text | enum(rule_code)"
+        },
+        {
+          "name": "prev_status",
+          "type": "enum (snapshot for restore)"
+        },
+        {
+          "name": "appeal_state",
+          "type": "enum(none, pending, upheld, overturned)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "abuse_signals (restricted)",
+      "note": "Sensitive fraud features (IP/ASN, device, vote-timing cohorts). Access-controlled, short retention (e.g. 30–90 days), prefer aggregated/hashed features over raw identifiers; not exposed on read paths.",
+      "fields": [
+        {
+          "name": "subject_id",
+          "type": "bigint (user or vote) (index)"
+        },
+        {
+          "name": "feature",
+          "type": "enum(account_age, ip_asn_hash, device_hash, timing_cohort, cohort_overlap)"
+        },
+        {
+          "name": "value",
+          "type": "aggregated/hashed (no raw IP stored long-term)"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamp (TTL-enforced retention)"
+        }
+      ]
+    },
+    {
       "name": "listing_cache (derived)",
       "note": "Rebuildable sorted sets in Redis, not a source-of-truth table. One ZSET per (scope, sort[, window]); key shape shown below.",
       "fields": [
@@ -700,7 +776,7 @@
       "title": "1. Naive: Vote Counter + Sort-on-Read (the baseline)",
       "description": [
         "Start with the simplest thing that works. Posts and comments live in one store; a vote just increments a count column on the post; the listing is produced by sorting all posts by (votes / age) at read time.",
-        "This is correct and trivial — and it exposes two problems the rest of the design exists to solve. First, sorting every post by a recomputed score on every page load is far too slow once there are millions of posts and heavy read traffic. Second, a naked counter increment double-counts on retries and is wide open to vote manipulation.",
+        "This is correct and trivial — and it exposes the two problems the rest of the design exists to solve. First, sorting a community's posts by a recomputed score on every page load is far too slow at scale: with millions of posts and ~150k listing reads/sec (peak ~300k/sec), a per-request sort can't meet the p99 < 200 ms target, so the read path must serve precomputed results instead of sorting on read. Second, a naked counter increment double-counts on retries and is wide open to vote manipulation.",
         "So the baseline motivates everything that follows: make voting correct (idempotent), move ranking off the read path, and precompute the listing."
       ],
       "view": {
@@ -813,6 +889,20 @@
           "instead": "Upsert one (user,item) vote row; derive the tally from it."
         }
       ],
+      "failureDrills": [
+        {
+          "scenario": "The event queue delivers the same vote event twice (at-least-once delivery, or a producer retry).",
+          "expectedBehavior": "The score worker applies each vote's effect exactly once. Because the event carries the vote row's version and the worker tracks the last-applied version per (user, item), a replayed event with an already-applied version is a no-op.",
+          "mitigation": "Make the delta idempotent on version, not on message identity. Persist last-applied version alongside the score so duplicates and out-of-order deliveries both collapse to the latest version.",
+          "lesson": "Idempotency must live in the consumer's own state (versioned rows), not in the queue's delivery guarantee — at-least-once is the realistic contract."
+        },
+        {
+          "scenario": "The ranker crashes after applying a vote delta to the score but before committing its consumer offset.",
+          "expectedBehavior": "On restart it re-reads the same event, but the version check sees that version already applied, so the score is not double-counted.",
+          "mitigation": "Apply the delta and advance offset under the same versioned guard; never trust the offset alone for correctness.",
+          "lesson": "Crash-between-apply-and-commit is the canonical reason at-least-once consumers need idempotent application, not just careful offset handling."
+        }
+      ],
       "flows": [
         {
           "name": "Vote -> dedup -> async score",
@@ -893,7 +983,7 @@
         "Ordering by raw upvotes would freeze old viral posts at the top forever. Use a time-decay 'hot' score that blends vote signal with age — e.g. log(votes) plus a term that decreases as the post gets older — so fresh, well-received content rises and everything sinks over time.",
         "Recompute scores asynchronously from vote events (the score worker reads tally + age and writes hot_score). This decouples the cheap vote write from the heavier ranking math.",
         "Crucially, time decay changes the score even when no new votes arrive, so vote-event-triggered updates alone aren't enough — an old post would keep its stale score forever. Add a periodic drift pass: the worker re-scores active items on a cadence (e.g. a rolling bucket of recently/actively-read posts every few minutes), and lets cold items age out naturally on next read. Only the working set needs continuous rescore, not every post ever submitted.",
-        "The exact formula is a tuning knob (gravity, vote weight); the key idea is score = f(votes, age), recomputed continuously."
+        "The exact formula is a tuning knob (gravity, vote weight); the key idea is score = f(votes, age), recomputed continuously. Treat ranking as tunable product logic, not a fixed constant: validate formula changes offline by replaying recorded vote events against the candidate formula, or shadow-score in production (compute the new score alongside the live one without serving it) and compare the resulting listings before rolling out — so a tweak that, say, buries fresh content is caught before users see it. (The follow-ups cover A/B testing the change once it's live.)"
       ],
       "view": {
         "nodes": [
@@ -1156,7 +1246,7 @@
           "description": "The score worker maintains a sorted set of post ids per (community, sort), so a read is an O(1) top-N fetch from cache.",
           "pros": [
             "Per-(community, sort) sorted set the score worker updates as scores change; reads are an O(1) top-N fetch.",
-            "Meets the <200ms latency target without sorting the community per request.",
+            "Meets the p99 < 200 ms latency target without sorting the community per request.",
             "The cache is derived and rebuildable from posts' scores — a cache loss is a recompute, not data loss."
           ],
           "cons": [
@@ -1237,7 +1327,7 @@
           }
         }
       ],
-      "decisionPrompt": "How do you serve a hot listing in <200 ms without sorting the whole community per request?",
+      "decisionPrompt": "How do you serve a hot listing in under 200 ms without sorting the whole community per request?",
       "patterns": [
         "Precomputed ranked listing"
       ],
@@ -1262,7 +1352,33 @@
         "before": "Sort per request.",
         "after": "O(1) listing reads from a maintained sorted set.",
         "newRisk": "Comments are the other big read — deep threads need their own model."
-      }
+      },
+      "traps": [
+        {
+          "trap": "Paginating ranked listings with a numeric offset (LIMIT/OFFSET or page numbers).",
+          "why": "Scores change while the user scrolls, so offset N shifts: a re-ranked post is shown twice or skipped.",
+          "instead": "Use a (score, post_id) seek cursor snapshotted against a short-lived listing version so the page is stable within a bounded staleness window."
+        },
+        {
+          "trap": "Caching top-1000 for all 100k communities, every sort and window, on one node.",
+          "why": "Real sorted-set overhead plus windows and replicas runs to tens of GB, not single-digit; cold communities waste most of it.",
+          "instead": "Cap coverage: top-1000 for active communities, top-100 for cold ones, evict idle sort/window sets, rebuild cold listings lazily on first read."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A user is mid-scroll on /hot when several posts on the page get re-ranked (a vote burst lands).",
+          "expectedBehavior": "The cursor snapshot pins the listing version, so the next page is computed against the snapshot the user started on — no duplicate or skipped posts within the bounded staleness window. A new session sees the fresh ranking.",
+          "mitigation": "Encode the listing version/token in the cursor; serve subsequent pages from that version until it expires, then transparently roll to the current version at a page boundary.",
+          "lesson": "Pagination stability is a snapshot/versioning problem, not a sort-order problem — bound staleness, don't chase perfect freshness mid-scroll."
+        },
+        {
+          "scenario": "A hot community's listing ZSET is lost (cache node eviction or failover).",
+          "expectedBehavior": "Reads briefly miss; the listing is rebuilt from posts' precomputed scores (it is derived state, not source of truth) while reads fall back to a read-through recompute of the top-N.",
+          "mitigation": "Rebuild on demand with a single-flight guard so one rebuild serves the thundering herd; serve a slightly stale replica copy meanwhile rather than recomputing per request.",
+          "lesson": "Framing the listing cache as rebuildable turns a 'cache outage' into a recompute latency blip, not a correctness or data-loss event."
+        }
+      ]
     },
     {
       "id": "comments",
@@ -1272,7 +1388,8 @@
         "Shard comments by post id so a thread lives together; sort siblings by their own (smaller) score, with created_at as a stable tiebreaker. Cache hot threads' rendered/sorted trees since popular posts are read far more than written; a new comment or comment vote invalidates (or patches) the affected thread-cache entry.",
         "Comments are first-class voted items: a comment vote flows through the same idempotent vote pipeline with item_type=comment, so the comment score the sibling sort uses is maintained exactly like a post score.",
         "Removed/deleted comments become tombstones rather than disappearing — a removed node collapses (its body hidden) but its visible-reply subtree is preserved, so children of a removed comment aren't orphaned. Reads filter on status.",
-        "Load huge threads incrementally rather than shipping thousands of comments at once: return top-level (and a shallow depth of) the highest-scored siblings first, with a moreChildren cursor per subtree so the client expands deeper branches on demand. The cursor is a (score, comment_id) seek within that parent's children."
+        "Load huge threads incrementally rather than shipping thousands of comments at once: return top-level (and a shallow depth of) the highest-scored siblings first, with a moreChildren cursor per subtree so the client expands deeper branches on demand. The cursor is a (score, comment_id) seek within that parent's children.",
+        "Cap path length to keep prefix queries cheap and the encoding bounded: enforce a maximum reply depth (e.g. ~8–10, matching the read API's depth param). Beyond the cap, new replies don't deepen the path — they attach as 'continue this thread' continuation nodes (a flattened branch the client loads as a fresh subtree), so a pathological reply chain can't produce unbounded paths or recursive render blowups. Encode each path segment as a fixed-width id so the materialized path stays a compact, index-friendly prefix."
       ],
       "view": {
         "nodes": [
@@ -1453,7 +1570,15 @@
         "before": "Recursive parent_id walks.",
         "after": "Subtree reads via path prefix; hot threads cached.",
         "newRisk": "Open voting invites manipulation — scores can be gamed."
-      }
+      },
+      "failureDrills": [
+        {
+          "scenario": "A new comment (or comment vote) lands on a post whose thread tree is in CommentCache being read by thousands of clients.",
+          "expectedBehavior": "The write invalidates or patches just the affected subtree-cache entry; concurrent readers either get the prior cached tree or the rebuilt one — never a half-updated tree. The new comment appears on the next read within the cache's staleness window.",
+          "mitigation": "Patch the cached subtree in place when cheap (insert one node, bump parent counts); fall back to invalidate-and-rebuild for the affected post under a single-flight guard so one rebuild serves the herd. Key the cache per post (and optionally per subtree) so a write to one thread never invalidates others.",
+          "lesson": "Hot-thread caches need write-time invalidation scoped to the smallest affected unit; coarse whole-post invalidation on every comment turns a popular thread into a rebuild storm."
+        }
+      ]
     },
     {
       "id": "fraud",
@@ -1462,7 +1587,8 @@
         "Open voting attracts ballot stuffing (sockpuppet accounts), brigading (coordinated external voting), and bots. The vote store's per-user records are the signal: detect anomalous patterns (many new accounts voting one post, correlated IPs/timing).",
         "Don't block synchronously — record the vote, then let the fraud service discount or strip illegitimate votes when scores recompute. Suspicious votes can be 'counted' to the voter but excluded from the real score (vote fuzzing / shadow handling).",
         "Persist the verdict on the vote row (trust_status: counted | shadowed | discounted) alongside the signals that drove it — account age, IP/ASN, vote timing correlation, voter-cohort overlap. When a verdict changes (a vote previously counted is later judged fraudulent, or a flagged account is cleared), the fraud service re-emits a vote event with the new trust_status; the ranker re-reads the authoritative trust-weighted tally and the affected listings are recomputed and invalidated, so old scores don't stay poisoned.",
-        "Rate-limit voting and weight votes by account trust so manipulation is expensive and low-impact."
+        "Rate-limit voting and weight votes by account trust so manipulation is expensive and low-impact.",
+        "Govern the abuse signals: IP/ASN, device, and vote-timing-cohort features are sensitive (see the abuse_signals model). Access-control them, keep them short-retention (e.g. 30–90 days), prefer aggregated/hashed features over raw identifiers, and never expose them on read paths. Treat false positives as expected — bound and track the false-positive rate as an operational metric, and route appeals/reviews through the moderation audit log so a wrongly-discounted voter has a path to recovery."
       ],
       "view": {
         "nodes": [
@@ -1638,7 +1764,22 @@
         "before": "All votes counted equally.",
         "after": "Suspicious votes discounted in scoring; voting rate-limited.",
         "newRisk": "Viral posts and hot communities create read/recompute hotspots; moderation must reflect in listings."
-      }
+      },
+      "traps": [
+        {
+          "trap": "Treating a fraud verdict as permanent and never reversing a discount.",
+          "why": "False positives are unavoidable; a wrongly-discounted legit voter (or a cleared account) leaves listings permanently skewed and erodes trust.",
+          "instead": "Make verdicts reversible: re-emit a versioned vote event with the new trust_status, let the ranker re-read the authoritative trust-weighted tally, and recompute/invalidate affected listings. Keep a false-positive review/appeal path."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A batch of votes was discounted as a brigade, but review later clears the accounts (false positive).",
+          "expectedBehavior": "Flipping the verdict re-emits each affected vote with trust_status=counted at a new version; the ranker re-reads the trust-weighted tally and the post's score and listings are recomputed, so the post recovers its rightful rank without manual score editing.",
+          "mitigation": "Drive recovery through the same versioned vote-event pipeline as the original discount — never hand-patch scores. Track a false-positive rate metric and route appeals through the moderation audit log.",
+          "lesson": "Fraud handling must be a reversible, event-driven verdict layered over authoritative votes, not a destructive edit — recompute from source of truth on reversal."
+        }
+      ]
     },
     {
       "id": "scale-mod",
@@ -1646,7 +1787,8 @@
       "description": [
         "Viral posts get extreme read and vote concurrency. Reads are already served from the listing/comment caches; for vote write bursts, the queue absorbs them and the score worker batches recompute (you don't need per-vote reordering). The queue gives backpressure: if the ranker falls behind on a spike, votes are still durably recorded and freshness degrades gracefully (a few extra seconds of lag) rather than dropping votes or stalling the write path.",
         "Moderation (removals, spam, shadow bans) is a workflow, not just a cache op. A mod action writes authoritative status (removed/spam/shadowed + tombstone) to the post/comment store, emits an invalidation event, evicts/penalizes the item in the ranked cache, and invalidates the affected comment-cache entries so a removed subtree collapses. Reads filter on status, so even before caches catch up a removed item is hidden. Run a spam check on submit and let mods act asynchronously; propagation has a bounded freshness target (sub-second to a few seconds).",
-        "Shard posts/comments by id/post; replicate caches for read volume (and key listings by community so a hot community's reads spread across replicas, not one shard). Treat all ranked/comment caches as rebuildable derived state over the authoritative store."
+        "Shard posts/comments by id/post; replicate caches for read volume (and key listings by community so a hot community's reads spread across replicas, not one shard). Treat all ranked/comment caches as rebuildable derived state over the authoritative store.",
+        "A single viral post is a hot key on every axis — vote writes, events, score updates, listing writes, and listing reads all concentrate on it — so 'use a queue' is only half the answer. Spread each axis explicitly: (1) Hot write keys — partition vote rows by (user, item) so idempotency stays local to a partition and no single row is the bottleneck; emit events partitioned by item_id so one post's events land on one ordered partition (preserving version order) but different posts spread across partitions. (2) Coalesce score updates — the ranker collapses many vote events for one post over a short window (e.g. 1–2 s) into a single score recompute and a single set of listing writes, so a 5k-votes/sec post produces a handful of score updates per second, not 5k. (3) Cap write fanout — a score change updates a bounded set of listings (its community + the global candidate set + the relevant top-window); cold sort/window sets are not maintained eagerly. (4) Hot read keys — a viral post's listing/comment pages are served from replicated read-through caches with stale-while-revalidate (serve slightly stale, refresh in the background), optionally a short-TTL local/process cache and CDN/edge cache for the anonymous front page, so one popular listing key is fanned out across replicas and edges rather than hammering a single cache node."
       ],
       "view": {
         "nodes": [
@@ -1699,6 +1841,10 @@
         {
           "issue": "Hot comment thread read storm.",
           "mitigation": "Comment-tree cache + incremental loading; replicate cache."
+        },
+        {
+          "issue": "One viral post is a hot key for writes and reads simultaneously.",
+          "mitigation": "Partition vote rows by (user,item) and events by item_id (order preserved per post, load spread across posts); coalesce many vote events for the post into one score recompute per short window; cap listing write fanout to the bounded set of listings it's in; serve its hot listing/comment pages from replicated read-through caches with stale-while-revalidate (plus optional edge/CDN cache for the anonymous front page)."
         }
       ],
       "flows": [
@@ -1770,13 +1916,35 @@
           "scenario": "A listing-cache shard is lost during front-page traffic.",
           "expectedBehavior": "Reads for that shard fall back to a DB sort (slower, within degraded latency) while the worker rebuilds the sorted sets from hot_scores.",
           "mitigation": "Replicate the cache tier and rebuild derived listings from authoritative scores."
+        },
+        {
+          "scenario": "One post goes massively viral: it becomes a hot key for vote writes, events, score updates, and listing/comment reads all at once.",
+          "expectedBehavior": "Vote writes stay spread because rows are partitioned by (user,item); its events land on one ordered partition so version order holds, but other posts' events spread across partitions. The ranker coalesces the flood of vote events into a handful of score recomputes per second and a bounded set of listing writes. Its hot listing/comment pages are served from replicated read-through caches (and edge cache for the anonymous front page) with stale-while-revalidate, so no single cache node or DB row melts.",
+          "mitigation": "Coalesce per-post score updates over a short window; cap listing write fanout; partition vote rows by (user,item) and events by item_id; serve hot read keys from replicas/edge with stale-while-revalidate; alert when a single key's QPS or a partition's lag crosses threshold.",
+          "lesson": "A queue alone doesn't solve hot keys — you must explicitly spread each axis (write, event, recompute, fanout, read) so one viral item can't concentrate load on a single row, partition, or cache node."
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Operational contracts (measurable SLOs + degraded paths)",
+          "points": [
+            "Ranking freshness: p99 score reflected in listings < 5 s after the vote (continuous events + periodic drift pass). Degraded: on queue lag, freshness slips a bounded few seconds; votes stay durably recorded and the write path stays fast.",
+            "Queue lag: consumer lag < 2 s; page on sustained lag that would push rank freshness past 5 s. Degraded: batch/coalesce recompute to drain faster and shed only non-critical recompute (e.g. cold windows) — never vote durability.",
+            "Listing snapshot TTL: the cursor token pins a listing version valid ~30–60 s, guaranteeing no duplicate or skipped post within that window. Past TTL the cursor rolls to the current version at a page boundary; a fresh session sees fresh ranking.",
+            "Listing cursor token contents: an opaque token of { scope, sort, window, listing_version, last (score, post_id) } — it bounds staleness and encodes the seek key. An invalid/expired token restarts from the current listing head.",
+            "Moderation propagation SLO: a removed item is hidden from reads immediately via the status filter; ranked/comment caches reconcile < 5 s; page if propagation exceeds ~30 s. Status-filtered reads hide the item even while caches are briefly stale.",
+            "Cache rebuild target: a lost listing/comment cache rebuilds from authoritative scores in < 60 s under a single-flight guard, hot keys first. During rebuild, reads fall back to a read-through DB sort (degraded latency) with no data loss.",
+            "RankCache degraded-read path: while RankCache is rebuilding, serve from a replica or a read-through recompute of top-N; a single-flight rebuild serves the herd and a slightly stale replica copy is served meanwhile rather than recomputing per request.",
+            "Fraud false-positive rate: tracked and bounded, with reversible verdicts via re-emitted vote events and appeals logged in moderation_actions; cleared accounts' votes are re-counted by recompute from source of truth, never by hand-editing scores.",
+            "Observability: one dashboard ties p99 listing/comment read latency, rank freshness, queue lag, cache hit rate, moderation propagation delay, and fraud false-positive rate together — each with a page threshold mapped to the contract it protects."
+          ]
         }
       ]
     }
   ],
   "finalDesign": {
     "title": "Final Design — Voting & Ranking Aggregator",
-    "description": "Votes are recorded idempotently per (user, item_type, item) with a version, and emitted as versioned events { prev_direction, new_direction, trust_status }; a score worker consumes them idempotently, applies fraud discounting, computes a time-decay hot score (with a periodic drift pass), and maintains precomputed ranked listings (sorted sets) per (scope, sort[, window]) for community and global front page. Listing reads are O(1) cache lookups paginated by a (score, id) seek cursor; threaded comments use a materialized path (sharded by post) with status-driven tombstones, hot threads cached and loaded incrementally. Vote bursts are absorbed by the queue with batched recompute and graceful freshness degradation; moderation writes authoritative post/comment status and invalidates both the ranked listing cache and the comment-tree cache. The authoritative post/comment/vote stores are the source of truth; all ranked and comment caches are rebuildable derived state over them.",
+    "description": "Votes are recorded idempotently per (user, item_type, item) with a version, and emitted as versioned events { prev_direction, new_direction, trust_status }; a score worker consumes them idempotently, applies fraud discounting, computes a time-decay hot score (with a periodic drift pass), and maintains precomputed ranked listings (sorted sets) per (scope, sort[, window]) for community and global front page. Listing reads are O(1) cache lookups paginated by a (score, id) seek cursor; threaded comments use a materialized path (sharded by post) with status-driven tombstones, hot threads cached and loaded incrementally. Vote bursts are absorbed by the queue with batched recompute and graceful freshness degradation; moderation writes authoritative post/comment status (with a moderation_actions audit log for who/why/restore) and invalidates both the ranked listing cache and the comment-tree cache. A single viral post is spread across every axis — vote rows partitioned by (user,item), events by item_id, per-post score updates coalesced over a short window, bounded listing write fanout, and hot read keys served from replicated/edge caches with stale-while-revalidate — so no one item becomes a hot key. The whole thing runs to measurable operational contracts (see Step 7): rank freshness < 5 s, bounded queue lag, listing-snapshot TTL on cursor tokens, sub-5 s moderation propagation, < 60 s cache rebuild, and a tracked fraud false-positive rate. The authoritative post/comment/vote stores are the source of truth; all ranked and comment caches are rebuildable derived state over them.",
     "view": {
       "nodes": [
         "Client",
@@ -1883,6 +2051,16 @@
         "requirement": "Scale to viral posts",
         "how": "Caches for reads, batched recompute for vote bursts.",
         "steps": [
+          "scale-mod"
+        ]
+      },
+      {
+        "requirement": "Read-heavy traffic mix (reads >> votes >> posts)",
+        "how": "Reads are served from derived caches — precomputed sorted-set listings and hot comment-tree caches — so the dominant ~150k listing + ~50k comment reads/sec never touch the authoritative store on the hot path. Writes (votes, comments) are recorded fast and processed asynchronously, with viral hot keys spread across partitions and replicated/edge caches so a single popular item can't concentrate load.",
+        "steps": [
+          "listings",
+          "comments",
+          "voting",
           "scale-mod"
         ]
       }

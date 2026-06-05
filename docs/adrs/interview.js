@@ -27,7 +27,6 @@
         stepCounter: document.getElementById("step-counter"),
         prevBtn: document.getElementById("prev-btn"),
         nextBtn: document.getElementById("next-btn"),
-        finalDecisionTree: document.getElementById("final-decision-tree"),
         diagramBlock: document.getElementById("diagram-block"),
         diagramHeading: document.getElementById("diagram-heading"),
         diagramDescription: document.getElementById("diagram-description"),
@@ -108,10 +107,12 @@
         followUps: "follow-ups",
         toProbeFurther: "to-probe-further",
         explainerComic: "explainer-comic",
+        stepsOverview: "steps-overview",
     };
 
     // Slugs that belong in the bottom "Wrap-up" sidebar group, in order.
     const WRAPUP_ORDER = [
+        INTRO_SLUGS.stepsOverview,
         INTRO_SLUGS.explainerComic,
         INTRO_SLUGS.satisfies,
         INTRO_SLUGS.technologyChoices,
@@ -853,17 +854,23 @@
         if (Array.isArray(data.interviewScript) && data.interviewScript.length > 0) {
             entries.push({kind: "intro", id: INTRO_SLUGS.interviewScript, title: "Interview Script", payload: data.interviewScript});
         }
+        if (Array.isArray(data.steps)) {
+            for (const step of data.steps) entries.push({kind: "step", id: step.id, title: step.title, payload: step});
+        }
         const finalDesign = resolveFinalDesign(data);
         if (finalDesign) {
             entries.push({
                 kind: "intro",
                 id: INTRO_SLUGS.finalDesign,
-                title: "Target Final Design",
+                title: "Final Design",
                 payload: finalDesign,
             });
         }
-        if (Array.isArray(data.steps)) {
-            for (const step of data.steps) entries.push({kind: "step", id: step.id, title: step.title, payload: step});
+        // Wrap-up > Steps Overview: the decision-tree map of the whole journey
+        // (steps -> chosen options -> final design). Derived from steps[], so
+        // it only appears when there are steps to map.
+        if (Array.isArray(data.steps) && data.steps.length > 0) {
+            entries.push({kind: "intro", id: INTRO_SLUGS.stepsOverview, title: "Steps Overview", payload: null});
         }
         if (typeof data.explainerComic === "string" && data.explainerComic.trim() !== "") {
             entries.push({kind: "intro", id: INTRO_SLUGS.explainerComic, title: "Explainer Comic", payload: data.explainerComic});
@@ -894,7 +901,7 @@
 
     function resolveFinalDesign(data) {
         if (data && data.finalDesign && hasStepLikeDiagram(data.finalDesign)) {
-            return Object.assign({title: "Target Final Design"}, data.finalDesign);
+            return Object.assign({title: "Final Design"}, data.finalDesign);
         }
         return null;
     }
@@ -3764,7 +3771,7 @@
         // Final design node closes the spine.
         const fi = finalEntryIndex();
         if (fi >= 0) {
-            lines.push(`  ${DECISION_TREE_FINAL_ID}["${mermaidNodeLabel("Target Final Design")}"]`);
+            lines.push(`  ${DECISION_TREE_FINAL_ID}["${mermaidNodeLabel("Final Design")}"]`);
             lines.push(`  class ${DECISION_TREE_FINAL_ID} dtFinalNode`);
             nodeTargets.set(DECISION_TREE_FINAL_ID, fi);
             if (prevId !== null) {
@@ -3816,37 +3823,31 @@
         });
     }
 
-    // Populate (or clear) the decision-tree map shown above the Final Design
-    // diagram. The tree is derived from the whole dataset (state.data); the
-    // Final Design entry's own payload is just the finalDesign object, so we
-    // read state.data here. Hidden on every entry except Final Design.
-    function renderFinalDecisionTree(show) {
-        const host = els.finalDecisionTree;
-        if (!host) return;
-        host.innerHTML = "";
-        if (!show || !state.data || !Array.isArray(state.data.steps) || state.data.steps.length === 0) {
-            host.hidden = true;
-            return;
-        }
-        host.hidden = false;
-
-        const heading = document.createElement("h3");
-        heading.className = "final-decision-tree-heading";
-        heading.textContent = "Decision Tree";
-        host.appendChild(heading);
+    // Wrap-up > Steps Overview. The decision-tree map of the whole journey
+    // (steps -> chosen options -> final design), derived from the dataset
+    // (state.data — the entry's own payload is null). Returns a DOM node for
+    // the intro block.
+    function renderIntroStepsOverview() {
+        const wrap = document.createElement("div");
+        wrap.className = "steps-overview";
 
         const intro = document.createElement("p");
         intro.className = "decision-tree-intro";
         intro.textContent = "How the design is reached, step by step. Each step's chosen option carries the path forward; dashed branches are the alternatives considered. Click any node to jump to it.";
-        host.appendChild(intro);
+        wrap.appendChild(intro);
+
+        if (!state.data || !Array.isArray(state.data.steps) || state.data.steps.length === 0) {
+            return wrap;
+        }
 
         const {source, nodeTargets} = buildDecisionTreeMermaid(state.data);
         // Top-to-bottom spine, no node-type captions (this is a flow map, not
         // the typed architecture); wire clicks once the SVG exists.
-        host.appendChild(makeMermaidEl(forceFlowchartDirection(source, "TB"), "decision-tree-diagram", {
+        wrap.appendChild(makeMermaidEl(forceFlowchartDirection(source, "TB"), "decision-tree-diagram", {
             annotateNodeTypes: false,
             onRendered: (target) => wireDecisionTreeClicks(target, nodeTargets),
         }));
+        return wrap;
     }
 
     // Overview > Interview Script. Each item: { phase, time?, say }.
@@ -3943,6 +3944,9 @@
             case INTRO_SLUGS.explainerComic:
                 node = renderIntroExplainerComic(entry.payload);
                 break;
+            case INTRO_SLUGS.stepsOverview:
+                node = renderIntroStepsOverview();
+                break;
             default:
                 node = document.createElement("div");
                 node.textContent = "(no renderer for this section)";
@@ -3963,18 +3967,14 @@
         const step = entry.payload;
         const isFinalDesign = entry.id === INTRO_SLUGS.finalDesign;
 
-        // The Final Design entry skips the "Design Rationale" prose and leads
-        // straight with the decision-tree map; ordinary steps show it.
+        // The Final Design entry skips the "Design Rationale" prose; ordinary
+        // steps show it. (The decision-tree map now lives in the Wrap-up
+        // "Steps Overview" entry, not here.)
         if (isFinalDesign) {
             els.stepDescription.innerHTML = "";
         } else {
             renderDescription(step.description, step.whyNow, step.decisionPrompt);
         }
-
-        // The Final Design entry leads with the decision-tree map (the whole
-        // journey of steps -> chosen options -> final design); other steps
-        // don't show it.
-        renderFinalDecisionTree(isFinalDesign);
 
         if (Array.isArray(step.options) && step.options.length > 0) {
             if (state.currentOptionIndex >= step.options.length) state.currentOptionIndex = 0;
@@ -3986,8 +3986,7 @@
         els.diagramBlock.hidden = false;
         // On Final Design the diagram is the high-level architecture; label it
         // and move the diagram's caption (the "step description" otherwise shown
-        // *under* the diagram) above it, between the decision-tree map and the
-        // diagram itself.
+        // *under* the diagram) above the diagram itself.
         if (els.diagramHeading) {
             els.diagramHeading.hidden = !isFinalDesign;
             els.diagramHeading.textContent = isFinalDesign ? "High-Level Architecture" : "";
@@ -4041,7 +4040,6 @@
             await renderStepLikeEntry(entry, null);
         } else if (entry.kind === "intro") {
             els.stepDescription.innerHTML = "";
-            renderFinalDecisionTree(false);
             els.diagramBlock.hidden = true;
             els.stepExtras.innerHTML = "";
             els.introBlock.hidden = false;

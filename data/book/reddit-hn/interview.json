@@ -202,6 +202,18 @@
         "label": "remove/penalize"
       },
       {
+        "id": "mod-db",
+        "from": "ModSvc",
+        "to": "PostDB",
+        "label": "write status / tombstone"
+      },
+      {
+        "id": "mod-commentcache",
+        "from": "ModSvc",
+        "to": "CommentCache",
+        "label": "invalidate removed subtree"
+      },
+      {
         "id": "post-mod",
         "from": "PostSvc",
         "to": "ModSvc",
@@ -269,29 +281,54 @@
   },
   "capacity": [
     {
-      "label": "Reads",
-      "value": "the dominant load",
-      "note": "Listings + comment trees; served from cache."
+      "label": "Daily active users",
+      "value": "~50M DAU",
+      "note": "Assume ~5M peak concurrent; numbers below are illustrative to size the design, not exact."
     },
     {
-      "label": "Votes per second",
-      "value": "high",
-      "note": "Bursty on viral posts; processed async for scoring."
+      "label": "Listing reads/sec",
+      "value": "~150k/s (peak ~300k/s)",
+      "note": "The dominant load: ~10 listing views per user-session-minute. Served from RankCache, so this is cache QPS."
     },
     {
-      "label": "Posts per second",
-      "value": "low",
-      "note": "Far fewer than votes."
+      "label": "Comment-tree reads/sec",
+      "value": "~50k/s",
+      "note": "Thread opens; ~1/3 of listing reads. Hot threads served from CommentCache."
     },
     {
-      "label": "Comment depth",
-      "value": "deep / wide",
-      "note": "Threads can be thousands of comments."
+      "label": "Votes/sec",
+      "value": "~10k/s (peak viral-post burst ~5k/s on a single post)",
+      "note": "Recorded synchronously, scored async. A single viral post can absorb thousands of votes/sec — handled by the queue."
     },
     {
-      "label": "Ranking freshness",
-      "value": "seconds",
-      "note": "Hot score recomputed continuously, not per vote synchronously."
+      "label": "Comment writes/sec",
+      "value": "~2k/s",
+      "note": "Far fewer than votes; each emits an event for thread-cache invalidation."
+    },
+    {
+      "label": "Post submits/sec",
+      "value": "~200/s",
+      "note": "Smallest write volume; each runs a spam check on submit."
+    },
+    {
+      "label": "Score-worker events/sec",
+      "value": "~12k/s",
+      "note": "Votes + comment events. One score change can fan out to several sorted sets (community + global + top window)."
+    },
+    {
+      "label": "Active communities / front-page candidates",
+      "value": "~100k active communities; ~5k front-page candidates",
+      "note": "Global front page aggregates top members of the most active communities, refreshed on a short cycle."
+    },
+    {
+      "label": "Listing-cache memory",
+      "value": "~5–10 GB",
+      "note": "~100k communities x 3 sorts x top-1000 ids (~8 bytes/member) ≈ 2.4 GB of members, plus overhead and replicas. Fits in a replicated Redis tier."
+    },
+    {
+      "label": "Ranking freshness target",
+      "value": "< 5 s p99",
+      "note": "Hot score recomputed continuously from events + a periodic drift pass; a vote need not reorder the listing instantly."
     }
   ],
   "api": [
@@ -408,16 +445,44 @@
     },
     {
       "method": "GET",
+      "path": "/v1/frontpage/{sort}",
+      "description": "Read the global front page for a sort mode (hot|top|new). top accepts ?window=day|week|all.",
+      "request": "?cursor=<opaque>&window=day",
+      "response": "{ \"posts\": [ ... ], \"nextCursor\": \"...\" }"
+    },
+    {
+      "method": "GET",
       "path": "/v1/posts/{id}/comments",
-      "description": "Read the threaded comment tree for a post.",
-      "request": "?sort=top",
-      "response": "{ \"comments\": [ { \"id\": \"c_1\", \"children\": [...] } ] }"
+      "description": "Read the threaded comment tree for a post; collapses removed/deleted subtrees to tombstones.",
+      "request": "?sort=top&cursor=<opaque>&depth=8",
+      "response": "{ \"comments\": [ { \"id\": \"c_1\", \"score\": 42, \"status\": \"visible\", \"children\": [...], \"moreChildrenCursor\": \"...\" } ], \"nextCursor\": \"...\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/posts/{id}/comments",
+      "description": "Add a comment (or reply, via parentId) to a post. Returns the created comment with its materialized path.",
+      "request": "{ \"parentId\": \"c_3\", \"body\": \"...\" }",
+      "response": "{ \"commentId\": \"c_88\", \"path\": \"12/47/88\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/comments/{id}/vote",
+      "description": "Vote on a comment. Idempotent per user, same contract as post voting; emits a vote event with item_type=comment.",
+      "request": "{ \"direction\": \"up\" }",
+      "response": "{ \"ok\": true, \"score\": 17 }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/mod/{itemType}/{id}/remove",
+      "description": "Moderator removes a post or comment (itemType = post|comment). Writes authoritative status, emits an invalidation event, evicts ranked/comment caches. Restore via the mirror endpoint /restore.",
+      "request": "{ \"reason\": \"spam\", \"shadow\": false }",
+      "response": "{ \"ok\": true, \"status\": \"removed\" }"
     }
   ],
   "dataModel": [
     {
       "name": "posts",
-      "note": "Authoritative posts with vote tallies and a precomputed score.",
+      "note": "Authoritative posts with vote tallies, a precomputed score, and moderation state.",
       "fields": [
         {
           "name": "post_id",
@@ -432,6 +497,18 @@
           "type": "bigint"
         },
         {
+          "name": "title",
+          "type": "text"
+        },
+        {
+          "name": "url",
+          "type": "text | null (link posts)"
+        },
+        {
+          "name": "body",
+          "type": "text | null (text posts)"
+        },
+        {
           "name": "ups",
           "type": "int"
         },
@@ -444,6 +521,14 @@
           "type": "double (precomputed)"
         },
         {
+          "name": "status",
+          "type": "enum(active, removed, spam, shadowed)"
+        },
+        {
+          "name": "removed_at",
+          "type": "timestamp | null (tombstone)"
+        },
+        {
           "name": "created_at",
           "type": "timestamp"
         }
@@ -451,7 +536,7 @@
     },
     {
       "name": "comments",
-      "note": "Threaded comments; materialized path enables subtree reads.",
+      "note": "Threaded comments; materialized path enables subtree reads, status drives tombstone collapse.",
       "fields": [
         {
           "name": "comment_id",
@@ -466,22 +551,50 @@
           "type": "bigint | null"
         },
         {
+          "name": "author_id",
+          "type": "bigint"
+        },
+        {
+          "name": "body",
+          "type": "text (or content-store pointer)"
+        },
+        {
           "name": "path",
           "type": "materialized path (e.g. 12/47/88) for subtree queries"
         },
         {
+          "name": "depth",
+          "type": "smallint (derived from path; caps very deep threads)"
+        },
+        {
           "name": "score",
           "type": "int"
+        },
+        {
+          "name": "status",
+          "type": "enum(visible, removed, deleted, shadowed)"
+        },
+        {
+          "name": "removed_at",
+          "type": "timestamp | null (tombstone)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp (sibling sort)"
         }
       ]
     },
     {
       "name": "votes",
-      "note": "One row per (user, item) for dedup and fraud analysis.",
+      "note": "One row per (user, item_type, item) for dedup and fraud analysis; version makes async updates idempotent.",
       "fields": [
         {
           "name": "user_id",
           "type": "bigint (PK part)"
+        },
+        {
+          "name": "item_type",
+          "type": "enum(post, comment) (PK part)"
         },
         {
           "name": "item_id",
@@ -492,8 +605,34 @@
           "type": "enum(up, down, none)"
         },
         {
-          "name": "created_at",
+          "name": "version",
+          "type": "bigint (bumped on each change; carried in the event)"
+        },
+        {
+          "name": "trust_status",
+          "type": "enum(counted, shadowed, discounted) (fraud verdict)"
+        },
+        {
+          "name": "updated_at",
           "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "listing_cache (derived)",
+      "note": "Rebuildable sorted sets in Redis, not a source-of-truth table. One ZSET per (scope, sort[, window]); key shape shown below.",
+      "fields": [
+        {
+          "name": "key",
+          "type": "(scope, sort, window) e.g. comm:42:hot, front:top:day, comm:42:new"
+        },
+        {
+          "name": "member_id",
+          "type": "post_id"
+        },
+        {
+          "name": "score",
+          "type": "double (hot_score | net | created_at depending on sort)"
         }
       ]
     }
@@ -611,8 +750,9 @@
       "id": "voting",
       "title": "2. Idempotent Voting",
       "description": [
-        "A vote must be one-per-user-per-item: store a row keyed by (user, item) so a repeat vote upserts (up -> down, or remove) rather than incrementing twice. This makes votes idempotent and safe to retry.",
+        "A vote must be one-per-user-per-item: store a row keyed by (user, item_type, item) so a repeat vote upserts (up -> down, or remove) rather than incrementing twice. This makes votes idempotent and safe to retry. Note the row is keyed by item_type too, so a post id and a comment id never collide.",
         "Record the vote fast and return an optimistic score; the authoritative tally and ranking update happen asynchronously. Emit a vote event onto a queue for downstream scoring and fraud checks.",
+        "Make the event idempotent end-to-end. The upsert bumps a per-row version and emits { user_id, item_type, item_id, version, prev_direction, new_direction, ts }. The ranker keys on (user, item, version): a duplicate delivery is a no-op, and a changed vote carries both directions so the worker applies the correct delta (flipping an up to a down moves net score by 2, not 1) or simply re-reads the authoritative tally. Retries can happen at both the HTTP vote request and the queue/ranker consumer, so both layers must be safe.",
         "The vote store (sharded by item) is both the dedup mechanism and the raw material for fraud analysis."
       ],
       "view": {
@@ -662,8 +802,8 @@
         "Voting is the input to ranking; getting one-vote-per-user and async scoring right is the foundation for everything else."
       ],
       "recap": {
-        "before": "Nothing.",
-        "after": "Votes recorded idempotently; events queued for scoring.",
+        "before": "Non-idempotent counters and sort-on-read from the naive baseline.",
+        "after": "Votes recorded idempotently per (user, item_type, item); versioned events queued for scoring.",
         "newRisk": "Raw vote counts aren't a good ordering — fresh content must beat stale popular content."
       },
       "traps": [
@@ -752,6 +892,7 @@
       "description": [
         "Ordering by raw upvotes would freeze old viral posts at the top forever. Use a time-decay 'hot' score that blends vote signal with age — e.g. log(votes) plus a term that decreases as the post gets older — so fresh, well-received content rises and everything sinks over time.",
         "Recompute scores asynchronously from vote events (the score worker reads tally + age and writes hot_score). This decouples the cheap vote write from the heavier ranking math.",
+        "Crucially, time decay changes the score even when no new votes arrive, so vote-event-triggered updates alone aren't enough — an old post would keep its stale score forever. Add a periodic drift pass: the worker re-scores active items on a cadence (e.g. a rolling bucket of recently/actively-read posts every few minutes), and lets cold items age out naturally on next read. Only the working set needs continuous rescore, not every post ever submitted.",
         "The exact formula is a tuning knob (gravity, vote weight); the key idea is score = f(votes, age), recomputed continuously."
       ],
       "view": {
@@ -980,6 +1121,8 @@
       "description": [
         "Sorting a community's posts by hot score on every read won't meet the latency target. Maintain a precomputed listing per (community, sort) — a sorted set of post ids the score worker updates as scores change.",
         "Reads become an O(1) cache read of the top-N ids, hydrated with post metadata and paginated by cursor. The front page is the same idea over an aggregate of communities.",
+        "Each sort mode is maintained differently: hot is the time-decay score with the periodic drift recompute; top is the net score within a time window (day/week/all) so it needs a windowed sorted set, not just one; new is simply ordered by created_at and is append-mostly (no rescore). The global front page is built by aggregating the top members of the most active communities (or a dedicated global sorted set the worker also pushes to) — it is candidate generation across communities, not a single big sort.",
+        "Pagination must be stable even though scores change while a user pages. Use a seek cursor of (score, post_id) rather than a numeric offset, and bound staleness by snapshotting against a short-lived listing version/token so a re-ranked post doesn't appear twice or get skipped mid-scroll; reads stay within a bounded staleness window.",
         "The listing cache is derived and rebuildable from posts' scores, so a cache loss is a recompute, not data loss."
       ],
       "view": {
@@ -991,7 +1134,11 @@
         ],
         "caption": "The post/comment service reads precomputed ranked listings from the ranked listing cache that the ranking worker keeps updated.",
         "links": [
-          "lb-post",
+          {
+            "from": "Client",
+            "to": "PostSvc",
+            "label": "read listing"
+          },
           "post-rankcache",
           "ranker-rankcache"
         ],
@@ -1122,8 +1269,10 @@
       "title": "5. Threaded Comments",
       "description": [
         "Comments are nested arbitrarily deep. Storing only parent_id forces recursive queries to read a thread. Instead store a materialized path (the chain of ancestor ids) so any subtree is a prefix query and the whole thread sorts naturally.",
-        "Shard comments by post id so a thread lives together; sort siblings by their own (smaller) score. Cache hot threads' rendered/sorted trees since popular posts are read far more than written.",
-        "Load huge threads incrementally (top-level first, expand on demand) rather than shipping thousands of comments at once."
+        "Shard comments by post id so a thread lives together; sort siblings by their own (smaller) score, with created_at as a stable tiebreaker. Cache hot threads' rendered/sorted trees since popular posts are read far more than written; a new comment or comment vote invalidates (or patches) the affected thread-cache entry.",
+        "Comments are first-class voted items: a comment vote flows through the same idempotent vote pipeline with item_type=comment, so the comment score the sibling sort uses is maintained exactly like a post score.",
+        "Removed/deleted comments become tombstones rather than disappearing — a removed node collapses (its body hidden) but its visible-reply subtree is preserved, so children of a removed comment aren't orphaned. Reads filter on status.",
+        "Load huge threads incrementally rather than shipping thousands of comments at once: return top-level (and a shallow depth of) the highest-scored siblings first, with a moreChildren cursor per subtree so the client expands deeper branches on demand. The cursor is a (score, comment_id) seek within that parent's children."
       ],
       "view": {
         "nodes": [
@@ -1134,7 +1283,11 @@
         ],
         "caption": "The post/comment service persists comments to the post store and reads the assembled comment tree from the comment tree cache for the client.",
         "links": [
-          "lb-post",
+          {
+            "from": "Client",
+            "to": "PostSvc",
+            "label": "read/write comment"
+          },
           "post-db",
           "post-commentcache"
         ],
@@ -1308,6 +1461,7 @@
       "description": [
         "Open voting attracts ballot stuffing (sockpuppet accounts), brigading (coordinated external voting), and bots. The vote store's per-user records are the signal: detect anomalous patterns (many new accounts voting one post, correlated IPs/timing).",
         "Don't block synchronously — record the vote, then let the fraud service discount or strip illegitimate votes when scores recompute. Suspicious votes can be 'counted' to the voter but excluded from the real score (vote fuzzing / shadow handling).",
+        "Persist the verdict on the vote row (trust_status: counted | shadowed | discounted) alongside the signals that drove it — account age, IP/ASN, vote timing correlation, voter-cohort overlap. When a verdict changes (a vote previously counted is later judged fraudulent, or a flagged account is cleared), the fraud service re-emits a vote event with the new trust_status; the ranker re-reads the authoritative trust-weighted tally and the affected listings are recomputed and invalidated, so old scores don't stay poisoned.",
         "Rate-limit voting and weight votes by account trust so manipulation is expensive and low-impact."
       ],
       "view": {
@@ -1317,11 +1471,15 @@
           "VoteStore",
           "Ranker"
         ],
-        "caption": "The vote service asks the vote-fraud/abuse service whether each vote is legitimate while still recording votes to the store and feeding the ranking worker.",
+        "caption": "The vote service asks the vote-fraud/abuse service whether each vote is legitimate while still recording votes to the store; the fraud verdict feeds the ranking worker so suspicious votes are discounted at recompute.",
         "links": [
           "vote-fraud",
           "vote-store",
-          "eventq-ranker"
+          {
+            "from": "Fraud",
+            "to": "Ranker",
+            "label": "discount verdict"
+          }
         ],
         "highlight": [
           "Fraud"
@@ -1486,23 +1644,27 @@
       "id": "scale-mod",
       "title": "7. Scaling, Hot Posts, and Moderation",
       "description": [
-        "Viral posts get extreme read and vote concurrency. Reads are already served from the listing/comment caches; for vote write bursts, the queue absorbs them and the score worker batches recompute (you don't need per-vote reordering).",
-        "Moderation (removals, spam, shadow bans) must reflect in listings: removing a post evicts it from the ranked cache and hides its comments. Run a spam check on submit and let mods act asynchronously, with listings updated by the same worker that maintains them.",
-        "Shard posts/comments by id/post; replicate caches for read volume. Treat all ranked/comment caches as rebuildable derived state."
+        "Viral posts get extreme read and vote concurrency. Reads are already served from the listing/comment caches; for vote write bursts, the queue absorbs them and the score worker batches recompute (you don't need per-vote reordering). The queue gives backpressure: if the ranker falls behind on a spike, votes are still durably recorded and freshness degrades gracefully (a few extra seconds of lag) rather than dropping votes or stalling the write path.",
+        "Moderation (removals, spam, shadow bans) is a workflow, not just a cache op. A mod action writes authoritative status (removed/spam/shadowed + tombstone) to the post/comment store, emits an invalidation event, evicts/penalizes the item in the ranked cache, and invalidates the affected comment-cache entries so a removed subtree collapses. Reads filter on status, so even before caches catch up a removed item is hidden. Run a spam check on submit and let mods act asynchronously; propagation has a bounded freshness target (sub-second to a few seconds).",
+        "Shard posts/comments by id/post; replicate caches for read volume (and key listings by community so a hot community's reads spread across replicas, not one shard). Treat all ranked/comment caches as rebuildable derived state over the authoritative store."
       ],
       "view": {
         "nodes": [
           "PostSvc",
           "ModSvc",
+          "PostDB",
           "RankCache",
+          "CommentCache",
           "EventQ",
           "Ranker"
         ],
-        "caption": "The post/comment service runs submissions through the moderation service, which removes or penalizes entries in the ranked listing cache that the ranking worker also updates.",
+        "caption": "The post/comment service runs submissions through the moderation service, which writes authoritative status to the store and invalidates both the ranked listing and comment-tree caches; the event queue feeds the ranking worker that maintains the ranked cache.",
         "links": [
           "post-mod",
+          "mod-db",
           "mod-rankcache",
-          "vote-eventq",
+          "mod-commentcache",
+          "eventq-ranker",
           "ranker-rankcache"
         ],
         "highlight": [
@@ -1521,7 +1683,8 @@
         "reddit-sorts",
         "hn-ranking",
         "redis-sorted-sets",
-        "kafka-design"
+        "kafka-design",
+        "sre-monitoring"
       ],
       "recap": {
         "before": "Functional ranking + comments.",
@@ -1531,11 +1694,60 @@
       "bottlenecks": [
         {
           "issue": "A viral post floods the vote queue.",
-          "mitigation": "Batch score recompute; reordering can lag a few seconds (acceptable)."
+          "mitigation": "Batch score recompute; reordering can lag a few seconds (acceptable). The queue is the backpressure buffer — votes are recorded durably even when the ranker is behind."
         },
         {
           "issue": "Hot comment thread read storm.",
           "mitigation": "Comment-tree cache + incremental loading; replicate cache."
+        }
+      ],
+      "flows": [
+        {
+          "name": "Moderator removes a front-page post",
+          "note": "A mod removal writes authoritative status, then invalidates ranked and comment caches so the item disappears from listings and its subtree collapses.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "ModSvc",
+                "label": "Moderation Service"
+              },
+              {
+                "id": "PostDB",
+                "label": "Post Store"
+              },
+              {
+                "id": "RankCache",
+                "label": "Listing Cache"
+              },
+              {
+                "id": "CommentCache",
+                "label": "Comment Cache"
+              }
+            ],
+            "messages": [
+              {
+                "from": "ModSvc",
+                "to": "PostDB",
+                "arrow": "->>",
+                "label": "set status=removed + tombstone"
+              },
+              {
+                "from": "ModSvc",
+                "to": "RankCache",
+                "arrow": "->>",
+                "label": "evict from every listing it's in"
+              },
+              {
+                "from": "ModSvc",
+                "to": "CommentCache",
+                "arrow": "->>",
+                "label": "invalidate thread / collapse subtree"
+              }
+            ]
+          },
+          "highlight": [
+            "ModSvc"
+          ]
         }
       ],
       "failureDrills": [
@@ -1543,13 +1755,28 @@
           "scenario": "The ranked listing cache is lost.",
           "expectedBehavior": "Listings are rebuilt from posts' hot_scores by the score worker; reads briefly fall back to a DB sort.",
           "mitigation": "Treat listings as rebuildable derived state."
+        },
+        {
+          "scenario": "The vote queue lags badly during a viral spike.",
+          "expectedBehavior": "Votes are still durably recorded; ranking freshness slips a few seconds past the < 5 s target but no votes are lost and the write path stays fast.",
+          "mitigation": "Queue absorbs the burst; batch recompute drains it; alert on queue lag and rank-freshness SLO."
+        },
+        {
+          "scenario": "A moderator removes a post but the cache eviction event is delayed.",
+          "expectedBehavior": "The authoritative status flips immediately, so status-filtered reads hide the item even while the ranked/comment caches are briefly stale.",
+          "mitigation": "Filter on status at read time; bound mod-propagation freshness and reconcile caches against authoritative state."
+        },
+        {
+          "scenario": "A listing-cache shard is lost during front-page traffic.",
+          "expectedBehavior": "Reads for that shard fall back to a DB sort (slower, within degraded latency) while the worker rebuilds the sorted sets from hot_scores.",
+          "mitigation": "Replicate the cache tier and rebuild derived listings from authoritative scores."
         }
       ]
     }
   ],
   "finalDesign": {
     "title": "Final Design — Voting & Ranking Aggregator",
-    "description": "Votes are recorded idempotently per (user,item) and emitted as events; a score worker consumes them, applies fraud discounting, computes a time-decay hot score, and maintains precomputed ranked listings (sorted sets) per community/front page. Listing reads are O(1) cache lookups; threaded comments use a materialized path (sharded by post) with hot threads cached and loaded incrementally. Vote bursts are absorbed by the queue with batched recompute; moderation removes items from listings/comments; all ranked and comment caches are rebuildable derived state over the authoritative post store.",
+    "description": "Votes are recorded idempotently per (user, item_type, item) with a version, and emitted as versioned events { prev_direction, new_direction, trust_status }; a score worker consumes them idempotently, applies fraud discounting, computes a time-decay hot score (with a periodic drift pass), and maintains precomputed ranked listings (sorted sets) per (scope, sort[, window]) for community and global front page. Listing reads are O(1) cache lookups paginated by a (score, id) seek cursor; threaded comments use a materialized path (sharded by post) with status-driven tombstones, hot threads cached and loaded incrementally. Vote bursts are absorbed by the queue with batched recompute and graceful freshness degradation; moderation writes authoritative post/comment status and invalidates both the ranked listing cache and the comment-tree cache. The authoritative post/comment/vote stores are the source of truth; all ranked and comment caches are rebuildable derived state over them.",
     "view": {
       "nodes": [
         "Client",
@@ -1580,6 +1807,8 @@
         "ranker-db",
         "ranker-rankcache",
         "mod-rankcache",
+        "mod-db",
+        "mod-commentcache",
         "post-mod"
       ],
       "groups": [
@@ -1621,7 +1850,7 @@
       },
       {
         "requirement": "Moderation reflected",
-        "how": "Removals evict from ranked/comment caches.",
+        "how": "Mod action writes authoritative status + tombstone, then invalidates ranked and comment caches; reads filter on status.",
         "steps": [
           "scale-mod"
         ]
@@ -1665,26 +1894,27 @@
       "time": "first 5 min",
       "say": [
         "Confirm read-heavy: listings + comments dominate votes dominate posts.",
-        "Pin fast precomputed listings and vote integrity as the hard goals.",
-        "Agree ranking is eventually consistent (seconds), not per-vote."
+        "Put numbers on it: ~150k listing reads/s, ~10k votes/s, viral-post bursts ~5k votes/s on one post — this justifies cache-served reads and async scoring.",
+        "Pin fast precomputed listings (p99 < 200 ms) and vote integrity as the hard goals.",
+        "Agree ranking is eventually consistent (< 5 s), not per-vote."
       ]
     },
     {
       "phase": "High-level design",
       "time": "next 10 min",
       "say": [
-        "Idempotent voting recorded fast, scored async.",
-        "Time-decay hot score from votes + age.",
-        "Precomputed ranked listings for O(1) reads."
+        "Idempotent voting recorded fast (one row per (user, item_type, item), versioned event), scored async.",
+        "Time-decay hot score from votes + age, with a periodic drift pass for score decay.",
+        "Precomputed ranked listings for O(1) reads; hot/top/new each maintained differently; (score, id) seek cursor for stable paging."
       ]
     },
     {
       "phase": "Deep dive",
       "time": "next 15 min",
       "say": [
-        "Threaded comments via materialized path.",
-        "Vote-fraud detection and discounting.",
-        "Viral-post scaling and moderation propagation."
+        "Threaded comments via materialized path; comments are voted items too; removed nodes tombstone and collapse.",
+        "Vote-fraud detection and discounting; persist the verdict and re-rank when it changes.",
+        "Viral-post scaling (queue backpressure) and moderation propagation: authoritative status write then ranked + comment cache invalidation."
       ]
     },
     {
@@ -1692,7 +1922,7 @@
       "time": "final 5 min",
       "say": [
         "Map requirements to mechanisms.",
-        "Tradeoffs: ranking formula tuning, recompute lag, fraud false positives.",
+        "Tradeoffs: ranking formula tuning, recompute lag, fraud false positives, cursor staleness bound.",
         "Mention personalization and per-community ranking as extensions."
       ]
     }
@@ -1718,8 +1948,9 @@
       "level": "Staff",
       "expectations": [
         "Reasons about vote-fraud discounting and recompute batching.",
-        "Treats listings as rebuildable derived state.",
-        "Discusses ranking-formula tradeoffs and hot-post scaling precisely."
+        "Treats listings as rebuildable derived state and specifies versioned, idempotent vote events.",
+        "Discusses ranking-formula tradeoffs and hot-post scaling precisely.",
+        "Operates the system under viral traffic: rank-freshness SLO + queue-lag backpressure, fraud false-positive rate, and bounded moderation-propagation delay with status-filtered reads."
       ]
     }
   ],

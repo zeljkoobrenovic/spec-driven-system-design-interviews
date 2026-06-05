@@ -340,37 +340,52 @@
   },
   "capacity": [
     {
-      "label": "Posts per day",
-      "value": "100M+",
-      "note": "Each spawns multiple media variants."
+      "label": "Upload QPS",
+      "value": "~1.2k avg / ~6k peak",
+      "note": "100M posts/day ≈ 1.2k/sec average; assume ~5x burst factor."
     },
     {
-      "label": "Variants per post",
-      "value": "several",
-      "note": "Thumbnail..full; video renditions."
+      "label": "Processing jobs",
+      "value": "~6k jobs/sec",
+      "note": "~5 variants/renditions per post; CPU/GPU-heavy transcode drives the worker fleet."
     },
     {
-      "label": "Feed reads",
-      "value": ">> posts",
-      "note": "Justifies precomputed feeds + CDN."
+      "label": "Media storage",
+      "value": "~PB/yr, ~5x originals",
+      "note": "Variant amplification: avg ~2MB original → ~10MB across sizes; storage grows with every size × post."
     },
     {
-      "label": "Avg followers",
-      "value": "~hundreds",
-      "note": "Heavy-tailed; celebrities have millions."
+      "label": "Feed read QPS",
+      "value": "~1M+ /sec",
+      "note": "Reads >> posts; each read drives candidate hydration + heavy CDN media egress."
+    },
+    {
+      "label": "Fanout writes",
+      "value": "~100k+ /sec avg",
+      "note": "~hundreds of followers × push rate; spikes far higher — bounded by hybrid (celebrity pull)."
+    },
+    {
+      "label": "Feed-cache memory",
+      "value": "~a few KB/user",
+      "note": "Cap ~500–1000 post ids/user; cold users evicted, rebuilt from pull on return."
+    },
+    {
+      "label": "Candidates per read",
+      "value": "~few hundred → top 20",
+      "note": "Pushed + pulled candidates; ranker scores the small set."
     },
     {
       "label": "Feed latency",
       "value": "< 200 ms p99",
-      "note": "Precomputed candidate feed + hot hydration."
+      "note": "Precomputed candidates + hot hydration; ranker budget ~50–80 ms with a fallback."
     }
   ],
   "api": [
     {
       "method": "POST",
       "path": "/v1/posts",
-      "description": "Create a post by uploading media; returns fast, processing is async.",
-      "request": "{ \"media\": \"<upload>\", \"caption\": \"...\" }",
+      "description": "Create a post from an already-uploaded media object (resumable/pre-signed upload happens first); returns fast, processing is async. An Idempotency-Key header collapses client retries so a double-tapped publish creates one post.",
+      "request": "{ \"uploadId\": \"up_31\", \"caption\": \"...\" }  (header: Idempotency-Key)",
       "response": "{ \"postId\": \"p_9\", \"status\": \"processing\" }",
       "sequence": {
         "participants": [
@@ -496,6 +511,55 @@
       "description": "Follow an account; future posts fan out to this follower.",
       "request": "{ \"targetUserId\": \"u_42\" }",
       "response": "{ \"following\": true }"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/follow/{targetUserId}",
+      "description": "Unfollow an account; the followee's posts stop fanning out and are filtered from the feed at hydration time until the cached entries age out.",
+      "request": "—",
+      "response": "{ \"following\": false }"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/users/{userId}/posts",
+      "description": "Profile grid: a user's own ready posts, newest-first, cursor-paginated. Served from an author/time index, not the home feed.",
+      "request": "?cursor=<opaque>&limit=24",
+      "response": "{ \"posts\": [ ... ], \"nextCursor\": \"...\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/posts/{postId}/likes",
+      "description": "Like a post (idempotent per user/post via the like's natural key). Records an interaction event; the displayed aggregate count is updated asynchronously.",
+      "request": "{ }",
+      "response": "{ \"liked\": true }"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/posts/{postId}/likes",
+      "description": "Unlike a post (idempotent). Removes the user's like row and emits a decrement event.",
+      "request": "—",
+      "response": "{ \"liked\": false }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/posts/{postId}/comments",
+      "description": "Add a comment. Stored per post and read back via a paginated comment list.",
+      "request": "{ \"text\": \"...\" }",
+      "response": "{ \"commentId\": \"c_7\", \"createdAt\": \"...\" }"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/posts/{postId}/comments",
+      "description": "Read a post's comments, newest- or oldest-first, cursor-paginated; takedowns/blocked authors are filtered at read time.",
+      "request": "?cursor=<opaque>&limit=20",
+      "response": "{ \"comments\": [ ... ], \"nextCursor\": \"...\" }"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/posts/{postId}/status",
+      "description": "Poll a post's processing state after upload (uploading, processing, ready, failed, blocked).",
+      "request": "—",
+      "response": "{ \"postId\": \"p_9\", \"status\": \"ready\" }"
     }
   ],
   "dataModel": [
@@ -521,7 +585,11 @@
         },
         {
           "name": "status",
-          "type": "enum(processing, ready)"
+          "type": "enum(uploading, processing, ready, failed, deleted, blocked)"
+        },
+        {
+          "name": "visibility",
+          "type": "enum(public, private)"
         },
         {
           "name": "created_at",
@@ -554,6 +622,86 @@
         {
           "name": "post_ids",
           "type": "list<bigint> (newest-first, capped)"
+        }
+      ]
+    },
+    {
+      "name": "profile_posts",
+      "note": "Author/time index over ready posts; serves the profile grid (newest-first by author) without scanning home feeds.",
+      "fields": [
+        {
+          "name": "author_id",
+          "type": "bigint (index key)"
+        },
+        {
+          "name": "post_id",
+          "type": "bigint (time-sortable, newest-first)"
+        }
+      ]
+    },
+    {
+      "name": "likes",
+      "note": "One row per (user, post): exact user-visible like state and dedup. Aggregate display counts are approximate and derived elsewhere.",
+      "fields": [
+        {
+          "name": "post_id",
+          "type": "bigint (PK part)"
+        },
+        {
+          "name": "user_id",
+          "type": "bigint (PK part — dedups repeat likes)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "comments",
+      "note": "Comments per post, paginated by id; sharded by post_id.",
+      "fields": [
+        {
+          "name": "comment_id",
+          "type": "bigint PK (time-sortable)"
+        },
+        {
+          "name": "post_id",
+          "type": "bigint (index)"
+        },
+        {
+          "name": "author_id",
+          "type": "bigint"
+        },
+        {
+          "name": "text",
+          "type": "text"
+        },
+        {
+          "name": "status",
+          "type": "enum(visible, deleted, blocked)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "post_counters",
+      "note": "Approximate aggregate counts per post (likes, comments, views) for display and ranking; updated async, separate from exact per-user like rows.",
+      "fields": [
+        {
+          "name": "post_id",
+          "type": "bigint (PK)"
+        },
+        {
+          "name": "like_count",
+          "type": "bigint (approximate)"
+        },
+        {
+          "name": "comment_count",
+          "type": "bigint (approximate)"
         }
       ]
     }
@@ -676,8 +824,9 @@
       "id": "upload",
       "title": "2. Async Media Upload and Processing",
       "description": [
-        "A post is media-first. The upload service stores the original in durable object storage, creates a post record in 'processing', and returns immediately — heavy work happens asynchronously via a processing queue.",
+        "A post is media-first. Large media goes up via a resumable / pre-signed object-store upload first; the upload service then creates a post record in 'processing' and returns immediately — heavy work happens asynchronously via a processing queue.",
         "Workers generate the device variants the app needs: multiple image sizes (thumbnail, feed, full) and, for video, transcoded renditions. They write variants to a derivative store and mark the post 'ready' (publishable).",
+        "Make the pipeline correct, not just fast. An Idempotency-Key on create collapses client retries to one post; the post moves through an explicit state machine (uploading → processing → ready, plus failed / blocked / deleted). Workers process jobs idempotently (a retried job overwrites the same variant keys), validate and re-encode media, strip EXIF, and run moderation; a job that exhausts retries goes to a dead-letter queue and the post is marked failed (surfaced via GET /posts/{id}/status) rather than stuck forever in processing.",
         "Decoupling upload from processing keeps posting fast and lets the processing fleet scale with media volume independently."
       ],
       "view": {
@@ -880,6 +1029,18 @@
         "after": "Originals stored, variants generated async, post becomes ready.",
         "newRisk": "Variants must be delivered to millions of viewers globally and fast."
       },
+      "traps": [
+        {
+          "trap": "Treating async upload as just 'queue + workers' with no idempotency or failure path.",
+          "why": "Client retries can create duplicate posts, worker retries can publish twice, and a failed transcode leaves the post stuck in 'processing' forever.",
+          "instead": "Use an Idempotency-Key on create, idempotent jobs keyed to fixed variant paths, an explicit state machine (uploading → processing → ready / failed / blocked), and a DLQ that marks the post failed."
+        },
+        {
+          "trap": "Accepting media without validation or moderation.",
+          "why": "Poison/oversized media can crash workers, and unsafe content reaches viewers; EXIF can leak location.",
+          "instead": "Validate and re-encode media, strip EXIF, and gate publish on a moderation check (blocked is a terminal state)."
+        }
+      ],
       "flows": [
         {
           "name": "Async upload → process → publish",
@@ -1128,7 +1289,8 @@
       "description": [
         "Assembling a feed by querying every followee on each read is too slow. Precompute it: when a post is published (ready), fan out its id into each follower's candidate feed list (fanout-on-write) so reads are a cheap cached lookup.",
         "Celebrities break pure push (one post = millions of feed writes), so use a hybrid: push for normal accounts, and pull the few celebrities a user follows at read time, merging both. This is the same push/pull tradeoff as a text feed, applied to media posts.",
-        "Store only post ids in feeds; the post and its media URLs are hydrated on read (a post lives once, referenced by many feeds)."
+        "Store only post ids in feeds; the post and its media URLs are hydrated on read (a post lives once, referenced by many feeds).",
+        "Operationally: bound the read-time pull (fetch at most M pull-mode authors × K recent posts each, dedup by post_id), partition the fanout queue by follower shard and batch writes, and make feed-cache inserts idempotent (a retried fanout writes the same post id once). When an account crosses the push/pull threshold, use a classification version or cutoff timestamp so posts aren't double-counted or dropped during the flip. Surface per-author fanout lag as a metric and alert on it."
       ],
       "view": {
         "nodes": [
@@ -1376,7 +1538,8 @@
       "description": [
         "Modern feeds aren't reverse-chronological; they're ranked by predicted engagement. The feed service treats the precomputed list (plus pulled celebrity posts) as candidates and the ranking service scores them.",
         "This is candidate-generation + ranking: cheap recall (the fanout candidate set) then a richer scoring pass over the small set using signals (recency, affinity to the author, predicted likes/comments, media type).",
-        "Hydrate the top-N: fetch post metadata and media variant URLs, paginate by cursor. Ranking runs on the small candidate set, so it stays within the latency budget."
+        "Hydrate the top-N: fetch post metadata and media variant URLs, paginate by cursor. Ranking runs on the small candidate set, so it stays within the latency budget.",
+        "Ranking is now a read-path dependency, so it needs a hard timeout and a fallback: if the ranker or feature fetch exceeds ~50–80 ms, return reverse-chronological (or cached-score) candidates and alert on the timeout rate. For stable pagination, the first page mints a short-lived cursor token capturing the ranked candidate snapshot (rank position, score version, and a high-watermark) so page 2 doesn't reshuffle under the user."
       ],
       "view": {
         "nodes": [
@@ -1388,7 +1551,11 @@
         ],
         "caption": "The feed service reads candidate post ids from the feed cache, sends them to the ranking service for ordering, then hydrates the ranked posts from the post store.",
         "links": [
-          "lb-feed",
+          {
+            "from": "Client",
+            "to": "FeedSvc",
+            "label": "GET home feed"
+          },
           "feed-feedcache",
           "feed-ranker",
           "feed-post"
@@ -1555,6 +1722,18 @@
         "after": "Engagement-ranked, hydrated, paginated feed.",
         "newRisk": "Viral posts and celebrity reads create hot spots; feeds must be rebuildable."
       },
+      "failureDrills": [
+        {
+          "scenario": "The ranker (or feature fetch) is slow or unavailable.",
+          "expectedBehavior": "After a ~50–80 ms timeout the feed falls back to reverse-chronological (or last cached scores) candidates, so the user still gets a feed.",
+          "mitigation": "Hard read-path timeout with chronological fallback; alert on timeout rate and degrade rather than block."
+        },
+        {
+          "scenario": "A user paginates while underlying candidates change.",
+          "expectedBehavior": "Page 2 continues from the page-1 ranking without reshuffling already-seen posts.",
+          "mitigation": "Mint a short-lived cursor token holding the ranked snapshot (rank position, score version, high-watermark)."
+        }
+      ],
       "flows": [
         {
           "name": "Feed read: candidates → rank → hydrate",
@@ -1646,7 +1825,8 @@
       "title": "6. Likes, Comments, and Counters",
       "description": [
         "Interactions (likes, comments, views) are high-volume and feed back into ranking. A like is a write that updates an engagement signal; on viral posts a synchronous counter increment becomes a hotspot.",
-        "Handle counts asynchronously: record interaction events, aggregate them (dedup per user where needed), and update approximate counters used for display and ranking. Comments are stored per post and read on demand.",
+        "Separate exact user-visible state from approximate aggregates. A like is one row per (user, post) — that gives idempotent 'did I like this?' state and dedups repeat taps. The displayed *count* is approximate, aggregated asynchronously from interaction events into a per-post counter used for display and ranking, so a viral post's 1M likes/min never hammer a single row.",
+        "Comments are stored per post and read back with cursor pagination; they carry moderation state (visible / deleted / blocked) and are filtered at read time. Counts are aggregated the same async way.",
         "These engagement signals flow back to the ranking service, so the feed reflects what's resonating — closing the loop between interaction and ranking."
       ],
       "view": {
@@ -1661,7 +1841,11 @@
         "links": [
           "client-lb",
           "post-postdb",
-          "feed-ranker"
+          {
+            "from": "PostSvc",
+            "to": "Ranker",
+            "label": "engagement signal"
+          }
         ],
         "highlight": [
           "PostSvc"
@@ -1863,7 +2047,9 @@
       "description": [
         "Shard posts and the social graph by id; replicate the feed cache and CDN for read volume. Viral posts get extreme reads — already absorbed by CDN (media) and the post/feed caches (metadata).",
         "Treat the feed cache as rebuildable derived state: if a user's feed shard is lost, rebuild it from the pull path (recent posts from their followees) and resume push. Fanout bursts (a popular account posts) buffer in the queue with batched workers.",
-        "Cap feed length (keep the recent window), evict cold users, and bound celebrity-pull cost with the threshold knob from the fanout step."
+        "Cap feed length (keep the recent window), evict cold users, and bound celebrity-pull cost with the threshold knob from the fanout step.",
+        "Filter at hydration, not at write. A post id can sit in millions of feed caches, so deletes, takedowns/moderation, private-account changes, blocks/mutes, and unfollows are enforced when the feed service hydrates ids — drop ids that are no longer visible to this viewer and purge the CDN on media deletion. That keeps feed entries cheap (just ids) while staying correct, and avoids rewriting millions of cached lists on every visibility change.",
+        "Operate it: monitor per-author fanout lag and processing-queue backlog, replay failed fanout from the DLQ, budget feed-cache rebuilds, and degrade gracefully per region (serve stale/chronological) when the ranker or graph service is slow."
       ],
       "view": {
         "nodes": [
@@ -1910,6 +2096,10 @@
         {
           "issue": "Losing a feed-cache shard.",
           "mitigation": "Rebuild from followees' recent posts (pull) and resume push."
+        },
+        {
+          "issue": "Fanout lag on a popular account's post.",
+          "mitigation": "Partition fanout by follower shard, batch idempotent writes, and replay from the DLQ; alert on per-author lag."
         }
       ],
       "failureDrills": [
@@ -1917,13 +2107,18 @@
           "scenario": "The feed cache is evicted for a returning user.",
           "expectedBehavior": "Feed is reassembled from followees (+ celebrity pull) so the user still sees content.",
           "mitigation": "Treat the feed cache as rebuildable derived state."
+        },
+        {
+          "scenario": "A post is deleted, taken down, or its author goes private / is unfollowed after fanout.",
+          "expectedBehavior": "The post stops appearing for viewers who shouldn't see it on the next read, without rewriting millions of cached feeds.",
+          "mitigation": "Filter post ids at hydration against current visibility/follow/block state and purge the CDN on media deletion."
         }
       ]
     }
   ],
   "finalDesign": {
     "title": "Final Design — Media Feed",
-    "description": "Uploads store the original and create a 'processing' post, then workers generate device variants (and video renditions) served via CDN. On publish, a hybrid fanout pushes the post id into normal followers' precomputed feeds and leaves celebrities to be pulled at read time. The feed service merges pushed + pulled candidates, the ranker scores them by engagement signals, and the top-N are hydrated with post metadata + CDN media URLs and cursor-paginated. Interactions are counted asynchronously and feed back into ranking; feeds are sharded, replicated, and rebuildable from the pull path.",
+    "description": "Uploads go to durable object storage (resumable/pre-signed), then create a 'processing' post that moves through an explicit state machine; workers generate device variants (and video renditions) served via CDN, with idempotent jobs and a DLQ for failures. On publish, a hybrid fanout pushes the post id into normal followers' precomputed feeds (partitioned, idempotent) and leaves celebrities to be pulled at read time. The feed service merges pushed + pulled candidates, the ranker scores them by engagement signals (with a chronological fallback on timeout and stable cursor pagination), and the top-N are hydrated with post metadata + CDN media URLs — filtering deleted/private/blocked/unfollowed ids at hydration. Likes are exact per-user rows while display counts are aggregated asynchronously (the interaction event stream + aggregator from Step 6 is folded into the post service here); comments are stored and paginated per post. Profile grids are served from an author/time index. Feeds are sharded, replicated, and rebuildable from the pull path.",
     "view": {
       "nodes": [
         "Client",
@@ -1998,14 +2193,21 @@
       },
       {
         "requirement": "Follow/unfollow",
-        "how": "Social graph changes fanout targets.",
+        "how": "Social graph changes fanout targets; unfollow stops pushes and is filtered at hydration until cached entries age out.",
         "steps": [
           "fanout"
         ]
       },
       {
+        "requirement": "Profile grid",
+        "how": "Author/time index over ready posts (profile_posts), hydrated with CDN media URLs — independent of the home feed.",
+        "steps": [
+          "variants"
+        ]
+      },
+      {
         "requirement": "Likes/comments",
-        "how": "Async engagement counting + comment store.",
+        "how": "Exact per-user like rows for 'I liked this' + dedup; async-aggregated approximate counts for display/ranking; comments stored per post and paginated.",
         "steps": [
           "interactions"
         ]
@@ -2119,7 +2321,8 @@
     "How do you build an Explore/discovery feed (content from non-followed accounts)?",
     "How do you handle video the same pipeline does photos (transcode, adaptive)?",
     "How do you keep feeds bounded in memory at scale?",
-    "How would you incorporate real-time engagement into ranking quickly?"
+    "How would you incorporate real-time engagement into ranking quickly?",
+    "How do private accounts, blocks/mutes, and post takedowns get enforced across already-fanned-out feeds?"
   ],
   "toProbeFurther": {
     "links": [

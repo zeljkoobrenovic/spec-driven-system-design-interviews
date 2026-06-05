@@ -70,7 +70,17 @@
         "traits": [
           "stateless"
         ],
-        "description": "Follower edges for fanout (who sees whose stories)."
+        "description": "Follower edges plus audience state (close-friends membership, blocks, hidden-from) for fanout-time eligibility and read-time revalidation."
+      },
+      {
+        "id": "TraySvc",
+        "label": "Tray Read Service",
+        "type": "service",
+        "category": "compute",
+        "traits": [
+          "stateless"
+        ],
+        "description": "Server-side tray-read path: authenticates the viewer, reads the tray cache, filters expired entries, applies seen-state, merges celebrity-pull stories, and revalidates audience against current relationship state."
       },
       {
         "id": "FanoutQueue",
@@ -131,7 +141,7 @@
         "traits": [
           "stateless"
         ],
-        "description": "Authenticates a view, checks expiry/visibility, dedupes by (viewer, story), marks seen, and emits a view event."
+        "description": "Authenticates a view, checks expiry + audience visibility, dedupes by (viewer, story), marks seen, and emits a view event. Also serves the author-facing viewer-list read after checking the caller owns the story."
       },
       {
         "id": "ViewLog",
@@ -227,8 +237,20 @@
       {
         "id": "lb-tray",
         "from": "LB",
-        "to": "TrayCache",
+        "to": "TraySvc",
         "label": "read story tray"
+      },
+      {
+        "id": "tray-cache",
+        "from": "TraySvc",
+        "to": "TrayCache",
+        "label": "read cached tray"
+      },
+      {
+        "id": "tray-graph",
+        "from": "TraySvc",
+        "to": "Graph",
+        "label": "revalidate audience + pull celebrities"
       },
       {
         "id": "client-cdn",
@@ -243,16 +265,10 @@
         "label": "origin fetch"
       },
       {
-        "id": "client-seen",
-        "from": "Client",
-        "to": "SeenStore",
-        "label": "mark/read seen"
-      },
-      {
         "id": "tray-seen",
-        "from": "TrayCache",
+        "from": "TraySvc",
         "to": "SeenStore",
-        "label": "unseen filter"
+        "label": "unseen filter / ordering"
       },
       {
         "id": "reaper-storydb",
@@ -297,10 +313,16 @@
         "label": "viewer list + count (TTL)"
       },
       {
-        "id": "lb-viewerstore",
+        "id": "lb-viewersvc",
         "from": "LB",
+        "to": "ViewSvc",
+        "label": "read who-viewed (author)"
+      },
+      {
+        "id": "viewersvc-store",
+        "from": "ViewSvc",
         "to": "ViewerStore",
-        "label": "read who-viewed"
+        "label": "read viewer list + count (after author check)"
       }
     ],
     "types": [
@@ -320,6 +342,7 @@
         "id": "read-path",
         "label": "Tray & Seen",
         "nodes": [
+          "TraySvc",
           "TrayCache",
           "SeenStore",
           "CDN"
@@ -353,11 +376,16 @@
   ],
   "capacityDiagram": [
     "graph LR",
-    "  Posts[Many stories/day]",
-    "  TTL[All expire in 24h]",
-    "  Seen[Per-viewer seen-state]",
-    "  Posts --> TTL",
-    "  TTL --> Seen"
+    "  Posts[~6k posts/s<br/>~20k peak]",
+    "  Fanout[~1.2M tray writes/s<br/>celebrities pulled]",
+    "  Reads[~1M tray opens/s<br/>read-heavy]",
+    "  Views[~3-5M view events/s<br/>partition by story]",
+    "  State[Bounded ~24h live state<br/>trays/seen/viewers auto-expire]",
+    "  Posts --> Fanout",
+    "  Fanout --> Reads",
+    "  Reads --> Views",
+    "  Views --> State",
+    "  Posts --> State"
   ],
   "requirements": {
     "functional": [
@@ -406,6 +434,36 @@
       "label": "Fanout lag budget",
       "value": "seconds (p99 < ~10s)",
       "note": "A normal post should land in followers' trays within seconds; queue backlog beyond that degrades tray UX."
+    },
+    {
+      "label": "Tray-entry writes & memory",
+      "value": "~1.2M writes/s; ~hundreds of GB live",
+      "note": "6k posts/s × ~200 push followers ≈ ~1.2M tray writes/s (celebrities excluded via pull). Each entry is ~tens of bytes (story_id + expiresAt + author). Live tray entries ≈ DAU × avg active followee-stories; at ~tens of bytes each this is ~hundreds of GB — sharded by viewer, so spread it wide."
+    },
+    {
+      "label": "Seen-state live entries",
+      "value": "~unique (viewer, story) over 24h",
+      "note": "Bounded by the 24h window: one membership entry per story a viewer actually opens. At ~16–24 bytes/entry, even billions of opens/day stay in the low-TB range and auto-expire — sharded by viewer."
+    },
+    {
+      "label": "View-event stream",
+      "value": "~3–5M events/s → ~hundreds of MB/s",
+      "note": "At ~40–60 bytes/event (story_id, viewer_id, ts, idem key) → ~hundreds of MB/s. Partition by story_id so celebrity spikes (10M+/story) spread across consumers; retain a short replay window (e.g. hours) for aggregator recovery — not 24h."
+    },
+    {
+      "label": "Viewer-store size",
+      "value": "exact lists for ordinary, HLL for celebrity",
+      "note": "Ordinary stories keep an exact capped/paginated list (~bytes × viewers). Celebrity stories cap the list and switch counts to a fixed-size HLL sketch (~1.5–12 KB/story regardless of 10M+ views), so a viral story can't blow up memory."
+    },
+    {
+      "label": "Media bandwidth",
+      "value": "~0.5 PB uploaded/day; CDN-dominated egress",
+      "note": "~500M × ~1MB ≈ ~0.5 PB/day uploaded; transcoding to a few renditions + thumbnail multiplies stored bytes ~2–4×. Reads are far larger but CDN-served — with a high edge hit ratio, origin (MediaStore) egress is a small fraction of total view bandwidth."
+    },
+    {
+      "label": "Rebuild-rate budget",
+      "value": "throttled to a fraction of normal read QPS",
+      "note": "On a tray-cache shard loss, rebuilds (fan-in over followees' active stories) are rate-limited/jittered to a bounded fraction of story-store read capacity so a mass eviction doesn't stampede the source of truth; a partial tray is served while warming."
     }
   ],
   "api": [
@@ -433,8 +491,8 @@
             "label": "Story Store"
           },
           {
-            "id": "Fanout",
-            "label": "Fanout"
+            "id": "FanoutQueue",
+            "label": "Fanout Queue"
           }
         ],
         "messages": [
@@ -442,7 +500,7 @@
             "from": "Client",
             "to": "PostSvc",
             "arrow": "->>",
-            "label": "post story"
+            "label": "post story (audience: followers|close_friends)"
           },
           {
             "from": "PostSvc",
@@ -454,19 +512,19 @@
             "from": "PostSvc",
             "to": "StoryDB",
             "arrow": "->>",
-            "label": "persist (expiresAt)"
+            "label": "persist (expiresAt, audience, snapshot_version)"
           },
           {
             "from": "PostSvc",
-            "to": "Fanout",
+            "to": "FanoutQueue",
             "arrow": "->>",
-            "label": "fan out to followers"
+            "label": "enqueue fanout job"
           },
           {
             "from": "PostSvc",
             "to": "Client",
             "arrow": "-->>",
-            "label": "201 storyId + expiry"
+            "label": "201 storyId + expiry (fanout async)"
           }
         ]
       }
@@ -483,8 +541,16 @@
             "id": "Client"
           },
           {
+            "id": "TraySvc",
+            "label": "Tray Read Service"
+          },
+          {
             "id": "TrayCache",
             "label": "Tray Cache"
+          },
+          {
+            "id": "Graph",
+            "label": "Social Graph"
           },
           {
             "id": "SeenStore",
@@ -494,21 +560,33 @@
         "messages": [
           {
             "from": "Client",
+            "to": "TraySvc",
+            "arrow": "->>",
+            "label": "get tray (auth)"
+          },
+          {
+            "from": "TraySvc",
             "to": "TrayCache",
             "arrow": "->>",
-            "label": "get tray"
+            "label": "read cached tray entries"
           },
           {
-            "from": "TrayCache",
+            "from": "TraySvc",
+            "to": "Graph",
+            "arrow": "->>",
+            "label": "revalidate audience (drop now-blocked/unfollowed) + pull celebrities"
+          },
+          {
+            "from": "TraySvc",
             "to": "SeenStore",
             "arrow": "->>",
-            "label": "unseen filter"
+            "label": "unseen filter / ordering"
           },
           {
-            "from": "TrayCache",
+            "from": "TraySvc",
             "to": "Client",
             "arrow": "-->>",
-            "label": "active stories (unseen-first)"
+            "label": "active, eligible stories (unseen-first; expired filtered)"
           }
         ]
       }
@@ -529,6 +607,14 @@
             "label": "View Service"
           },
           {
+            "id": "StoryDB",
+            "label": "Story Store"
+          },
+          {
+            "id": "Graph",
+            "label": "Social Graph"
+          },
+          {
             "id": "SeenStore",
             "label": "Seen Store"
           },
@@ -546,9 +632,15 @@
           },
           {
             "from": "ViewSvc",
-            "to": "ViewSvc",
+            "to": "StoryDB",
             "arrow": "->>",
-            "label": "check not expired + visible to viewer"
+            "label": "load story: not expired, status=active, audience"
+          },
+          {
+            "from": "ViewSvc",
+            "to": "Graph",
+            "arrow": "->>",
+            "label": "check viewer eligible (follower/close-friend, not blocked)"
           },
           {
             "from": "ViewSvc",
@@ -574,15 +666,78 @@
     {
       "method": "GET",
       "path": "/v1/stories/{id}/viewers",
-      "description": "Author reads who viewed their story (capped/paginated list + count) from the async-built viewer store.",
+      "description": "Author reads who viewed their story (capped/paginated list + count) from the async-built viewer store. The view service verifies the caller owns the story before returning the list; ordering is by first view (earliest viewer first), with recency available as a secondary sort.",
       "request": "{ \"cursor\": \"<opaque>\", \"limit\": 50 }",
-      "response": "{ \"count\": 10234, \"viewers\": [ { \"viewerId\": \"u_7\" } ], \"nextCursor\": \"...\" }"
+      "response": "{ \"count\": 10234, \"viewers\": [ { \"viewerId\": \"u_7\" } ], \"nextCursor\": \"...\" }",
+      "sequence": {
+        "participants": [
+          {
+            "id": "Client",
+            "label": "Author"
+          },
+          {
+            "id": "ViewSvc",
+            "label": "View Service"
+          },
+          {
+            "id": "StoryDB",
+            "label": "Story Store"
+          },
+          {
+            "id": "ViewerStore",
+            "label": "Viewer List / Count"
+          }
+        ],
+        "messages": [
+          {
+            "from": "Client",
+            "to": "ViewSvc",
+            "arrow": "->>",
+            "label": "get viewers (auth, cursor)"
+          },
+          {
+            "from": "ViewSvc",
+            "to": "StoryDB",
+            "arrow": "->>",
+            "label": "load story; assert caller == author_id"
+          },
+          {
+            "type": "alt",
+            "label": "caller owns the story",
+            "messages": [
+              {
+                "from": "ViewSvc",
+                "to": "ViewerStore",
+                "arrow": "->>",
+                "label": "read capped/paginated list + count (ordered by first view)"
+              },
+              {
+                "from": "ViewSvc",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "200 viewers + count + nextCursor"
+              }
+            ],
+            "else": {
+              "label": "not the author",
+              "messages": [
+                {
+                  "from": "ViewSvc",
+                  "to": "Client",
+                  "arrow": "-->>",
+                  "label": "403 forbidden"
+                }
+              ]
+            }
+          }
+        ]
+      }
     }
   ],
   "dataModel": [
     {
       "name": "stories",
-      "note": "Story metadata with an expiry; auto-purged, sharded by author.",
+      "note": "Story metadata with an expiry and its audience policy; auto-purged, sharded by author.",
       "fields": [
         {
           "name": "story_id",
@@ -595,6 +750,18 @@
         {
           "name": "media_key",
           "type": "object-store key"
+        },
+        {
+          "name": "audience",
+          "type": "enum (followers | close_friends)"
+        },
+        {
+          "name": "audience_snapshot_version",
+          "type": "bigint (graph version at fanout; lets reads detect stale eligibility)"
+        },
+        {
+          "name": "status",
+          "type": "enum (active | taken_down) — set on report/policy block before TTL"
         },
         {
           "name": "created_at",
@@ -704,6 +871,16 @@
       "group": "Fanout to Story Trays"
     },
     {
+      "name": "Audience policy with read-time revalidation",
+      "what": "Store each story's audience (followers/close-friends) and check eligibility at fanout time, then revalidate at read/view time against current relationship state so unfollow/block/close-friends changes during the live window suppress already-fanned-out entries.",
+      "whenToUse": "Time-limited content whose audience can change while it is still visible.",
+      "steps": [
+        "fanout",
+        "views"
+      ],
+      "group": "Fanout to Story Trays"
+    },
+    {
       "name": "Per-viewer seen-state",
       "what": "Track seen stories per viewer to order unseen-first and dim seen ones.",
       "whenToUse": "Story UIs that distinguish new vs viewed.",
@@ -756,7 +933,7 @@
       "title": "1. Naive: Normal Posts + Nightly Delete + Assemble-on-Read",
       "description": [
         "Start with the simplest thing that works. Store a story exactly like a permanent post — a row in the story store and a media blob — with no special lifecycle. To make it 'ephemeral', run a nightly batch job (the reaper) that scans the whole store and deletes anything older than 24h. To show a tray, query each followee on read for their recent, not-yet-deleted stories and merge them.",
-        "This is correct in spirit and dead simple — and it exposes the problems the rest of the design solves. First, a nightly scan-and-delete over hundreds of millions of rows is brutally expensive, and between runs the store holds far more than a day of data. Second, until that job runs, expired stories are still present, so a naive read can show content that should already be gone. Third, assembling a tray by querying every followee on each read is far too slow for a read-heavy story feed.",
+        "This is correct in spirit and dead simple — and it exposes the three problems the rest of the design solves. First, a nightly scan-and-delete over hundreds of millions of rows is brutally expensive, and between runs the store holds far more than a day of data. Second, until that job runs, expired stories are still present, so a naive read can show content that should already be gone. Third, assembling a tray by querying every followee on each read is far too slow for a read-heavy story feed.",
         "So the baseline motivates everything that follows: make expiry intrinsic (TTL-native storage that auto-purges), precompute trays with fanout, and always filter expired entries on read so a stale story is never shown."
       ],
       "view": {
@@ -989,8 +1166,9 @@
       "id": "fanout",
       "title": "3. Fanout to Story Trays",
       "description": [
-        "Viewing is read-heavy, so precompute each user's story tray: when someone posts, fan out the story id into each follower's tray cache (fanout-on-write), so reading the tray is a cheap cached lookup, not a query across all followees.",
-        "Fanout is async: POST /v1/stories returns as soon as the story is durably written and a fanout job is enqueued; workers then drain the queue. A normal-author fanout finishing in seconds is fine — followers see the story land in their tray within the lag budget. Tray writes are idempotent (push keyed by (follower, story) id) so retries after a worker crash don't duplicate entries. Audience checks (followers vs. close-friends) happen here at fanout time, so a story is only pushed into eligible followers' trays.",
+        "Viewing is read-heavy, so precompute each user's story tray: when someone posts, fan the story id out into each follower's tray cache (fanout-on-write), so reading the tray is a cheap cached lookup rather than a query across all followees.",
+        "Fanout is async: POST /v1/stories returns as soon as the story is durably written and a fanout job is enqueued; workers then drain the queue. A normal-author fanout finishing in seconds is fine — followers see the story land in their tray within the lag budget. Tray writes are idempotent (push keyed by (follower, story) id) so retries after a worker crash don't duplicate entries.",
+        "Audience policy is concrete here. Each story carries an audience (followers or close_friends) plus an audience_snapshot_version (the graph version at fanout time). At fanout the worker reads the social graph and pushes only into eligible followers' trays: close-friends membership is honored, and blocked / hidden-from viewers are excluded. But the audience is a contract that must hold for the full 24h window, and relationships change inside it: a viewer who unfollows, gets blocked, or is dropped from close-friends after fanout still holds a now-stale tray entry. So eligibility is rechecked at read time — both the tray read and view recording revalidate against current relationship state via the graph, and the snapshot version lets the read path spot entries built under an older audience. Fanout-time filtering keeps the common case cheap; read-time revalidation is the correctness backstop — the same filter-on-read discipline used for expiry, now applied to audience.",
         "Tray entries themselves carry the story's TTL, so the tray naturally only contains active stories. As with any feed, the heavy-tailed follower distribution means celebrities are handled by pull (fetch their active stories at read time) rather than pushing to tens of millions of trays — a hybrid fanout.",
         "The tray stores story ids (and authors); media is hydrated from the CDN on view. This is the same fanout model as a permanent feed, but every entry is short-lived."
       ],
@@ -1160,6 +1338,7 @@
       "patterns": [
         "Fanout-on-write to trays",
         "Hybrid fanout (celebrity pull)",
+        "Audience policy with read-time revalidation",
         "Bounded async fanout"
       ],
       "whyNow": [
@@ -1254,17 +1433,22 @@
       "description": [
         "Story UIs distinguish unseen (bright ring, shown first) from already-viewed. That requires tracking, per viewer, which stories they've seen — a viewer x story relationship that's large but, helpfully, also ephemeral (it only matters while the story is alive).",
         "Keep seen-state in a fast store keyed by viewer (a set of seen story ids), aligned to the story TTL so it auto-expires too. Reading the tray filters/orders by this set (unseen-first); viewing a story adds it to the set.",
+        "Seen-state is a service-owned store, not a client-addressable surface. The mark-seen write belongs to the view service (Step 6): it authenticates the viewer, checks the story is unexpired and the viewer is still eligible, and writes idempotently — so retries don't corrupt state and a viewer can't forge a seen mark. On the read side, the tray read service consults the seen-set to order unseen-first. Either way the client talks to a service, never to the cache directly.",
         "Because seen-state expires with the stories, it never accumulates unbounded — the ephemerality that defines stories also bounds this otherwise-explosive relationship."
       ],
       "view": {
         "nodes": [
           "Client",
-          "TrayCache",
+          "LB",
+          "ViewSvc",
+          "TraySvc",
           "SeenStore"
         ],
-        "caption": "The mobile client marks stories seen in the seen-state store, which the tray cache consults to filter the tray down to unseen stories.",
+        "caption": "The view service owns the idempotent mark-seen write to the seen-state store; the tray read service reads that store to order the tray unseen-first. The cache is never client-addressable.",
         "links": [
-          "client-seen",
+          "client-lb",
+          "lb-view",
+          "view-seen",
           "tray-seen"
         ],
         "highlight": [
@@ -1290,13 +1474,13 @@
           ],
           "view": {
             "nodes": [
-              "Client",
-              "TrayCache",
+              "ViewSvc",
+              "TraySvc",
               "SeenStore"
             ],
-            "caption": "The seen-state store keeps a per-viewer seen-set keyed by viewer, which the tray cache reads to filter unseen stories.",
+            "caption": "The view service writes a per-viewer seen-set keyed by viewer; the tray read service reads it to order unseen-first.",
             "links": [
-              "client-seen",
+              "view-seen",
               "tray-seen"
             ],
             "highlight": [
@@ -1322,16 +1506,16 @@
           ],
           "view": {
             "nodes": [
-              "Client",
-              "TrayCache",
+              "ViewSvc",
+              "TraySvc",
               {
                 "id": "SeenStore",
                 "label": "Per-Story Viewer Set"
               }
             ],
-            "caption": "The seen-state store keeps a per-story viewer set, which the tray cache consults to filter unseen stories.",
+            "caption": "Seen-state keyed by story as a per-story viewer set, written by the view service and read by the tray read service.",
             "links": [
-              "client-seen",
+              "view-seen",
               "tray-seen"
             ],
             "highlight": [
@@ -1357,16 +1541,16 @@
           ],
           "view": {
             "nodes": [
-              "Client",
-              "TrayCache",
+              "ViewSvc",
+              "TraySvc",
               {
                 "id": "SeenStore",
                 "label": "Seen Watermark (viewer,author)"
               }
             ],
-            "caption": "The seen-state store keeps a high-water-mark timestamp per (viewer, author), which the tray cache uses to filter unseen stories.",
+            "caption": "Seen-state as a high-water-mark timestamp per (viewer, author), written by the view service and read by the tray read service.",
             "links": [
-              "client-seen",
+              "view-seen",
               "tray-seen"
             ],
             "highlight": [
@@ -1412,6 +1596,7 @@
         "TTL stores purge eventually, but purge timing is approximate — an expired story id could still sit in a tray cache for a bit. The correctness boundary is read authorization, not cleanup: the server assigns an authoritative expiresAt at create time, tray entries carry that expiresAt, and tray reads filter out any entry past it before returning. That read-time filter — not the reaper — is what guarantees no expired story is ever shown.",
         "Media must expire on the same boundary: a story's media is served via signed/CDN-authorized URLs whose validity is capped to the story's expiry, so a stale story can't be fetched through an old URL even if the object lingers in the store or a CDN edge cache. Object-store lifecycle and DB TTL may lag without violating the user-facing guarantee.",
         "The reaper is only a cheap backstop: it drops straggler tray ids and reconciles orphaned media in a pass over recently-touched data, never a global scan. Product ephemerality means 'not shown after expiry', not instant physical erasure from every replica, CDN cache, backup, and analytics log.",
+        "The same read-time gate also handles early removal: if a story is reported or policy-blocked, its status flips to taken_down and reads treat it exactly like an expired entry — dropped on read, signed URLs revoked, CDN invalidated — so a story can disappear before its TTL with no special deletion path. (Pre-publish safety scanning lives in Step 2; this is the after-the-fact case.)",
         "Layering read-time filtering and bounded media authorization over TTL purge gives both correctness (read filter) and cheap cleanup (TTL) — the key to ephemeral correctness at scale."
       ],
       "view": {
@@ -1590,11 +1775,15 @@
       "flows": [
         {
           "name": "Tray read: filter-on-read never shows a stale story",
-          "note": "Even if an expired id still sits in the tray cache before TTL purge, the read drops any entry past its expiresAt.",
+          "note": "The tray read service is the correctness boundary: even if an expired id still sits in the tray cache before TTL purge, the service drops any entry past its expiresAt before returning. The cache is never read by the client directly.",
           "sequence": {
             "participants": [
               {
                 "id": "Client"
+              },
+              {
+                "id": "TraySvc",
+                "label": "Tray Read Service"
               },
               {
                 "id": "TrayCache",
@@ -1608,17 +1797,23 @@
             "messages": [
               {
                 "from": "Client",
+                "to": "TraySvc",
+                "arrow": "->>",
+                "label": "get tray (auth)"
+              },
+              {
+                "from": "TraySvc",
                 "to": "TrayCache",
                 "arrow": "->>",
-                "label": "get tray"
+                "label": "read cached tray entries"
               },
               {
                 "type": "alt",
                 "label": "entry past expiresAt",
                 "messages": [
                   {
-                    "from": "TrayCache",
-                    "to": "TrayCache",
+                    "from": "TraySvc",
+                    "to": "TraySvc",
                     "arrow": "->>",
                     "label": "drop expired id (filter-on-read)"
                   }
@@ -1627,7 +1822,7 @@
                   "label": "still active",
                   "messages": [
                     {
-                      "from": "TrayCache",
+                      "from": "TraySvc",
                       "to": "SeenStore",
                       "arrow": "->>",
                       "label": "unseen filter / ordering"
@@ -1636,7 +1831,7 @@
                 }
               },
               {
-                "from": "TrayCache",
+                "from": "TraySvc",
                 "to": "Client",
                 "arrow": "-->>",
                 "label": "active stories only (unseen-first)"
@@ -1644,7 +1839,7 @@
             ]
           },
           "highlight": [
-            "TrayCache"
+            "TraySvc"
           ]
         }
       ]
@@ -1654,8 +1849,9 @@
       "title": "6. View Counts and Viewer Lists",
       "description": [
         "Authors see who viewed their story (a viewer list) and a count. Views are high-volume; recording each synchronously to the story record would hotspot popular authors. The view service authenticates the request, checks the story is not expired and is visible to this viewer, marks seen, and emits a view event to a stream; a view aggregator consumes events and builds the per-story viewer list and count in a viewer store.",
-        "Dedup matters: mobile clients retry, and the stream is at-least-once, so both the mark-seen write and the aggregator dedup by (viewer_id, story_id) — duplicate view events never inflate the unique viewer list or count. The mark-seen happens synchronously in the view service (so the UX updates immediately) while the viewer-list/count aggregation is async off the hot path.",
-        "The viewer list is itself ephemeral — it only matters while the story is alive — so it expires with the story, again bounding the data. The viewer list is capped/paginated. Counts are exact for ordinary stories but switch to an approximate sketch (HyperLogLog) for celebrity-scale stories where exactness doesn't matter and a unique-count estimate in fixed space is far cheaper."
+        "Dedup matters: mobile clients retry and the stream is at-least-once, so both the mark-seen write and the aggregator dedup by (viewer_id, story_id) — duplicate view events never inflate the unique viewer list or count. The mark-seen happens synchronously in the view service (so the UX updates immediately) while the viewer-list/count aggregation runs async off the hot path.",
+        "The viewer list is itself ephemeral — it only matters while the story is alive — so it expires with the story, again bounding the data. The viewer list is capped/paginated and ordered by first view (earliest viewer first), with recency available as a secondary sort. Counts are exact for ordinary stories but switch to an approximate sketch (HyperLogLog) for celebrity-scale stories where exactness doesn't matter and a unique-count estimate in fixed space is far cheaper.",
+        "The viewer list is author-only: GET /v1/stories/{id}/viewers goes through the view service, which verifies the caller owns the story before reading the viewer store — the store is never a client-addressable surface, mirroring the seen-state and tray boundaries."
       ],
       "view": {
         "nodes": [
@@ -1816,7 +2012,8 @@
       ],
       "decisionPrompt": "A celebrity's story gets 10M views. Do you write each view to the story row?",
       "patterns": [
-        "Async view counting"
+        "Async view counting",
+        "Audience policy with read-time revalidation"
       ],
       "probeLinks": [
         "kafka-design",
@@ -1956,7 +2153,119 @@
           "lifecycle"
         ]
       },
-      "decisionPrompt": "Why does the 24h ephemerality actually make this system EASIER to scale than a permanent feed?",
+      "options": [
+        {
+          "name": "Rate-limited rebuild + serve partial tray (default)",
+          "description": "On a tray-cache shard loss, rebuild each tray from followees' currently-active stories, but throttle/jitter the fan-in so the story store isn't stampeded, and serve a partial (best-effort) tray while it warms.",
+          "pros": [
+            "The story store (source of truth) is protected by a bounded rebuild rate, so a mass eviction can't take it down.",
+            "Users keep getting a usable tray during recovery instead of an error.",
+            "Reuses the rebuildable-derived-state model — no extra durable storage for trays."
+          ],
+          "cons": [
+            "During the warm-up window some users see an incomplete tray (a few stories missing until rebuilt).",
+            "Rebuild throttling adds a tuning knob (rate, jitter, priority) to operate.",
+            "A cold shard takes time to fully repopulate under the rate cap."
+          ],
+          "view": {
+            "nodes": [
+              "TraySvc",
+              "TrayCache",
+              "Graph",
+              "StoryDB"
+            ],
+            "caption": "On cache loss the tray read service rebuilds from followees' active stories via the graph and story store, rate-limited, serving a partial tray while warming.",
+            "links": [
+              "tray-cache",
+              "tray-graph",
+              {
+                "from": "TraySvc",
+                "to": "StoryDB",
+                "label": "rebuild from active stories (rate-limited)"
+              }
+            ],
+            "highlight": [
+              "TraySvc",
+              "StoryDB"
+            ],
+            "groups": [
+              "read-path"
+            ]
+          }
+        },
+        {
+          "name": "Block reads until the tray is fully rebuilt",
+          "description": "Treat the tray as authoritative: on cache loss, fully reconstruct it before serving any read, so users never see a partial tray.",
+          "pros": [
+            "Every served tray is complete — no transient missing-story window.",
+            "Simple correctness story: a read only succeeds against a fully warm tray."
+          ],
+          "cons": [
+            "Reads fail or hang during rebuild — a tray-cache outage becomes a user-visible read outage.",
+            "A mass eviction triggers synchronized full rebuilds, exactly the story-store stampede to avoid.",
+            "Worst behavior happens precisely when load is already high."
+          ],
+          "view": {
+            "nodes": [
+              "TraySvc",
+              "StoryDB",
+              "Graph"
+            ],
+            "caption": "Reads block while the tray read service fully reconstructs the tray from the story store and graph before serving.",
+            "links": [
+              {
+                "from": "TraySvc",
+                "to": "Graph",
+                "label": "all followees"
+              },
+              {
+                "from": "TraySvc",
+                "to": "StoryDB",
+                "label": "full fan-in (blocking)"
+              }
+            ],
+            "highlight": [
+              "TraySvc"
+            ],
+            "groups": [
+              "read-path"
+            ]
+          }
+        },
+        {
+          "name": "Make tray cache durable (replicate / persist)",
+          "description": "Avoid rebuilds entirely by treating the tray cache as a durable, replicated store so a node loss never loses tray state.",
+          "pros": [
+            "No rebuild path and no story-store fan-in on node loss.",
+            "Tray reads stay complete and fast through failures."
+          ],
+          "cons": [
+            "Pays durability/replication cost for state that is cheap to recompute and expires in 24h anyway.",
+            "Contradicts the derived-state model: now there are two sources of truth to keep consistent.",
+            "Higher steady-state cost for a transient-data store."
+          ],
+          "view": {
+            "nodes": [
+              "TraySvc",
+              {
+                "id": "TrayCache",
+                "label": "Durable Tray Store (replicated)"
+              }
+            ],
+            "caption": "The tray cache is replicated/persisted so a node loss never needs a rebuild from the story store.",
+            "links": [
+              "tray-cache"
+            ],
+            "highlight": [
+              "TrayCache"
+            ],
+            "groups": [
+              "read-path"
+            ]
+          }
+        }
+      ],
+      "decisionPrompt": "A tray-cache shard is lost during peak traffic. What do you serve while it rebuilds — a partial tray, nothing, or do you make the cache durable so it never happens?",
       "whyNow": [
         "Closing on sharding + bounded live data shows the ephemerality is a scaling advantage and the derived stores are rebuildable — completing the design."
       ],
@@ -2038,6 +2347,11 @@
           "scenario": "The CDN serves a media object after the story expired.",
           "expectedBehavior": "The signed URL's validity is capped at the story expiry, so the fetch is rejected even if the object lingers in an edge cache.",
           "mitigation": "Cap signed-URL / CDN-authorization TTL to story expiry; monitor CDN expired-media (404/expired) rate."
+        },
+        {
+          "scenario": "A story is reported or policy-blocked and must disappear before its 24h TTL.",
+          "expectedBehavior": "The story's status flips to taken_down: read paths treat it like an expired entry (the tray read service and view service drop it on read, so it vanishes from trays and can't be viewed), media URLs are revoked / CDN entries invalidated so the blob can't be fetched, and the viewer list stops growing. Cached tray responses age out within their short TTL or are invalidated. Physical media deletion still follows the same approximate-purge path as expiry — the user-facing guarantee is enforced at read time, not by instant erasure.",
+          "mitigation": "Treat takedown as early expiry: set status=taken_down (an authoritative read-time gate alongside expiresAt), revoke signed URLs / invalidate CDN, and let TTL/lifecycle reclaim bytes. The safety scan in Step 2 blocks unsafe media before it ever goes live; takedown handles content reported after it does."
         }
       ]
     }
@@ -2056,6 +2370,7 @@
         "Graph",
         "FanoutQueue",
         "Fanout",
+        "TraySvc",
         "TrayCache",
         "SeenStore",
         "Reaper",
@@ -2065,7 +2380,7 @@
         "ViewerStore",
         "Obs"
       ],
-      "caption": "The client posts through the gateway to the post service, which stores media (served via the CDN) and stories, enqueues fanout (workers push ids into tray caches via the social graph), tracks seen-state, reaps expired entries, and routes views through the view service to async aggregation; observability watches the operating signals.",
+      "caption": "The client posts through the gateway to the post service, which stores media (served via the CDN) and stories, then enqueues fanout (workers push ids into tray caches via the social graph). Reads go through the tray read service (expiry filter, seen-state, audience revalidation, celebrity merge); the view service owns mark-seen, view events flow to async aggregation, and author-authorized viewer-list reads come back through the view service; observability watches the operating signals.",
       "links": [
         "client-lb",
         "lb-post",
@@ -2076,9 +2391,10 @@
         "fanout-graph",
         "fanout-tray",
         "lb-tray",
+        "tray-cache",
+        "tray-graph",
         "client-cdn",
         "cdn-media",
-        "client-seen",
         "tray-seen",
         "reaper-storydb",
         "reaper-tray",
@@ -2087,7 +2403,8 @@
         "view-viewlog",
         "viewlog-agg",
         "agg-viewerstore",
-        "lb-viewerstore"
+        "lb-viewersvc",
+        "viewersvc-store"
       ],
       "groups": [
         "post-path",
@@ -2137,9 +2454,17 @@
       },
       {
         "requirement": "Basic audience (followers / close friends)",
-        "how": "Audience checked at fanout time (only eligible followers' trays) and re-checked at read time for relationship changes.",
+        "how": "Story carries audience + snapshot version; checked at fanout time (only eligible followers' trays) and revalidated at read time (tray read + view recording) against current relationship state, so an unfollow/block/close-friends removal during the 24h window suppresses the entry.",
         "steps": [
-          "fanout"
+          "fanout",
+          "views"
+        ]
+      },
+      {
+        "requirement": "Author-only viewer list",
+        "how": "The view service verifies the caller owns the story before returning the viewer list/count from the viewer store.",
+        "steps": [
+          "views"
         ]
       }
     ],
@@ -2389,7 +2714,9 @@
       "expectations": [
         "Reasons that ephemerality bounds data + seen-state.",
         "Designs never-show-expired correctness precisely.",
-        "Handles celebrity fanout and rebuildable trays at scale."
+        "Handles celebrity fanout and rebuildable trays at scale.",
+        "Treats audience as a contract over the live window: fanout-time eligibility plus read-time revalidation for unfollow/block/close-friends changes, and author-only viewer-list access.",
+        "Handles pre-expiry takedown as early expiry through the same read-time gate."
       ]
     }
   ],

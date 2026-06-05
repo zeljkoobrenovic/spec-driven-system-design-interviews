@@ -7,9 +7,16 @@
 
     const els = {
         overview: document.getElementById("overview"),
+        results: document.getElementById("overview-results"),
         status: document.getElementById("overview-status"),
+        search: document.getElementById("overview-search"),
+        searchInput: document.getElementById("overview-search-input"),
+        searchEmpty: document.getElementById("overview-search-empty"),
         error: document.getElementById("error-banner"),
     };
+
+    // All groups as loaded; the current search filters a copy of this.
+    let allGroups = [];
 
     function showError(msg) {
         if (els.error) {
@@ -69,7 +76,10 @@
     }
 
     function render(groups) {
-        els.overview.innerHTML = "";
+        els.results.innerHTML = "";
+        // Hide group titles when only one group is *visible* (matches the
+        // original single-group layout, and keeps a filtered-to-one-group
+        // result from showing a lone heading).
         const single = groups.length <= 1;
         groups.forEach((g) => {
             const section = document.createElement("section");
@@ -86,8 +96,42 @@
             grid.className = "overview-grid";
             g.datasets.forEach((d) => grid.appendChild(makeCard(d)));
             section.appendChild(grid);
-            els.overview.appendChild(section);
+            els.results.appendChild(section);
         });
+    }
+
+    function datasetMatches(dataset, groupName, query) {
+        const haystack = [
+            dataset.name,
+            dataset.id,
+            groupName,
+        ]
+            .filter(Boolean)
+            .join(" ")
+            .toLowerCase();
+        return haystack.includes(query);
+    }
+
+    // Returns a filtered copy of allGroups: groups keep only matching datasets,
+    // and groups with no remaining datasets are dropped. An empty query returns
+    // everything unchanged.
+    function filterGroups(query) {
+        const q = query.trim().toLowerCase();
+        if (!q) return allGroups;
+        return allGroups
+            .map((g) => ({
+                ...g,
+                datasets: g.datasets.filter((d) => datasetMatches(d, g.name, q)),
+            }))
+            .filter((g) => g.datasets.length > 0);
+    }
+
+    function applySearch() {
+        const query = els.searchInput ? els.searchInput.value : "";
+        const groups = filterGroups(query);
+        render(groups);
+        const hasResults = groups.some((g) => g.datasets.length > 0);
+        if (els.searchEmpty) els.searchEmpty.hidden = hasResults;
     }
 
     async function init() {
@@ -98,9 +142,15 @@
             if (total === 0) {
                 throw new Error('data/index.json must contain a non-empty "groups" array');
             }
-            render(groups);
+            allGroups = groups;
+            if (els.status) els.status.hidden = true;
+            if (els.search) els.search.hidden = false;
+            if (els.searchInput) {
+                els.searchInput.addEventListener("input", applySearch);
+            }
+            applySearch();
         } catch (err) {
-            els.status.textContent = "";
+            if (els.status) els.status.textContent = "";
             showError(err.message || String(err));
         }
     }

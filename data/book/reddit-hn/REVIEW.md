@@ -5,414 +5,388 @@ Review date: 2026-06-05
 
 ## Executive Summary
 
-This is a strong teaching case for the classic Reddit/Hacker News shape. The
-step progression is coherent: start with sort-on-read, fix voting correctness,
-introduce time-decay ranking, move ranked reads to precomputed listings, handle
-threaded comments, then close with fraud and moderation. The chosen mechanisms
-are mostly the right ones for the stated product.
+The recent updates substantially improved this interview. The previous high
+impact gaps around quantitative capacity, comment/moderation APIs, vote event
+idempotency, listing semantics, and Step 7 moderation propagation are now
+addressed in the dataset. The case has moved from a good conceptual walkthrough
+to a strong production-oriented teaching artifact.
 
-The remaining gaps are about production specificity rather than the core idea.
-Capacity is qualitative, so the p99 target and "large communities" claim are
-not testable. The API and data model do not yet cover comment creation,
-comment votes, moderation state, global/top/new listing semantics, or the
-idempotent event details needed for safe async score updates. Step 7 also has a
-small renderer-facing diagram issue: its queue edge is filtered because the
-source endpoint is not in the view.
+The remaining issues are narrower. The main risk is that the cache and hot-key
+capacity story is still too optimistic for the scale being claimed: 100k active
+communities, multiple sort/window sets, top-1000 members, and replicas likely
+cost far more than the stated 5-10 GB once real sorted-set overhead is counted.
+The dataset also names stable listing snapshots, moderation restore, fraud
+signals, and operational SLOs, but it does not yet define those contracts in
+enough detail for a top-tier production interview.
 
 | Axis | Rating | Notes |
 | --- | --- | --- |
-| System design soundness | 4/5 | Ranking, precomputed listings, idempotent voting, comments, and fraud are directionally right; capacity and state contracts need more precision. |
-| Production realism | 3.75/5 | Good async/cache framing, but thin on moderation workflow, vote-event idempotency, cursor stability, cache invalidation, and concrete hot-post budgets. |
-| Pedagogical flow | 4.25/5 | The sequence teaches one pressure point at a time; a few recaps and final-step details need tightening. |
-| Dataset/rendering fit | 4/5 | JSON and references validate; option diagrams are clean; Step 7's visible view drops one intended queue link. |
+| System design soundness | 4.5/5 | Core mechanisms are now coherent: idempotent versioned votes, time-decay ranking, precomputed listings, materialized-path comments, fraud discounting, and explicit moderation propagation. |
+| Production realism | 4.25/5 | Much stronger after the latest pass; cache sizing, hot-key mitigation, audit/privacy, and operational contracts still need precision. |
+| Pedagogical flow | 4.5/5 | The sequence teaches one pressure point at a time and the new details are introduced where they belong. |
+| Dataset/rendering fit | 4.75/5 | JSON parses, structured views resolve, option/final diagrams are clean, and the old Step 7 dropped-edge problem is fixed. |
 
 ## What Works Well
 
-- The requirements focus the interview on the right hard parts: ranked
-  listings, one vote per item, threaded comments, moderation, read-heavy load,
-  eventual ranking consistency, and viral/deep-thread scale
-  (`data/book/reddit-hn/interview.json:255`,
-  `data/book/reddit-hn/interview.json:262`).
-- Step 1 is a useful baseline. It explicitly says sort-on-read and counter
-  increments are deliberately naive, then uses that failure to motivate the
-  rest of the design (`data/book/reddit-hn/interview.json:560`,
-  `data/book/reddit-hn/interview.json:604`).
-- Step 2 teaches the correct vote invariant: one row per `(user, item)`, with
-  repeat votes treated as upserts rather than extra increments
-  (`data/book/reddit-hn/interview.json:614`).
-- The ranking step gives real alternatives instead of strawmen: time-decay hot
-  score, Wilson confidence, and raw net upvotes
-  (`data/book/reddit-hn/interview.json:779`,
-  `data/book/reddit-hn/interview.json:813`,
-  `data/book/reddit-hn/interview.json:851`).
-- The listing step makes the central read-path trade-off clear: precompute a
-  per-feed sorted set so listing reads are top-N cache reads rather than
-  per-request sorts (`data/book/reddit-hn/interview.json:981`,
-  `data/book/reddit-hn/interview.json:1008`).
-- The comments step chooses a credible default, materialized paths, and compares
-  it against parent pointers and closure tables
+- The capacity section now gives concrete sizing anchors: ~50M DAU, ~150k
+  listing reads/sec, ~50k comment reads/sec, ~10k votes/sec, ~12k score-worker
+  events/sec, ~100k active communities, and a < 5 s ranking freshness target
+  (`data/book/reddit-hn/interview.json:282`).
+- The API now covers the behaviors promised by the requirements: community
+  listing, global front page, comment read/create, comment vote, and moderation
+  removal (`data/book/reddit-hn/interview.json:448`,
+  `data/book/reddit-hn/interview.json:455`,
+  `data/book/reddit-hn/interview.json:462`,
+  `data/book/reddit-hn/interview.json:469`,
+  `data/book/reddit-hn/interview.json:476`).
+- The data model now supports the main invariants. Posts and comments carry
+  status/tombstone fields, votes include `item_type`, `version`, and
+  `trust_status`, and listing cache state is explicitly derived
+  (`data/book/reddit-hn/interview.json:484`,
+  `data/book/reddit-hn/interview.json:538`,
+  `data/book/reddit-hn/interview.json:588`,
+  `data/book/reddit-hn/interview.json:622`).
+- Step 2 now teaches idempotency end-to-end, including duplicate queue delivery
+  and up-to-down vote deltas (`data/book/reddit-hn/interview.json:755`).
+- Step 3 now calls out the periodic drift pass needed because time decay changes
+  even without new votes (`data/book/reddit-hn/interview.json:895`).
+- Step 4 now distinguishes hot, top, new, and global front-page maintenance, and
+  introduces seek cursors plus bounded listing snapshots
   (`data/book/reddit-hn/interview.json:1124`,
-  `data/book/reddit-hn/interview.json:1150`,
-  `data/book/reddit-hn/interview.json:1233`).
-- The final design integrates the main concepts: idempotent voting, queued
-  score recompute, fraud discounting, time-decay scores, precomputed listings,
-  materialized-path comments, hot-thread cache, moderation, and rebuildable
-  derived state (`data/book/reddit-hn/interview.json:1550`).
+  `data/book/reddit-hn/interview.json:1125`).
+- Step 5 now treats comments as first-class voted items and handles tombstones,
+  incremental loading, and per-subtree cursors
+  (`data/book/reddit-hn/interview.json:1274`,
+  `data/book/reddit-hn/interview.json:1275`).
+- Step 7 is now a real operational close-out. It explains queue backpressure,
+  moderation status writes, rank/comment cache invalidation, status-filtered
+  reads, and cache rebuilds (`data/book/reddit-hn/interview.json:1647`,
+  `data/book/reddit-hn/interview.json:1648`,
+  `data/book/reddit-hn/interview.json:1753`).
 
 ## Highest-Impact Issues
 
-### 1. Capacity is qualitative, so the design cannot be checked against scale
+### 1. Listing-cache sizing is likely too optimistic
 
-The requirements include a concrete latency goal, p99 listing reads under
-200 ms, and a broad scale claim for large communities and viral posts
-(`data/book/reddit-hn/interview.json:264`,
-`data/book/reddit-hn/interview.json:267`). The capacity section then uses
-labels like "the dominant load", "high", "low", "deep / wide", and "seconds"
-(`data/book/reddit-hn/interview.json:270`). That is useful for intuition, but
-it does not convert product load into work units.
+The capacity section estimates listing-cache memory at 5-10 GB for roughly
+100k communities x 3 sorts x top-1000 ids, plus overhead and replicas
+(`data/book/reddit-hn/interview.json:324`). The raw member id math is useful,
+but it underplays the actual cost of a production sorted-set tier. Sorted-set
+members need keys, scores, object overhead, indexes/skip lists or equivalent
+structures, allocator overhead, windows for top/day/week/all, global candidate
+sets, replicas, and possibly per-region copies.
 
-Why it matters: the design's main claims depend on numeric thresholds. A
-candidate should be able to say roughly how many listing reads/sec, votes/sec,
-comment reads/sec, hot-post vote bursts, sorted-set writes/sec, score-worker
-events/sec, and cache entries are being handled. Without numbers, the choice of
-sorted sets, batching, cache replication, and comment incremental loading cannot
-be pressure-tested.
+Why it matters: the design's central read-path answer is "precompute listings
+in cache." If the memory estimate is low by an order of magnitude, the
+candidate may miss the real trade-off between caching every community/sort and
+caching only active communities, shrinking top-N, using tiered storage, or
+building cold listings lazily.
 
-Concrete fix: add a capacity table with example numbers. For instance: daily
-active users, listing reads/sec, comment thread reads/sec, votes/sec, post
-submits/sec, peak viral-post votes/sec, top-N listing size, number of active
-communities, ranking freshness target, and memory estimate for cached listing
-ids. Then tie Step 7's batching and cache replication back to those numbers.
+Concrete fix: replace the single 5-10 GB estimate with a two-line model: raw
+member bytes versus realistic in-memory sorted-set overhead plus replicas. Then
+state a policy such as "maintain top-1000 for active communities, top-100 for
+cold communities, evict inactive sort/window sets, and rebuild cold listings on
+demand." This keeps the same architecture but makes the cost and cache-coverage
+trade-off honest.
 
-### 2. API and data model do not yet cover the stated comment and moderation behavior
+### 2. Hot-key and partition behavior needs one more explicit design decision
 
-The API currently has post creation, post voting, community hot listing, and
-comment-tree read endpoints (`data/book/reddit-hn/interview.json:299`,
-`data/book/reddit-hn/interview.json:306`,
-`data/book/reddit-hn/interview.json:369`,
-`data/book/reddit-hn/interview.json:411`). The requirements also promise
-comment votes, comment creation, global front page, top/new sorts, and
-moderation removals (`data/book/reddit-hn/interview.json:255`).
+Step 7 says viral posts are handled by queues, batched recompute, replicated
+caches, and sharding by id/post (`data/book/reddit-hn/interview.json:1647`,
+`data/book/reddit-hn/interview.json:1649`). That is directionally right, but it
+does not fully say how hot write keys and hot read keys are spread. A single
+viral post concentrates vote writes, event traffic, score updates, and listing
+updates. A single front-page or hot-community listing can also become a hot
+cache key even if the cache is replicated.
 
-The data model is similarly minimal. `votes` has `user_id`, `item_id`, and
-`direction`, but no `item_type` or vote version, so a post id and comment id
-can collide conceptually and event consumers cannot safely reason about
-changed votes (`data/book/reddit-hn/interview.json:479`). `comments` has
-`comment_id`, `post_id`, `parent_id`, `path`, and `score`, but lacks the fields
-needed by the API and moderation story: author, body/content pointer, created
-time, status, deleted/removed timestamp, depth, and sort metadata
-(`data/book/reddit-hn/interview.json:453`). `posts` has score fields, but not
-status/moderation state, title/url/text fields, or a separate listing/index
-representation (`data/book/reddit-hn/interview.json:419`).
+Why it matters: "use a queue" is not by itself a hot-key solution. The design
+should say whether vote events are partitioned by item, by user, or by vote row;
+whether rank recompute coalesces many vote events for one post into one score
+update; how listing writes avoid fanout storms; and how hot listing reads are
+served from replicas, local process caches, CDN/edge caches, or page-sharded
+keys.
 
-Why it matters: the architecture promises one vote per item, comment voting,
-moderation removals, cache rebuilds, and sorted listings. The persisted state
-needs to make those behaviors explicit. Otherwise the walkthrough teaches the
-components but leaves the contracts underspecified.
+Concrete fix: add a Step 7 paragraph or failure drill for hot-key handling:
+coalesce score updates per post over a short interval, partition vote rows so
+idempotency remains local, cap write fanout to listing sets, and serve hot
+listing pages from replicated/read-through caches with stale-while-revalidate.
 
-Concrete fix: add endpoints for `POST /v1/posts/{id}/comments`,
-`POST /v1/comments/{id}/vote`, `GET /v1/frontpage/{sort}`, and moderation
-actions such as remove/restore. Extend the model with `item_type` in votes,
-vote event version or previous/new direction, post/comment `status`, moderation
-metadata, comment author/content/timestamps, and a derived listing-cache record
-or schema note for `(scope, sort, member_id, score)`.
+### 3. Operational contracts are named but not fully specified
 
-### 3. Moderation is a requirement, but the workflow is too thin
+The dataset now mentions a < 5 s rank freshness target, cursor snapshot tokens,
+status-filtered reads, cache rebuilds, queue lag alerts, moderation propagation
+delay, and fraud false-positive rates (`data/book/reddit-hn/interview.json:329`,
+`data/book/reddit-hn/interview.json:1125`,
+`data/book/reddit-hn/interview.json:1761`,
+`data/book/reddit-hn/interview.json:1953`). Those are exactly the right
+production concerns, but the contracts remain prose-level.
 
-Moderation is present in the requirements and final design, and Step 7 mentions
-spam checks, removals, shadow bans, cache eviction, and async mod actions
-(`data/book/reddit-hn/interview.json:259`,
-`data/book/reddit-hn/interview.json:1486`,
-`data/book/reddit-hn/interview.json:1552`). That is the right scope, but it is
-not yet a complete workflow.
+Why it matters: this interview is now strong enough that a senior/staff
+candidate should be pushed on measurable behavior. What does the listing cursor
+token contain? How long is a listing snapshot valid? What is the degraded-read
+path when `RankCache` is rebuilding? What metric pages the team when moderation
+propagation exceeds the bound? Which queue lag translates to violated rank
+freshness?
 
-The architecture has `ModSvc -> RankCache` and `PostSvc -> ModSvc`, but no
-explicit status write to the authoritative store and no invalidation path to
-`CommentCache` (`data/book/reddit-hn/interview.json:125`,
-`data/book/reddit-hn/interview.json:1553`). The `satisfies` row says removals
-evict ranked and comment caches, but the diagram does not show the comment
-cache side and the data model has no removal state
-(`data/book/reddit-hn/interview.json:1625`).
+Concrete fix: add a small "operational contracts" table in Step 7 or the final
+design: rank freshness SLO, queue lag threshold, listing snapshot TTL, cache
+rebuild target, moderation propagation SLO, and fallback read behavior.
 
-Why it matters: for Reddit/HN-like systems, moderation is not just a cache
-operation. The source of truth must record removed/spam/shadowed state, reads
-must filter tombstones, listings must remove or downrank entries, comments must
-hide or collapse removed subtrees, and async cache invalidation needs a bounded
-freshness target.
+### 4. Abuse and moderation state still lacks audit/privacy detail
 
-Concrete fix: add a short moderation flow: mod action writes post/comment
-status to the authoritative store, emits an invalidation event, removes or
-penalizes the item in `RankCache`, invalidates affected `CommentCache` entries,
-and leaves a tombstone or audit record. Add a Step 7 failure drill for delayed
-moderation propagation.
+The fraud step now records account age, IP/ASN, vote timing correlation, and
+cohort overlap, and it persists `trust_status` on votes
+(`data/book/reddit-hn/interview.json:1464`,
+`data/book/reddit-hn/interview.json:612`). Moderation now writes authoritative
+status and tombstones (`data/book/reddit-hn/interview.json:1648`). That is a
+good mechanism, but the data model does not yet include audit records, moderator
+actor/reason fields, restore state, appeal/review handling, or retention/access
+rules for sensitive abuse signals.
 
-### 4. Listing semantics are underspecified for top/new/global and pagination
+Why it matters: fraud and moderation are high-impact product operations. Without
+an audit trail and retention story, the design can remove or downrank content
+but cannot explain who did it, why, how it is reviewed, and how sensitive
+signals are protected.
 
-The requirements name hot, top, new, per-community listings, and a global front
-page (`data/book/reddit-hn/interview.json:258`). The design mostly explains
-hot ranking and a generic per `(community, sort)` sorted set
-(`data/book/reddit-hn/interview.json:981`). That is a good core, but the other
-listing modes need one more layer of specificity.
-
-Why it matters: "hot", "top", "new", and global front page have different
-maintenance rules. `new` can be an append/time index, `top` usually needs a
-time window and vote confidence or raw score, `hot` decays even without new
-votes, and global front page needs candidate aggregation across communities.
-Pagination is also tricky because scores change while a user is paging through
-a listing.
-
-Concrete fix: add a small listing-policy table: `hot` sorted by time-decay
-score with periodic drift recompute, `top` sorted by score within a window,
-`new` sorted by `created_at`, global front page built from active community
-candidates or a separate global sorted set. Add a cursor rule, such as snapshot
-token plus `(score, post_id)` seek cursor, and state how stale reads are
-bounded.
-
-### 5. The async vote pipeline needs explicit idempotent event semantics
-
-Step 2 correctly stores one vote per `(user, item)` and emits a queue event for
-changed votes (`data/book/reddit-hn/interview.json:614`,
-`data/book/reddit-hn/interview.json:611`). The API response returns an
-optimistic score (`data/book/reddit-hn/interview.json:306`). The missing detail
-is what the event contains and how the ranker handles retries, duplicates, and
-vote changes.
-
-Why it matters: changing an upvote to a downvote is not the same as adding a
-new downvote. It can change net score by two, and duplicated queue delivery
-must not double-apply the delta. Fraud discounting also needs to know whether a
-vote is authoritative, shadow-counted, discounted, or removed.
-
-Concrete fix: specify that the vote store write produces an idempotent event
-with `vote_id` or `(user_id, item_type, item_id, version)`, previous direction,
-new direction, timestamp, and fraud/trust status. The ranker should either
-re-read authoritative tallies or apply idempotent deltas keyed by version. The
-API should label returned score as optimistic or estimated when ranking is
-eventually consistent.
+Concrete fix: add a lightweight `moderation_actions` or audit-log model and a
+short note that abuse signals have retention limits, access controls, and
+aggregated features where possible. The API already mentions a mirror restore
+endpoint; the model should have enough state to support it.
 
 ## System Design Soundness
 
-The system's main decomposition is sound. `PostSvc` owns posts and comments,
-`VoteSvc` owns idempotent vote writes, `EventQ` decouples vote ingestion from
-ranking, `Ranker` maintains derived listing state, `RankCache` and
-`CommentCache` serve the read-heavy paths, and `Fraud` plus `ModSvc` address
-the integrity requirements (`data/book/reddit-hn/interview.json:11`,
-`data/book/reddit-hn/interview.json:125`).
+The system decomposition is now sound and internally consistent. `PostSvc`
+handles post/comment writes and reads, `VoteSvc` records idempotent votes,
+`EventQ` decouples writes from ranking, `Ranker` recomputes time-decay scores,
+`RankCache` serves precomputed listings, `CommentCache` serves hot threads,
+`Fraud` discounts manipulated votes, and `ModSvc` writes status plus invalidates
+derived state.
 
-The strongest design decisions are treating ranked listings as derived state,
-keeping vote writes fast, and acknowledging that ranking is eventually
-consistent. The weaker decisions are mostly unstated rather than wrong: how
-many sorted sets are maintained, how global candidates are selected, how score
-drift is recomputed without vote events, how rank caches are rebuilt under load,
-and how moderation state is represented in the source of truth.
+The best design choices are the ones that keep source-of-truth and derived
+state separate. Votes are authoritative in `VoteStore`; posts/comments/status
+live in `PostDB`; listing and comment caches are explicitly rebuildable. The
+final design summarizes that clearly (`data/book/reddit-hn/interview.json:1779`).
 
-The comments design is plausible for interview purposes. Materialized paths and
-post-id sharding are good defaults for write-once threaded discussions
-(`data/book/reddit-hn/interview.json:1121`). The next production detail would
-be to define sibling ordering, collapsed/deleted comment behavior, max depth or
-path encoding limits, and incremental loading cursors.
+The design is less complete around physical partitioning and cost. The dataset
+names sharding, batching, and replication, but it should be more explicit about
+which keys define the partitions, which workloads are coalesced, and how much
+memory or write amplification each sorted listing policy creates.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: Vote Counter + Sort-on-Read
 
-Strong. The step is intentionally simple and exposes the two failures that
-matter: sort-on-read does not meet read latency at scale, and counter
-increments break under retries and manipulation.
+Strong. The baseline is intentionally simple and exposes the two reasons the
+rest of the design exists: sort-on-read melts under read-heavy load, and raw
+counter increments are not idempotent. Keep it.
+
+Minor improvement: this step could include a tiny capacity callback, such as
+"sorting all community posts cannot serve ~150k listing reads/sec," to connect
+the new capacity section to the first failure.
 
 ### Step 2: Idempotent Voting
 
-Strong conceptually. The one-row-per-user-item invariant is the right teaching
-point, and the sequence diagram is useful. Tighten the `recap.before`, which
-currently says "Nothing" even though the learner is coming from the naive
-baseline; it should refer to non-idempotent counters and sort-on-read state
-(`data/book/reddit-hn/interview.json:611`).
+Strong after the update. The step now covers `(user, item_type, item)`,
+versioned events, duplicate delivery, and direction flips. That is the right
+place to teach event idempotency because retries can happen before and after
+the queue.
 
-Add event idempotency details here rather than waiting for a later step. This
-is where candidates should learn that retries can happen both at the HTTP vote
-request and at the queue/ranker consumer.
+Suggested improvement: add a failure drill for duplicate queue delivery or a
+ranker crash after applying a delta but before committing its offset. That would
+make the idempotency lesson testable.
 
 ### Step 3: The Hot-Ranking Score
 
-Strong. It presents the right alternatives and explains why raw vote count is
-not enough. Add the continuous recompute rule: because time decay changes even
-without new votes, the ranker needs periodic refresh or bucketed rescore for
-active items, not only vote-event-triggered updates.
+Strong. The alternatives are meaningful and the new periodic drift pass fixes a
+common hidden bug in hot-score systems: time decay changes without vote events.
+
+Suggested improvement: include one sentence on formula experimentation and
+guardrails. The follow-up asks about A/B testing, but the main step could name
+offline replay or shadow scoring so candidates see ranking as tunable product
+logic, not a fixed formula.
 
 ### Step 4: Precomputed Ranked Listings
 
-Strong central step. The default sorted-set answer is the right one for the
-latency target. Add maintenance semantics for each sort mode and global front
-page, plus cursor stability under changing scores.
+Very strong central step. It now explains hot/top/new/global semantics and
+stable pagination. The remaining production detail is physical cost: sorted-set
+memory, write fanout, cold-community eviction, and stale snapshot TTLs.
+
+Suggested improvement: add a failure drill for a cursor page where scores
+change mid-scroll, or for rebuilding a hot community listing after cache loss.
 
 ### Step 5: Threaded Comments
 
-Good choice and good alternatives. Materialized path is a credible default for
-deep, mostly append-only threads. The main missing teaching point is API/state:
-the dataset should explicitly support comment creation, comment voting,
-comment removal, sibling sorting, and incremental pagination.
+Strong. Materialized path is a credible default, and the step now covers
+comment votes, tombstones, incremental loading, sibling sort, and hot-thread
+cache invalidation.
+
+Suggested improvement: specify a maximum depth or path encoding strategy. The
+model has `depth`, and the API has `depth=8`, but the step could say whether
+very deep replies are capped, flattened, or loaded as continuation nodes.
 
 ### Step 6: Vote-Fraud and Abuse Prevention
 
-Good topic and good trade-off between async discounting, synchronous blocking,
-and trust-weighted voting (`data/book/reddit-hn/interview.json:1306`,
-`data/book/reddit-hn/interview.json:1373`,
-`data/book/reddit-hn/interview.json:1412`). Add one operational detail: what
-signals are recorded, what happens after a fraud verdict changes, and how old
-scores/listings are recomputed or invalidated.
+Strong and realistic. Async discounting is the right default for keeping vote
+latency low, and the step now handles verdict changes by re-emitting events and
+recomputing affected listings.
+
+Suggested improvement: add a short operational note for false positives and
+sensitive signal handling. Fraud systems need auditability and privacy controls
+because IP/ASN and account-history features are sensitive.
 
 ### Step 7: Scaling, Hot Posts, and Moderation
 
-This is the right closing step, but it is currently thinner than the preceding
-decision steps. It has no options, no flow, and only one failure drill
-(`data/book/reddit-hn/interview.json:1486`,
-`data/book/reddit-hn/interview.json:1531`,
-`data/book/reddit-hn/interview.json:1541`). Add a moderation propagation flow
-and one or two more drills: vote queue lag on a viral post, delayed moderation
-eviction, cache shard loss during front-page traffic, or comment-cache
-invalidation for a removed subtree.
+This is now a proper closing step. The moderation flow and failure drills make
+the final operational story much more credible, and the old diagram issue is
+gone because `eventq-ranker` is used in the visible view.
+
+Suggested improvement: expand the hot-post drill from "queue lags" to "one post
+is a hot key." That forces the candidate to discuss coalescing, partitioning,
+write fanout, and hot listing reads.
 
 ## Final Design Review
 
-The final design integrates the components introduced in the walkthrough and
-states the important derived-state principle: ranked and comment caches are
-rebuildable over authoritative storage (`data/book/reddit-hn/interview.json:1552`).
-That is the right final posture.
+The final design is coherent and integrates the walkthrough. It names the right
+contracts: versioned vote events, idempotent scoring, fraud discounting,
+periodic drift, sorted listings by scope/sort/window, `(score, id)` seek
+cursors, materialized-path comments, status tombstones, moderation invalidation,
+queue backpressure, and rebuildable derived caches
+(`data/book/reddit-hn/interview.json:1779`).
 
-The final design would be stronger if it explicitly named the source-of-truth
-tables behind moderation and comments, the listing-cache key space, and the
-vote-event semantics. It currently says moderation removes items from
-listings/comments, but the final view only has `ModSvc -> RankCache` and does
-not show a direct comment-cache invalidation or authoritative status write
-(`data/book/reddit-hn/interview.json:1553`).
+The final design would become excellent with one additional operational table:
+ranking freshness, queue lag, snapshot TTL, moderation propagation, cache
+rebuild target, and observability metrics. The final paragraph already contains
+the concepts; the missing piece is turning them into measurable contracts.
 
 ## Concept Introduction and Learning Flow
 
-The learning sequence is clear: naive read sorting, idempotent votes, ranking
-formula, precomputed listings, comment trees, fraud, and final scaling. The
-concepts are introduced just in time and tied to the step that uses them:
-idempotent vote, time-decay ranking, precomputed listing, materialized path, and
-vote discounting.
+The concept staging is now very good:
 
-The only sequencing concern is that moderation appears as a requirement early
-but is not developed until the last step. That can still work, but Step 7
-should then be a fuller operational step with explicit state and invalidation
-flow, not just a short close-out.
+- The naive baseline creates the need.
+- Idempotent voting fixes correctness and retry safety.
+- Time-decay ranking fixes stale popularity.
+- Precomputed listings fix read latency.
+- Materialized-path comments fix nested-thread reads.
+- Fraud discounting protects rank integrity.
+- Scaling/moderation closes the operational story.
+
+The concepts are introduced just in time and reused later. The only remaining
+learning-flow gap is that failure drills are concentrated in Step 7. Adding one
+or two drills earlier would let the candidate practice the same concepts when
+they are introduced rather than only at the end.
 
 ## Step-to-Final-Design Coherence
 
-Most step-to-final-design mapping is coherent:
+The mapping from steps to final design is strong:
 
-- `naive` motivates the move away from sort-on-read.
-- `voting` introduces `VoteSvc`, `VoteStore`, and queue emission.
-- `ranking` introduces `Ranker` and score recompute.
-- `listings` introduces `RankCache` as derived state.
-- `comments` introduces materialized paths and `CommentCache`.
-- `fraud` introduces `Fraud` and vote discounting.
-- `scale-mod` introduces `ModSvc`, cache rebuilds, batching, and moderation.
+- `naive` motivates abandoning sort-on-read and raw counters.
+- `voting` introduces `VoteSvc`, `VoteStore`, versioned events, and `EventQ`.
+- `ranking` introduces `Ranker`, hot score, and drift recompute.
+- `listings` introduces `RankCache` and listing cursor semantics.
+- `comments` introduces materialized-path comments and `CommentCache`.
+- `fraud` introduces `Fraud`, `trust_status`, and re-ranking on verdict changes.
+- `scale-mod` introduces `ModSvc`, authoritative status writes, cache
+  invalidation, queue backpressure, and cache rebuilds.
 
-The main mismatch is Step 7's diagram. It includes `EventQ` and says vote
-bursts are absorbed by the queue, but its view references `vote-eventq` without
-including `VoteSvc`, so the renderer filters that edge and leaves the queue
-story visually underconnected (`data/book/reddit-hn/interview.json:1493`,
-`data/book/reddit-hn/interview.json:1502`). Use `eventq-ranker` in that view,
-or include `VoteSvc` as a node.
+The final design includes all of those components and its structured view links
+resolve cleanly.
 
 ## Realism Compared With Production Systems
 
-The case is realistic at the mechanism level: async scoring, sorted-set style
-listings, cache-as-derived-state, materialized-path threads, trust/fraud
-signals, and moderation propagation are all plausible. It is less realistic in
-operational contracts. Production systems would normally spell out:
+The dataset now compares well with real production feed/comment systems at the
+mechanism level. It has the right split between authoritative writes and
+derived reads, it treats ranking as eventually consistent, it addresses comment
+tree reads separately from listing reads, and it makes moderation a state
+workflow rather than a cache-only operation.
 
-- Queue delivery and ranker idempotency.
-- Ranking recompute cadence for time-decay drift.
-- Listing cursor stability and duplicate/gap avoidance.
-- Global/front-page candidate generation.
-- Post/comment status and tombstone filtering.
-- Comment-cache invalidation after moderation.
-- Backpressure behavior when the vote queue lags.
-- Observability for p99 listing reads, queue lag, rank freshness, cache hit
-  rate, fraud false positives, and moderation propagation delay.
+The remaining realism gaps are typical late-stage interview refinements:
 
-Those are natural additions; they do not require changing the core design.
+- Cache memory and sorted-set overhead need a realistic estimate.
+- Hot-key mitigation should be explicit for viral posts and front-page reads.
+- Queue partitioning and coalesced rank updates should be spelled out.
+- Listing snapshot tokens need a TTL and duplicate/gap contract.
+- Moderation needs audit/restore records and propagation metrics.
+- Fraud signals need retention, access control, and false-positive workflow.
+- Observability should tie p99 reads, rank freshness, queue lag, cache hit rate,
+  moderation delay, and fraud false positives to concrete SLOs.
 
 ## Dataset and Renderer-Facing Observations
 
 Validation and cross-reference checks were clean:
 
 - `interview.json` parses as JSON.
-- Step, pattern, `satisfies`, API sequence participant, and probe-link
-  references resolve.
-- Option-specific architecture views have link endpoints present in their node
-  lists.
+- Step view nodes resolve to canonical architecture nodes.
+- Step, option, and final-design view links resolve to known architecture
+  links, and their endpoints are present in the visible node sets.
+- Step highlights are visible in their own views.
+- `satisfies[*].steps[*]` references resolve.
+- Flow participants resolve to canonical node IDs.
 
-One visible renderer-facing issue remains: Step 7 has no options, so its
-top-level view is rendered directly. The `vote-eventq` link is dropped because
-`VoteSvc` is not in that view's nodes. Replace it with `eventq-ranker` or add
-`VoteSvc`.
+The previous visible Step 7 issue is fixed. Its view now includes the queue and
+ranker with the `eventq-ranker` link, so the queue story is no longer visually
+underconnected (`data/book/reddit-hn/interview.json:1661`).
 
-The top-level views for `listings`, `comments`, and `fraud` also contain
-shared links whose endpoints are outside the top-level view, but their option
-views are clean and are what the renderer shows by default. Treat those as
-low-risk cleanup rather than user-visible breakage.
+One small content/rendering observation remains: top-level non-functional
+requirements include the read-heavy load shape, but the `satisfies` wrap-up
+maps only four non-functional requirements: fast listing reads, vote integrity,
+eventually-consistent ranking, and viral-post scale
+(`data/book/reddit-hn/interview.json:1820`,
+`data/book/reddit-hn/interview.json:1861`). That is not a schema error, but a
+candidate-facing "Design vs. Requirements" view would be more complete if it
+also mapped read-heavy traffic to cache-served listings/comments and async
+writes.
 
 ## Recommended Edits, Prioritized
 
-### P1: Add quantitative capacity and hot-post budgets
+### P1: Correct the listing-cache memory and fanout model
 
-Replace qualitative capacity labels with example numbers and derived work:
-reads/sec, votes/sec, hot-post burst votes/sec, active community count,
-front-page candidate count, score-worker throughput, listing-cache memory, and
-ranking freshness.
+Show raw member bytes separately from realistic sorted-set overhead and
+replicas. Add a policy for active versus cold communities and sort/window sets.
 
-### P1: Complete API and state contracts for comments, votes, and moderation
+### P1: Add explicit hot-key mitigation
 
-Add comment create/vote endpoints, moderation action endpoints, `item_type` and
-event versioning in votes, post/comment status fields, and a derived listing
-state description.
+In Step 7, describe coalesced rank updates for one viral post, partitioning
+choices for vote events, write-fanout caps for listing updates, and replicated
+or local caching for hot listing pages.
 
-### P1: Make moderation propagation explicit
+### P2: Add an operational-contract table
 
-Add a Step 7 flow showing authoritative status write, invalidation event,
-rank-cache removal, comment-cache invalidation, and tombstone/audit behavior.
+Define rank freshness SLO, queue lag threshold, listing snapshot TTL,
+moderation propagation SLO, cache rebuild target, and degraded-read behavior.
 
-### P2: Specify listing modes and cursor semantics
+### P2: Add moderation audit and fraud-signal governance
 
-Define hot/top/new/global maintenance and add a cursor rule that avoids
-duplicates or gaps while scores change.
+Extend the model with a moderation audit/action record, restore state, and
+retention/access notes for abuse signals.
 
-### P2: Strengthen ranker/event idempotency
+### P2: Add earlier failure drills
 
-Describe event payloads and consumer behavior for duplicate delivery,
-up-to-down changes, fraud discount changes, and recompute from authoritative
-tallies.
+Add focused drills for duplicate vote events, cursor stability under score
+changes, comment-cache invalidation, and fraud verdict reversal.
 
-### P3: Fix Step 7 diagram connectivity
+### P3: Complete the `satisfies` mapping
 
-Use `eventq-ranker` or add `VoteSvc` so `EventQ` is connected in the visible
-scaling/moderation diagram.
+Add a non-functional row for the read-heavy traffic mix, tied to `listings`,
+`comments`, `voting`, and `scale-mod`.
 
-### P3: Refresh interview script and level rubric
+### P3: Tighten comment depth/path wording
 
-The script is clear but high level (`data/book/reddit-hn/interview.json:1662`).
-Add prompts for capacity math, moderation state, listing cursor semantics, and
-queue/ranker idempotency. Add a Staff expectation for operating rank freshness,
-fraud false positives, and moderation propagation under viral traffic.
+State the maximum depth or continuation strategy for pathological nested
+threads.
 
 ## What Not To Change
 
-- Keep the naive baseline. It is a good teaching setup, not wasted space.
-- Keep time-decay hot score as the default ranking choice.
-- Keep precomputed sorted listings as the default read-path solution.
-- Keep materialized path as the default comments solution.
-- Keep async fraud discounting as the default integrity approach; synchronous
-  blocking is correctly framed as an alternative with latency/false-positive
-  costs.
-- Keep caches framed as derived and rebuildable state.
+- Keep the naive baseline. It is an effective teaching setup.
+- Keep time-decay hot score as the default ranking answer.
+- Keep precomputed sorted listings as the main read-path solution.
+- Keep materialized path as the default comment-tree model.
+- Keep async fraud discounting as the default integrity approach.
+- Keep moderation as an authoritative state change plus cache invalidation.
+- Keep caches framed as derived and rebuildable rather than source-of-truth.
 
 ## Bottom Line
 
-This dataset is already a usable, coherent interview walkthrough. To make it
-production-grade, add numbers, complete the API/data model contracts, and turn
-moderation plus async scoring from stated components into explicit workflows.
-The core design should stay intact.
+This is now a strong Reddit/Hacker News system design walkthrough. The latest
+dataset changes closed the major correctness and completeness gaps. The next
+increment is production sharpness: realistic cache sizing, explicit hot-key
+behavior, and measurable operational contracts.

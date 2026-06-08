@@ -9,17 +9,27 @@
         "type": "service",
         "category": "compute",
         "traits": [],
-        "description": "Ack / Visibility Tracker: Synchronous application component that owns request-time business logic."
+        "description": "Ack / Visibility Tracker: Owns per-message lease state in work-queue mode — visibility timeouts, receipt handles, retry counts, and DLQ routing."
       },
       {
-        "id": "B",
-        "label": "Broker",
-        "type": "service",
-        "category": "compute",
+        "id": "Assign",
+        "label": "Assignment Store",
+        "type": "database",
+        "category": "state",
         "traits": [
           "stateful"
         ],
-        "description": "Broker: Synchronous application component that owns request-time business logic."
+        "description": "Assignment Store: Shared store consumers use to claim partition ownership in client-side cooperative assignment (no central coordinator)."
+      },
+      {
+        "id": "ConsumerDedup",
+        "label": "Consumer Dedup Store",
+        "type": "database",
+        "category": "state",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Consumer Dedup Store: Per-consumer store of seen business keys used to make at-least-once processing idempotent."
       },
       {
         "id": "Broker",
@@ -77,17 +87,6 @@
         "description": "Dead-Letter Queue: Work queue or broker abstraction that buffers tasks for consumers."
       },
       {
-        "id": "F",
-        "label": "Follower",
-        "type": "database",
-        "category": "state",
-        "traits": [
-          "stateful",
-          "replicated"
-        ],
-        "description": "Follower: Authoritative or operational state store for records, metadata, counters, locks, or durable state."
-      },
-      {
         "id": "Follower",
         "label": "Follower Replica",
         "type": "database",
@@ -106,14 +105,6 @@
         "category": "boundary",
         "traits": [],
         "description": "Consumer Group: Client-side application, SDK, portal, device, or upstream caller software outside the backend boundary."
-      },
-      {
-        "id": "I",
-        "label": "Dedup",
-        "type": "worker",
-        "category": "compute",
-        "traits": [],
-        "description": "Dedup: Asynchronous or background compute component that processes jobs, events, batches, or scheduled work."
       },
       {
         "id": "Idem",
@@ -141,11 +132,25 @@
       },
       {
         "id": "Log",
-        "label": "Append-Only Log",
-        "type": "observability",
-        "category": "ops",
-        "traits": [],
-        "description": "Append-Only Log: Telemetry, monitoring, alerting, logging, dashboard, or audit component."
+        "label": "Message Table",
+        "type": "database",
+        "category": "state",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Message Table: A relational/mutable row-per-message table with a consumed flag (the rejected alternative to an append-only log)."
+      },
+      {
+        "id": "Controller",
+        "label": "Controller / Metadata Quorum",
+        "type": "orchestrator",
+        "category": "compute",
+        "traits": [
+          "stateful",
+          "leader",
+          "replicated"
+        ],
+        "description": "Controller / Metadata Quorum: Control-plane quorum that owns partition metadata — leader assignment, ISR membership, leader/controller epochs — and fences stale leaders and producers."
       },
       {
         "id": "Offsets",
@@ -404,6 +409,30 @@
         "from": "Ack",
         "to": "P0",
         "label": "timeout"
+      },
+      {
+        "id": "producer-broker-publish",
+        "from": "Producer",
+        "to": "Broker",
+        "label": "publish + idem id"
+      },
+      {
+        "id": "broker-router-route",
+        "from": "Broker",
+        "to": "Router",
+        "label": "route by key"
+      },
+      {
+        "id": "controller-broker-metadata",
+        "from": "Controller",
+        "to": "Broker",
+        "label": "leader + ISR metadata"
+      },
+      {
+        "id": "controller-leader-elect",
+        "from": "Controller",
+        "to": "Leader",
+        "label": "assign / elect leader"
       }
     ],
     "types": []
@@ -435,7 +464,8 @@
       "Consumers subscribe and read messages, tracking their position.",
       "Messages are durable once acknowledged to the producer.",
       "Support multiple independent consumer groups over the same topic.",
-      "Dead-letter messages that repeatedly fail processing."
+      "Support two consumption contracts: a stream/log mode (consumers commit a group offset) and a work-queue mode (per-message lease, ack/delete, retry count, DLQ). This queue-vs-log choice is the first thing to pin down — it drives the API, data model, and failure modes.",
+      "Dead-letter messages that repeatedly fail processing (work-queue mode), or route them to an error topic (stream mode)."
     ],
     "nonFunctional": [
       "High throughput: millions of messages per second.",
@@ -476,14 +506,39 @@
       "label": "Ordering scope",
       "value": "per partition",
       "note": "Global ordering doesn't scale; ordering is guaranteed within a partition only."
+    },
+    {
+      "label": "Raw ingress",
+      "value": "~1 GB/s",
+      "note": "1M msgs/s × 1 KB ≈ 1 GB/s write before replication. Batching + compression (say 3–5×) cuts on-wire/on-disk bytes."
+    },
+    {
+      "label": "Replicated write load",
+      "value": "~3 GB/s",
+      "note": "With replication factor 3 the cluster physically writes ~3× ingress before compression — the real disk/network budget."
+    },
+    {
+      "label": "Retention storage",
+      "value": "~86 TB/day raw, ~259 TB RF=3",
+      "note": "1 GB/s × 86,400 s ≈ 86 TB/day raw; ×3 for replicas ≈ 259 TB/day before compression and segment/index overhead."
+    },
+    {
+      "label": "Read fan-out",
+      "value": "+1 GB/s per active group",
+      "note": "Each consumer group is an independent read stream; N caught-up groups add ~N× ingress in reads (mostly served from page cache when consumers keep up)."
+    },
+    {
+      "label": "Partition / broker count",
+      "value": "~hundreds of partitions",
+      "note": "If one partition sustains ~10 MB/s, 1 GB/s needs ~100+ partitions; broker count follows from per-broker disk throughput and NIC (e.g. ~10–25 Gbps) plus headroom for replication and reads."
     }
   ],
   "api": [
     {
       "method": "POST",
       "path": "/v1/topics/{topic}/messages",
-      "description": "Publish a message. Optional key decides the partition; producer may batch.",
-      "request": "{ \"key\": \"user_1\", \"value\": \"...\", \"idempotency_id\": \"p_42\" }",
+      "description": "Publish a message. Optional key decides the partition; producer may batch. The broker dedups retries by (producer_id, producer_epoch, seq); producer_epoch fences a stale/zombie producer after a restart.",
+      "request": "{ \"key\": \"user_1\", \"value\": \"...\", \"producer_id\": \"p_7\", \"producer_epoch\": 3, \"seq\": 42 }",
       "response": "200 OK { \"partition\": 0, \"offset\": 109823 }",
       "sequence": {
         "participants": [
@@ -492,41 +547,41 @@
             "alias": "P"
           },
           {
-            "id": "B",
+            "id": "Broker",
             "label": "Broker (leader)"
           },
           {
-            "id": "F",
+            "id": "Follower",
             "label": "Follower"
           }
         ],
         "messages": [
           {
             "from": "Producer",
-            "to": "B",
+            "to": "Broker",
             "arrow": "->>",
-            "label": "publish(key, value)"
+            "label": "publish(key, value, producer_id, seq)"
           },
           {
-            "from": "B",
-            "to": "B",
+            "from": "Broker",
+            "to": "Broker",
             "arrow": "->>",
-            "label": "append to partition log"
+            "label": "dedup + append to partition log"
           },
           {
-            "from": "B",
-            "to": "F",
+            "from": "Broker",
+            "to": "Follower",
             "arrow": "->>",
             "label": "replicate"
           },
           {
-            "from": "F",
-            "to": "B",
+            "from": "Follower",
+            "to": "Broker",
             "arrow": "-->>",
-            "label": "acked"
+            "label": "in-sync acked"
           },
           {
-            "from": "B",
+            "from": "Broker",
             "to": "Producer",
             "arrow": "-->>",
             "label": "200 (partition, offset)"
@@ -537,16 +592,30 @@
     {
       "method": "GET",
       "path": "/v1/topics/{topic}/poll",
-      "description": "Poll for messages from the partitions assigned to this consumer group member, starting at the committed offset.",
-      "request": "GET /poll?group=g1&max=500",
-      "response": "200 OK { \"records\": [ { \"partition\":0, \"offset\":109824, \"value\":\"...\" } ] }"
+      "description": "Stream/log mode. Poll for messages from the partitions assigned to this consumer group member, starting at the committed offset. The member identity (member_id, generation) lets the coordinator fence stale members after a rebalance.",
+      "request": "GET /poll?group=g1&member_id=m3&generation=12&max_bytes=1048576&max_wait_ms=200",
+      "response": "200 OK { \"records\": [ { \"partition\":0, \"offset\":109824, \"value\":\"...\" } ], \"assigned\": [0,1] }"
     },
     {
       "method": "POST",
       "path": "/v1/topics/{topic}/commit",
-      "description": "Commit the consumer group's offset after processing.",
-      "request": "{ \"group\": \"g1\", \"partition\": 0, \"offset\": 110324 }",
-      "response": "200 OK"
+      "description": "Stream/log mode. Commit the consumer group's offset after processing. The coordinator rejects commits whose generation is older than the current one, so a consumer that lost ownership in a rebalance can't overwrite progress.",
+      "request": "{ \"group\": \"g1\", \"member_id\": \"m3\", \"generation\": 12, \"offsets\": [ { \"partition\": 0, \"offset\": 110324 } ] }",
+      "response": "200 OK  (409 STALE_GENERATION if generation < current)"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/queues/{queue}/receive",
+      "description": "Work-queue mode. Receive up to N messages, each leased with a receipt handle for a visibility timeout; the message is invisible to other consumers until acked or the lease expires.",
+      "request": "POST /receive { \"max\": 10, \"visibility_ms\": 30000 }",
+      "response": "200 OK { \"messages\": [ { \"message_id\": \"abc\", \"receipt_handle\": \"rh_91\", \"receive_count\": 1, \"value\": \"...\" } ] }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/queues/{queue}/ack",
+      "description": "Work-queue mode. Acknowledge (delete) a leased message by its receipt handle. A stale handle (lease already expired and message redelivered) is rejected so a slow consumer can't delete someone else's in-flight copy.",
+      "request": "{ \"receipt_handle\": \"rh_91\" }",
+      "response": "200 OK  (410 LEASE_EXPIRED if the lease has timed out)"
     }
   ],
   "dataModel": [
@@ -570,15 +639,19 @@
     },
     {
       "name": "partition_log",
-      "note": "Append-only, ordered sequence of records per partition. Offset is the position.",
+      "note": "Append-only, ordered sequence of records per (topic, partition). Offset is the position. Physically stored as segment files with sparse offset/time indexes; retention/compaction reclaim old segments.",
       "fields": [
         {
+          "name": "topic",
+          "type": "varchar PK"
+        },
+        {
           "name": "partition",
-          "type": "int"
+          "type": "int PK"
         },
         {
           "name": "offset",
-          "type": "bigint"
+          "type": "bigint PK"
         },
         {
           "name": "key",
@@ -589,6 +662,14 @@
           "type": "bytes"
         },
         {
+          "name": "headers",
+          "type": "map null"
+        },
+        {
+          "name": "schema_id",
+          "type": "int null"
+        },
+        {
           "name": "ts",
           "type": "timestamptz"
         }
@@ -596,33 +677,117 @@
     },
     {
       "name": "consumer_offsets",
-      "note": "Per (group, partition) committed position. The only consumer-side state.",
+      "note": "Stream/log mode. Per (topic, group, partition) committed position, fenced by generation. The only consumer-side state.",
       "fields": [
         {
+          "name": "topic",
+          "type": "varchar PK"
+        },
+        {
           "name": "group",
-          "type": "varchar"
+          "type": "varchar PK"
         },
         {
           "name": "partition",
-          "type": "int"
+          "type": "int PK"
         },
         {
           "name": "committed_offset",
           "type": "bigint"
+        },
+        {
+          "name": "generation",
+          "type": "int"
+        },
+        {
+          "name": "metadata",
+          "type": "varchar null"
+        },
+        {
+          "name": "commit_ts",
+          "type": "timestamptz"
         }
       ]
     },
     {
       "name": "dedup_ids",
-      "note": "Producer idempotency ids to dedupe retried publishes (exactly-once produce).",
+      "note": "Producer idempotency state to dedupe retried publishes (exactly-once append within a bounded window). Keyed by producer; producer_epoch fences zombie producers.",
       "fields": [
         {
           "name": "producer_id",
+          "type": "varchar PK"
+        },
+        {
+          "name": "producer_epoch",
+          "type": "int"
+        },
+        {
+          "name": "last_seq",
+          "type": "bigint"
+        }
+      ]
+    },
+    {
+      "name": "partition_metadata",
+      "note": "Control-plane metadata owned by the controller/quorum: who leads each partition, its replica set, in-sync set, and the epochs used to fence stale leaders.",
+      "fields": [
+        {
+          "name": "topic",
+          "type": "varchar PK"
+        },
+        {
+          "name": "partition",
+          "type": "int PK"
+        },
+        {
+          "name": "leader_broker",
+          "type": "int"
+        },
+        {
+          "name": "replicas",
+          "type": "int[]"
+        },
+        {
+          "name": "isr",
+          "type": "int[]"
+        },
+        {
+          "name": "leader_epoch",
+          "type": "int"
+        },
+        {
+          "name": "controller_epoch",
+          "type": "int"
+        }
+      ]
+    },
+    {
+      "name": "inflight (work-queue mode)",
+      "note": "Per-message lease state for work-queue consumption: who holds it, until when, and how many times it has been delivered. Absent in pure log mode.",
+      "fields": [
+        {
+          "name": "message_id",
+          "type": "varchar PK"
+        },
+        {
+          "name": "receipt_handle",
           "type": "varchar"
         },
         {
-          "name": "seq",
-          "type": "bigint"
+          "name": "visible_after",
+          "type": "timestamptz"
+        },
+        {
+          "name": "receive_count",
+          "type": "int"
+        },
+        {
+          "name": "max_receives",
+          "type": "int"
+        },
+        {
+          "name": "dlq_target",
+          "type": "varchar null"
         }
       ]
     }
@@ -697,7 +862,7 @@
     {
       "id": "in-memory-queue",
       "title": "1. In-Memory Queue (the baseline)",
-      "description": "Start with a single broker holding an in-memory FIFO queue: producers push, one consumer pops. It works until the broker restarts (messages lost) or load exceeds one node — which is exactly why the rest of the design exists.",
+      "description": "Start with a single broker holding an in-memory FIFO queue: producers push, one consumer pops. This is genuinely fine for local, ephemeral, best-effort work where losing a few in-flight items is acceptable. It fails our durability requirement, though: it works until the broker restarts (messages lost) or load exceeds one node — which is exactly why the rest of the design exists.",
       "patterns": [
         "Synchronous request/response"
       ],
@@ -835,7 +1000,7 @@
               "Producer",
               "Log"
             ],
-            "caption": "The producer inserts each message as a row and updates a consumed flag in an append-only log table.",
+            "caption": "The producer inserts each message as a row and the broker mutates a consumed flag in a relational message table (the rejected alternative to an append-only log).",
             "links": [
               "producer-log-insert-update-flag"
             ],
@@ -855,6 +1020,18 @@
           "trap": "Hashing keys to partitions but later changing the partition count",
           "why": "Re-hashing scatters a key's history across partitions, breaking per-key ordering.",
           "instead": "Treat partition count as semi-fixed; grow with care, or use sticky/explicit partitioning."
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Why the log stays fast at high throughput",
+          "points": [
+            "Each partition is a series of segment files; writes only ever append to the active segment, so the OS does large sequential writes.",
+            "A sparse offset/time index per segment lets a consumer seek to an offset without scanning the whole file.",
+            "Producers batch and compress, so 1M msgs/s of ~1 KB (≈1 GB/s raw) becomes far fewer, larger I/Os.",
+            "Caught-up consumers read recent segments straight from the page cache, so a hot partition serves many groups with little extra disk I/O.",
+            "Retention/compaction delete or rewrite whole old segments rather than mutating rows in place."
+          ]
         }
       ],
       "failureDrills": [
@@ -1075,11 +1252,12 @@
       "options": [
         {
           "name": "Broker-coordinated group with partition assignment (default)",
-          "description": "A group coordinator assigns each partition to exactly one member and reassigns on join/leave, while committed offsets are stored centrally so restarts resume cleanly.",
+          "description": "A group coordinator assigns each partition to exactly one member and reassigns on join/leave, while committed offsets are stored centrally so restarts resume cleanly. Each assignment round bumps a generation number, and commits from an older generation are rejected.",
           "pros": [
             "A group coordinator owns the partition-to-consumer assignment, so when one consumer crashes its partitions are reassigned (rebalanced) automatically.",
             "Each partition is consumed by exactly one member, preserving per-partition ordering.",
-            "Committed offsets are stored centrally, so a restarted consumer resumes exactly where the group left off."
+            "Committed offsets are stored centrally, so a restarted consumer resumes exactly where the group left off.",
+            "Generation fencing: after a rebalance the coordinator rejects commits from the old generation, so a paused or crashed consumer can't overwrite the new owner's progress when it wakes up."
           ],
           "cons": [
             "A rebalance pauses the whole group briefly (stop-the-world) while assignments are recomputed.",
@@ -1161,12 +1339,96 @@
             ]
           }
         }
+      ],
+      "flows": [
+        {
+          "name": "Consumer crash -> rebalance -> resume from committed offset",
+          "note": "A heartbeat timeout triggers a rebalance; the new owner resumes at the last committed offset, and the dead member's stale-generation commits are fenced.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "C1",
+                "label": "Consumer 1 (dies)"
+              },
+              {
+                "id": "Coord",
+                "label": "Group Coordinator"
+              },
+              {
+                "id": "C2",
+                "label": "Consumer 2 (new owner)"
+              },
+              {
+                "id": "P0",
+                "label": "Partition 0"
+              },
+              {
+                "id": "Offsets",
+                "label": "Consumer Offsets"
+              }
+            ],
+            "messages": [
+              {
+                "from": "C1",
+                "to": "Coord",
+                "arrow": "->>",
+                "label": "heartbeat (gen=12)"
+              },
+              {
+                "from": "C1",
+                "to": "C1",
+                "arrow": "->>",
+                "label": "crash (heartbeats stop)"
+              },
+              {
+                "from": "Coord",
+                "to": "Coord",
+                "arrow": "->>",
+                "label": "heartbeat timeout -> rebalance, gen=13"
+              },
+              {
+                "from": "Coord",
+                "to": "C2",
+                "arrow": "->>",
+                "label": "assign P0 (gen=13)"
+              },
+              {
+                "from": "C2",
+                "to": "Offsets",
+                "arrow": "->>",
+                "label": "read committed offset for P0"
+              },
+              {
+                "from": "C2",
+                "to": "P0",
+                "arrow": "->>",
+                "label": "fetch from committed offset"
+              },
+              {
+                "from": "C1",
+                "to": "Coord",
+                "arrow": "->>",
+                "label": "(zombie) commit(gen=12)"
+              },
+              {
+                "from": "Coord",
+                "to": "C1",
+                "arrow": "-->>",
+                "label": "409 STALE_GENERATION (fenced)"
+              }
+            ]
+          },
+          "highlight": [
+            "Coord",
+            "C2"
+          ]
+        }
       ]
     },
     {
       "id": "delivery-semantics",
       "title": "4. Delivery Semantics & Idempotency",
-      "description": "Make the guarantees explicit. The default is at-least-once (redeliver until acked), which means duplicates; achieve exactly-once effect by deduping with producer idempotency ids and idempotent consumers. True exactly-once delivery is impossible, but exactly-once effect is achievable.",
+      "description": "Make the guarantees explicit. The default is at-least-once (redeliver until acked), which means duplicates; achieve exactly-once effect by deduping with producer idempotency ids and idempotent consumers. True exactly-once delivery is impossible. Broker-side producer dedup gives exactly-once append to the log within a bounded producer session/window — not exactly-once processing across consume -> process -> produce, which additionally needs transactions, an outbox, or idempotent consumer-side writes.",
       "patterns": [
         "At-least-once + idempotency"
       ],
@@ -1186,8 +1448,8 @@
         },
         {
           "term": "Producer idempotency id",
-          "definition": "A (producer, sequence) tag the broker uses to drop duplicate appends.",
-          "whyItMatters": "Makes producer retries safe without duplicating log records.",
+          "definition": "A (producer_id, producer_epoch, seq) tag the broker uses to drop duplicate appends within a bounded window.",
+          "whyItMatters": "Makes producer retries safe without duplicating log records; the epoch fences a zombie producer after a restart.",
           "group": "Delivery Semantics & Idempotency"
         }
       ],
@@ -1206,8 +1468,8 @@
                 "alias": "B"
               },
               {
-                "id": "I",
-                "label": "Dedup"
+                "id": "Idem",
+                "label": "Dedup Store"
               }
             ],
             "messages": [
@@ -1215,16 +1477,16 @@
                 "from": "Producer",
                 "to": "Broker",
                 "arrow": "->>",
-                "label": "publish(seq=42) [retry]"
+                "label": "publish(producer_id, seq=42) [retry]"
               },
               {
                 "from": "Broker",
-                "to": "I",
+                "to": "Idem",
                 "arrow": "->>",
-                "label": "seen seq=42?"
+                "label": "seen (producer_id, seq=42)?"
               },
               {
-                "from": "I",
+                "from": "Idem",
                 "to": "Broker",
                 "arrow": "-->>",
                 "label": "yes"
@@ -1238,7 +1500,7 @@
             ]
           },
           "highlight": [
-            "I"
+            "Idem"
           ]
         }
       ],
@@ -1305,7 +1567,7 @@
           "pros": [
             "A retried publish carries the same idempotency id, so the broker appends it at most once even after a timeout.",
             "Dedup happens once at the broker, so every downstream consumer sees a single copy.",
-            "Combined with consumer offset commits this gives effective exactly-once into the log."
+            "Gives exactly-once append into the log within the dedup window; end-to-end exactly-once still needs idempotent or transactional consumers."
           ],
           "cons": [
             "The broker must keep a dedup window (producer id -> last sequence), costing memory and bounded by a retention window.",
@@ -1377,8 +1639,8 @@
     },
     {
       "id": "ack-visibility",
-      "title": "5. Acknowledgement, Visibility & Dead-Lettering",
-      "description": "For queue-style consumption, a polled message becomes invisible for a visibility timeout; the consumer acks on success or it reappears for retry after the timeout. Messages that fail repeatedly go to a dead-letter queue instead of blocking or vanishing.",
+      "title": "5. Queue Semantics on Top of the Log (Alternative Mode)",
+      "description": "This step adds a *second consumption mode*, not just another component. Offset logs and leased work queues both solve consumer failure, but they track different state: a log tracks one group *position*; a leased queue tracks per-message *ownership and retry count*. In work-queue mode a received message becomes invisible for a visibility timeout (a lease with a receipt handle); the consumer acks (deletes) on success or it reappears for retry after the timeout, and a message that fails repeatedly goes to a dead-letter queue. The final design supports both modes with separate state machines — pick log mode for ordered streaming/replay, queue mode for competing-consumer task distribution.",
       "patterns": [
         "Visibility timeout / ack",
         "Dead-letter queue"
@@ -1432,13 +1694,24 @@
           "Retries poison messages indefinitely."
         ]
       },
+      "deepDives": [
+        {
+          "title": "Log mode vs. queue mode — two different contracts",
+          "points": [
+            "Log/stream mode: ack means commit the group offset; the record stays in the log until retention; a stuck record blocks ordered progress for that partition unless the app skips it or emits to an error topic. State = one offset per (group, partition).",
+            "Work-queue mode: ack means delete/complete; the broker tracks a per-message lease (receipt handle, visibility deadline, receive count); ordering is weaker (competing consumers complete out of order). State = per-message in-flight rows + a DLQ.",
+            "Don't blend them: a single consumer should pick one contract. The DLQ is native to queue mode; in log mode the equivalent is an application-level error topic.",
+            "Choose queue mode for task distribution where any worker can take any message; choose log mode for ordered replayable streams and multiple independent readers."
+          ]
+        }
+      ],
       "recap": {
         "before": "A crash mid-process could lose or duplicate-block a message.",
-        "after": "In-flight messages are tracked; failures retry then dead-letter.",
-        "newRisk": "Visibility timeout tuning and DLQ monitoring are now needed."
+        "after": "A second, queue-style consumption mode tracks per-message leases; failures retry then dead-letter. Log mode (offsets) and queue mode (leases) now coexist as distinct contracts.",
+        "newRisk": "Two modes mean two state machines; visibility-timeout tuning and DLQ monitoring are now needed for queue mode."
       },
       "whyNow": [
-        "Queue-style consumers need safe in-flight handling once delivery semantics are set."
+        "Once delivery semantics are set, candidates must decide whether the system is a log, a work queue, or a dual-mode broker — and not mix the two contracts in one consumer."
       ],
       "view": {
         "nodes": [
@@ -1637,6 +1910,30 @@
           "definition": "Promoting a follower when the leader fails.",
           "whyItMatters": "Keeps the partition available without losing acked data.",
           "group": "Replication & Durability"
+        },
+        {
+          "term": "Leader epoch & fencing",
+          "definition": "A monotonically increasing number bumped on each leader change; a controller/metadata quorum owns per-partition leadership and the current epoch.",
+          "whyItMatters": "Producers and followers carrying a stale epoch are rejected (NotLeader/fenced), so a deposed leader can't accept writes after a partition.",
+          "group": "Replication & Durability"
+        },
+        {
+          "term": "min in-sync replicas",
+          "definition": "The minimum ISR size required to accept a write.",
+          "whyItMatters": "If too few replicas are in-sync, the leader refuses writes rather than risk acking data only one node holds.",
+          "group": "Replication & Durability"
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Control plane: who knows the leader, and how stale leaders are fenced",
+          "points": [
+            "A controller / metadata quorum owns per-partition metadata: leader, replica set, ISR, leader epoch, controller epoch.",
+            "Producers and consumers fetch metadata to find the current leader; on a NotLeader/epoch-changed response they refresh metadata and retry to the new leader.",
+            "Writes require at least min-ISR in-sync replicas; otherwise the leader refuses rather than ack data only it holds.",
+            "Only in-sync replicas are eligible for election. Promoting an out-of-sync follower (unclean election) trades durability for availability and silently loses acked data.",
+            "Leader epoch fences a deposed leader: writes or replication carrying an old epoch are rejected, preventing split-brain after a network partition."
+          ]
         }
       ],
       "options": [
@@ -1728,18 +2025,21 @@
       ],
       "view": {
         "nodes": [
+          "Controller",
           "Producer",
           "Leader",
           "Follower"
         ],
-        "caption": "The producer publishes to the leader replica, which replicates to a follower and acks the producer only after the in-sync follower confirms.",
+        "caption": "The controller assigns the partition leader and tracks ISR; the producer publishes to the leader, which replicates to a follower and acks only after the in-sync follower confirms.",
         "links": [
+          "controller-leader-elect",
           "producer-leader-publish",
           "leader-follower-replicate",
           "follower-leader-in-sync-ack",
           "leader-producer-ack-after-isr"
         ],
         "highlight": [
+          "Controller",
           "Leader",
           "Follower"
         ]
@@ -1798,6 +2098,84 @@
           },
           "highlight": [
             "Leader",
+            "Follower"
+          ]
+        },
+        {
+          "name": "Leader failover with epoch fencing",
+          "note": "The controller detects the dead leader, elects an in-sync follower with a bumped epoch, and the producer retries to the new leader; the old leader is fenced.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Producer",
+                "alias": "P"
+              },
+              {
+                "id": "Controller",
+                "label": "Controller"
+              },
+              {
+                "id": "Leader",
+                "label": "Old Leader (dies)"
+              },
+              {
+                "id": "Follower",
+                "label": "Follower -> New Leader"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Producer",
+                "to": "Leader",
+                "arrow": "->>",
+                "label": "publish (epoch=5)"
+              },
+              {
+                "from": "Leader",
+                "to": "Leader",
+                "arrow": "->>",
+                "label": "host dies"
+              },
+              {
+                "from": "Controller",
+                "to": "Controller",
+                "arrow": "->>",
+                "label": "detect failure; elect in-sync follower, epoch=6"
+              },
+              {
+                "from": "Controller",
+                "to": "Follower",
+                "arrow": "->>",
+                "label": "you are leader (epoch=6)"
+              },
+              {
+                "from": "Producer",
+                "to": "Leader",
+                "arrow": "->>",
+                "label": "retry publish (epoch=5)"
+              },
+              {
+                "from": "Leader",
+                "to": "Producer",
+                "arrow": "-->>",
+                "label": "NotLeader / fenced — refresh metadata"
+              },
+              {
+                "from": "Producer",
+                "to": "Follower",
+                "arrow": "->>",
+                "label": "publish to new leader (epoch=6)"
+              },
+              {
+                "from": "Follower",
+                "to": "Producer",
+                "arrow": "-->>",
+                "label": "ack (no acked data lost)"
+              }
+            ]
+          },
+          "highlight": [
+            "Controller",
             "Follower"
           ]
         }
@@ -1887,6 +2265,22 @@
             "Spread leaders evenly and move replicas gradually to avoid a rebalance storm.",
             "Consumer parallelism within a group can't exceed partition count — size accordingly."
           ]
+        },
+        {
+          "title": "Sizing from the capacity numbers",
+          "points": [
+            "Target partitions ≈ total throughput ÷ per-partition throughput: ~1 GB/s at ~10 MB/s per partition ≈ 100+ partitions, with headroom.",
+            "Broker count follows from per-broker disk write throughput and NIC, including ~3× replication traffic and per-group read fan-out — not just ingress.",
+            "Too many partitions is also a cost: more metadata, more open files/memory, longer leader-election and recovery times. Don't over-shard blindly."
+          ]
+        },
+        {
+          "title": "Hot keys (skew beats average)",
+          "points": [
+            "Key hashing spreads load only if keys are well-distributed; one hot key pins a whole partition and one consumer, so average throughput looks fine while one partition is saturated.",
+            "Mitigations: add a salt/sub-key to fan a hot key across partitions (giving up strict per-key order for it), use a custom partitioner, or isolate the hot tenant onto its own topic/partitions.",
+            "Detect via per-partition produce/consume lag, not just topic-level averages."
+          ]
         }
       ],
       "traps": [
@@ -1947,11 +2341,13 @@
   ],
   "finalDesign": {
     "title": "Final Design",
-    "description": "End-to-end: producers (with idempotency ids) publish to a key-routed, partitioned append-only log; each partition is leader-replicated and acked only after the in-sync set has it; consumer groups read in parallel from durable committed offsets with rebalancing on failure; queue-style consumers use visibility timeouts, acks, and a DLQ; partitions and leaders spread across brokers to scale.",
+    "description": "End-to-end: producers publish (with producer_id/epoch/seq) to the broker, which dedups and key-routes to a partitioned append-only log; a controller/metadata quorum owns leadership and ISR, so every partition (P0/P1/P2) is leader-replicated and acked only after the in-sync set has it — each has its own leader/follower set spread across brokers. Consumers choose a mode: stream/log mode reads in parallel from durable committed offsets with generation-fenced rebalancing on failure; work-queue mode uses per-message leases (visibility timeout), acks, and a DLQ. Dedup is broker-owned, not producer-owned.",
     "view": {
       "nodes": [
         "Producer",
+        "Broker",
         "Idem",
+        "Controller",
         "Router",
         "P0",
         "P1",
@@ -1966,10 +2362,13 @@
         "Ack",
         "DLQ"
       ],
-      "caption": "The producer dedups via the dedup store and the router hashes keys to partitions 0/1/2, each leader-replicated to a follower; the coordinator assigns partitions to consumers 1 and 2, which commit offsets, ack the visibility tracker, and dead-letter on retries.",
+      "caption": "The producer publishes with an idempotency id to the broker, which dedups against the dedup store and routes by key; the controller owns leader/ISR metadata, and each of partitions 0/1/2 is leader-replicated to a follower. The coordinator assigns partitions to consumers 1 and 2: in log mode they commit offsets; in queue mode they ack the visibility tracker, which dead-letters on retries.",
       "links": [
-        "producer-idem-idem-id",
-        "producer-router",
+        "producer-broker-publish",
+        "broker-idem-dedup",
+        "broker-router-route",
+        "controller-broker-metadata",
+        "controller-leader-elect",
         "router-p0-hash-key",
         "router-p1",
         "router-p2",
@@ -1988,6 +2387,146 @@
       ]
     }
   },
+  "technologyChoices": [
+    {
+      "concern": "Broker / log engine",
+      "steps": [
+        "durable-log",
+        "scale"
+      ],
+      "selfHosted": [
+        "Apache Kafka",
+        "Apache Pulsar",
+        "RabbitMQ (streams / quorum queues)",
+        "Redpanda"
+      ],
+      "cloud": {
+        "aws": [
+          "Amazon MSK",
+          "Amazon Kinesis Data Streams",
+          "Amazon SQS"
+        ],
+        "gcp": [
+          "Google Cloud Pub/Sub",
+          "Managed Service for Kafka"
+        ],
+        "azure": [
+          "Azure Event Hubs",
+          "Azure Service Bus"
+        ]
+      },
+      "tradeoff": [
+        "Self-hosting a log gives full control of retention, tuning, and cost but you own brokers, rebalancing, and disk capacity planning.",
+        "Managed/SaaS removes broker ops and scales on demand, at higher per-message cost and less low-level control.",
+        "SQS/Service Bus are work-queue-mode native (leases, DLQ); Kafka/Kinesis/Event Hubs are log-mode native (offsets)."
+      ],
+      "makesIrrelevant": [
+        "A fully managed, autoscaling broker can remove most manual partition/broker capacity planning."
+      ]
+    },
+    {
+      "concern": "Control plane / metadata & coordination",
+      "steps": [
+        "replication",
+        "consumer-groups"
+      ],
+      "selfHosted": [
+        "Kafka KRaft (built-in quorum)",
+        "ZooKeeper",
+        "etcd"
+      ],
+      "cloud": {
+        "aws": [
+          "Managed inside MSK"
+        ],
+        "gcp": [
+          "Managed inside Pub/Sub"
+        ],
+        "azure": [
+          "Managed inside Event Hubs"
+        ]
+      },
+      "tradeoff": [
+        "An external coordinator (ZooKeeper/etcd) is operationally separate to run and keep highly available.",
+        "A built-in quorum (KRaft) folds metadata into the brokers, simplifying ops at the cost of coupling."
+      ]
+    },
+    {
+      "concern": "Backpressure & admission control",
+      "steps": [
+        "scale"
+      ],
+      "selfHosted": [
+        "Producer quotas / throttling",
+        "Bounded producer buffers + blocking sends",
+        "Per-client rate limits"
+      ],
+      "cloud": {
+        "aws": [
+          "MSK / Kinesis throughput limits & throttling"
+        ],
+        "gcp": [
+          "Pub/Sub flow control"
+        ],
+        "azure": [
+          "Event Hubs throughput units / throttling"
+        ]
+      },
+      "tradeoff": [
+        "Throttling producers protects brokers when disk, network, or page cache saturate, but pushes the backlog upstream where it must be handled.",
+        "Dropping or shedding load keeps the broker healthy but loses messages — only acceptable for best-effort traffic."
+      ]
+    },
+    {
+      "concern": "Observability (lag, throughput, retention)",
+      "selfHosted": [
+        "Prometheus + Grafana",
+        "Consumer-lag exporters",
+        "Kafka JMX metrics"
+      ],
+      "cloud": {
+        "aws": [
+          "CloudWatch"
+        ],
+        "gcp": [
+          "Cloud Monitoring"
+        ],
+        "azure": [
+          "Azure Monitor"
+        ]
+      },
+      "tradeoff": [
+        "Consumer lag and retention-expiry are the signals that matter: a consumer falling behind faster than retention silently loses data.",
+        "Watch for rebalance storms and per-partition skew, not just topic-level averages."
+      ]
+    },
+    {
+      "concern": "Security & multi-tenant isolation",
+      "selfHosted": [
+        "TLS + SASL auth",
+        "Topic-level ACLs",
+        "Per-tenant quotas"
+      ],
+      "cloud": {
+        "aws": [
+          "IAM auth",
+          "MSK/SQS resource policies"
+        ],
+        "gcp": [
+          "IAM",
+          "Pub/Sub per-topic IAM"
+        ],
+        "azure": [
+          "Microsoft Entra ID",
+          "Service Bus RBAC + SAS"
+        ]
+      },
+      "tradeoff": [
+        "Topic/queue-level ACLs and per-tenant quotas prevent one noisy tenant from starving others on a shared cluster.",
+        "Per-tenant clusters give the strongest isolation at the cost of more infrastructure to run."
+      ]
+    }
+  ],
   "satisfies": {
     "functional": [
       {
@@ -2020,8 +2559,16 @@
       },
       {
         "requirement": "Dead-letter failing messages",
-        "how": "Retry cap routes poison messages to a DLQ.",
+        "how": "Work-queue mode: a retry cap routes poison messages to a DLQ. Log mode: the app skips and emits to an error topic.",
         "steps": [
+          "ack-visibility"
+        ]
+      },
+      {
+        "requirement": "Two consumption modes (log + work-queue)",
+        "how": "Log mode tracks a group offset; work-queue mode tracks per-message leases, retries, and a DLQ — separate state machines on the same log.",
+        "steps": [
+          "consumer-groups",
           "ack-visibility"
         ]
       }
@@ -2140,7 +2687,9 @@
     "How would you handle a slow consumer that falls far behind retention and risks data loss?",
     "How do you do geo-replication across regions and what consistency do you give?",
     "How would you expose backpressure to producers when brokers are saturated?",
-    "How do you monitor consumer lag and rebalance storms in production?"
+    "How do you monitor consumer lag and rebalance storms in production?",
+    "How would you design the DLQ replay workflow — inspecting, fixing, and re-injecting dead-lettered messages safely?",
+    "How does the controller/metadata quorum stay consistent, and what happens to producers during a leader-epoch change?"
   ],
   "toProbeFurther": {
     "links": [

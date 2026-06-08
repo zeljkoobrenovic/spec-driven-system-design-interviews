@@ -5,229 +5,213 @@ Review date: 2026-06-08
 
 ## Executive Summary
 
-This is a strong interview walkthrough for the core distributed log shape: append-only partitions, offsets, consumer groups, idempotent producers, ISR replication, and partition-based scaling are introduced in a coherent order. The case is usable as-is for teaching a Kafka-like queue/log, and it has good traps, follow-ups, and concrete trade-offs.
+The recent dataset changes materially improve this interview. The earlier review's biggest issues are mostly addressed: the requirements now call out log mode vs. work-queue mode, the API and data model include generation fencing and queue leases, the capacity section has real throughput/storage math, replication now has controller metadata and leader epochs, and the final design makes broker-owned dedup explicit.
 
-The main weakness is that the dataset mixes two different products into one final architecture: a partitioned log with consumer offsets and a work queue with per-message visibility leases, deletion, retries, and DLQ. Both are valid, but their APIs, data model, and failure modes diverge. The final design currently combines them without enough state or mode boundaries, so candidates may learn an architecture that is neither a clean Kafka-like log nor a clean SQS-like queue.
+The case is now a strong Kafka/SQS hybrid teaching walkthrough. The main remaining concern is not whether dual-mode messaging is acknowledged; it is whether the final architecture explains the exact boundary between a replayable log and a leased work queue clearly enough that candidates do not mix the state machines during an interview.
 
 | Axis | Rating | Notes |
 | --- | --- | --- |
-| System design soundness | 4/5 | Strong log/consumer-group/replication core; queue-vs-log semantics need sharper boundaries. |
-| Production realism | 3/5 | Good failure traps, but capacity math, controller metadata, backpressure, leases, and ops are under-modeled. |
-| Pedagogical flow | 4/5 | The step sequence is clear; Step 5 should be framed as a branch or optional queue mode. |
-| Dataset/rendering fit | 4/5 | JSON is structurally clean; a few node/type inconsistencies reduce diagram clarity. |
-| Overall | 4/5 | A solid case that needs semantic tightening more than a rewrite. |
+| System design soundness | 4/5 | Strong distributed-log core plus explicit queue mode; queue-mode state still needs more precision. |
+| Production realism | 4/5 | Much better capacity, fencing, metadata, and ops coverage; DLQ/redrive and lease edge cases remain thin. |
+| Pedagogical flow | 4/5 | The step sequence is coherent and improved; Step 5 still carries the highest cognitive load. |
+| Dataset/rendering fit | 4/5 | JSON and references validate; final diagram slightly under-shows multi-broker replication. |
+| Overall | 4/5 | A solid book-quality case with targeted refinements left. |
 
 ## What Works Well
 
-- The progression from in-memory queue to durable log is effective. The first step exposes durability and single-node limits before adding machinery.
-- The durable-log step teaches the most important shape: append-only partitions, offsets, sequential writes, and per-key ordering.
-- Consumer groups are introduced at the right time, with useful discussion of rebalances and durable offset commits.
-- The delivery-semantics section correctly avoids promising literal exactly-once delivery and instead teaches at-least-once plus idempotency.
-- Replication covers the key interview point: an ack is only meaningful if it waits for enough in-sync replicas.
-- The traps and follow-ups are practical: poison messages, premature offset commits, repartitioning, lag, geo-replication, and backpressure are all realistic topics.
+- The update fixed the old semantic ambiguity by adding a functional requirement for two consumption contracts and reframing Step 5 as an alternative queue mode.
+- Capacity is now grounded: raw ingress, RF=3 write load, retention storage, read fan-out, and partition/broker sizing are all explicit.
+- The API now distinguishes stream/log polling and commits from queue receive/ack, and commits include member identity plus generation fencing.
+- The data model now includes `partition_metadata` and queue-mode `inflight` state, which makes the controller and visibility tracker concrete instead of purely diagrammatic.
+- Replication is much more production-realistic with controller metadata, min ISR, leader epochs, stale leader fencing, and a failover flow.
+- The final design now correctly places dedup behind the broker instead of making the producer look like it owns the dedup store.
+- The new technology choices section usefully separates log-native systems from queue-native systems.
 
 ## Highest-Impact Issues
 
-### 1. The final design conflates log-stream and work-queue semantics
+### 1. Dual-mode support is explicit, but the queue/log boundary still needs sharper mechanics
 
-The dataset says it is designing a "message queue / log (think Kafka or SQS)" and the steps build a Kafka-like append-only log with consumer offsets. Step 5 then adds SQS-style visibility timeout, per-message invisibility, deletion/advance, retry count, and DLQ. The final design includes both durable committed offsets and an `Ack / Visibility Tracker`.
+The dataset now says the final design supports both stream/log mode and work-queue mode with separate state machines. That is the right fix. The remaining issue is that several phrases still imply queue-mode ack changes the append-only partition log itself: Step 5 says the tracker "requeues" to `P0`, and the flow says "delete / advance" against the partition.
 
-That mix is teachable, but only if the interview explicitly says there are two consumption modes:
+For a log-backed queue overlay, the log record should remain immutable. The queue-mode tracker should update visibility/lease state, not mutate the log or put the original record back into the partition. If the design instead means an SQS-style queue, the append-only partition log is an implementation detail and ordering/replay guarantees should be weaker.
 
-- stream mode: records remain in the log until retention; consumers commit offsets; stuck records block ordered progress for that partition unless the application skips or emits to an error topic.
-- work-queue mode: messages have leases/receipt handles, visibility timeouts, retry counters, deletion on ack, and a DLQ; ordering is weaker or scoped differently.
+Concrete fix: add a short mode contract note under Step 5 or the final design:
 
-Concrete fix: make Step 5 a branch named "Queue Semantics on Top of the Log" or "Alternative Queue Mode". Add a short decision note that the final design either supports both modes with separate state machines, or chooses the log mode and treats DLQ as an application/error-topic pattern. If both modes stay, add mode-specific API and data model fields.
+- log mode: records stay in the partition log until retention; ack means commit group offset.
+- queue mode: records are selected through a visibility index/lease table; ack marks the lease/message complete; timeout only changes `visible_after`; DLQ emits/moves a failed message after max receives.
 
-### 2. The API and data model do not support the visibility/DLQ behavior promised later
+### 2. Queue-mode API and `inflight` data model need more production fields
 
-The API has publish, poll, and commit. The data model has topics, partition_log, consumer_offsets, and dedup_ids. That supports the log/offset model, but not the visibility-timeout model.
+The added `/receive` and `/ack` endpoints are a good start, but the queue-mode state is still underspecified for the behavior promised in Step 5.
 
-Missing state for Step 5:
+Missing or unclear fields:
 
-- stable message id or receipt handle for ack/delete
-- visibility deadline / lease expiry
-- delivery attempt count
-- retry policy and max receives
-- DLQ target and dead-letter reason
-- per-message in-flight ownership
+- `queue`/`topic`, `partition`, and `offset` pointer from `inflight` back to the immutable log record
+- current lease owner/consumer id
+- lease version or attempt id so stale receipt handles are fenced deterministically
+- status/completion marker separate from receipt handle
+- DLQ reason, first/last receive timestamps, and redrive eligibility
+- retry policy ownership: per queue, per topic, or per message
 
-The `POST /commit` API also lacks generation/member fencing for consumer groups, so an old consumer can commit offsets after a rebalance unless the coordinator rejects stale generations. The poll API lacks `consumer_id`, group member identity, assignment epoch, or partition selection.
+Concrete fix: extend `inflight (work-queue mode)` and optionally add `queue_policies` / `dlq_messages`. Add `POST /change-visibility` or `POST /nack` if the case wants to discuss long-running work and explicit retry.
 
-Concrete fix: either keep only offset commits in the primary API and describe DLQ as consumer-side output/error topic, or add queue-mode endpoints such as `POST /ack` with a receipt handle and model the lease/retry fields explicitly.
+### 3. The final diagram still under-represents replicated partition placement
 
-### 3. Capacity is stated, not derived
+The final description says every partition has its own leader/follower set spread across brokers. The final view, however, has links only from `P0` to generic `Leader` and `Follower`; `P1` and `P2` are routed but not visually replicated.
 
-The capacity section gives useful targets (`~1M msgs/s`, `~1 KB typical`, hours to days retention), but it never converts them into storage, network, broker, or partition pressure.
+That is not a schema error, but it can mislead learners into thinking only one partition is replicated or that there is one global leader/follower pair.
 
-For example, 1M messages/sec at 1 KB is about 1 GB/sec raw ingress. With replication factor 3, the cluster writes about 3 GB/sec before compression and reads. One day of retention is roughly 86 TB raw before replication; with RF=3 it is roughly 259 TB before compression and segment overhead. Each active consumer group can add another read stream, so "many groups" materially changes network and disk/page-cache requirements.
+Concrete fix: either add broker nodes (`Broker A/B/C`) with partition leaders/followers placed on them, or add explicit replica-set labels/links for P1 and P2. If the diagram must stay compact, add a caption sentence saying "P0 is expanded as the example; P1/P2 have the same leader/follower pattern."
 
-Concrete fix: add a capacity paragraph or table that estimates raw ingress, replicated write load, retention storage, read fan-out, batch size, compression assumption, target partition count, and rough broker count. This would make the scaling step much more grounded.
+### 4. Exactly-once wording is improved but still mixes identifiers
 
-### 4. Final-design dedup path contradicts Step 4
+The API and data model now use `producer_id`, `producer_epoch`, and `seq`. Some captions still say "idempotency id." That is understandable shorthand, but it slightly blurs the stronger guarantee being taught: broker-owned producer sequence dedup within a bounded producer/session window.
 
-Step 4 correctly says the broker deduplicates producer retries by producer id and sequence before appending once. The final design view links `Producer -> Idem`, and the caption says "The producer dedups via the dedup store". That suggests the producer directly calls the dedup store, which weakens the guarantee because the append and dedup decision must be broker/partition-leader controlled.
+Concrete fix: replace "idempotency id" in Step 4 and final captions with "producer id/epoch/sequence" or explicitly say the idempotency id is the tuple. Consider noting that dedup is usually per producer and partition, not just one global `last_seq` per producer.
 
-Concrete fix: include `Broker` or `Leader` as the dedup decision point in the final design, and show `Producer -> Broker/Leader -> Idem -> append`. Alternatively, relabel the producer-to-Idem edge so it is clearly "idempotency id carried with publish" rather than a direct store call.
+### 5. Operational coverage exists, but the final walkthrough does not yet operationalize it
 
-### 5. Replication needs controller/metadata and fencing detail
+The technology choices and follow-ups now mention backpressure, lag, retention, security, quotas, and DLQ replay. These are good, but they mostly live in wrap-up material. A production message broker interview usually needs at least one operational loop in the main walkthrough.
 
-The replication step covers ISR, leader election, and unclean-election risk, which is good. What is missing is the control-plane story: who knows the leader for each partition, how producers find it, what happens when leadership changes, and how stale leaders/producers are fenced.
+Concrete fix: add a small "Operations & Failure Handling" deep dive in Step 7 or final design covering:
 
-Concrete fix: add a controller/metadata quorum concept or deep dive. Mention leader epoch, partition metadata, min in-sync replicas, stale leader fencing, and producer retry behavior after `NotLeader`/epoch changes. This turns the replication section from a simple pair of nodes into a realistic distributed-system component.
+- producer throttling when disk/page cache/network saturate
+- consumer lag and retention-expiry alerting
+- rebalance storm detection
+- DLQ inspection and safe redrive
+- topic/queue ACLs and per-tenant quotas
 
 ## System Design Soundness
 
-Requirements are reasonable and map to the steps, but they should force the queue-vs-log choice earlier. "Dead-letter messages that repeatedly fail processing" implies per-message retry accounting, while "Consumers subscribe and read messages, tracking their position" implies offset-based log consumption. Put that tension in the requirements as an explicit choice.
+The core distributed-log design is sound. It starts from an in-memory baseline, moves to append-only partitions, adds consumer groups and offsets, then layers delivery semantics, queue-mode leases, replication, and partition scaling. That is the right sequence for a message broker case.
 
-The API is serviceable for a log but too thin for a production broker. Publish should distinguish `producer_id`, `producer_epoch`, and sequence from a generic `idempotency_id`, because the data model uses producer/sequence dedup. Poll should carry group, member id, generation/epoch, max bytes, max wait, and assigned partitions. Commit should include group generation and per-partition offsets.
+The strongest parts are now capacity sizing and replication correctness. The dataset connects 1M messages/sec and 1 KB payloads to raw ingress, replicated write load, daily retention storage, read fan-out, and partition count. It also names the controller metadata needed for leader election and fencing.
 
-The data model needs more metadata. The partition log should include topic and partition in its primary key, not just partition/offset. It should also mention segment files, indexes, retention timestamps, and optional headers/schema id. Consumer offsets should include topic, group, partition, committed offset, metadata, commit timestamp, and generation. For replication, add partition metadata with leader, replicas, ISR, leader epoch, and controller epoch.
-
-The core architecture scales plausibly by partitioning, but the final view only shows `P0` connected to leader/follower replicas. If `P1` and `P2` are in the final design, the caption or diagram should make clear that each partition has its own leader/follower replica set and leaders are spread across brokers.
+The remaining design tension is dual-mode support. A hybrid broker can be valid, but the dataset should keep saying "two contracts" whenever queue-mode visibility appears. Work-queue completion should not look like a mutation of the replayable log.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: In-Memory Queue
 
-This is a good baseline. It exposes durability and single-node throughput limits without overloading the candidate. Consider adding one sentence that an in-memory queue can be acceptable for local, ephemeral, best-effort work, so the rejection is tied to the stated durability requirement rather than presented as universally wrong.
+This is a good baseline. The recent addition that in-memory queues are acceptable for ephemeral best-effort work is useful because it rejects the option only against the stated durability requirement.
 
 ### Step 2: Durable Partitioned Log
 
-This is the strongest step. The default option is correct and the table-with-consumed-flag alternative is a useful foil. The "row-per-message table" option caption currently says "append-only log table" while also describing flag updates; call it a relational table or mutable message table to avoid blurring it with the chosen append-only log.
-
-The step would benefit from one concrete capacity tie-in: segment files, sparse indexes, batching, page cache, and retention cleanup are why the log stays fast at high throughput.
+This is still one of the strongest steps. The updated row-per-message alternative is clearer because it is now a mutable relational table, not an "append-only log table." The deep dive on segment files, sparse indexes, batching, page cache, and retention cleanup is exactly the right level.
 
 ### Step 3: Consumer Groups & Offsets
 
-The concepts are well chosen. The default option should mention generation fencing: after a rebalance, commits from the old generation must be rejected. Without that, a crashed or paused consumer can overwrite progress after losing partition ownership.
-
-A sequence flow for "consumer crashes -> coordinator detects heartbeat timeout -> rebalance -> new owner resumes at committed offset" would make this step as concrete as the publish and replication steps.
+The generation-fencing update fixed a major realism gap. The new crash/rebalance flow is concrete and teaches why stale commits must be rejected. This step now has enough detail for a senior-level answer.
 
 ### Step 4: Delivery Semantics & Idempotency
 
-The distinction between exactly-once delivery and exactly-once effect is valuable. The text should tighten one phrase: broker-side producer dedup gives exactly-once append to the log within a bounded producer session/window, not exactly-once processing across consume -> process -> produce. The latter needs transactions, an outbox, or idempotent consumer-side writes.
+The updated wording correctly limits broker producer dedup to exactly-once append within a bounded window/session. The only remaining polish is naming consistency: captions should use the same producer id/epoch/seq tuple as the API and data model.
 
-The dedup data model should align with the API. Today the API uses `idempotency_id`, while the data model stores `producer_id` and `seq`. Pick one model or explain how the idempotency id is derived.
+### Step 5: Queue Semantics on Top of the Log
 
-### Step 5: Acknowledgement, Visibility & Dead-Lettering
-
-This is the main conceptual branch. The content is realistic for a work queue, but it is not a natural additive step on top of a Kafka-like offset log unless the dataset says it is adding a second consumption mode.
-
-The flow says ack deletes or advances a message. In a log, ack/commit advances the group offset and the record remains until retention. In a work queue, ack deletes or hides completion state, and the broker tracks per-message leases. The step should explicitly compare these two models and explain which one the final design is using.
+This is much improved and now explicitly says it is a second consumption mode. Keep that framing. The next refinement is to make the implementation mechanics precise: timeout should update lease visibility, ack should complete/delete queue state, and the immutable log should remain separate unless the chosen product is queue-native rather than log-native.
 
 ### Step 6: Replication & Durability
 
-The ack-after-ISR trade-off is correct. Add min ISR, leader epoch, controller metadata, and unclean leader election as first-class terms or a deep dive. These details are not optional in production; they are the difference between "replication exists" and "acked data is actually safe."
+This step is now production-realistic. The controller, min ISR, leader epoch, unclean election warning, and failover flow are strong. The only suggested addition is to connect leader metadata back to client routing in Step 7/final design so candidates understand how producers discover the current leader.
 
 ### Step 7: Scaling Partitions & Brokers
 
-This is directionally right. It could be stronger with numbers from the capacity section: target partitions from throughput and max partition throughput, broker count from disk/network, and a warning about too many partitions increasing metadata, memory, and recovery costs.
-
-The repartitioning guidance is good. Consider adding "hot keys" as an explicit failure mode and mitigation, because key skew is often more important than average throughput.
+The added sizing and hot-key deep dives are valuable. This step could become the natural home for a short operations section: admission control, per-partition lag, retention-expiry risk, rebalance storms, and quotas.
 
 ## Final Design Review
 
-The final design includes most components introduced by the steps, and the description is concise. The largest issue is the dedup and visibility paths:
+The final design is now mostly coherent. It includes the broker, dedup store, controller, router, partitions, replicas, coordinator, offsets, visibility tracker, and DLQ. The description explicitly says consumers choose either log mode or work-queue mode.
 
-- `Producer -> Idem` in the final diagram makes dedup look producer-owned, while Step 4 makes it broker-owned.
-- `Ack / Visibility Tracker` and `Consumer Offsets` are both shown as final requirements without defining whether this is log mode, queue mode, or both.
-- `P1` and `P2` appear without replica links, while the caption says each partition is leader-replicated.
-- There is no controller/metadata component, even though routing, leader election, ISR membership, and partition assignment all depend on it.
+The final view should be tightened in two places:
 
-A cleaner final design would show `Producer -> Router/Broker -> Partition Leader -> Followers`, broker-owned idempotency state, controller metadata, consumer group coordinator, offsets store, and either an optional queue-mode lease/DLQ subsystem or an application-level error topic.
+- Visually show that P1 and P2 are also replicated, or state that P0 is the expanded example.
+- Keep the visibility tracker as a queue-mode lease/completion subsystem, not as something that mutates the append-only log.
 
 ## Concept Introduction and Learning Flow
 
-Concepts are mostly introduced just in time. The strongest concept chain is offset -> consumer group -> rebalance -> delivery semantics -> ISR -> partition scaling.
+The concept chain is now strong:
 
-The weak point is that "visibility timeout" is introduced after offset commits without clearly saying it is a different consumption contract. Add a short concept bridge before Step 5:
+- append-only log -> partitioning -> offsets
+- consumer groups -> rebalance -> generation fencing
+- at-least-once -> broker producer dedup -> idempotent effects
+- log mode vs. queue mode -> visibility lease -> DLQ
+- ISR -> leader epoch -> safe failover
+- partition count -> broker count -> hot-key skew
 
-"Offset logs and leased work queues both solve consumer failure, but they track different state. Logs track a group position; leased queues track per-message ownership and retry count."
-
-That bridge would prevent candidates from mixing incompatible semantics in their answer.
+The only concept that still needs extra care is queue mode. The dataset correctly introduces it as a separate contract, but the diagrams and flows should keep repeating that separation so the learner does not collapse offset commits, visibility leases, and deletion into one vague "ack" concept.
 
 ## Step-to-Final-Design Coherence
 
-Every step contributes something to the final design, but some transitions need sharper ownership:
+Most step contributions now land cleanly in the final design:
 
-- Step 2 contributes partitions and offsets.
-- Step 3 contributes group coordination and committed offsets.
-- Step 4 contributes producer idempotency, but the final diagram should keep it broker-owned.
-- Step 5 contributes visibility and DLQ, but only if the final architecture supports queue-mode state.
-- Step 6 contributes replication, but the final diagram should imply every partition has replicas.
-- Step 7 contributes leader spread, but the final view does not show broker/leader distribution beyond `P0`.
+- Step 2 contributes key-routed partitions and append-only storage.
+- Step 3 contributes the coordinator, group members, and offset store.
+- Step 4 contributes broker-owned dedup state.
+- Step 5 contributes visibility leases and DLQ, with the caveat that it is queue-mode only.
+- Step 6 contributes controller metadata and replicated leaders/followers.
+- Step 7 contributes partition scaling and leader spread.
 
-The final design should be edited after the semantic decision in Step 5, not before.
+The final diagram should better show Step 6 and Step 7 together: multiple partitions spread across multiple brokers, each with a leader and followers.
 
 ## Realism Compared With Production Systems
 
-The dataset is realistic on the main algorithmic points, but production systems need a few more operational hooks:
+Compared with production systems, the dataset is now credible. It covers the hard topics: ordered partitions, offset ownership, stale generation fencing, producer sequence dedup, visibility leases, ISR, safe election, repartitioning, hot keys, and capacity sizing.
 
-- backpressure and admission control when broker disks, network, or page cache saturate
-- producer batching, compression, max request size, and retry policies
-- consumer lag monitoring, retention-expiry alerts, and slow-consumer handling
-- rebalance storm detection, static membership, and cooperative assignment
-- quotas and multi-tenant isolation across topics/groups
-- authentication, authorization, and topic-level ACLs
-- schema/versioning strategy for message payloads
-- segment retention, compaction, and disk-full behavior
-- DLQ replay workflow, not just DLQ storage
+Remaining production caveats:
 
-These do not all need full steps, but at least observability/backpressure and security/tenancy should appear in the wrap-up or technology/operations discussion.
+- queue-mode lease expiry and redrive workflows need more detail
+- producer batching/compression appears in capacity notes but not in the API/walkthrough as an operational knob
+- retention-expiry data loss for slow consumers deserves a concrete alerting/remediation note
+- tenant isolation and ACLs are present in technology choices but not in the final architecture
+- `dedup_ids` may need partition/topic scoping or a bounded dedup window description in the model
 
 ## Dataset and Renderer-Facing Observations
 
 - JSON parsing succeeds.
-- Step `view.links` references resolve against `highLevelArchitecture.links`.
+- Step, option, and final-design `view.nodes` resolve against `highLevelArchitecture.nodes`.
+- Step, option, and final-design `view.links` resolve against `highLevelArchitecture.links`.
 - `satisfies.*.steps` references resolve to real step ids.
-- `Log` is typed as `observability`, but in Step 2 it represents a mutable row-per-message table. Use a database-like type or rename it if it is meant as a log/telemetry node.
-- `B` and `Broker` both appear as broker-like nodes, and `F` and `Follower` both appear as follower-like nodes. Prefer canonical ids in sequence participants with aliases instead of duplicate architecture nodes.
-- Option-local nodes `Assign` and `ConsumerDedup` render through the fallback metadata path. That is valid, but if those option diagrams remain important, add explicit metadata or object refs with render labels/types so they get consistent visual semantics.
-- Raw Mermaid requirements/capacity diagrams are acceptable here, but any future edits should preserve the project convention that architecture steps use structured `view` objects.
+- `patterns[*].steps` references resolve to real step ids.
+- The old duplicate `B`/`Broker`, `F`/`Follower`, and `I`/`Idem` inconsistencies are fixed.
+- `Log` is now typed as a `database` and labelled as a mutable message table, which fits the rejected alternative.
+- There are no AI visuals or explainer comic wired for this dataset. That is acceptable; the review did not require generated assets.
 
 ## Recommended Edits, Prioritized
 
-### P1: Split or explicitly dual-mode the queue/log semantics
+### P1: Clarify queue-mode mechanics over the immutable log
 
-Decide whether this interview is primarily a Kafka-like log, an SQS-like work queue, or a dual-mode broker. Then align requirements, API, data model, Step 5, and final design with that decision.
+Change "requeue to partition" / "delete or advance" language so queue mode updates lease/completion state and DLQ routing, while the log remains immutable until retention.
 
-### P1: Fix final-design dedup ownership
+### P1: Complete the queue-mode state model
 
-Move dedup behind the broker/partition leader, or relabel the final edge so the producer is not shown directly owning the dedup store.
+Add queue/topic/partition/offset linkage, lease owner, lease version, completion status, DLQ reason, timestamps, and retry policy ownership to the work-queue model.
 
-### P1: Add missing state for visibility/DLQ if queue mode remains
+### P2: Improve the final diagram's replication picture
 
-Add receipt handles, lease expiry, retry count, DLQ target/reason, and ack/delete API semantics.
+Show P1/P2 replication or explicitly label P0 as the expanded example for every partition's leader/follower set.
 
-### P2: Add capacity math
+### P2: Normalize idempotency terminology
 
-Translate 1M msg/s and 1 KB messages into raw ingress, replicated writes, retention storage, consumer read fan-out, partition count, and broker count.
+Use `producer_id` + `producer_epoch` + `seq` consistently in captions, or define that "idempotency id" means that tuple.
 
-### P2: Add controller/metadata/fencing
+### P2: Add an operations deep dive
 
-Model partition leadership, ISR membership, leader epochs, stale commit fencing, and producer retries after leader changes.
+Add one concise section covering throttling, lag/retention alerts, rebalance storms, quotas/ACLs, and DLQ redrive.
 
-### P2: Tighten exactly-once wording
+### P3: Add one queue-mode failure flow
 
-Say producer idempotency gives exactly-once append within a bounded window/session. Consume-process-produce exactly-once effect needs transactions, outbox, or idempotent side effects.
-
-### P3: Add missing flows and operational sections
-
-Add a rebalance flow, a leader-failover flow, and an operations note covering lag, backpressure, quotas, ACLs, and retention-expiry alerts.
-
-### P3: Clean up diagram metadata
-
-Fix the `Log` type, reduce duplicate broker/follower nodes, and add metadata for option-local nodes if they remain.
+A receipt-handle expiry flow would teach why stale acks are rejected and why lease versions matter.
 
 ## What Not To Change
 
-- Keep the baseline-to-log progression. It is pedagogically effective.
-- Keep the append-only log vs mutable table comparison.
-- Keep the explicit discussion of at-least-once plus idempotency instead of promising literal exactly-once delivery.
-- Keep the ISR replication trade-off and unclean-election trap.
-- Keep the follow-up questions; they are well chosen for senior/staff-level probing.
+- Keep the baseline-to-log progression.
+- Keep the row table vs. append-only log comparison.
+- Keep the explicit two-mode framing; it is now the defining strength of the case.
+- Keep the generation-fencing and leader-epoch material.
+- Keep the capacity math and hot-key deep dives.
+- Keep the technology choices section, especially the distinction between log-native and queue-native products.
 
 ## Bottom Line
 
-This is a strong draft with the right core distributed-systems ideas. Its main improvement is not more features; it needs sharper semantic boundaries. Once the dataset clearly separates offset-log consumption from visibility-timeout queue consumption, the rest of the recommendations are straightforward production-hardening edits.
+The recent changes turned this from a good but semantically mixed draft into a strong dual-mode messaging interview. The remaining work is targeted: make queue-mode lease state precise, make the final diagram show replication more faithfully, and pull one operational loop into the main walkthrough.

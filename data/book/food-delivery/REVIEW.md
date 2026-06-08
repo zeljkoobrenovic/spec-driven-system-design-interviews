@@ -5,214 +5,200 @@ Review date: 2026-06-08
 
 ## Executive Summary
 
-This is a strong and interview-ready walkthrough. It has a clean progression from baseline order placement to state machine, geo indexing, dispatch, tracking, saga reliability, and regional scale. The teaching flow is especially good: every step exposes the next missing mechanism instead of dumping the full architecture at once.
+This review reflects the current dataset after the recent food-delivery revision. The prior high-impact gaps around capacity math, lifecycle APIs, reliability schema, offer leases, last-known location storage, and outbox/event publication have been materially addressed. The case is now a strong book-quality interview walkthrough with a credible production spine: durable order state machine, geo-indexed courier matching, live tracking via a last-known cache, saga compensation, transactional outbox, and region/cell scaling.
 
-The highest-impact gaps are mostly production-detail omissions rather than structural defects. The dataset should make capacity math concrete, expose the lifecycle/dispatch APIs that the architecture relies on, add explicit data structures for transition history, idempotency, payment and assignment attempts, and show the last-known location/cache and event/outbox path as first-class architecture elements rather than prose-only mechanisms.
+The remaining issues are narrower. The dataset should remove a few semantic inconsistencies around tracking reads and direct notification links, make the state machine's rejection/terminal states explicit, and turn several real failure modes into concrete flows rather than prose or follow-up questions. The design is no longer missing its core production mechanisms; the next improvements are about precision and operational completeness.
 
 | Axis | Rating | Notes |
 | --- | --- | --- |
-| System design soundness | 4 | Strong core mechanisms; needs more explicit state, idempotency, and partitioning details. |
-| Production realism | 3.5 | Covers sagas and geo writes, but understates leases, retries, outbox, provider callbacks, and operational safety. |
-| Pedagogical flow | 4.5 | Excellent step sequencing and problem revelation. |
-| Dataset/rendering fit | 4 | JSON is valid and references resolve; missing concrete visual nodes for prose-only mechanisms. |
-| Overall | 4 | A solid case that would become excellent with more implementation-level specificity. |
+| System design soundness | 4.5 | Strong core architecture with concrete capacity, state, idempotency, geo, tracking, and outbox mechanisms. |
+| Production realism | 4 | Good treatment of leases, retries, provider ambiguity, privacy, and degradation; still light on observability, connection fanout, and some edge workflows. |
+| Pedagogical flow | 4.5 | Excellent step progression from baseline to lifecycle, geo, dispatch, tracking, saga, and scale. |
+| Dataset/rendering fit | 4.5 | JSON and references resolve; remaining issues are semantic diagram/API consistency rather than schema breakage. |
+| Overall | 4.5 | A strong flagship case that mostly needs final production polish. |
 
 ## What Works Well
 
-- The interview has a clear teaching spine: naive order row -> lifecycle state machine -> geo index -> dispatch -> tracking -> saga -> regional scale.
-- Food delivery is treated as a three-sided workflow, not a generic ride-matching problem. Restaurant readiness and courier offer/accept are called out.
-- The geo-index options are realistic and balanced: geohash/S2, Redis GEO, and adaptive spatial indexing each have meaningful pros and cons.
-- Dispatch options teach real tradeoffs between greedy matching, batched optimization, and broadcast/pull acceptance.
-- The reliability step correctly centers the state machine as the saga ledger and names idempotent transitions.
-- Renderer-facing basics are clean: source JSON parses, step view nodes resolve to `highLevelArchitecture.nodes`, step view link ids resolve, sequence participants map to canonical node ids, `satisfies[*].steps[*]` slugs resolve, pattern references resolve, probe links resolve, and final-design groups resolve through `highLevelArchitecture.types`.
+- The recent revision fixed the old review's biggest concerns: capacity is now quantified, APIs include lifecycle and dispatch transitions, and the data model includes transition history, idempotency keys, payment attempts, courier offer leases, and outbox events.
+- The narrative remains clear: the reader discovers one missing mechanism at a time instead of seeing the final architecture too early.
+- Food delivery is modeled as a three-party workflow with restaurant readiness, courier availability, eater tracking, and payment compensation, not just a generic matching system.
+- Dispatch is now much more credible: time-boxed offer leases, `expires_at`, `offer_version`, CAS accept, timeout requeue, assignment attempts, and stale/busy courier filtering are all named.
+- The architecture now has first-class `LastKnown` and `OrderEvents` nodes, so the final design matches the core reliability and hot-read mechanisms described in prose.
+- Privacy and graceful degradation are now explicit non-functional requirements, and the satisfies mapping explains how the design addresses them.
 
 ## Highest-Impact Issues
 
-### 1. Capacity is qualitative, not worked through
+### 1. Tracking still mixes "read the stream" with "read last-known"
 
-The capacity section says "millions", "100Ks", and "every few sec/courier", but the design depends heavily on rates. A candidate needs concrete derived numbers to defend stream partitions, geo-index writes, tracking fanout, and dispatch latency.
+The final design correctly says tracking reads a materialized `LastKnown` cache, not the log-like `LocStream`. Some dataset surfaces still imply the older model: the `GET /v1/orders/{id}/track` API sequence reads "latest courier position" from `LocStream`, the high-level architecture still has a `locstream-tracking` link, and the scale step uses `locstream-tracking` in its main view.
 
-Recommended edit: add a worked example such as 2M orders/day with a 5x dinner peak, 100K live couriers pinging every 4 seconds, about 25K location writes/sec before peak multiplier, matching QPS tied to ready orders, and tracking fanout tied to active deliveries. Then map each rate to the component it stresses.
+Why it matters: this distinction is one of the interview's important lessons. Streams are for ingestion and fanout; last-known stores serve the current-position query. Mixing the two can confuse candidates and weakens the "do not query the log for latest state" teaching point.
 
-### 2. The API surface does not expose the lifecycle the architecture teaches
+Recommended edit: make the canonical tracking read path `LocStream -> LastKnown -> Tracking -> Eater` everywhere. Keep a stream-to-tracking path only if it is explicitly labeled as a push/update subscription, not a point read for latest position.
 
-The API only lists order creation, tracking fetch, and courier location updates. The walkthrough depends on restaurant confirm/ready/reject transitions, courier accept/decline/pickup/dropoff transitions, eater cancel, payment auth/capture, and possibly a push tracking subscription, but these are not represented.
+### 2. The state enum does not fully match the lifecycle prose
 
-Recommended edit: add APIs or explicitly scoped internal endpoints for:
+The lifecycle text includes restaurant rejection, and the restaurant-transition API accepts `reject`, but the `orders.state` enum does not include `rejected`. The enum also compresses some terminal/failure cases into `cancelled`, while the prose distinguishes restaurant rejection, eater cancellation before prep, refund after capture, and delivery/courier failure.
 
-- `POST /v1/orders/{id}/restaurant-transition` or concrete confirm/ready/reject endpoints.
-- `POST /v1/orders/{id}/courier-offers/{offerId}:accept|decline`.
-- `POST /v1/orders/{id}:cancel`.
-- idempotency keys on order placement and every lifecycle transition.
-- version or expected-state fields for compare-and-set transition safety.
+Why it matters: this interview teaches "state machine as source of truth." If the states are ambiguous, the candidate cannot reason precisely about allowed transitions, compensations, metrics, or support workflows.
 
-### 3. The data model is too thin for the promised reliability behavior
+Recommended edit: add a compact transition table and align the schema enum with it. At minimum, include `rejected` or document that restaurant rejection maps to `cancelled` with a reason. Consider explicit terminal states or reason fields for `cancelled_by_eater`, `rejected_by_restaurant`, and `delivery_failed` if the dataset wants to discuss support and refunds.
 
-The `orders`, `courier_location`, and `assignments` entities are a reasonable start, but they cannot fully support the described saga, auditing, retries, and compensations. The reliability step says transitions are idempotent and resumable, but the schema has no transition log, idempotency key table, payment authorization/capture record, offer attempt lease, or outbox/event table.
+### 3. Direct notification links and outbox links need clearer progression
 
-Recommended edit: add entities such as:
+The final design correctly uses `OrderEvents` as the durable event/outbox path for notifications and dispatch. Earlier views still show `OrderSvc -> Notify` directly through the `order-notify` link. That can be acceptable as a teaching simplification in Step 2, but the dataset should say when the design moves from direct notification calls to durable outbox publication.
 
-- `order_state_transitions(order_id, from_state, to_state, actor, transition_id, idempotency_key, created_at)`.
-- `payment_attempts(order_id, provider_payment_id, auth_state, capture_state, retry_count)`.
-- `courier_offers(offer_id, order_id, courier_id, expires_at, state, accepted_at)`.
-- `outbox_events(order_id, event_type, payload, published_at)`.
-- optional `delivery_tracking(order_id, courier_id, last_location_id, eta_version)`.
+Why it matters: the reliability step's point is that "state persisted" and "event emitted" must not split-brain. A lingering direct link can make the final architecture look less reliable than the text claims.
 
-### 4. "Last-known store" and event/outbox are prose-only mechanisms
+Recommended edit: either label the Step 2 direct notification edge as the pre-reliability simplification, or introduce `OrderEvents` in Step 2 as "state-change event" and deepen it into the transactional outbox in Step 6. In final/reliability views, prefer `OrderSvc -> OrderEvents -> Notify`.
 
-The text repeatedly says tracking reads a last-known store and state changes emit events, but the canonical architecture only shows `LocStream`, `GeoIndex`, `Tracking`, `OrderDB`, and `Notify`. That makes diagrams understate the hot read path and the reliability boundary between state transitions and notifications.
+### 4. Several hard failure modes remain prose-only
 
-Recommended edit: add explicit nodes for a `LastKnownLocation` cache/store and an `OrderEvents` stream or outbox. Wire courier pings to stream -> last-known -> tracking, and order state changes to outbox/events -> notification/dispatch consumers. This would make the diagrams match the prose and improve the final design.
+The reliability step now names ambiguous payment callbacks, duplicate retries, and reassignment, but the only failure sequence still centers on restaurant rejection after payment authorization. Other practical failure branches remain in descriptions and follow-up questions.
 
-### 5. Dispatch needs stronger concurrency and failure semantics
+Why it matters: food delivery systems fail at the edges: payment provider timeouts, restaurant app offline, courier accepts then disappears, routing provider throttling, and duplicate mobile retries. Showing one or two of these concretely would make the saga lesson much more production-realistic.
 
-The dispatch step mentions atomic claims and time-boxed offers, but the model should make leases and expiry concrete. The hard production bugs are double booking, stale courier availability, courier app reconnects, partial acceptance races, and re-offering after timeout.
+Recommended edit: add one additional sequence flow or failure drill for payment callback ambiguity and one for courier timeout/disappearance after accept. Show idempotency key lookup, state/version CAS, outbox event publication, and compensation/requeue in those flows.
 
-Recommended edit: teach the offer as a lease:
+### 5. Operations and safety are present, but not first-class enough
 
-- offer has `expires_at` and a monotonic `offer_version`.
-- accept uses compare-and-set from `offered` to `accepted`.
-- courier availability changes atomically with assignment.
-- timeout worker expires stale offers and requeues the order.
-- reassignment increments an assignment attempt counter and preserves history.
+The dataset now mentions privacy, retention, degraded ETA, and alert-worthy follow-ups. It still lacks a concrete observability or policy surface: no metrics table, no explicit access check in the tracking API, no support/admin audit path, and no connection/fanout tier for hundreds of thousands of live tracking sessions.
+
+Why it matters: a senior/staff-level food-delivery answer should show how the operator knows dispatch is failing before users do, and how location data is protected after assignment and delivery.
+
+Recommended edit: add a small operations section or deepen the scale step with metrics such as dispatch latency, offer acceptance rate, stale location percentage, ETA error, order transition failure rate, saga compensation rate, outbox lag, and tracking connection count. For privacy, add an authorization check on tracking: only assigned active order participants can see courier location, with precision reduction after delivery.
 
 ## System Design Soundness
 
-Requirements are well scoped for a food-delivery platform: order placement, restaurant prep, courier dispatch, live tracking, ETA, and lifecycle notifications. The non-functional requirements correctly prioritize consistency, seconds-level freshness, scale, and dispatch quality.
+The core system design is now strong. Requirements cover the right domain shape: order placement, restaurant prep, courier dispatch, live tracking, notifications, order correctness, high-frequency location updates, reliability, dispatch quality, privacy, and graceful degradation. Capacity is no longer hand-wavy; it gives order QPS, live couriers, location writes, matching rate, tracking sessions, and freshness targets.
 
-The main missing requirement is privacy and safety around location data. Courier GPS is sensitive, eater access should be limited to assigned active orders, and location retention should be short or explicitly justified. Another useful requirement is graceful degradation: under map/ETA provider failure, the system should still accept orders, dispatch with degraded scoring, and show coarse ETAs.
+The architecture choices are credible. Order service owns the lifecycle, OrderDB is authoritative, `order_state_transitions` is the saga ledger, idempotency keys dedupe client and transition retries, `courier_offers` models dispatch leases, `OrderEvents` represents the outbox/event path, and `LastKnown` separates latest-position reads from the location stream.
 
-The architecture is directionally sound. Order service as lifecycle owner, geo index for nearby couriers, dispatch scoring through ETA, and saga-based reliability are credible. The final design coherently integrates the steps, but it compresses several production-critical mechanisms into prose. Last-known location storage, order event publishing, idempotency storage, and payment/provider callback handling should be first-class components or data entities.
-
-The capacity section should be upgraded from labels to calculations. This design is dominated by peak location writes, hot geo cells, tracking fanout, and dispatch candidate scoring. Without rates, it is hard to justify stream partitioning, cache sizing, regional dispatch isolation, or whether WebSocket/SSE push is affordable.
+The main design gap is precision around state semantics. If restaurant rejection and failed delivery are real transitions, they should appear in the state model or be explicitly represented as cancellation reasons. A second smaller gap is order placement depth: if this case wants to cover payment correctness in more detail, an `order_items` or `order_quote` snapshot would preserve menu price, fees, tax, and item choices at checkout. That can stay scoped out, but it should be intentional.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive baseline
 
-Strong baseline. It clearly shows why a single order row and manual dispatch fail. The trap is useful.
+This step is now stronger because it explicitly calls out duplicate submissions and payment retry causing duplicate orders or double authorization. It motivates idempotency, lifecycle modeling, dispatch, tracking, and failure recovery cleanly.
 
-Improvement: make the baseline explicitly fail on duplicate order submissions and payment retry, not just manual dispatch and no tracking. That would prepare the reader for idempotency earlier.
+Improvement: none required beyond keeping the baseline short. It does its job.
 
-### Step 2: Order lifecycle state machine
+### Step 2: The Order Lifecycle State Machine
 
-This is the right backbone. The description explains allowed transitions, party-triggered transitions, and notification events.
+This is still the right backbone. The step explains allowed actors, prior states, notification events, and the order store as source of truth.
 
-Improvement: add a compact transition table or examples with actor and allowed previous states. For example, restaurant can move `confirmed -> preparing -> ready`; courier can move `assigned -> picked_up -> in_transit -> delivered`; cancellation branches differ before and after prep.
+Improvement: add a compact transition table with actor, from-state, to-state, and compensation. Align it with the data model enum, especially restaurant rejection and cancellation branches.
 
-### Step 3: Live courier locations
+### Step 3: Live Courier Locations
 
-The geo-index explanation and alternatives are strong. It correctly warns against writing every GPS ping to the order DB.
+The geo step is solid. It now ties the 25K writes/sec peak to stream/index design, names stale-location filtering, distinguishes available vs on-delivery couriers, and discusses bounded location retention.
 
-Improvement: include TTL/staleness handling and privacy retention. The index should drop couriers whose `updated_at` is old, distinguish available vs on-delivery couriers, and avoid retaining full GPS history unless needed for fraud/support with bounded retention.
+Improvement: keep the default geohash/S2 choice, but add one sentence about partition keys and hot-cell mitigation linking forward to Step 7.
 
 ### Step 4: Dispatch
 
-This is the strongest system-design step. It teaches ready-time-aware matching, scoring, offer/accept, and alternatives beyond nearest courier.
+This is one of the strongest steps. It now teaches offer leases, CAS accept, timeout requeue, `assignment_attempts`, stale/busy filtering, and the trade-offs between greedy, batched, and broadcast dispatch.
 
-Improvement: make the assignment record and offer lease explicit. The flow should include courier accept updating `assignments` and `orders`, and the timeout branch should requeue the order or advance to the next candidate with attempt history.
+Improvement: if the data model is expanded later, add a small courier availability/state entity or clarify that `courier_location.status` is the authoritative live availability record used by dispatch.
 
-### Step 5: Live tracking and ETA
+### Step 5: Live Tracking and ETA
 
-The step correctly separates tracking from the order database and compares push with polling.
+The tracking step is much improved by the `LastKnown` cache and the push-vs-polling alternatives. The option text correctly warns that millions of persistent connections need a connection/gateway tier.
 
-Improvement: add the connection tier or fanout layer needed for millions of long-lived connections. Also separate the stream from the last-known cache: consumers do not usually query a log-like stream for "latest position"; they read a materialized last-known view.
+Improvement: make the API sequence and scale diagram match the step: tracking should read `LastKnown`, not `LocStream`. If push is the default, consider adding a `ConnectionGateway` or `RealtimeGateway` node in the final design or tracking option.
 
-### Step 6: Consistency across failures
+### Step 6: Consistency Across Failures
 
-The saga framing is right and the failure drills are useful.
+The saga step now has the right ingredients: idempotency keys, CAS on expected state/version, transition log, payment attempts, and transactional outbox. This is a major improvement over the previous review.
 
-Improvement: the sequence diagram only covers restaurant rejection after payment auth. Add branches for payment provider timeout/callback ambiguity, courier accepts then disappears, duplicate transition retry, and cancellation after capture. Add outbox/inbox or dedup semantics so "transition persisted" and "event emitted" do not split-brain.
+Improvement: add one more concrete flow for a failure that is not restaurant rejection. Payment provider ambiguity and courier disappearance after accept are the highest-value choices.
 
-### Step 7: Scaling spikes, geo hotspots, and regions
+### Step 7: Scaling Spikes, Geo Hotspots, and Regions
 
-The scale step correctly focuses on meal-time spikes, regional dispatch, rebuildable geo state, and graceful degradation.
+The scale step is now much more actionable. Region/cell partitioning, hot-cell splitting, GPS-ping backpressure, and degraded ETA mode are all useful options.
 
-Improvement: make the scaling decisions more concrete. Add options or sub-bullets for partitioning by region/cell, hot-cell splitting, backpressure on GPS pings, degraded ETA mode, dispatch queue prioritization, and cross-region boundary orders.
+Improvement: update the main scale view so it uses `LastKnown` consistently and shows the regional/cell partitioning idea more visibly. The current text is better than the diagram.
 
 ## Final Design Review
 
-The final design is coherent and maps to the step journey. It includes the three clients, gateway, order service/store, payment, dispatch, geo index, location stream, tracking, ETA, and notification service. The description correctly states that orders are authoritative while geo/last-known state is rebuildable.
+The final design is coherent and now integrates the major mechanisms introduced by the steps. It says each transition is persisted with an idempotency key and emitted through a transactional outbox, dispatch uses time-boxed offer leases, courier pings feed a region-partitioned stream, tracking reads a last-known cache, and provider failure degrades to coarse ETA rather than failing the order.
 
-The gap is that the diagram does not actually include all the mechanisms the final description names. In particular, "last-known store" is not a node, and state-change event/outbox handling is represented only as `OrderSvc -> Notify`. For a reliability-focused interview, that path should show durable event publication or an outbox so notifications, dispatch triggers, and saga recovery are grounded.
+The final diagram is also much closer to the prose than before because it includes `OrderEvents` and `LastKnown`. The remaining omissions are acceptable for an interview but worth noting: there is no explicit real-time connection tier, no observability/alerting component, no admin/support audit path, and no visual indication of per-region/cell partitioning beyond captions.
 
 ## Concept Introduction and Learning Flow
 
-Concepts are introduced just in time. State machine appears before geo and dispatch; dispatch appears before tracking; saga appears after the happy path. That sequence is easy for a candidate to present.
+Concepts are introduced in a strong order. The baseline exposes the pain; the state machine gives the durable source of truth; geo indexing enables dispatch; dispatch enables assignment; tracking consumes the location pipeline; saga reliability arrives after the happy path is visible; scale then makes the hot paths concrete.
 
-The next improvement is to connect concepts to concrete artifacts. "Order state machine" should map to a transition table and transition log. "Saga with compensation" should map to an orchestrator state record, idempotency keys, and outbox events. "Location streaming + last-known" should map to a stream plus materialized cache/store.
+The next learning-flow improvement is to mark when an early simplification is deliberately replaced. Step 2 can show direct notification as a simple event concept, but Step 6 should clearly upgrade it to transactional outbox. Step 5 can discuss streams for ingestion, but all later surfaces should consistently teach last-known materialization for reads.
 
 ## Step-to-Final-Design Coherence
 
-The final design includes the components introduced by the steps, and the `satisfies` section maps requirements to the right steps. The strongest coherence issue is that scale-related details do not alter the final design much. The final design says "shard by region" and "per-region dispatch", but the architecture still looks single-region and single-instance.
+Coherence is high. Every step now contributes a visible final-design mechanism: lifecycle state in `OrderDB`, payment in `PaySvc`, dispatch in `Dispatch`, geo in `GeoIndex`, pings in `LocStream`, tracking in `LastKnown` and `Tracking`, and reliability in `OrderEvents`.
 
-Recommended edit: either add a final-design option or caption details that show region/cell partitioning, stream partitions, and per-region dispatch workers. That keeps the final design from sounding like a single-city diagram with scale added in text.
+The weakest transition is still from the scale step to the final design. The text says per-region dispatch and region/cell partitioning, but the final design remains a single logical instance of each component. That is acceptable if the final diagram is logical, but a caption should explicitly say each stream/index/dispatch box is region-partitioned.
 
 ## Realism Compared With Production Systems
 
-The dataset captures the most important production themes: moving-object geo indexing, offer/accept dispatch, live tracking, and distributed workflow compensation. It is more realistic than a generic marketplace design.
+The dataset now captures many real production concerns: high-frequency location writes, stale courier filtering, time-boxed offer leases, idempotency, provider ambiguity, outbox publishing, privacy, retention, and degraded routing/ETA.
 
-The realism gaps are:
+Remaining realism gaps:
 
-- Payment provider ambiguity: duplicate callbacks, auth expiration, capture failure, chargeback/refund workflows.
-- Restaurant integration ambiguity: tablet/app offline, rejection after delay, prep-time estimates, throttling busy restaurants.
-- Courier operations: accept timeout, location spoofing, app offline, reassignment, multi-order batching.
-- Observability: no explicit metrics for dispatch latency, offer acceptance rate, stale location percentage, ETA error, state-transition failure rate, or saga compensation rate.
-- Security/privacy: no access control for tracking, location retention, GPS precision reduction after delivery, or auditability of support/admin access.
-- Operations/cost: ETA/routing provider rate limits and fallback are not discussed.
+- Payment workflows: auth expiry, duplicate callbacks, capture failure, refund status, and reconciliation jobs could be clearer.
+- Restaurant operations: tablet/app offline, delayed rejection, prep-time estimate changes, and busy-restaurant throttling are not deeply modeled.
+- Courier operations: app reconnect, spoofed GPS, accept-then-disappear, reassignment after pickup, and fairness are mostly follow-ups.
+- Tracking operations: connection fanout, reconnect/backfill, and authorization checks need more concrete treatment.
+- Observability: the case should name metrics and alerts tied to dispatch, tracking, outbox, saga, and ETA quality.
 
 ## Dataset and Renderer-Facing Observations
 
 - `interview.json` parses successfully.
-- Step view node ids resolve to canonical high-level nodes.
-- Step view link ids resolve to high-level links.
-- Option view nodes and links resolve.
-- Sequence participants resolve to high-level node ids.
-- `satisfies.functional[*].steps` and `satisfies.nonFunctional[*].steps` resolve to real step ids.
-- `patterns[].steps` and `step.patterns` references resolve.
-- Step `probeLinks` resolve to entries in `toProbeFurther.links`.
-- `finalDesign.view.groups` resolves to `highLevelArchitecture.types`.
-- No source-vs-generated docs edit is needed for this review-only change.
-
-Renderer-facing improvement: if the dataset adds `LastKnownLocation`, `OrderEvents`, or `Outbox` nodes, update all affected step views, option views, final design view, and `satisfies` text together so the diagram diff remains meaningful.
+- Step and option view node ids resolve to canonical `highLevelArchitecture.nodes`.
+- Step and option view link ids resolve to `highLevelArchitecture.links`.
+- Sequence participants in API and step flows resolve to high-level node ids.
+- `satisfies.functional[*].steps`, `satisfies.nonFunctional[*].steps`, and `patterns[].steps` resolve to real step ids.
+- `finalDesign.view.groups` resolves through `highLevelArchitecture.types`.
+- The remaining renderer-facing concern is semantic, not structural: several valid links still imply direct stream-to-tracking reads or direct order-to-notification calls where the final design prefers `LastKnown` and `OrderEvents`.
+- No docs rebuild is needed for this review-only change.
 
 ## Recommended Edits, Prioritized
 
-### P1: Make capacity concrete
+### P1: Make tracking read path consistent
 
-Add assumptions and derived QPS/write-rate/fanout numbers for orders, location pings, dispatch matches, tracking sessions, and notification events. Tie each number to the component it sizes.
+Change the track API sequence, high-level link usage, and scale views so latest-position reads go through `LastKnown`. Keep stream-to-tracking only for an explicitly named push/update feed.
 
-### P1: Expand data model for reliability
+### P1: Align the lifecycle state model
 
-Add state transition history, idempotency keys, payment attempts, courier offer leases, and an outbox/event table.
+Add a transition table and align `orders.state` with restaurant rejection, cancellation, refund, and delivery failure semantics.
 
-### P1: Add lifecycle and dispatch APIs
+### P1: Clarify direct notification vs transactional outbox
 
-Represent restaurant transitions, courier offer accept/decline, cancel, and idempotent state updates.
+Make the progression explicit: early direct notification is a simplification, while the reliable design routes state-change publication through `OrderEvents`.
 
-### P2: Add last-known location and order-event/outbox architecture nodes
+### P2: Add one or two concrete failure flows
 
-Make prose-only mechanisms visible in high-level architecture, step views, option views, and final design.
+Add sequence flows or drills for payment callback ambiguity and courier disappearance after accept, showing idempotency, CAS, outbox publication, and compensation.
 
-### P2: Deepen dispatch failure handling
+### P2: Add operational metrics and privacy enforcement
 
-Document leases, CAS assignment, timeout requeue, stale courier filtering, and reassignment history.
+Name metrics/alerts and show tracking authorization or access policy around courier location visibility.
 
-### P2: Strengthen operations and privacy
+### P2: Consider a connection fanout component
 
-Add observability metrics, access control for tracking, bounded location retention, and degraded mode for routing/ETA provider failure.
+If push remains the default tracking option, add a `RealtimeGateway` or similar component to make hundreds of thousands of live tracking sessions concrete.
 
-### P3: Add scale options
+### P3: Expand order placement only if in scope
 
-Turn the final scale step into explicit alternatives: regional partitioning, dynamic hot-cell splitting, GPS ping backpressure, dispatch batching, and degraded ETA mode.
+If payment/order correctness is meant to be deeper than logistics, add order item or quote snapshot entities. Otherwise, explicitly keep menu/catalog/order-line details out of scope.
 
 ## What Not To Change
 
-- Preserve the current step order; it teaches the problem well.
-- Keep the geo-index and dispatch alternatives; they are practical and non-strawman.
-- Keep the saga step after tracking; the reader has enough happy-path context by then.
-- Keep the `satisfies` mapping concise, but enrich it after adding concrete entities/APIs.
+- Preserve the current step order; it teaches the design well.
+- Keep the concrete capacity assumptions; they now anchor the whole case.
+- Keep the geo-index and dispatch alternatives; they are practical and balanced.
+- Keep the data model additions for transitions, idempotency, payment attempts, offer leases, and outbox events.
+- Keep the final design focused on logistics and lifecycle reliability rather than expanding into every DoorDash adjacent subsystem.
 
 ## Bottom Line
 
-This is a strong book case with a clear interview narrative. The next revision should make the implicit production mechanisms explicit: numbers, lifecycle APIs, durable transition/idempotency records, offer leases, last-known location storage, and outbox/event publication. Those changes would move it from a solid conceptual design to a production-realistic flagship interview.
+The food-delivery interview has moved from a good conceptual design to a strong production-oriented case. The previous P1 gaps are largely fixed. The next pass should be a consistency and operations pass: tracking reads through last-known everywhere, state enum and transition prose line up, notification paths clearly evolve into outbox publication, and the hardest failure modes become concrete flows.

@@ -5,410 +5,376 @@ Review date: 2026-06-08
 
 ## Executive Summary
 
-This is a coherent and teachable feature-store case. The walkthrough correctly
-centers the three ideas that matter most in interviews: a central feature
-registry, dual offline/online stores, and point-in-time-correct training joins.
-The step order is natural, the option trade-offs are mostly real, and the final
-design integrates the chosen path cleanly.
+This is now a strong, book-ready feature-store walkthrough. The recent pass
+closed several important gaps: the capacity section now has concrete numbers,
+the data model carries feature versions and event-vs-ingestion timestamps, the
+online serving API exposes freshness/version metadata, materialization has a
+checkpointed publish-boundary flow, and the previous diagram endpoint issues
+are fixed.
 
-The main gaps are production-contract gaps rather than conceptual ones. The
-capacity model is qualitative, the data model is too small for the correctness
-claims it makes, and the serving/materialization contracts do not yet expose
-freshness, partial-result, versioning, or backfill behavior clearly enough. There
-is also a concrete renderer-facing issue: a few step diagrams reference links
-whose endpoint nodes are not included in the same view.
+The remaining issues are mostly about turning the improved concepts into
+operational contracts. The case references model feature sets, billion-row
+training joins, governance, and privacy, but those topics are still thinner than
+the now-excellent registry, dual-store, point-in-time, and technology-choice
+explanations.
 
 | Area | Rating | Notes |
 | --- | --- | --- |
-| System design soundness | 4/5 | Strong core architecture; needs richer quantitative sizing, storage schema, and materialization semantics. |
-| Production realism | 3.5/5 | Covers skew, leakage, freshness, and governance, but lacks operational contracts for backfills, TTLs, partial feature vectors, access control, and feature lifecycle. |
-| Pedagogical flow | 4.5/5 | The step progression is clear and teaches one major problem at a time. Step 7 is dense but understandable. |
-| Dataset/rendering fit | 4/5 | JSON parses and most references resolve; three selected links have endpoints missing from their view nodes. |
-| Overall | 4/5 | Book-quality foundation; a targeted production-hardening pass would make it excellent. |
+| System design soundness | 4.5/5 | Core architecture is correct and now backed by better API/schema detail; derived sizing and training-job semantics are the main missing pieces. |
+| Production realism | 4.25/5 | Covers versions, freshness, late data, fallback, retention, and rebuilds; governance enforcement and async job contracts need more structure. |
+| Pedagogical flow | 4.5/5 | The seven-step progression is clear, concept order is right, and the later changes made versioning and failure behavior more teachable. |
+| Dataset/rendering fit | 4.75/5 | JSON parses cleanly; selected view nodes/links, sequence participants, and `satisfies` step references resolve. |
+| Overall | 4.5/5 | A credible feature-store interview with a few production-contract gaps left. |
 
 ## What Works Well
 
-- The naive baseline is effective. It shows why per-model feature code causes
-  duplication, poor discovery, and train/serve skew before introducing the
-  registry.
-- The dual-store explanation is crisp: offline warehouse for historical bulk
-  training reads, online KV/cache for low-latency inference reads.
-- Step `training` correctly emphasizes point-in-time joins as the subtle
-  correctness property, not a minor implementation detail.
-- The options are useful rather than strawman-only. Examples: shared SDK vs
-  registry, online cache over offline source of truth, serving-time feature
-  logging, batch-only vs stream-only materialization.
-- The final design ties the main pieces together: registry, batch and stream
-  compute, offline and online stores, training API, serving API, materializer,
-  and monitoring.
-- The wrap-up sections are useful. `satisfies`, `interviewScript`,
-  `levelVariants`, `followUps`, and `toProbeFurther` all reinforce the intended
-  learning path.
+- The naive baseline cleanly motivates the rest of the design: duplicate
+  feature logic causes skew, poor reuse, and weak ownership.
+- Step `registry` now treats the registry as a versioned contract, not just a
+  catalog. Lifecycle state, compatibility checks, ownership, and model pinning
+  are introduced early enough.
+- The dual-store explanation is precise: offline warehouse for bulk historical
+  reads, online KV/cache for low-latency latest-value reads, both fed from the
+  same definitions.
+- Step `training` correctly explains point-in-time joins using both `event_ts`
+  and `ingested_at`, which is the production nuance that prevents late-arrival
+  leakage.
+- Step `serving` is much stronger now. The API and flow mention model feature
+  sets, max staleness, feature versions, missing/stale lists, and default or
+  last-known sources.
+- Step `freshness` now includes materialization job states, idempotent writes,
+  source offsets/checkpoints, publish boundaries, late data, backfills, and
+  concrete monitoring metrics.
+- Step `scale` covers the right operating concerns: independent store scaling,
+  hot keys, version pinning, access control, audit, lineage, retention/deletion,
+  and online-store rebuilds.
+- The final design integrates the steps cleanly and does not introduce
+  unrelated machinery at the end.
 
 ## Highest-Impact Issues
 
-### 1. The capacity model is too qualitative to drive design decisions
+### 1. Capacity numbers need derived sizing decisions
 
-The capacity section currently says "1000s" of features, "ms, high QPS" online
-reads, "bulk" offline reads, and "seconds-minutes" freshness. Those labels are
-directionally right, but they do not let a candidate size the online store,
-estimate feature-vector payloads, reason about hot entities, or compare batch
-backfill cost against stream processing cost.
+The capacity section is no longer qualitative: it has entity counts, feature
+counts, 100k QPS peak, p99 under 10 ms, 200k updates/sec, 1B-row point-in-time
+joins, 2-year retention, and a 1-2 TB hot online set. That is a major
+improvement.
 
-This matters because the architecture claims independent scaling and single-digit
-millisecond serving. Without rough numbers, the reader cannot defend decisions
-such as in-memory KV vs SSD-backed KV, shard count, replication, materialization
-frequency, warehouse partitioning, or whether online requests should fetch all
-features in one multi-get.
+What is still missing is the next step in the interview: converting those
+numbers into defensible design choices. A candidate should be able to use the
+numbers to justify shard count, replication, memory vs SSD, write bandwidth,
+multi-get shape, offline partitioning, stream state size, and backfill limits.
 
-Concrete fix: add interview-scale numbers:
+Concrete fix:
 
-- Entities: e.g. 100M users, 10M items, several entity types.
-- Online reads: e.g. 50k to 200k QPS peak, p99 under 10 ms, 20 to 200 features
-  per request, 1 to 20 KB feature vectors.
-- Writes/materialization: stream updates per second, nightly batch rows, online
-  update fanout.
-- Offline: training-set join size, history retention, backfill examples, and
-  warehouse scan size.
-- Freshness classes: seconds, minutes, hours, daily, with explicit SLOs.
+- Add 4-6 derived estimates after the existing capacity table.
+- Example calculations: `100k QPS * 1-20 KB = 100 MB/s to 2 GB/s read payload
+  before replication/cache effects`; `200k updates/sec * value size` for write
+  bandwidth; `1-2 TB hot set * 3 replicas` for online storage footprint.
+- Tie each estimate to a decision: SSD-backed KV with hot-key cache, entity-key
+  sharding, one serving multi-get, warehouse partitioning by feature/entity/time,
+  and admission control for large backfills.
+- Add one sentence on what changes if QPS or feature vector size is 10x higher.
 
-### 2. The data model is too small for point-in-time and versioning guarantees
+### 2. Training-data generation is too synchronous for billion-row joins
 
-The dataset promises no leakage, train/serve consistency, model pinning, and
-governed feature evolution. The current data model has only three entities:
-`feature_definition`, `offline_feature (warehouse)`, and `online_feature (kv)`.
-That is enough for the diagram, but not enough for the promised correctness
-contract.
+`POST /v1/training-data` returns a `datasetUri`, but the capacity section says
+training jobs are roughly 1B-row point-in-time joins with multi-TB warehouse
+scans. That work should be modeled as an asynchronous job, not a simple request
+that immediately returns a finished dataset.
 
-The point-in-time story needs more than `entity_id`, `feature_values`, and
-`event_ts`. Real joins need feature identity/version, entity type, event time,
-created/ingested time for deduping and late arrivals, value validity, source
-version, and sometimes TTL. Governance needs ownership, approval state, access
-policy, lineage, compatibility checks, and model-to-feature-version bindings.
+This matters because the training API is where point-in-time correctness becomes
+an operational product. It needs job IDs, status, progress, cost/quota controls,
+snapshot or watermark semantics, output schema, idempotency, and a way to audit
+which feature versions and source snapshots produced the dataset.
 
-Concrete fix: expand `dataModel` with a few focused records:
+Concrete fix:
 
-- `feature_definition`: `feature_id`, `name`, `entity_type`, `transform_spec`,
-  `source_id`, `freshness_slo`, `owner`, `version`, `state`, `created_at`.
-- `feature_value_history`: `feature_id`, `feature_version`, `entity_key`,
-  `event_ts`, `created_ts` or `ingested_at`, `value`, `source_offset`,
-  `ttl/expires_at`.
-- `online_feature_value`: `feature_id`, `feature_version`, `entity_key`,
-  `value`, `updated_at`, `expires_at`, `freshness_state`.
-- `model_feature_binding`: `model_id`, `model_version`, `feature_id`,
-  `feature_version`.
-- Optional governance records: `feature_lineage`, `access_policy`,
-  `materialization_job`.
+- Change the training API shape to `POST /v1/training-datasets` returning
+  `{jobId, status, estimatedRows, estimatedCost}`.
+- Add `GET /v1/training-datasets/{jobId}` returning progress, output URI,
+  feature versions, source snapshot/watermark, and failure reason.
+- Add a `training_dataset_job` or `training_dataset_manifest` record to the data
+  model.
+- In step `training`, add a short flow showing job creation, PIT join execution,
+  manifest publication, and model consumption.
 
-### 3. Online serving should expose staleness, partial results, and failure policy
+### 3. Model feature sets and fallback policy are referenced but not modeled
 
-Step `serving` says serving degrades gracefully with defaults or last-known
-values if a feature is missing. That is the right idea, but the API and step flow
-do not make the contract explicit. `GET /v1/online-features` returns only the
-feature values, with no metadata about missing values, stale values, freshness,
-version, or whether defaults were applied.
+The serving API accepts `modelFeatureSet=ranker@v7`, and the text says the model
+can continue, drop optional features, fail closed, or use a fallback model when
+features are stale. That is the right behavior, but the data model only has
+`model_feature_binding`. It does not yet define the feature set as an API-facing
+contract with per-feature policy.
 
-This matters because online feature serving is on the inference critical path.
-The inference service needs to know whether it received a complete vector,
-whether a critical feature is stale, and whether it should continue, fail closed,
-fallback to a default model, or skip a feature group. This is also where latency
-budgets, multi-get batching, caching, and hot-key handling should be visible.
+Without this, the partial-vector behavior is hard to defend. The serving layer
+needs to know which features are required, which are optional, which default
+value is safe, and how stale each feature is allowed to be for this model.
 
-Concrete fix: make the serving API response and step text carry the production
-contract:
+Concrete fix:
 
-- Request includes `entityType`, `entityId`, `featureRefs` with versions or a
-  model feature set, and maybe `maxStalenessMs`.
-- Response includes `values`, `missing`, `stale`, `updatedAt`, `featureVersion`,
-  and `source` (`fresh`, `last_known`, `default`).
-- Step `serving` includes a short flow or failure drill for online-store miss,
-  stale feature, and partial vector handling.
-- Step `scale` ties this to shard replication, timeouts, request fanout, and
-  hot-entity mitigation.
+- Add a `feature_set` or `model_feature_set` record: `feature_set_id`,
+  `model_id`, `model_version`, `state`, `created_at`.
+- Add a join record with `feature_id`, `feature_version`, `required`,
+  `default_value`, `max_staleness_ms`, `value_type`, and maybe
+  `fallback_policy`.
+- Mention that the serving API resolves `modelFeatureSet=ranker@v7` into this
+  pinned policy before reading the online store.
+- In step `serving`, make the partial-vector flow name one required feature and
+  one optional feature so the fallback behavior is concrete.
 
-### 4. Materialization and backfills need a more explicit operational contract
+### 4. Governance and privacy are described, but enforcement is still implicit
 
-The case correctly presents per-feature batch vs stream materialization and
-monitoring. It does not yet show how materialization jobs are scheduled,
-checkpointed, retried, deduped, or backfilled, nor how late events affect online
-and offline stores.
+Step `scale` now says the right things: classification, access policies, audit
+logs, lineage, retention, deletion, and team/model-scoped access. The data model
+also includes `classification` on `feature_definition`. That is good, but the
+system still does not show where policy is enforced or audited.
 
-This matters because feature stores fail in quiet ways: a stream job falls
-behind, a batch job writes a partial refresh, a backfill rewrites history, or a
-definition change updates online values before the matching offline history is
-ready. The dataset mentions rebuildable online state, but it should teach the
-control-plane state that makes that safe.
+Feature stores often expose sensitive derived behavior signals. A production
+answer should make it clear that governance is not only a catalog annotation;
+serving and training requests must be authorized, logged, and bounded by
+retention/deletion rules.
 
-Concrete fix: add a small materialization/backfill thread:
+Concrete fix:
 
-- `materialization_job` state: scheduled, running, checkpointed, failed,
-  committed.
-- Idempotent writes keyed by feature, entity, version, and event time.
-- Batch publish boundary for online refreshes so partial updates do not become
-  visible accidentally.
-- Stream checkpoints and source offsets.
-- Backfill admission control, progress, rollback, and model/feature-version
-  compatibility.
+- Add `access_policy`, `audit_event`, and `deletion_request` records, or fold
+  them into a concise governance subsection if the data model would get too big.
+- In the registry API or serving/training API text, mention policy checks by
+  team/model purpose and feature classification.
+- Add one failure drill: a model requests a sensitive feature it is not approved
+  to use, or a user-deletion request must remove online and offline values.
+- Clarify whether lineage is source-to-feature, feature-to-feature,
+  feature-to-model, or all three.
 
-### 5. Several diagrams reference links whose endpoint nodes are not visible
+### 5. Technology Choices wrap-up is now present
 
-The source JSON parses and basic node/link IDs resolve, but a stricter view
-check finds three selected links whose endpoint nodes are missing from the same
-view:
+The dataset now includes a book-style `technologyChoices` section covering the
+implementation decisions that make a feature store a composed system rather
+than one custom service: registry/platform API, offline history, online serving
+store, batch compute, streaming materialization, source ingestion, training
+dataset manifests, serving runtime, orchestration, governance, and monitoring.
 
-- Step `freshness`: link `monitor-offline` points to `Offline`, but `Offline`
-  is not in `view.nodes`.
-- Step `scale`: links `model-serve` and `model-train` point from `Model`, but
-  `Model` is not in `view.nodes`.
-
-Mermaid can synthesize implicit nodes for link endpoints, which risks unlabeled
-or inconsistently styled diagram nodes. The fix is small: include `Offline` in
-the `freshness` view nodes, and include `Model` in the `scale` view nodes, or
-remove those links from the views.
+Follow-up: keep the section decision-oriented. It should stay focused on the
+trade-offs that map to the seven architecture steps rather than grow into a
+complete vendor catalog.
 
 ## System Design Soundness
 
-The architecture is sound at the conceptual level. A feature store really does
-need a central definition plane, offline and online materializations, a
-point-in-time training API, a low-latency serving API, and monitoring for
-freshness and skew. The dataset avoids the common mistake of treating the
-feature store as only a cache or only a warehouse.
+The architecture is sound. A realistic feature store needs the exact components
+the dataset introduces: a central registry, offline historical values,
+low-latency online values, batch and stream compute, a point-in-time training
+API, an online serving API, materialization, and monitoring.
 
-The main weakness is that the design currently describes correctness in prose
-more than in contracts. Point-in-time correctness requires a precise storage
-schema and join contract. Train/serve consistency requires feature-version
-binding and transform compatibility. Freshness requires SLOs, timestamps, and
-alert thresholds. Graceful serving fallback requires response metadata and model
-behavior.
+The strongest correctness work is in steps `training` and `serving`. The dataset
+now distinguishes value validity from value availability using `event_ts` and
+`ingested_at`, and the serving API carries metadata that prevents silent scoring
+on stale or defaulted values.
 
-Security and privacy are also light. Feature stores often contain sensitive user
-attributes and behavior-derived signals. The registry/governance discussion
-should include access control, feature classification, audit logs, and
-retention/deletion behavior, at least briefly.
+The main soundness gap is not a missing component. It is missing explicit
+contracts for large operations: training-set generation, model feature-set
+policy, governance enforcement, and capacity-derived design choices.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: Each Model Computes Features Ad Hoc
 
-This is a strong opening. It motivates both duplication and train/serve skew,
-and the trap is concrete. The only possible improvement is to name an example
-that will recur later, such as `user_7d_clicks`, and show how the training SQL
-and serving code drift.
+This remains a strong opening. The recurring `user_7d_clicks` example gives the
+reader a concrete feature that can drift between training SQL and serving code.
+Keep this step short; it is doing the right job by exposing the pain.
 
 ### Step 2: Define Features Once (Registry)
 
-The central-registry choice is well explained. The comparison against a shared
-SDK is particularly useful because it is a real alternative, not a fake one.
+This step improved substantially. It now introduces the registry as a versioned
+contract with lifecycle state, compatibility checks, ownership, access control,
+and lineage. The shared-SDK alternative is a real trade-off and helps candidates
+explain why a registry is more than a code library.
 
-The step would be stronger if the registry contract included feature lifecycle:
-draft, reviewed, active, deprecated, retired; owner approval; compatibility
-checks; and model pinning to a version. These ideas appear in step `scale`, but
-the registry is where they should be introduced as part of the contract.
+Suggested improvement: add one small registry response example that includes
+`featureId`, `version`, `state`, and `owner`, so the contract is visible in the
+API as well as in prose.
 
 ### Step 3: Dual Offline and Online Stores
 
-The access-pattern argument is clear and correct. The online-cache-over-offline
-option is a good way to teach source-of-truth trade-offs.
+The access-pattern contrast is clear and correct. The step also now explains
+source-of-truth and publish-boundary semantics better than before.
 
-The missing detail is data movement semantics. If the offline store is
-authoritative and online is derived, the design should say how online refreshes
-are committed, what happens during partial refresh, and how cache misses are
-handled. If streaming writes directly to online, the design should say how it
-keeps semantic parity with batch.
+Suggested improvement: explicitly name the online store's consistency target.
+For example: "read-your-latest-materialized-value, not read-after-source-event."
+That helps candidates avoid promising impossible freshness.
 
 ### Step 4: Point-in-Time-Correct Training Data
 
-This is the strongest step conceptually. It clearly explains leakage and the
-as-of join. The served-feature-log option is also a valuable nuance because it
-shows a different way to get train/serve parity.
+This is the strongest teaching step. It explains leakage, as-of joins, late
+arrivals, and the served-feature-log alternative. The new trap about ignoring
+`ingested_at` is exactly the right production nuance.
 
-The step should distinguish event time, feature value time, and creation or
-ingestion time. Late-arriving data and backfilled values can otherwise leak
-information even when the join uses `value valid <= event_ts`. Add that nuance
-to the data model and maybe one failure drill.
+Suggested improvement: make the training API asynchronous and show the output
+manifest. This would connect the correctness concept to the real 1B-row job
+the capacity section describes.
 
 ### Step 5: Online Serving and Train/Serve Consistency
 
-The step gets the high-level point right: serving reads are simple low-latency
-lookups, and the hard part is computing values upstream from the same logic used
-offline.
+This step now has a good serving contract: pinned model feature sets or feature
+refs, max staleness, metadata, stale/missing arrays, and explicit fallback
+behavior.
 
-It needs more serving contract detail. A production feature server should define
-timeouts, batching, partial vectors, missing values, stale values, defaulting,
-critical vs optional features, response metadata, and version compatibility with
-the model.
+Suggested improvement: model the feature-set policy behind that API. The reader
+should see where `required`, `default_value`, and `max_staleness_ms` live.
 
 ### Step 6: Materialization and Freshness
 
-This step teaches the right trade-off: batch for slow features, stream for fast
-features, and monitoring for freshness, drift, and skew. The batch-only and
-stream-only alternatives are useful.
+This step is much more production-realistic after the recent changes. It covers
+per-feature batch vs stream materialization, checkpointing, idempotent upserts,
+publish boundaries, backfills, watermarks, and monitoring metrics.
 
-The operational mechanics need one level more detail: scheduling, checkpoints,
-deduplication, source offsets, idempotent online writes, late-event handling, and
-safe backfill. The monitor should also have concrete metrics such as last update
-age, stream lag, feature null rate, distribution drift, online/offline
-comparison error, and alert thresholds.
+Suggested improvement: add one sentence about backpressure/admission control.
+Backfills can starve online freshness if they compete with stream
+materialization, so the control plane should throttle or isolate them.
 
 ### Step 7: Scale, Governance, and Reliability
 
-This is a good closing step, but it is carrying many concerns at once:
-independent scaling, sharding, ownership, versioning, access control, lineage,
-rebuildability, and graceful fallback. The content is correct, but it would be
-easier to defend if it had a flow or failure drill for one production scenario:
-definition change, online shard loss, or stale stream materialization.
+The closing step now carries the right concerns: sharding, hot keys, version
+pinning, stream lag, retention/deletion, shard loss, and graceful fallback. The
+online-shard failure drill is useful and concrete.
 
-The existing failure drill for an online shard loss is useful. Add expected
-serving behavior in more detail: which features are defaulted, how the model is
-notified, what SLO is violated, and how rematerialization progress is tracked.
+This step is dense but acceptable as a wrap-up. If it grows further, split some
+of the governance detail into `technologyChoices` or a dedicated wrap-up section
+rather than adding an eighth architecture step.
 
 ## Final Design Review
 
-The final design is coherent and includes the right components. It reflects the
-chosen path from the steps and does not introduce unrelated new machinery at the
-end. It is especially strong at summarizing the core invariants:
-single-definition logic, dual stores, point-in-time training, online serving,
-per-feature freshness, and monitoring.
+The final design is coherent and reflects the chosen path from the steps. It
+names the versioned registry, batch and stream compute, offline and online
+stores, point-in-time training, online serving metadata, materialization, and
+monitoring. It also correctly describes the online store as rebuildable derived
+state.
 
-The final design should include the concrete production contracts recommended
-above. In particular, add model-to-feature-version binding, serving response
-metadata, materialization job state, and explicit governance/access control. If
-those are added to the steps, the final design can summarize them without
-becoming bloated.
+The final design would be stronger if it mentioned three explicit contracts:
+
+- Training datasets are async jobs with manifests.
+- Model feature sets are pinned policies, not just a query parameter.
+- Governance is enforced on serving and training reads, not only documented in
+  the registry.
 
 ## Concept Introduction and Learning Flow
 
-Concept staging is strong. The reader learns the registry before dual stores,
-dual stores before point-in-time joins, point-in-time before serving
-consistency, and serving consistency before freshness and scale. That is the
-right order for this topic.
+The concept order is right:
 
-The main improvement is to introduce feature versioning earlier. It appears in
-step `scale`, but versioning is not just a scale concern; it is part of how the
-registry prevents training-serving mismatch after a feature definition changes.
+- First show ad hoc feature computation and skew.
+- Then centralize definitions in a registry.
+- Then separate offline and online stores by access pattern.
+- Then teach point-in-time correctness.
+- Then teach online serving and train/serve consistency.
+- Then introduce freshness/materialization.
+- Finally discuss scale, governance, and reliability.
 
-The dataset could also benefit from a small concept for "event time vs created
-time" in step `training`, because that is the difference between a good
-point-in-time explanation and a production-grade one.
+Versioning now appears early enough in the registry step, which fixes the older
+flow problem where it felt like a late scale-only concern. Event time vs
+ingestion time is also introduced in the right place.
 
 ## Step-to-Final-Design Coherence
 
-The steps build cleanly into `finalDesign`. Every major final-design component
-is introduced earlier:
+The steps build cleanly into `finalDesign`:
 
 - `Registry` comes from step `registry`.
 - `Batch`, `Stream`, `Offline`, and `Online` come from step `stores`.
 - `TrainAPI` and point-in-time joins come from step `training`.
-- `ServeAPI` and train/serve consistency come from step `serving`.
+- `ServeAPI`, metadata, and partial-result behavior come from step `serving`.
 - `Materializer` and `Monitor` come from step `freshness`.
-- Scaling, versioning, and graceful fallback come from step `scale`.
+- Scaling, governance, rebuildability, and fallback come from step `scale`.
 
-The main coherence gap is that some promised final-design behaviors do not have
-enough schema/API backing. The story says definitions are governed and versioned,
-online state is rebuildable, and serving degrades gracefully. The data model and
-API should make those claims inspectable.
+No final-design component appears out of nowhere. The remaining coherence issue
+is that a few final-design promises need concrete backing records or APIs:
+training manifests, feature-set policies, and governance/audit enforcement.
 
 ## Realism Compared With Production Systems
 
-The case captures the main realism of feature stores: there are two different
-read paths, skew is subtle, leakage is easy, and freshness is not uniform across
-features. It also correctly points to monitoring for drift and online/offline
-skew.
+The dataset now captures the main production realities of feature stores:
+training and serving have conflicting access patterns, leakage is easy,
+train/serve skew is subtle, freshness differs per feature, online state is
+derived, and monitoring must detect silent degradation.
 
-Production gaps to close:
+Remaining production gaps:
 
-- Multi-tenant ownership and access control for sensitive features.
-- Feature lifecycle and compatibility checks before definition changes.
-- Model pinning to feature versions and feature sets.
-- Serving API behavior for stale, missing, or partially available values.
-- Materialization job state, idempotency, checkpointing, late data, and backfill.
-- Online-store replication, shard loss, hot-key mitigation, and request fanout.
-- Cost controls for streaming every feature vs selectively materializing.
-- Retention and deletion behavior for historical feature values.
+- Async training dataset jobs with status, manifests, snapshots, quotas, and
+  idempotent retry.
+- Feature-set policy records for required/optional features, defaults, and max
+  staleness.
+- Enforcement points for access policy, audit, retention, and deletion.
+- Derived sizing for shards, replication, hot-key caching, bandwidth, and
+  offline partitioning.
+- Explicit technology/provider trade-offs.
 
 ## Dataset and Renderer-Facing Observations
 
 Validation passed:
 
 - `data/book/feature-store/interview.json` parses as JSON.
-- Top-level structure is appropriate for a book walkthrough.
 - `steps[]` IDs referenced by `satisfies.functional[].steps` and
   `satisfies.nonFunctional[].steps` resolve.
-- Basic `view.nodes` string IDs resolve to `highLevelArchitecture.nodes`.
-- Basic `view.links` string IDs resolve to `highLevelArchitecture.links`.
+- Step `view.nodes` string IDs resolve to `highLevelArchitecture.nodes`.
+- Step `view.links` string IDs resolve to `highLevelArchitecture.links`.
+- Selected view links have endpoints included in the same view.
+- Step flow and API sequence participants/messages resolve to canonical
+  high-level architecture node IDs.
+- Pattern and probe-link step references resolve.
 
-Issues to fix:
+Renderer-facing notes:
 
-- Step `freshness` selects `monitor-offline` but omits `Offline` from
-  `view.nodes`.
-- Step `scale` selects `model-serve` and `model-train` but omits `Model` from
-  `view.nodes`.
-- The capacity section is schema-valid but not specific enough for the design
-  it supports.
-- The API examples are schema-valid but too thin for serving metadata,
-  materialization, and versioning behavior.
+- The previous `freshness` and `scale` view endpoint mismatches are fixed.
+- The dataset is valid without `technologyChoices`, but adding that optional
+  book field would improve the rendered wrap-up.
+- No docs rebuild is needed for this review-only file; `REVIEW.md` is repo-only
+  and is skipped by the build.
 
 ## Recommended Edits, Prioritized
 
-### P1: Add quantitative capacity and serving SLOs
+### P1: Make training dataset generation asynchronous
 
-Replace qualitative placeholders with rough but defensible numbers for entity
-count, feature count, online QPS, p99 latency, feature-vector size, update
-volume, training join size, retention, and freshness classes.
+Add training dataset job creation, status/progress, output manifest, source
+snapshot/watermark, feature-version list, and idempotency semantics.
 
-### P1: Expand the data model to support correctness claims
+### P1: Add a model feature-set policy record
 
-Add feature versioning, event/created timestamps, source offsets, online
-freshness metadata, model-feature bindings, and materialization job state.
+Represent required vs optional features, default values, max staleness, value
+types, and fallback policy behind `modelFeatureSet=ranker@v7`.
 
-### P1: Fix diagram view endpoint mismatches
+### P1: Derive capacity into design choices
 
-Add `Offline` to step `freshness` view nodes and `Model` to step `scale` view
-nodes, or remove the selected links that reference them.
+Translate the existing capacity numbers into online storage footprint, read and
+write bandwidth, shard/replica shape, hot-key strategy, offline partitioning,
+and backfill limits.
 
-### P2: Strengthen the online serving API contract
+### P2: Make governance enforceable
 
-Include feature refs or model feature sets, versions, freshness metadata,
-missing/stale/defaulted fields, and partial-result policy.
+Add access policy, audit events, and deletion/retention handling as schema
+records or a concise governance subsection. Show policy checks on training and
+serving reads.
 
-### P2: Add one materialization/backfill sequence or failure drill
+### P2: Add Technology Choices
 
-Show checkpoints, idempotent writes, commit/publish boundary, late data, and
-rollback or retry behavior.
+Add `technologyChoices` for registry, offline store, online store, batch/stream
+compute, orchestration, and monitoring, including managed vs self-hosted
+trade-offs.
 
-### P2: Move versioning from a late governance note into the registry contract
+### P3: Add one backpressure or quota drill
 
-Step `registry` should establish that definitions are versioned contracts, and
-step `scale` should then explain how that contract operates at many teams and
-models.
-
-### P3: Add security and retention polish
-
-Add a small privacy/governance thread for sensitive features: access policy,
-audit, retention, deletion, and feature classification.
-
-### P3: Add concrete monitoring metrics
-
-Use examples such as feature freshness age, stream lag, null-rate spike,
-online/offline skew delta, distribution drift, stale-read count, and
-materialization failure rate.
+Show what happens when a large backfill competes with stream freshness or when
+a team requests too many expensive PIT joins.
 
 ## What Not To Change
 
-- Keep the seven-step progression. It is the right teaching shape for this
-  domain.
-- Keep the naive baseline; it motivates the rest of the architecture well.
-- Keep the dual-store framing as the central architectural idea.
-- Keep point-in-time correctness as its own step. It is the highest-signal ML
-  systems concept in the case.
-- Keep the real alternatives in the option sets, especially shared SDK,
-  serving-time feature logging, and batch-only vs stream-only materialization.
+- Keep the seven-step progression. It is the right teaching shape.
+- Keep point-in-time correctness as its own step.
+- Keep the dual-store framing as the central architecture.
+- Keep the shared-SDK, served-feature-log, batch-only, and stream-only
+  alternatives; they are realistic trade-offs.
+- Keep the online-shard failure drill; it is a useful production check.
 
 ## Bottom Line
 
-This dataset is already a strong feature-store interview. It teaches the
-essential architecture and the most important correctness risks clearly. The
-next improvement pass should make the production contracts concrete: numbers,
-schemas, API metadata, materialization state, feature-version bindings, and a
-small diagram fix. Those changes would move it from a good conceptual case to a
-production-realistic book chapter.
+The feature-store dataset has moved from a good conceptual walkthrough to a
+credible production-oriented interview. The next pass should not rework the
+architecture. It should add a few missing contracts: async training dataset
+jobs, feature-set fallback policy, derived capacity sizing, governance
+enforcement, and technology choices.

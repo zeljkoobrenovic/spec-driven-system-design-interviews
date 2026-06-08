@@ -50,7 +50,7 @@
         "traits": [
           "stateless"
         ],
-        "description": "Authoritative answer to 'is this room free for these dates?'"
+        "description": "Authoritative answer to 'is this unit free for these dates?'"
       },
       {
         "id": "AvailDB",
@@ -60,7 +60,28 @@
         "traits": [
           "stateful"
         ],
-        "description": "Per-property per-date inventory; the source of truth for booking."
+        "description": "Per-unit per-date inventory; the source of truth for booking."
+      },
+      {
+        "id": "AvailStream",
+        "label": "Availability Change Stream",
+        "type": "stream",
+        "category": "async",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Emits availability transitions (held/booked/released) from the truth store."
+      },
+      {
+        "id": "CacheProjector",
+        "label": "Cache & Index Projector",
+        "type": "worker",
+        "category": "async",
+        "traits": [
+          "stateless",
+          "derived"
+        ],
+        "description": "Consumes availability changes and updates the browse cache and search index."
       },
       {
         "id": "BookingSvc",
@@ -70,7 +91,7 @@
         "traits": [
           "stateless"
         ],
-        "description": "Orchestrates hold -> confirm; enforces no-double-book."
+        "description": "Drives the hold -> confirm -> cancel state machine; enforces no-double-book."
       },
       {
         "id": "BookingDB",
@@ -186,10 +207,28 @@
         "label": "persist reservation"
       },
       {
-        "id": "avail-cache",
+        "id": "avail-stream",
         "from": "AvailDB",
+        "to": "AvailStream",
+        "label": "emit availability change"
+      },
+      {
+        "id": "stream-projector",
+        "from": "AvailStream",
+        "to": "CacheProjector",
+        "label": "consume change"
+      },
+      {
+        "id": "projector-cache",
+        "from": "CacheProjector",
         "to": "Cache",
         "label": "update read cache"
+      },
+      {
+        "id": "projector-idx",
+        "from": "CacheProjector",
+        "to": "SearchIdx",
+        "label": "update browse view"
       },
       {
         "id": "reaper-hold",
@@ -201,7 +240,13 @@
         "id": "reaper-avail",
         "from": "Reaper",
         "to": "AvailDB",
-        "label": "release dates"
+        "label": "release expired-hold dates"
+      },
+      {
+        "id": "booking-cancel-avail",
+        "from": "BookingSvc",
+        "to": "AvailSvc",
+        "label": "release dates on cancel"
       },
       {
         "id": "client-avail",
@@ -217,7 +262,9 @@
         "nodes": [
           "SearchSvc",
           "SearchIdx",
-          "Cache"
+          "Cache",
+          "AvailStream",
+          "CacheProjector"
         ]
       },
       {
@@ -248,62 +295,78 @@
   ],
   "capacityDiagram": [
     "graph LR",
-    "  Props[Millions of properties]",
-    "  Search[Browse-heavy]",
-    "  Book[Booking must be exact]",
-    "  Props --> Search",
+    "  Units[1M units x 365 nights = 365M rows]",
+    "  Search[Search ~50k QPS]",
+    "  Book[Hold+confirm ~500 QPS]",
+    "  Units --> Search",
     "  Search --> Book"
   ],
   "requirements": {
     "functional": [
-      "Search available properties by location, date range, and filters.",
-      "Show a property's calendar / availability for chosen dates.",
-      "Hold dates during checkout, then confirm a booking with payment.",
-      "Cancel a booking and free the dates.",
-      "Prevent double-booking the same room for overlapping dates."
+      "Search available units (listings) by location, date range, and filters.",
+      "Show a unit's calendar / availability for chosen dates.",
+      "Hold a unit's dates during checkout, then confirm a booking with payment.",
+      "Cancel a confirmed booking, free the dates, and refund per policy.",
+      "Prevent double-booking the same unit for overlapping dates."
     ],
     "nonFunctional": [
       "Browse is read-heavy and can be approximately fresh (fast search).",
-      "Booking must be strongly consistent: never sell the same room twice for overlapping dates.",
+      "Booking must be strongly consistent: never sell the same unit twice for overlapping dates.",
       "Low search latency; booking can be a touch slower but must be correct.",
-      "Scale to millions of properties and high search volume.",
-      "Hold + payment flow is reliable: an abandoned checkout releases inventory."
+      "Scale to millions of units and high search volume.",
+      "Hold/confirm/cancel are retry-safe (idempotent) and self-heal abandoned checkouts.",
+      "Search and booking stay decoupled: browse traffic never touches the booking-critical store."
     ]
   },
   "capacity": [
     {
-      "label": "Properties",
-      "value": "millions",
-      "note": "Each with a per-date calendar."
+      "label": "Reservable unit",
+      "value": "(unit_id, date)",
+      "note": "Default unit is a listing with capacity 1/night; hotels add room_type_id with counts."
     },
     {
-      "label": "Search:book",
-      "value": "search >>> book",
-      "note": "Most traffic is browsing."
+      "label": "Availability rows",
+      "value": "~365M",
+      "note": "1M units x 365-night horizon = 365M rows before replicas/history; ~tens of GB, shardable by unit."
     },
     {
-      "label": "Booking unit",
-      "value": "(room, date-range)",
-      "note": "Inventory is per-night, contiguous range."
+      "label": "Search QPS",
+      "value": "~50k peak",
+      "note": "Read-heavy browse; served from index + cache, never the truth store."
+    },
+    {
+      "label": "Hold/confirm QPS",
+      "value": "~500 peak",
+      "note": "~100x less than search; write path to the truth store."
+    },
+    {
+      "label": "Stay length",
+      "value": "~3 nights avg (1-14)",
+      "note": "Each hold/confirm/cancel touches N night rows, so write amplification ~3x."
+    },
+    {
+      "label": "Cache invalidation",
+      "value": "~1k events/sec peak",
+      "note": "Each confirm/cancel emits N night changes through the projector to cache + index."
+    },
+    {
+      "label": "Hot-unit contention",
+      "value": "1 shard serializes",
+      "note": "A contested unit's date rows serialize on one shard/key — correct, but a throughput ceiling."
     },
     {
       "label": "Hold TTL",
-      "value": "minutes",
-      "note": "Long enough to pay, short enough to free abandoned holds."
-    },
-    {
-      "label": "Consistency",
-      "value": "strong on book",
-      "note": "Approximate on browse, exact at booking."
+      "value": "~10 min",
+      "note": "Long enough to pay, short enough to free abandoned holds; reaped on expiry."
     }
   ],
   "api": [
     {
       "method": "GET",
       "path": "/v1/search",
-      "description": "Search available stays by location, dates, and filters (approximate availability).",
+      "description": "Search available units (listings) by location, dates, and filters (approximate availability).",
       "request": "?place=SF&checkIn=2026-06-01&checkOut=2026-06-04&guests=2",
-      "response": "{ \"results\": [ { \"propertyId\": \"p_3\", \"price\": \"...\" } ] }",
+      "response": "{ \"results\": [ { \"unitId\": \"u_3\", \"propertyId\": \"p_3\", \"roomTypeId\": null, \"price\": { \"amount\": 480, \"currency\": \"USD\" }, \"approxAvailable\": true } ] }",
       "sequence": {
         "participants": [
           {
@@ -353,9 +416,9 @@
     {
       "method": "POST",
       "path": "/v1/holds",
-      "description": "Hold a room for date range during checkout; authorizes payment.",
-      "request": "{ \"propertyId\": \"p_3\", \"checkIn\": \"...\", \"checkOut\": \"...\" }",
-      "response": "{ \"holdId\": \"h_9\", \"expiresAt\": \"...\" }",
+      "description": "Hold a unit's date range during checkout and authorize payment. Idempotent on Idempotency-Key.",
+      "request": "Idempotency-Key: k_h1\n{ \"unitId\": \"u_3\", \"checkIn\": \"2026-06-01\", \"checkOut\": \"2026-06-04\", \"guestId\": \"g_7\", \"priceQuoteId\": \"q_2\", \"paymentMethodId\": \"pm_5\" }",
+      "response": "{ \"holdId\": \"h_9\", \"state\": \"held\", \"expiresAt\": \"2026-05-20T10:10:00Z\", \"paymentAuthorizationId\": \"auth_4\" }  // 409 { \"error\": \"unavailable\" } on conflict",
       "sequence": {
         "participants": [
           {
@@ -432,19 +495,108 @@
     {
       "method": "POST",
       "path": "/v1/bookings",
-      "description": "Confirm a held booking; captures payment and finalizes the reservation.",
-      "request": "{ \"holdId\": \"h_9\", \"idempotencyKey\": \"k_1\" }",
-      "response": "{ \"bookingId\": \"b_9\", \"state\": \"confirmed\" }"
+      "description": "Confirm a held booking. Drives a retry-safe state machine: captures payment, finalizes inventory, persists the booking. Idempotent on Idempotency-Key. May return a transitional state while recovery is in progress.",
+      "request": "Idempotency-Key: k_c1\n{ \"holdId\": \"h_9\" }",
+      "response": "{ \"bookingId\": \"b_9\", \"state\": \"confirmed\" }  // or { \"state\": \"confirming\" } (retry), { \"state\": \"confirm_failed\" }, 409 { \"error\": \"hold_expired\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/bookings/{bookingId}/cancel",
+      "description": "Cancel a confirmed booking, release its nights back to open exactly once, and trigger a refund per policy. Idempotent on Idempotency-Key.",
+      "request": "Idempotency-Key: k_x1\n{ \"reason\": \"guest_request\" }",
+      "response": "{ \"bookingId\": \"b_9\", \"state\": \"cancelled\", \"refund\": { \"amount\": 432, \"currency\": \"USD\", \"policy\": \"flexible\" } }",
+      "sequence": {
+        "participants": [
+          {
+            "id": "Client"
+          },
+          {
+            "id": "BookingSvc",
+            "label": "Booking Service"
+          },
+          {
+            "id": "BookingDB",
+            "label": "Booking Store"
+          },
+          {
+            "id": "AvailSvc",
+            "label": "Availability"
+          },
+          {
+            "id": "PaySvc",
+            "label": "Payment"
+          }
+        ],
+        "messages": [
+          {
+            "from": "Client",
+            "to": "BookingSvc",
+            "arrow": "->>",
+            "label": "cancel booking {idemKey}"
+          },
+          {
+            "type": "alt",
+            "label": "booking is confirmed",
+            "messages": [
+              {
+                "from": "BookingSvc",
+                "to": "BookingDB",
+                "arrow": "->>",
+                "label": "confirmed -> cancelling"
+              },
+              {
+                "from": "BookingSvc",
+                "to": "AvailSvc",
+                "arrow": "->>",
+                "label": "release nights -> open (once)"
+              },
+              {
+                "from": "BookingSvc",
+                "to": "PaySvc",
+                "arrow": "->>",
+                "label": "refund per policy"
+              },
+              {
+                "from": "BookingSvc",
+                "to": "BookingDB",
+                "arrow": "->>",
+                "label": "cancelling -> cancelled"
+              },
+              {
+                "from": "BookingSvc",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "cancelled + refund"
+              }
+            ],
+            "else": {
+              "label": "already cancelled (retry)",
+              "messages": [
+                {
+                  "from": "BookingSvc",
+                  "to": "Client",
+                  "arrow": "-->>",
+                  "label": "cancelled (original result)"
+                }
+              ]
+            }
+          }
+        ]
+      }
     }
   ],
   "dataModel": [
     {
       "name": "availability",
-      "note": "Per-property per-date inventory — the source of truth for booking.",
+      "note": "Per-unit per-date inventory — the source of truth for booking. Default unit = listing (capacity 1/night); hotels carry room_type_id with counts.",
       "fields": [
         {
-          "name": "property_id",
+          "name": "unit_id",
           "type": "bigint (shard key)"
+        },
+        {
+          "name": "room_type_id",
+          "type": "bigint | null (hotels)"
         },
         {
           "name": "date",
@@ -455,42 +607,16 @@
           "type": "enum(open, held, booked)"
         },
         {
+          "name": "available_count",
+          "type": "int (1 for listings; >1 for room-type inventory)"
+        },
+        {
           "name": "hold_id",
-          "type": "uuid | null"
+          "type": "uuid | null (the currently valid hold)"
         },
         {
           "name": "version",
           "type": "bigint (optimistic concurrency)"
-        }
-      ]
-    },
-    {
-      "name": "bookings",
-      "note": "Authoritative reservations + lifecycle.",
-      "fields": [
-        {
-          "name": "booking_id",
-          "type": "uuid PK"
-        },
-        {
-          "name": "property_id",
-          "type": "bigint"
-        },
-        {
-          "name": "check_in",
-          "type": "date"
-        },
-        {
-          "name": "check_out",
-          "type": "date"
-        },
-        {
-          "name": "state",
-          "type": "enum(held, confirmed, cancelled)"
-        },
-        {
-          "name": "idempotency_key",
-          "type": "varchar"
         }
       ]
     },
@@ -503,7 +629,11 @@
           "type": "uuid PK"
         },
         {
-          "name": "property_id",
+          "name": "unit_id",
+          "type": "bigint"
+        },
+        {
+          "name": "owner_guest_id",
           "type": "bigint"
         },
         {
@@ -511,8 +641,100 @@
           "type": "[check_in, check_out)"
         },
         {
+          "name": "state",
+          "type": "enum(held, confirming, confirmed, expired, cancelled)"
+        },
+        {
+          "name": "payment_authorization_id",
+          "type": "varchar | null"
+        },
+        {
           "name": "expires_at",
           "type": "timestamp (TTL)"
+        },
+        {
+          "name": "confirming_at",
+          "type": "timestamp | null"
+        }
+      ]
+    },
+    {
+      "name": "bookings",
+      "note": "Authoritative reservations + lifecycle.",
+      "fields": [
+        {
+          "name": "booking_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "hold_id",
+          "type": "uuid (source hold)"
+        },
+        {
+          "name": "unit_id",
+          "type": "bigint"
+        },
+        {
+          "name": "guest_id",
+          "type": "bigint"
+        },
+        {
+          "name": "check_in",
+          "type": "date"
+        },
+        {
+          "name": "check_out",
+          "type": "date"
+        },
+        {
+          "name": "state",
+          "type": "enum(confirming, confirmed, confirm_failed, cancelling, cancelled)"
+        },
+        {
+          "name": "amount",
+          "type": "decimal"
+        },
+        {
+          "name": "currency",
+          "type": "char(3)"
+        },
+        {
+          "name": "payment_reference",
+          "type": "varchar (capture/refund id)"
+        },
+        {
+          "name": "cancelled_at",
+          "type": "timestamp | null"
+        }
+      ]
+    },
+    {
+      "name": "idempotency_keys",
+      "note": "Makes hold/confirm/cancel safe to retry — stores the request fingerprint and final response per key.",
+      "fields": [
+        {
+          "name": "key",
+          "type": "varchar PK"
+        },
+        {
+          "name": "scope",
+          "type": "enum(hold, confirm, cancel)"
+        },
+        {
+          "name": "request_hash",
+          "type": "varchar (detect key reuse with a different body)"
+        },
+        {
+          "name": "status",
+          "type": "enum(in_progress, succeeded, failed)"
+        },
+        {
+          "name": "response",
+          "type": "json (replayed on retry)"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamp (retention)"
         }
       ]
     }
@@ -520,7 +742,7 @@
   "patterns": [
     {
       "name": "Date-range inventory",
-      "what": "Model availability per property per night so a stay is a contiguous range of open nights.",
+      "what": "Model availability per unit per night so a stay is a contiguous range of open nights.",
       "whenToUse": "Reservations over date ranges (lodging, rentals).",
       "steps": [
         "inventory"
@@ -547,8 +769,8 @@
     },
     {
       "name": "Atomic range reservation",
-      "what": "Check-and-mark the whole date range in one atomic operation to prevent double-booking.",
-      "whenToUse": "Concurrent bookings on the same room.",
+      "what": "Check-and-mark the whole date range in one atomic operation (committing only if affected rows = nights) to prevent double-booking.",
+      "whenToUse": "Concurrent bookings on the same unit.",
       "steps": [
         "consistency"
       ],
@@ -571,6 +793,34 @@
         "confirm"
       ],
       "group": "Confirm, Idempotency, and Expiry"
+    },
+    {
+      "name": "Confirm saga / booking state machine",
+      "what": "Model confirm as recoverable states (confirming/confirmed/confirm_failed) keyed to stable references, since external payment capture can't join a local DB transaction.",
+      "whenToUse": "A confirm that crosses an external payment plus multiple stores.",
+      "steps": [
+        "confirm"
+      ],
+      "group": "Confirm, Idempotency, and Expiry"
+    },
+    {
+      "name": "Cancel & release",
+      "what": "Cancel a confirmed booking via confirmed -> cancelling -> cancelled, releasing the nights to open exactly once, invalidating caches, and refunding per policy — idempotently.",
+      "whenToUse": "Reservations that can be undone after confirmation.",
+      "steps": [
+        "confirm"
+      ],
+      "group": "Confirm, Idempotency, and Expiry"
+    },
+    {
+      "name": "Change stream + projector (derived stores)",
+      "what": "Stream truth-store changes through a projector that updates derived browse stores (cache, search index), giving freshness a named owner.",
+      "whenToUse": "Approximate read views derived from an authoritative write store.",
+      "steps": [
+        "search",
+        "scale"
+      ],
+      "group": "Search: Approximate Browse"
     }
   ],
   "steps": [
@@ -578,9 +828,9 @@
       "id": "naive",
       "title": "1. Naive: Check Availability, Then Write a Booking (the baseline)",
       "description": [
-        "Start with the simplest booking flow: when a guest books, read the availability for the dates, and if it looks free, write a booking row. Search is a query over the same availability/property tables.",
-        "It reads naturally and is wrong under concurrency. Between the check and the write, a second guest can run the same check, see the same dates free, and also write a booking — a classic read-then-write race that double-books the room for overlapping dates. Separately, searching the authoritative availability tables on every browse doesn't scale to millions of properties and browse-heavy traffic.",
-        "So the baseline motivates the design: model per-night date-range inventory, reserve a range atomically (so exactly one booking wins), and serve browse from a fast approximate index/cache while the book step verifies the truth."
+        "Start with the simplest booking flow: when a guest books a unit, read the availability for the dates, and if it looks free, write a booking row. Search is a query over the same availability/unit tables.",
+        "It reads naturally and is wrong under concurrency. Between the check and the write, a second guest can run the same check on the same unit, see the same dates free, and also write a booking — a classic read-then-write race that double-books the unit for overlapping dates. Separately, searching the authoritative availability tables on every browse doesn't scale to millions of units and browse-heavy traffic.",
+        "So the baseline motivates the design: pick a precise reservable unit (a listing, or a hotel room type with counts), model per-night date-range inventory, reserve a range atomically (so exactly one booking wins), and serve browse from a fast approximate index/cache while the book step verifies the truth."
       ],
       "view": {
         "nodes": [
@@ -605,7 +855,7 @@
           "booking-core"
         ]
       },
-      "decisionPrompt": "Two guests check the same room for the same dates at the same moment, both see it free, and both write a booking. What did you just do?",
+      "decisionPrompt": "Two guests check the same unit for the same dates at the same moment, both see it free, and both write a booking. What did you just do?",
       "whyNow": [
         "Check-then-write is the intuitive booking flow; watching it double-book under a concurrent race is exactly what motivates atomic range reservation and the approximate-browse / exact-book split."
       ],
@@ -623,7 +873,7 @@
       "traps": [
         {
           "trap": "Checking availability and then writing the booking in two separate steps.",
-          "why": "Two concurrent requests both pass the check before either writes, double-booking the room for overlapping dates.",
+          "why": "Two concurrent requests both pass the check before either writes, double-booking the unit for overlapping dates.",
           "instead": "Reserve the whole date range in one atomic conditional operation so exactly one booking wins."
         }
       ]
@@ -632,8 +882,8 @@
       "id": "inventory",
       "title": "2. Model Inventory as Date-Range Availability",
       "description": [
-        "Lodging inventory is per-night: a property/room is available or not for each date. A stay is a contiguous range of nights, and booking it means every night in the range is open.",
-        "Store availability per (property, date) with a state (open/held/booked). This per-night model is what makes overlapping-range conflict detection precise — two stays conflict iff they share any night.",
+        "Lodging inventory is per-night: a reservable unit is available or not for each date. A stay is a contiguous range of nights, and booking it means every night in the range is open. First fix the unit of inventory: an Airbnb-style listing is one unit with capacity 1 per night; a hotel is (property, room_type) with an available_count per night (and possibly individual room assignment).",
+        "Store availability per (unit, date) with a state (open/held/booked) and, for hotels, an available_count. This per-night model is what makes overlapping-range conflict detection precise — two stays conflict iff they share any night the unit can't cover.",
         "This availability store is the source of truth for booking; everything browse-side is derived from it."
       ],
       "view": {
@@ -658,16 +908,17 @@
       "options": [
         {
           "name": "Per-night availability rows (default)",
-          "description": "Availability is stored as one row per (property, date) carrying an open/held/booked state, so a stay reserves every night row in its range.",
+          "description": "Availability is stored as one row per (unit, date) carrying an open/held/booked state, so a stay reserves every night row in its range.",
           "pros": [
             "Two stays conflict iff they share any night, so overlap detection is exact and simple.",
-            "A row per (property, date) maps cleanly onto atomic conditional updates over a date range.",
+            "A row per (unit, date) maps cleanly onto atomic conditional updates over a date range.",
             "Natural state machine per night (open/held/booked) for holds, reaper release, and pricing per date."
           ],
           "cons": [
             "A long stay touches many rows, so reserve/release operate on a range, not a single row.",
-            "Row count is properties x calendar horizon — large, though bounded and shardable by property.",
-            "Open-ended or far-future inventory needs a bounded horizon or lazy row creation."
+            "Row count is units x calendar horizon (~365M for 1M units x 365 nights) — large, though bounded and shardable by unit.",
+            "Open-ended or far-future inventory needs a bounded horizon or lazy row creation.",
+            "Quantity inventory (a room type with N identical rooms) needs an available_count per night, not a single open/booked flag."
           ],
           "view": {
             "nodes": [
@@ -757,9 +1008,9 @@
       "id": "search",
       "title": "3. Search: Approximate Browse",
       "description": [
-        "Browse is read-heavy and tolerant of slight staleness. Build a search index over properties (geo + attributes) and an availability read cache; search returns properties that appear available for the dates, fast.",
-        "Search availability is approximate by design — a property shown as available might get booked by someone else a second later. That's acceptable for browse; the booking step is where exactness is enforced.",
-        "Separating fast/approximate discovery from slow/exact booking is the key consistency split: don't make every search hit the authoritative availability store."
+        "Browse is read-heavy and tolerant of slight staleness. Build a search index over units (geo + attributes) and an availability read cache; search returns units that appear available for the dates, fast.",
+        "Search availability is approximate by design — a unit shown as available might get booked by someone else a second later. That's acceptable for browse; the booking step is where exactness is enforced.",
+        "Keep the derived stores fresh through an explicit path: availability transitions (held/booked/released) flow through a change stream into a projector that updates the read cache and search index — don't make every search hit the authoritative availability store, and don't leave cache freshness as an unowned side effect."
       ],
       "view": {
         "nodes": [
@@ -767,23 +1018,26 @@
           "LB",
           "SearchSvc",
           "SearchIdx",
-          "Cache"
+          "Cache",
+          "AvailStream",
+          "CacheProjector"
         ],
-        "caption": "The guest client searches through the gateway and search service, which queries the search index by geo and filters and reads approximate availability from the read cache.",
+        "caption": "The guest client searches through the gateway and search service, which queries the search index by geo and filters and reads approximate availability from a read cache that a projector keeps current from the availability change stream.",
         "links": [
           "client-lb",
           "lb-search",
           "search-idx",
           "search-cache",
-          "avail-cache"
+          "stream-projector",
+          "projector-cache",
+          "projector-idx"
         ],
         "highlight": [
           "SearchSvc",
-          "SearchIdx"
+          "CacheProjector"
         ],
         "groups": [
-          "discovery",
-          "booking-core"
+          "discovery"
         ]
       },
       "options": [
@@ -796,8 +1050,8 @@
             "Index and cache scale and replicate independently of the booking core."
           ],
           "cons": [
-            "Search availability is approximate — a property shown free may be booked a second later (corrected at the booking step).",
-            "The availability cache must be fed from booking changes, adding a freshness pipeline.",
+            "Search availability is approximate — a unit shown free may be booked a second later (corrected at the booking step).",
+            "The availability cache + index must be fed from booking changes via a change stream and projector, adding a freshness pipeline.",
             "Two derived stores (index + cache) to keep reasonably fresh."
           ],
           "view": {
@@ -820,8 +1074,7 @@
               "SearchIdx"
             ],
             "groups": [
-              "discovery",
-              "booking-core"
+              "discovery"
             ]
           }
         },
@@ -875,30 +1128,21 @@
           "cons": [
             "Eventually consistent — still approximate at the moment of search, just fresher.",
             "Adds a change stream + projector to build and operate.",
-            "More moving parts than a cache for a property set that may not change that fast."
+            "More moving parts than a cache for a unit set that may not change that fast."
           ],
           "view": {
             "nodes": [
               "SearchSvc",
               "SearchIdx",
-              {
-                "id": "AvailStream",
-                "label": "Availability Change Stream"
-              },
+              "AvailStream",
+              "CacheProjector",
               "AvailDB"
             ],
-            "caption": "Availability changes flow from the store through a change stream into the search index, which the search service queries for browse.",
+            "caption": "Availability changes flow from the store through a change stream and projector into the search index, which the search service queries for browse.",
             "links": [
-              {
-                "from": "AvailDB",
-                "to": "AvailStream",
-                "label": "emit change"
-              },
-              {
-                "from": "AvailStream",
-                "to": "SearchIdx",
-                "label": "update browse view"
-              },
+              "avail-stream",
+              "stream-projector",
+              "projector-idx",
               "search-idx"
             ],
             "highlight": [
@@ -935,7 +1179,7 @@
       "recap": {
         "before": "Search hits the truth store.",
         "after": "Fast approximate search; truth reserved for booking.",
-        "newRisk": "Two guests can both reach checkout for the same room — booking must not double-sell."
+        "newRisk": "Two guests can both reach checkout for the same unit — booking must not double-sell."
       }
     },
     {
@@ -944,11 +1188,12 @@
       "description": [
         "Booking is multi-step (review, pay), during which someone else mustn't grab the room. When checkout starts, place a hold on the date range: mark those nights 'held' with a short TTL and authorize payment.",
         "The hold gives the guest a window to complete payment without the dates being sold from under them. If they confirm, the hold becomes a booking; if they abandon, the hold expires.",
-        "Holds are short (minutes) so abandoned checkouts don't lock inventory — a balance between giving guests time and not starving real demand."
+        "Holds are short (minutes) so abandoned checkouts don't lock inventory — a balance between giving guests time and not starving real demand. The hold carries its own lifecycle fields — state (held/confirming/confirmed/expired), owner, payment_authorization_id, and expires_at — and each held night row records the currently valid hold_id. The reaper releases a night only when it is still held by a hold that is still expired and unconfirmed, so it never reopens nights that a newer checkout re-held or that a confirm already booked."
       ],
       "view": {
         "nodes": [
           "Client",
+          "LB",
           "BookingSvc",
           "AvailSvc",
           "HoldStore",
@@ -956,6 +1201,7 @@
         ],
         "caption": "The booking service reserves dates via the availability service, places a TTL hold in the hold store, then authorizes payment through the payment service.",
         "links": [
+          "client-lb",
           "lb-booking",
           "booking-avail",
           "booking-hold",
@@ -1067,7 +1313,7 @@
           "cons": [
             "A lock held for minutes across a slow human payment step ties up a DB resource the whole time.",
             "A client that abandons or crashes mid-checkout strands the lock until a timeout — same expiry problem as a hold, with worse blast radius.",
-            "Long-held locks hurt throughput and can cascade under contention on hot properties."
+            "Long-held locks hurt throughput and can cascade under contention on hot units."
           ],
           "view": {
             "nodes": [
@@ -1144,8 +1390,8 @@
       "id": "consistency",
       "title": "5. Preventing Double-Booking",
       "description": [
-        "The core correctness requirement: never sell the same room twice for overlapping dates. The hold acquisition must be atomic — check that every night in the range is open and mark them held in one operation, so two concurrent requests can't both pass the check.",
-        "Use a conditional/transactional update over the date range (or optimistic concurrency with the version column): the first request wins the range; the second sees a conflict and is rejected. The availability store, sharded by property, serializes writes per property.",
+        "The core correctness requirement: never sell the same unit twice for overlapping dates. The hold acquisition must be atomic — check that every night in the range is open and mark them held in one operation, so two concurrent requests can't both pass the check.",
+        "Use a conditional/transactional update over the date range (or optimistic concurrency with the version column): the first request wins the range; the second sees a conflict and is rejected. Critically, the update must affect exactly N rows (one per night) — a naive `UPDATE ... WHERE date IN range AND state='open'` will happily update a partial subset if some nights are taken, so the transaction must compare the affected row count to the number of nights and roll back unless they match. The availability store, sharded by unit, serializes writes per unit.",
         "This is the same check-and-reserve-atomically discipline as any limited-inventory system, applied to a contiguous date range rather than a single counter."
       ],
       "view": {
@@ -1170,15 +1416,16 @@
       "options": [
         {
           "name": "Atomic conditional update / OCC (default)",
-          "description": "A single conditional/transactional update checks every night is open and marks them held at once, using a version column so the losing concurrent request just fails.",
+          "description": "A single conditional/transactional update checks every night is open and marks them held at once, committing only if the affected row count equals the number of nights, using a version column so the losing concurrent request just fails.",
           "pros": [
             "Check-all-nights-open-and-mark-held in one conditional update, so two concurrent requests can't both pass.",
             "Optimistic concurrency (version column) needs no long-held locks — the loser just retries or fails.",
-            "Sharding availability by property serializes writes per property naturally."
+            "Sharding availability by unit serializes writes per unit naturally."
           ],
           "cons": [
+            "Must verify affected rows = number of nights and roll back on a partial match, or a partially-taken range silently half-reserves.",
             "The loser of a race must handle a conflict and retry, adding client-side complexity.",
-            "Hot dates on a famous property serialize on one property's rows — correct but a throughput ceiling.",
+            "Hot dates on a famous unit serialize on one unit's rows — correct but a throughput ceiling.",
             "Requires the store to support the conditional/transactional primitive over a range."
           ],
           "view": {
@@ -1210,7 +1457,7 @@
             "Deterministic: the second request blocks, then sees the nights taken."
           ],
           "cons": [
-            "Locks held under load can queue and degrade throughput on hot properties.",
+            "Locks held under load can queue and degrade throughput on hot units.",
             "Risk of deadlocks when ranges are locked in different orders across requests.",
             "Doesn't extend cleanly to a sharded/distributed store the way a conditional update does."
           ],
@@ -1237,8 +1484,8 @@
           }
         },
         {
-          "name": "Distributed lock per property+range",
-          "description": "A separate lock service (Redis/ZooKeeper) grants an exclusive lock on property+range, coordinating mutual exclusion outside the availability store's own writes.",
+          "name": "Distributed lock per unit+range",
+          "description": "A separate lock service (Redis/ZooKeeper) grants an exclusive lock on unit+range, coordinating mutual exclusion outside the availability store's own writes.",
           "pros": [
             "A lock service (e.g. Redis/ZooKeeper) coordinates exclusivity even across multiple booking services.",
             "Works when the availability store itself can't offer a strong conditional primitive.",
@@ -1259,12 +1506,12 @@
               "AvailSvc",
               "AvailDB"
             ],
-            "caption": "The booking service first acquires a property+range lock from a distributed lock service before reserving through the availability store.",
+            "caption": "The booking service first acquires a unit+range lock from a distributed lock service before reserving through the availability store.",
             "links": [
               {
                 "from": "BookingSvc",
                 "to": "LockSvc",
-                "label": "acquire property+range lock"
+                "label": "acquire unit+range lock"
               },
               "booking-avail",
               "avail-db"
@@ -1278,13 +1525,13 @@
           }
         }
       ],
-      "decisionPrompt": "Two guests submit a hold for the same room and dates at the same millisecond. How does exactly one win?",
+      "decisionPrompt": "Two guests submit a hold for the same unit and dates at the same millisecond. How does exactly one win?",
       "concepts": [
         {
           "term": "Atomic range reservation",
           "definition": "Check all nights open and mark them held in a single atomic/conditional operation.",
           "whyItMatters": "Prevents the read-then-write race that causes double-booking.",
-          "example": "UPDATE availability SET state='held' WHERE property=p AND date IN range AND state='open' — succeeds only if all rows matched.",
+          "example": "UPDATE availability SET state='held' WHERE unit=u AND date IN range AND state='open' — commit only if affected rows = number of nights, else roll back.",
           "group": "Preventing Double-Booking"
         }
       ],
@@ -1392,9 +1639,10 @@
       "id": "confirm",
       "title": "6. Confirm, Idempotency, and Expiry",
       "description": [
-        "On confirm, capture the authorized payment and transition the hold to a confirmed booking atomically (held nights -> booked). Use an idempotency key so a retried confirm (network blip) doesn't create two bookings or double-charge.",
-        "If the guest abandons checkout, the hold reaper expires it past its TTL and releases the nights back to 'open' — inventory self-heals without manual cleanup.",
-        "The booking lifecycle (held -> confirmed -> cancelled) is durable; cancellation frees the dates and refunds per policy. Confirm is the money-moving step, so correctness here mirrors the wallet/payment discipline."
+        "Confirm crosses an external payment capture and two stores (availability + bookings), so it cannot be one atomic transaction. Model it as a retry-safe state machine (a small saga): booking goes confirming -> confirmed (or confirm_failed), each step keyed to stable references (hold_id, payment_authorization_id) and guarded by an idempotency key so a retried confirm never creates two bookings or double-charges. 'Atomic' applies only to the local availability update (held nights -> booked), not to the payment leg.",
+        "The recoverable edges are the whole point. Capture-succeeded-but-write-failed: a retry recognizes the existing capture (via the authorization id / idempotency record) and finalizes exactly one booking. Write-succeeded-but-response-lost: a retry replays the stored response instead of redoing work. Hold-expiry racing confirm: confirm first transitions the hold held -> confirming (CAS), so the reaper, which only releases still-held expired holds, can no longer reopen the nights mid-confirm.",
+        "If the guest abandons checkout, the reaper expires the hold past its TTL and releases the nights back to 'open' — inventory self-heals without manual cleanup.",
+        "Cancellation is a separate lifecycle edge, not the inverse of confirm: confirmed -> cancelling -> cancelled, releasing the booked nights to open exactly once, emitting a cache/search invalidation, and refunding per policy — all idempotent. (See the Cancel API for the flow.) Confirm and cancel are the money-moving steps, so correctness here mirrors the wallet/payment discipline."
       ],
       "view": {
         "nodes": [
@@ -1423,10 +1671,17 @@
       "decisionPrompt": "The guest pays, but the confirm response is lost and they retry. How do you avoid a second booking/charge?",
       "concepts": [
         {
-          "term": "Idempotent confirm + hold reaping",
-          "definition": "A confirm keyed for dedup, plus a reaper that releases expired holds.",
-          "whyItMatters": "Makes confirm retry-safe and ensures abandoned holds never permanently lock inventory.",
-          "example": "Retry with key k_1 returns the original booking; an unpaid hold expires and frees its nights.",
+          "term": "Confirm as a retry-safe state machine (saga)",
+          "definition": "Booking lifecycle states (confirming/confirmed/confirm_failed/cancelling/cancelled) with each step keyed to stable references and an idempotency key, instead of an impossible atomic payment+DB transaction.",
+          "whyItMatters": "External capture can't join a local transaction; explicit states + idempotency make every interrupted step recoverable and replayable.",
+          "example": "Crash after capture, before write -> retry sees the capture and finalizes one booking; lost response -> retry replays the stored result.",
+          "group": "Confirm, Idempotency, and Expiry"
+        },
+        {
+          "term": "Hold reaping (TTL expiry)",
+          "definition": "A reaper releases nights of still-held, still-expired, unconfirmed holds back to open.",
+          "whyItMatters": "Abandoned holds never permanently lock inventory, and the still-held guard avoids racing a confirm or a newer hold.",
+          "example": "An unpaid hold passes its TTL; the reaper sets its nights open only if they're still held by that hold.",
           "group": "Confirm, Idempotency, and Expiry"
         }
       ],
@@ -1438,27 +1693,44 @@
       ],
       "patterns": [
         "Idempotent confirm",
-        "TTL hold expiry (reaping)"
+        "Confirm saga / booking state machine",
+        "TTL hold expiry (reaping)",
+        "Cancel & release"
       ],
       "whyNow": [
-        "Idempotent confirm + reaping complete the correctness story: no double-booking, no double-charge, no leaked inventory."
+        "A retry-safe confirm state machine + reaping + a real cancel path complete the correctness story: no double-booking, no double-charge, no leaked inventory, and a clean release on cancellation."
       ],
       "recap": {
-        "before": "Confirm could double-book/charge; holds could leak.",
-        "after": "Idempotent confirm; expired holds auto-released.",
-        "newRisk": "Hot properties (popular listing, event dates) concentrate contention; search freshness lags truth."
+        "before": "Confirm was described as one atomic payment+DB step; cancellation was prose-only; holds could leak.",
+        "after": "Confirm is a retry-safe saga; cancel releases nights once and refunds per policy; expired holds auto-released.",
+        "newRisk": "Hot units (popular listing, event dates) concentrate contention; search freshness lags truth."
       },
       "failureDrills": [
         {
           "scenario": "Booking service crashes after capturing payment but before recording the booking.",
-          "expectedBehavior": "Retry with the idempotency key recognizes the captured payment and finalizes one booking.",
-          "mitigation": "Idempotent confirm keyed to the hold/payment."
+          "expectedBehavior": "Retry with the idempotency key recognizes the captured payment (via the authorization id) and finalizes exactly one booking.",
+          "mitigation": "Confirm saga keyed to hold/payment references; payment capture is checked before re-capturing."
+        },
+        {
+          "scenario": "Confirm succeeds but the response is lost; the client retries.",
+          "expectedBehavior": "The idempotency record is found in 'succeeded' state and its stored response is replayed — no second booking or charge.",
+          "mitigation": "Idempotency-Key record stores request hash, status, and final response."
+        },
+        {
+          "scenario": "The hold's TTL expires at the same moment the guest hits confirm.",
+          "expectedBehavior": "Confirm CAS-transitions the hold held -> confirming first; the reaper, which only releases still-held expired holds, skips it. If the reaper won the CAS, confirm sees the hold gone and returns hold_expired.",
+          "mitigation": "Single held -> confirming transition guards confirm vs reaper."
+        },
+        {
+          "scenario": "Payment capture is permanently declined at confirm.",
+          "expectedBehavior": "Booking moves to confirm_failed and the held nights are released back to open; the client is told to retry payment.",
+          "mitigation": "Saga compensation releases the hold on a terminal capture failure."
         }
       ],
       "flows": [
         {
-          "name": "Idempotent confirm: capture payment, finalize once",
-          "note": "Confirm captures the authorized payment and transitions held nights to booked under an idempotency key; a retried confirm returns the same booking.",
+          "name": "Confirm saga: capture, finalize, persist — once",
+          "note": "Confirm CAS-locks the hold (held -> confirming), captures the authorized payment, marks held nights booked, persists the booking, and records the result under the idempotency key. A retry for the same key replays the stored response.",
           "sequence": {
             "participants": [
               {
@@ -1467,6 +1739,10 @@
               {
                 "id": "BookingSvc",
                 "label": "Booking Service"
+              },
+              {
+                "id": "HoldStore",
+                "label": "Hold Store"
               },
               {
                 "id": "PaySvc",
@@ -1494,9 +1770,15 @@
                 "messages": [
                   {
                     "from": "BookingSvc",
+                    "to": "HoldStore",
+                    "arrow": "->>",
+                    "label": "CAS held -> confirming"
+                  },
+                  {
+                    "from": "BookingSvc",
                     "to": "PaySvc",
                     "arrow": "->>",
-                    "label": "capture authorized payment"
+                    "label": "capture (skip if already captured)"
                   },
                   {
                     "from": "BookingSvc",
@@ -1508,7 +1790,7 @@
                     "from": "BookingSvc",
                     "to": "BookingDB",
                     "arrow": "->>",
-                    "label": "persist booking (confirmed)"
+                    "label": "persist booking + store idem response"
                   },
                   {
                     "from": "BookingSvc",
@@ -1522,12 +1804,87 @@
                   "messages": [
                     {
                       "from": "BookingSvc",
+                      "to": "BookingDB",
+                      "arrow": "->>",
+                      "label": "read idem record"
+                    },
+                    {
+                      "from": "BookingSvc",
                       "to": "Client",
                       "arrow": "-->>",
-                      "label": "confirmed (original booking)"
+                      "label": "replay stored response (one booking)"
                     }
                   ]
                 }
+              }
+            ]
+          },
+          "highlight": [
+            "BookingSvc",
+            "PaySvc"
+          ]
+        },
+        {
+          "name": "Recovery: capture succeeded but write failed",
+          "note": "The booking service crashed after capturing payment but before persisting the booking. The retried confirm detects the existing capture and the in_progress idempotency record and finalizes exactly one booking instead of re-capturing.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Client"
+              },
+              {
+                "id": "BookingSvc",
+                "label": "Booking Service"
+              },
+              {
+                "id": "PaySvc",
+                "label": "Payment"
+              },
+              {
+                "id": "AvailDB",
+                "label": "Availability Store"
+              },
+              {
+                "id": "BookingDB",
+                "label": "Booking Store"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Client",
+                "to": "BookingSvc",
+                "arrow": "->>",
+                "label": "confirm hold {idemKey} (retry)"
+              },
+              {
+                "from": "BookingSvc",
+                "to": "BookingDB",
+                "arrow": "->>",
+                "label": "idem record = in_progress"
+              },
+              {
+                "from": "BookingSvc",
+                "to": "PaySvc",
+                "arrow": "->>",
+                "label": "capture already done? yes (auth id)"
+              },
+              {
+                "from": "BookingSvc",
+                "to": "AvailDB",
+                "arrow": "->>",
+                "label": "held nights -> booked (idempotent)"
+              },
+              {
+                "from": "BookingSvc",
+                "to": "BookingDB",
+                "arrow": "->>",
+                "label": "persist booking + mark idem succeeded"
+              },
+              {
+                "from": "BookingSvc",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "confirmed (one booking, one charge)"
               }
             ]
           },
@@ -1542,26 +1899,32 @@
       "id": "scale",
       "title": "7. Scaling Search, Hot Properties, and Freshness",
       "description": [
-        "Shard the availability and booking stores by property id so per-property writes serialize locally and load spreads. Search scales separately: the index + availability cache are derived and replicated for browse volume.",
-        "Hot dates/properties (a festival weekend, a famous listing) concentrate booking contention on one property's rows; this is bounded — contention is per-property, and the atomic range reservation keeps it correct, just serialized.",
-        "Keep search freshness reasonable by updating the availability cache from booking changes (a booking removes those nights from browse soon after). Stale search is acceptable because booking re-checks the truth — the cache only needs to be approximately right."
+        "Shard the availability and booking stores by unit id so per-unit writes serialize locally and load spreads. Search scales separately: the index + availability cache are derived and replicated for browse volume (~50k search QPS vs ~500 hold/confirm QPS, so the two tiers size very differently).",
+        "Hot dates/units (a festival weekend, a famous listing) concentrate booking contention on one unit's rows; this is bounded — contention is per-unit, and the atomic range reservation keeps it correct, just serialized. For a single famous unit that is a real write hotspot, admission control (a short waiting room/queue in front of its hold endpoint) smooths the spike without breaking correctness.",
+        "Keep search freshness reasonable by streaming availability changes through the projector into the cache and index (a booking removes those nights from browse within seconds). Stale search is acceptable because booking re-checks the truth — the cache only needs to be approximately right.",
+        "Operate it with signals, not vibes: conflict rate on contested ranges, hold-expiry/reaper backlog, cache staleness age, confirm-saga stuck count (bookings stuck in confirming), payment-ambiguity count, and search-to-hold conversion. Keep an availability audit/history of state transitions for reconciliation and disputes."
       ],
       "view": {
         "nodes": [
           "SearchSvc",
           "Cache",
+          "CacheProjector",
+          "AvailStream",
           "AvailDB",
+          "BookingSvc",
           "BookingDB"
         ],
-        "caption": "The search service reads approximate availability from a cache refreshed by the availability store, keeping browse fast while bookings persist to the booking store.",
+        "caption": "The search service reads approximate availability from a cache the projector refreshes from the availability change stream, keeping browse fast while bookings persist to the booking store.",
         "links": [
           "search-cache",
-          "avail-cache",
+          "avail-stream",
+          "stream-projector",
+          "projector-cache",
           "booking-db"
         ],
         "highlight": [
           "Cache",
-          "AvailDB"
+          "CacheProjector"
         ],
         "groups": [
           "discovery",
@@ -1570,28 +1933,32 @@
       },
       "decisionPrompt": "A famous listing's peak weekend gets thousands of concurrent booking attempts. What stays correct, and what's the bottleneck?",
       "whyNow": [
-        "Closing on sharding + hot properties + cache freshness shows the browse/book split scales and stays correct under contention."
+        "Closing on sharding + hot units + cache freshness + operational signals shows the browse/book split scales and stays correct under contention."
       ],
       "recap": {
-        "before": "Single stores; unbounded freshness.",
-        "after": "Property-sharded truth; replicated approximate search; cache updated from bookings.",
-        "newRisk": "Search-vs-truth lag and per-property hot rows — bounded by re-check-at-book and per-property serialization."
+        "before": "Single stores; unbounded freshness; no operational signals.",
+        "after": "Unit-sharded truth; replicated approximate search; cache updated via change stream + projector; metrics on contention/freshness/saga health.",
+        "newRisk": "Search-vs-truth lag and per-unit hot rows — bounded by re-check-at-book and per-unit serialization."
       },
       "bottlenecks": [
         {
-          "issue": "Hot property/date contention.",
-          "mitigation": "Per-property sharding serializes its writes; atomic range reservation keeps correctness; show 'just booked' fast via cache update."
+          "issue": "Hot unit/date contention.",
+          "mitigation": "Per-unit sharding serializes its writes; atomic range reservation keeps correctness; admission control (waiting room) smooths a single famous unit's spike; show 'just booked' fast via cache update. Watch the conflict rate on contested ranges."
         },
         {
           "issue": "Search showing stale availability.",
-          "mitigation": "Update the cache from booking events; the book step re-verifies authoritatively."
+          "mitigation": "Stream booking changes through the projector to the cache/index; the book step re-verifies authoritatively. Watch cache staleness age."
+        },
+        {
+          "issue": "Confirm sagas stuck or holds leaking.",
+          "mitigation": "Alert on bookings stuck in 'confirming', reaper backlog, and payment-ambiguity counts; reconcile against the availability audit/history."
         }
       ]
     }
   ],
   "finalDesign": {
     "title": "Final Design — Lodging Reservation System",
-    "description": "Availability is modeled per property per night (the source of truth). Browse is served from a fast, approximate search index + availability cache; the booking flow enforces exactness. Starting checkout places a TTL hold via an atomic range reservation (check-all-nights-open-and-mark-held in one operation), so concurrent attempts can't double-book; payment is authorized at hold and captured on an idempotent confirm that transitions held nights to booked. A reaper releases abandoned holds. Availability/booking stores shard by property (serializing per-property writes); the search cache updates from booking events while the book step always re-checks the truth.",
+    "description": "The reservable unit is a listing (capacity 1/night) or a hotel room type with counts; availability is modeled per unit per night (the source of truth). Browse is served from a fast, approximate search index + availability cache, kept current by a change stream + projector off the truth store. The booking flow enforces exactness: starting checkout places a TTL hold via an atomic range reservation (check-all-nights-open-and-mark-held in one operation, committing only if affected rows = nights), so concurrent attempts can't double-book; payment is authorized at hold and captured on confirm. Confirm is a retry-safe state machine (confirming -> confirmed/confirm_failed) keyed to hold/payment references and an idempotency key, not an atomic payment+DB transaction. A reaper releases abandoned, still-held holds. Cancellation runs confirmed -> cancelling -> cancelled, releasing nights once, invalidating caches, and refunding per policy. Availability/booking stores shard by unit (serializing per-unit writes); the book step always re-checks the truth.",
     "view": {
       "nodes": [
         "Client",
@@ -1599,6 +1966,8 @@
         "SearchSvc",
         "SearchIdx",
         "Cache",
+        "AvailStream",
+        "CacheProjector",
         "BookingSvc",
         "AvailSvc",
         "AvailDB",
@@ -1607,7 +1976,7 @@
         "PaySvc",
         "Reaper"
       ],
-      "caption": "The guest client reaches the gateway for search over the index and availability cache, and booking, where the booking service reserves via the availability store, places holds, pays, and persists to the booking store while a reaper releases expired holds.",
+      "caption": "The guest client reaches the gateway for search over the index and availability cache (kept fresh by a change stream + projector), and booking, where the booking service reserves via the availability store, places holds, pays, persists to the booking store, and releases dates on cancel, while a reaper releases expired holds.",
       "links": [
         "client-lb",
         "lb-search",
@@ -1619,9 +1988,13 @@
         "booking-hold",
         "booking-pay",
         "booking-db",
-        "avail-cache",
+        "avail-stream",
+        "stream-projector",
+        "projector-cache",
+        "projector-idx",
         "reaper-hold",
         "reaper-avail",
+        "booking-cancel-avail",
         "client-avail"
       ],
       "groups": [
@@ -1648,7 +2021,7 @@
       },
       {
         "requirement": "Hold then book",
-        "how": "TTL hold + idempotent confirm with payment.",
+        "how": "TTL hold + retry-safe confirm saga with payment.",
         "steps": [
           "hold",
           "confirm"
@@ -1656,7 +2029,7 @@
       },
       {
         "requirement": "Cancel + free dates",
-        "how": "Booking lifecycle transition releases nights.",
+        "how": "confirmed -> cancelling -> cancelled releases nights once, invalidates caches, and refunds per policy (idempotent cancel API).",
         "steps": [
           "confirm"
         ]
@@ -1672,7 +2045,7 @@
     "nonFunctional": [
       {
         "requirement": "Fast browse (approx ok)",
-        "how": "Replicated search index + availability cache.",
+        "how": "Replicated search index + availability cache kept fresh by a change stream + projector.",
         "steps": [
           "search",
           "scale"
@@ -1680,23 +2053,24 @@
       },
       {
         "requirement": "Strong booking consistency",
-        "how": "Atomic check-and-mark per-property.",
+        "how": "Atomic check-and-mark per-unit (commit only if affected rows = nights).",
         "steps": [
           "consistency"
         ]
       },
       {
         "requirement": "Reliable hold/payment",
-        "how": "TTL holds + idempotent confirm + reaper.",
+        "how": "TTL holds + retry-safe confirm saga + reaper.",
         "steps": [
           "hold",
           "confirm"
         ]
       },
       {
-        "requirement": "Scale to millions of properties",
-        "how": "Property-sharded stores + separate search tier.",
+        "requirement": "Scale to millions of units",
+        "how": "Unit-sharded stores + separate search tier fed by a change stream + projector.",
         "steps": [
+          "search",
           "scale"
         ]
       }
@@ -1707,17 +2081,17 @@
       "phase": "Scope & requirements",
       "time": "first 5 min",
       "say": [
+        "Pin the reservable unit first: a listing (capacity 1/night) vs a hotel room type with counts — no-double-book is only meaningful at that key.",
         "Confirm date-range inventory and the browse(approx)-vs-book(exact) split.",
-        "Pin no-double-booking as the hard correctness requirement.",
-        "Note browse is read-heavy; booking is comparatively rare but must be exact."
+        "Pin no-double-booking as the hard correctness requirement; note browse is read-heavy, booking comparatively rare but exact."
       ]
     },
     {
       "phase": "High-level design",
       "time": "next 10 min",
       "say": [
-        "Per-night availability as the source of truth.",
-        "Fast approximate search from an index + cache.",
+        "Per-night availability as the source of truth, keyed by the chosen unit.",
+        "Fast approximate search from an index + cache, kept fresh by a change stream + projector.",
         "Hold-then-confirm checkout flow."
       ]
     },
@@ -1725,9 +2099,10 @@
       "phase": "Deep dive",
       "time": "next 15 min",
       "say": [
-        "Atomic range reservation to prevent double-booking.",
-        "Idempotent confirm + hold reaping.",
-        "Property sharding, hot dates, and search freshness."
+        "Atomic range reservation (commit only if affected rows = nights) to prevent double-booking.",
+        "Confirm as a retry-safe saga (capture/write/response recovery) + hold reaping with a still-held guard.",
+        "Cancellation: confirmed -> cancelling -> cancelled, release once, invalidate caches, refund per policy.",
+        "Unit sharding, hot dates, and search freshness."
       ]
     },
     {
@@ -1735,8 +2110,9 @@
       "time": "final 5 min",
       "say": [
         "Map requirements to mechanisms.",
-        "Tradeoffs: hold TTL length, search staleness vs truth, per-property contention.",
-        "Mention overbooking strategies and multi-room properties as extensions."
+        "Tradeoffs: hold TTL length, search staleness vs truth, per-unit contention.",
+        "Operational signals: conflict rate, reaper backlog, stuck confirm sagas, cache staleness age.",
+        "Mention overbooking strategies and quantity inventory (rooms > 1/night) as extensions."
       ]
     }
   ],
@@ -1746,31 +2122,34 @@
       "expectations": [
         "Models per-night availability and books it.",
         "Adds a hold.",
-        "May miss the atomic reservation race and browse/book split."
+        "May miss the atomic reservation race, the reservable-unit choice, and the browse/book split."
       ]
     },
     {
       "level": "Senior",
       "expectations": [
-        "Designs approximate browse vs exact book.",
-        "Atomic range reservation + TTL holds.",
-        "Idempotent confirm + reaper."
+        "Names the reservable unit explicitly and designs approximate browse vs exact book.",
+        "Atomic range reservation (with the rows = nights check) + TTL holds.",
+        "Confirm as a retry-safe saga + reaper; a real cancel/release path."
       ]
     },
     {
       "level": "Staff",
       "expectations": [
-        "Reasons about per-property contention and sharding.",
-        "Handles search-vs-truth freshness precisely.",
-        "Discusses overbooking policy and hold-TTL tradeoffs."
+        "Reasons about per-unit contention, sharding, and a named change-stream/projector for derived freshness.",
+        "Handles confirm recovery (capture/write/response) and hold-vs-confirm-vs-reaper races precisely.",
+        "Discusses operational signals, quantity inventory, overbooking policy, and hold-TTL tradeoffs."
       ]
     }
   ],
   "followUps": [
+    "What is your reservable unit — a listing, a room, or a room type with counts — and how does that choice change the schema?",
+    "Walk through confirm recovery: payment captured but the booking write failed, then the client retries. What happens?",
+    "How does cancellation release nights exactly once and keep search/caches consistent?",
     "How would you intentionally overbook (like airlines) and manage the risk?",
     "How do you keep search availability fresh without hammering the truth store?",
     "How long should a hold TTL be, and what's the tradeoff?",
-    "How would you handle a property with multiple identical rooms (inventory > 1 per night)?",
+    "How would you handle a room type with multiple identical rooms (inventory > 1 per night)?",
     "How do you prevent a hot listing's peak dates from becoming a write hotspot?"
   ],
   "toProbeFurther": {

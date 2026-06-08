@@ -322,6 +322,31 @@
       "label": "Online store size",
       "value": "~1-2 TB hot set",
       "note": "Latest values only; SSD-backed KV with hot keys in memory."
+    },
+    {
+      "label": "Derived: read bandwidth",
+      "value": "~100 MB/s - 2 GB/s",
+      "note": "100k QPS * 1-20 KB vector before replication/cache; pushes SSD-backed KV with a hot-key in-memory tier and a single multi-get per request to bound fanout."
+    },
+    {
+      "label": "Derived: write bandwidth",
+      "value": "~0.2 - 4 GB/s online",
+      "note": "200k updates/sec * 1-20 KB; entity-key sharding spreads it so no single shard takes the full stream write rate."
+    },
+    {
+      "label": "Derived: online footprint",
+      "value": "~3-6 TB with replicas",
+      "note": "1-2 TB hot set * 3 replicas. Entity-key sharding sized so each shard's working set fits the in-memory tier; replicas absorb hot-key reads and shard loss."
+    },
+    {
+      "label": "Derived: offline + stream state",
+      "value": "partition by feature/entity/time",
+      "note": "Warehouse partitioned so a 1B-row PIT join scans only relevant feature/entity/time ranges; stream operator state bounded by active entities * windowed features, checkpointed to durable storage."
+    },
+    {
+      "label": "Derived: backfill limits",
+      "value": "admission-controlled",
+      "note": "Large backfills throttled/isolated from stream materialization so they never starve online freshness. If QPS or vector size goes 10x, the read-bandwidth and footprint estimates scale linearly — add shards/replicas and lean harder on the hot-key cache before the offline path changes at all."
     }
   ],
   "api": [
@@ -329,8 +354,8 @@
       "method": "POST",
       "path": "/v1/features",
       "description": "Register a feature definition (source + transform) used by both training and serving.",
-      "request": "{ \"name\": \"user_7d_clicks\", \"entity\": \"user\", \"source\": \"clicks\", \"transform\": \"count_7d\" }",
-      "response": "{ \"featureId\": \"f_9\" }",
+      "request": "{ \"name\": \"user_7d_clicks\", \"entity\": \"user\", \"source\": \"clicks\", \"transform\": \"count_7d\", \"owner\": \"growth-ml\" }",
+      "response": "{ \"featureId\": \"f_9\", \"version\": 1, \"state\": \"draft\", \"owner\": \"growth-ml\" }",
       "sequence": {
         "participants": [
           {
@@ -421,10 +446,10 @@
     },
     {
       "method": "POST",
-      "path": "/v1/training-data",
-      "description": "Build a point-in-time-correct training dataset from an entity+timestamp list.",
-      "request": "{ \"entities\": [ {entity, ts, label} ... ], \"features\": [...] }",
-      "response": "{ \"datasetUri\": \"...\" }",
+      "path": "/v1/training-datasets",
+      "description": "Submit an asynchronous point-in-time-correct training-dataset job over an entity+timestamp+label list. A 1B-row PIT join scans multi-TB of warehouse history, so this returns a job handle immediately rather than a finished dataset. idempotencyKey makes a retried submission return the same jobId instead of starting a duplicate scan.",
+      "request": "{ \"entities\": [ {entity, ts, label} ... ], \"featureRefs|modelFeatureSet\": \"ranker@v7\", \"idempotencyKey\": \"...\" }",
+      "response": "{ \"jobId\": \"tdj_123\", \"status\": \"queued\", \"estimatedRows\": 1.0e9, \"estimatedCost\": \"~2.4 TB scan\" }",
       "sequence": {
         "participants": [
           {
@@ -444,19 +469,51 @@
             "from": "Model",
             "to": "TrainAPI",
             "arrow": "->>",
-            "label": "entities + timestamps + label"
+            "label": "submit job: entities + timestamps + label + feature set"
           },
           {
             "from": "TrainAPI",
             "to": "Offline",
             "arrow": "->>",
-            "label": "point-in-time join (as-of ts)"
+            "label": "enqueue PIT join (admission-controlled by quota)"
           },
           {
             "from": "TrainAPI",
             "to": "Model",
             "arrow": "-->>",
-            "label": "training dataset"
+            "label": "{ jobId, status: queued, estimatedRows, estimatedCost }"
+          }
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/training-datasets/{jobId}",
+      "description": "Poll an async training-dataset job. When done it returns the output URI plus the manifest that makes the dataset auditable: the exact feature versions and the source snapshot/watermark the PIT join read, so the dataset is reproducible and a model knows precisely which inputs produced it.",
+      "request": "GET /v1/training-datasets/tdj_123",
+      "response": "{ \"jobId\": \"tdj_123\", \"status\": \"succeeded\", \"progress\": 1.0, \"outputUri\": \"s3://.../tdj_123.parquet\", \"featureVersions\": { \"user_7d_clicks\": 3, \"user_country\": 1 }, \"sourceWatermark\": \"2026-06-01T00:00:00Z\", \"rows\": 998340221, \"failureReason\": null }",
+      "sequence": {
+        "participants": [
+          {
+            "id": "Model"
+          },
+          {
+            "id": "TrainAPI",
+            "label": "Training Data API"
+          }
+        ],
+        "messages": [
+          {
+            "from": "Model",
+            "to": "TrainAPI",
+            "arrow": "->>",
+            "label": "GET status(jobId)"
+          },
+          {
+            "from": "TrainAPI",
+            "to": "Model",
+            "arrow": "-->>",
+            "label": "{ status, progress, outputUri, featureVersions, sourceWatermark }"
           }
         ]
       }
@@ -600,6 +657,146 @@
       ]
     },
     {
+      "name": "model_feature_set",
+      "note": "Resolves modelFeatureSet=ranker@v7 into a pinned policy the serving layer applies before reading the online store: which features are required, their defaults, and how stale each may be.",
+      "fields": [
+        {
+          "name": "feature_set_id",
+          "type": "string PK (e.g. ranker@v7)"
+        },
+        {
+          "name": "model_id",
+          "type": "FK"
+        },
+        {
+          "name": "model_version",
+          "type": "int"
+        },
+        {
+          "name": "state",
+          "type": "enum (draft/active/deprecated)"
+        },
+        {
+          "name": "fallback_policy",
+          "type": "enum (continue/fail_closed/fallback_model)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "model_feature_set_member",
+      "note": "One row per feature in a feature set: pins the version and the per-feature serving policy (required vs optional, safe default, staleness bound).",
+      "fields": [
+        {
+          "name": "feature_set_id",
+          "type": "FK"
+        },
+        {
+          "name": "feature_id",
+          "type": "FK"
+        },
+        {
+          "name": "feature_version",
+          "type": "int (pinned)"
+        },
+        {
+          "name": "required",
+          "type": "bool (fail closed if missing/stale)"
+        },
+        {
+          "name": "default_value",
+          "type": "typed value (used when missing)"
+        },
+        {
+          "name": "max_staleness_ms",
+          "type": "int (older => flagged stale)"
+        },
+        {
+          "name": "value_type",
+          "type": "int/float/string/embedding"
+        }
+      ]
+    },
+    {
+      "name": "training_dataset_job",
+      "note": "Async job + manifest for a 1B-row PIT training-set build: status/progress, the output URI, and the exact feature versions and source snapshot/watermark that produced it (auditable, reproducible, idempotent by key).",
+      "fields": [
+        {
+          "name": "job_id",
+          "type": "string PK"
+        },
+        {
+          "name": "idempotency_key",
+          "type": "string (retried submit -> same job)"
+        },
+        {
+          "name": "requested_by",
+          "type": "team/model (quota + audit)"
+        },
+        {
+          "name": "feature_set_id | feature_refs",
+          "type": "what was joined"
+        },
+        {
+          "name": "feature_versions",
+          "type": "map feature_id -> version (manifest)"
+        },
+        {
+          "name": "source_watermark",
+          "type": "snapshot/watermark of inputs read"
+        },
+        {
+          "name": "status",
+          "type": "enum (queued/running/succeeded/failed)"
+        },
+        {
+          "name": "progress",
+          "type": "float 0..1"
+        },
+        {
+          "name": "output_uri",
+          "type": "dataset location"
+        },
+        {
+          "name": "failure_reason",
+          "type": "string (nullable)"
+        }
+      ]
+    },
+    {
+      "name": "access_policy + audit_event + deletion_request",
+      "note": "Governance is enforced, not just annotated: access_policy authorizes a (team/model, feature) read by classification; audit_event logs who read/changed what; deletion_request propagates a user erasure to offline history and online values.",
+      "fields": [
+        {
+          "name": "policy: principal",
+          "type": "team/model id"
+        },
+        {
+          "name": "policy: feature_id + classification",
+          "type": "what + sensitivity (e.g. PII)"
+        },
+        {
+          "name": "policy: allow",
+          "type": "bool (serving/training read gate)"
+        },
+        {
+          "name": "audit: actor, action, target, ts",
+          "type": "who read/changed which feature/job"
+        },
+        {
+          "name": "deletion: entity_key, requested_at",
+          "type": "user erasure request"
+        },
+        {
+          "name": "deletion: status",
+          "type": "enum (pending/offline_done/online_done/complete)"
+        }
+      ]
+    },
+    {
       "name": "materialization_job",
       "note": "Control-plane state making rebuildable online state safe: checkpointed, idempotent, with a publish boundary so partial refreshes never become visible.",
       "fields": [
@@ -692,7 +889,7 @@
       "title": "1. Naive: Each Model Computes Features Ad Hoc",
       "description": [
         "Start with how teams actually begin: there is no feature store. Each model's training pipeline computes its features directly from the raw sources in its own code (a SQL query, a Spark job), and each serving service re-implements the same logic to compute features at inference time.",
-        "It works for one model, but it doesn't scale across teams or stay correct. Take user_7d_clicks (a user's clicks in the last 7 days), the example we follow through the whole design: the training pipeline computes it in batch SQL over warehouse history while the serving service recomputes it from a recent-events table at request time. The two implementations are 'the same' feature but inevitably drift — train/serve skew that silently degrades the model. Every team re-derives popular features like this slightly differently, duplicating work and logic. And nobody can discover or reuse what already exists.",
+        "It works for one model, but it doesn't scale across teams or stay correct. Take user_7d_clicks (a user's clicks in the last 7 days), the example we follow through the whole design. The training pipeline computes it in batch SQL over warehouse history; the serving service recomputes it from a recent-events table at request time. The two implementations are 'the same' feature, but they inevitably drift — train/serve skew that silently degrades the model. Meanwhile every team re-derives popular features like this slightly differently, duplicating work, and nobody can discover or reuse what already exists.",
         "So the ad-hoc approach motivates a central place to define each feature once — a registry — and dedicated offline/online stores fed from that single definition."
       ],
       "view": {
@@ -923,7 +1120,7 @@
       "description": [
         "Training and serving have opposite access patterns. Training reads large historical datasets (bulk, latency-tolerant); serving reads a few features for one entity in milliseconds. So maintain two stores fed from the same definitions.",
         "The offline store (a warehouse) holds timestamped historical feature values for building training data. The online store (a low-latency KV/cache) holds the latest value per entity for inference. Both are computed from the registry's definitions, so they're consistent by construction.",
-        "Data-movement semantics matter once you pick which store is authoritative. If the offline store is the source of truth and online is derived, online refreshes commit behind a publish boundary so a partial refresh never becomes visible, and cache misses fall back to a default/last-known value (covered in serving). If streaming writes online directly for fresh features, it must compute from the same registry definition as batch so the two paths keep semantic parity. Either way the online store is rebuildable derived state.",
+        "Data-movement semantics matter once you pick which store is authoritative. If the offline store is the source of truth and online is derived, online refreshes commit behind a publish boundary so a partial refresh never becomes visible, and cache misses fall back to a default/last-known value (covered in serving). If streaming instead writes online directly for fresh features, it must compute from the same registry definition as batch so the two paths keep semantic parity. Either way the online store is rebuildable derived state. Be explicit about its consistency target: serving promises read-your-latest-materialized-value, not read-after-source-event. A feature is current as of the last committed materialization (bounded by the freshness SLO), not the instant the source event happened — promising the latter would be impossible to keep.",
         "This dual-store design is the architectural heart of a feature store: same feature, two materializations tuned to two very different read patterns."
       ],
       "view": {
@@ -1105,7 +1302,8 @@
         "Training joins features to labeled events. The trap: using a feature's current value for a past event leaks information the model wouldn't have had then (data leakage), inflating offline metrics and failing in production.",
         "Point-in-time correctness fixes this: for each training row (entity, event timestamp, label), join the feature value as it was at that timestamp — an 'as-of' join against the timestamped offline store. The training data API does this join correctly so engineers don't hand-roll it (and get it wrong).",
         "The subtle part is which timestamp. The offline store separates event time (when the value was valid) from ingested/created time (when it landed). The join must filter on event_ts <= the row's event time, but it must also respect availability: a value whose ingested_at is after the row's event time would not have been known then. Otherwise a late-arriving or backfilled value silently leaks future information even though 'value valid <= event_ts' looks correct.",
-        "This is the subtlest correctness property of a feature store and a top interview signal: the offline store must be timestamped with both event and ingestion time, and joins must respect both."
+        "This is the subtlest correctness property of a feature store and a top interview signal: the offline store must be timestamped with both event and ingestion time, and joins must respect both.",
+        "Operationally, generating a training set is a 1B-row PIT join over multi-TB of history, so the API is asynchronous: POST /v1/training-datasets returns a jobId, estimated rows, and estimated cost; the job runs admission-controlled (so one team's huge join can't starve others); and when it finishes it publishes a manifest — the output URI plus the exact feature versions and source snapshot/watermark it read. That manifest makes the dataset reproducible and auditable, and an idempotency key means a retried submit returns the same job rather than re-scanning."
       ],
       "view": {
         "nodes": [
@@ -1256,6 +1454,13 @@
           "whyItMatters": "A correct as-of join must respect both, or a late-arriving/backfilled value leaks information the model couldn't have had at the event.",
           "example": "A value valid at t but ingested at t+2d must not appear in a training row whose event time is t.",
           "group": "Point-in-Time-Correct Training Data"
+        },
+        {
+          "term": "Async training-set job + manifest",
+          "definition": "Dataset generation is a long-running job (jobId, status, progress) that publishes a manifest pinning the feature versions and source snapshot/watermark it read.",
+          "whyItMatters": "A 1B-row PIT join is too big to return synchronously, and the manifest makes the dataset reproducible, auditable, and idempotent on retry.",
+          "example": "POST /v1/training-datasets -> tdj_123; poll until succeeded, then read the output URI plus {user_7d_clicks: v3}.",
+          "group": "Point-in-Time-Correct Training Data"
         }
       ],
       "probeLinks": [
@@ -1337,6 +1542,68 @@
             "TrainAPI",
             "Offline"
           ]
+        },
+        {
+          "name": "Async training-dataset job + manifest",
+          "note": "A 1B-row PIT join is a multi-TB warehouse scan, so dataset generation is an async job, not a blocking call. Submit returns a jobId and estimate; the join runs admission-controlled; the API publishes a manifest pinning the exact feature versions and source watermark; the model polls until the dataset URI is ready and consumes it.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Model",
+                "label": "Model / Trainer"
+              },
+              {
+                "id": "TrainAPI",
+                "label": "Training Data API"
+              },
+              {
+                "id": "Offline",
+                "label": "Offline Store"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Model",
+                "to": "TrainAPI",
+                "arrow": "->>",
+                "label": "submit job (entities, feature set, idempotencyKey)"
+              },
+              {
+                "from": "TrainAPI",
+                "to": "Model",
+                "arrow": "-->>",
+                "label": "{ jobId, estimatedRows, estimatedCost }"
+              },
+              {
+                "from": "TrainAPI",
+                "to": "Offline",
+                "arrow": "->>",
+                "label": "run PIT join (admission-controlled by quota)"
+              },
+              {
+                "from": "TrainAPI",
+                "to": "TrainAPI",
+                "arrow": "->>",
+                "label": "publish manifest: feature versions + source watermark"
+              },
+              {
+                "from": "Model",
+                "to": "TrainAPI",
+                "arrow": "->>",
+                "label": "poll status(jobId)"
+              },
+              {
+                "from": "TrainAPI",
+                "to": "Model",
+                "arrow": "-->>",
+                "label": "succeeded: outputUri + manifest -> train"
+              }
+            ]
+          },
+          "highlight": [
+            "TrainAPI",
+            "Offline"
+          ]
         }
       ]
     },
@@ -1347,7 +1614,8 @@
         "At inference, the model fetches features for an entity from the online store via the serving API in single-digit ms. The critical correctness property: these online features must be computed by the same logic as the offline features used in training — otherwise train/serve skew silently degrades the model.",
         "The shared registry definition is what guarantees this: the same transform spec drives both offline (batch) and online (stream) computation, so 'user_7d_clicks' means the same thing in both. Avoid reimplementing the transform in serving code. The request pins feature versions (or a model feature set), so the model reads exactly the versions it trained on.",
         "Serving reads are simple key lookups (entity -> feature vector), done as a single multi-get to stay in the latency budget; the hard work (computing the features) happened upstream. Keep the online store in-memory/low-latency for the QPS.",
-        "The serving contract must be explicit about partial results: the response returns per-feature metadata (version, updatedAt, source = fresh/last_known/default) plus 'missing' and 'stale' lists. A miss or a value older than maxStalenessMs falls back to a default or last-known value and is flagged, so the inference service can decide per feature — continue, drop an optional feature, or fail closed / use a fallback model if a critical feature is stale — rather than silently scoring on a bad vector."
+        "What makes the partial-vector behavior defensible is the model feature set behind modelFeatureSet=ranker@v7. The serving layer resolves that handle into a pinned policy before it reads the online store: a list of members, each with feature_id, pinned feature_version, required vs optional, a safe default_value, and a per-feature max_staleness_ms. So 'continue, drop, or fail closed' isn't decided ad hoc — it's the feature set's declared policy. For example, user_7d_clicks might be required with max_staleness_ms=60000, while user_country is optional with a default of 'unknown'.",
+        "The serving contract is then explicit about partial results. The response returns per-feature metadata (version, updatedAt, source = fresh/last_known/default) plus 'missing' and 'stale' lists. A miss, or a value past its policy's max_staleness_ms, falls back to that feature's default or last-known value and is flagged. The inference service then applies the set's fallback policy — continue, drop an optional feature, or fail closed / use a fallback model if a required feature is stale — rather than silently scoring on a bad vector."
       ],
       "view": {
         "nodes": [
@@ -1376,6 +1644,13 @@
           "definition": "Identical feature logic (from one definition) used for both training and serving.",
           "whyItMatters": "Eliminates skew — the silent killer of production ML quality.",
           "example": "Same count_7d transform computes the offline and online value.",
+          "group": "Online Serving and Train/Serve Consistency"
+        },
+        {
+          "term": "Model feature set (pinned policy)",
+          "definition": "A named handle (ranker@v7) the serving layer resolves into pinned feature versions plus per-feature policy: required vs optional, a safe default, and a max staleness.",
+          "whyItMatters": "Makes partial-vector behavior a declared contract — the server knows which feature may be defaulted and how stale each may be, instead of the model guessing at request time.",
+          "example": "ranker@v7: user_7d_clicks required, max_staleness 60s; user_country optional, default 'unknown'.",
           "group": "Online Serving and Train/Serve Consistency"
         }
       ],
@@ -1449,7 +1724,7 @@
         },
         {
           "name": "Partial vector: missing / stale feature handling",
-          "note": "When a feature is missing or older than maxStalenessMs, serving fills a default/last-known value and flags it in the response. The inference service decides per feature: continue on an optional feature, or fail closed / use a fallback model when a critical feature is stale — never score silently on a bad vector.",
+          "note": "Serving resolves ranker@v7 into its pinned policy, then reads the online store. user_7d_clicks (required, max_staleness 60s) is stale and user_country (optional, default 'unknown') is missing. The required feature being stale triggers the set's fallback policy (fallback model); the optional one is filled from its default. Both are flagged so the inference service never scores silently on a bad vector.",
           "sequence": {
             "participants": [
               {
@@ -1474,6 +1749,12 @@
               },
               {
                 "from": "ServeAPI",
+                "to": "ServeAPI",
+                "arrow": "->>",
+                "label": "resolve set -> pinned versions + required/default/staleness"
+              },
+              {
+                "from": "ServeAPI",
                 "to": "Online",
                 "arrow": "->>",
                 "label": "multi-get latest values"
@@ -1482,19 +1763,19 @@
                 "from": "Online",
                 "to": "ServeAPI",
                 "arrow": "-->>",
-                "label": "1 missing, 1 past TTL (stale)"
+                "label": "user_country missing; user_7d_clicks past max_staleness"
               },
               {
                 "from": "ServeAPI",
                 "to": "Model",
                 "arrow": "-->>",
-                "label": "values + meta {source: default/last_known}, missing[], stale[]"
+                "label": "user_country=default; user_7d_clicks stale; missing[], stale[]"
               },
               {
                 "from": "Model",
                 "to": "Model",
                 "arrow": "->>",
-                "label": "critical stale? -> fallback model; else continue"
+                "label": "required user_7d_clicks stale -> fallback model"
               }
             ]
           },
@@ -1511,7 +1792,7 @@
       "description": [
         "The online store must reflect recent data. Materialize features into it: batch jobs refresh slowly-changing features on a schedule; stream processing updates fast-changing features (recent activity) in near-real-time from event streams.",
         "Freshness is per-feature: 'user lifetime purchases' can lag by hours; 'clicks in the last 5 minutes' must be seconds-fresh. The materialization layer picks batch vs stream per feature based on its freshness requirement, balancing cost against staleness.",
-        "Materialization needs an operational contract so it fails loudly, not quietly. Jobs are scheduled and tracked through states (scheduled -> running -> checkpointed -> committed); online writes are idempotent, keyed by (feature, version, entity, event_ts) so retries and replays don't double-count; stream jobs persist checkpoints/source offsets and use event-time watermarks so late events update the right history slice; and a batch refresh writes behind a publish boundary so a half-finished refresh never becomes visible. Backfills (a new feature, or a corrected definition) run as admission-controlled jobs with progress and rollback, and only bind to models once their offline history and online values agree.",
+        "Materialization needs an operational contract so it fails loudly, not quietly. Jobs are scheduled and tracked through states (scheduled -> running -> checkpointed -> committed); online writes are idempotent, keyed by (feature, version, entity, event_ts) so retries and replays don't double-count; stream jobs persist checkpoints/source offsets and use event-time watermarks so late events update the right history slice; and a batch refresh writes behind a publish boundary so a half-finished refresh never becomes visible. Backfills (a new feature, or a corrected definition) run as admission-controlled jobs with progress and rollback, and only bind to models once their offline history and online values agree. A large backfill and live stream materialization compete for the same compute and online write bandwidth, so the control plane applies backpressure: it throttles or isolates backfills (a separate resource pool, rate caps) so they never starve the streaming path and breach a feature's freshness SLO.",
         "Monitoring closes the loop with concrete metrics and alert thresholds: last-update age vs the feature's freshness SLO, stream consumer lag, feature null-rate spikes, distribution drift, online/offline skew delta (served value vs offline recompute), stale-read count, and materialization failure rate — catching silent degradation before it hurts the model."
       ],
       "view": {
@@ -1738,6 +2019,13 @@
             "Online"
           ]
         }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A large backfill competes with live stream materialization for compute and write bandwidth.",
+          "expectedBehavior": "Without backpressure the backfill saturates the online store's write path, stream consumer lag climbs, and fast features (e.g. clicks-in-last-5-min) breach their freshness SLO while the backfill runs — silent staleness on the features that need freshness most. With admission control the control plane caps/isolates the backfill so the streaming path keeps its bandwidth; the backfill simply takes longer, tracked by progress, and freshness SLOs hold.",
+          "mitigation": "Admission control + separate resource pool / rate caps for backfills; prioritize stream materialization; alert on consumer lag vs SLO; pause or slow a backfill automatically when live freshness is threatened."
+        }
       ]
     },
     {
@@ -1745,7 +2033,7 @@
       "title": "7. Scale, Governance, and Reliability",
       "description": [
         "Scale the two stores independently: the online store (KV/in-memory) shards by entity for ms reads at high QPS; the offline store (warehouse/columnar) scales for bulk historical scans. Compute (batch + stream) scales with feature count and data volume.",
-        "Governance operates the registry's versioned contract at thousands of features and ~100 teams: ownership and approval on definition changes, version pinning (models keep the versions they trained on), lineage (what sources/features feed a model), and reuse (a popular feature is computed once and serves many models). Because feature stores hold sensitive user attributes and behavior-derived signals, this is also where privacy lives: per-feature classification (public/internal/sensitive/PII), access policies scoped by team/model, audit logs of who read or changed what, and retention/deletion so historical values expire and a user-deletion request propagates to offline history and online values.",
+        "Governance operates the registry's versioned contract at thousands of features and ~100 teams: ownership and approval on definition changes, version pinning (models keep the versions they trained on), lineage (tracked in all three directions — source-to-feature, feature-to-feature for derived features, and feature-to-model), and reuse (a popular feature is computed once and serves many models). Because feature stores hold sensitive user attributes and behavior-derived signals, governance must be enforced, not just annotated. Enforcement lives on the read paths: every serving and training request is authorized against an access_policy keyed by (team/model purpose, feature classification) before the online store or PIT join runs, and every read or definition change is written to an audit_event. Per-feature classification (public/internal/sensitive/PII) drives those checks. Retention and deletion bound the data: historical values age out on a schedule, and a user-deletion request propagates to both offline history and online values.",
         "Reliability: the registry and offline store are authoritative; the online store and materialized values are derived and rebuildable (re-materialize from the offline store/sources). Serving degrades gracefully (default/last-known values) if a feature is missing, rather than failing inference."
       ],
       "view": {
@@ -1804,6 +2092,10 @@
         {
           "issue": "Unbounded history / sensitive-data retention.",
           "mitigation": "TTL online values; partition + age out offline history; propagate deletion requests to both stores."
+        },
+        {
+          "issue": "Unauthorized access to sensitive features.",
+          "mitigation": "Classify features; authorize serving/training reads against access policy on the read path; audit every read and definition change; deny-and-flag rather than silently returning."
         }
       ],
       "failureDrills": [
@@ -1811,13 +2103,23 @@
           "scenario": "The online store loses a shard.",
           "expectedBehavior": "Reads for entities on that shard miss; serving returns default/last-known values flagged source != fresh, with the affected features listed as stale/missing so the inference service can drop optional features or use a fallback model for critical ones. The freshness SLO for those features is reported violated while rematerialization runs, and the model is notified via the response metadata rather than getting a silent bad vector.",
           "mitigation": "Online store as rebuildable derived state: re-materialize the shard from the offline store/sources with tracked progress; replicas absorb traffic; graceful serving fallback throughout."
+        },
+        {
+          "scenario": "A model requests a sensitive (PII) feature its team isn't approved to use.",
+          "expectedBehavior": "The serving/training read is authorized against the access_policy before any store access. The (model purpose, feature classification) pair has no allow rule, so the request is denied — that feature is omitted with a not-authorized reason rather than silently returned — and the attempt is written to an audit_event. The model proceeds without it (if optional) or fails closed, never scoring on data it isn't cleared for.",
+          "mitigation": "Classification on every feature; policy check on the read path (not just registry annotation); audit log of allow/deny; explicit approval workflow to grant access deliberately."
+        },
+        {
+          "scenario": "A user exercises their right to be deleted.",
+          "expectedBehavior": "A deletion_request for the entity key is recorded and propagates to both stores: offline history rows for that entity are tombstoned/purged and online values are deleted, with the request's status advancing pending -> offline_done -> online_done -> complete. Future training sets exclude the entity; serving returns missing (handled by per-feature defaults) for it. Audit retains that the deletion happened without retaining the deleted values.",
+          "mitigation": "Entity-keyed deletion that fans out to offline partitions and online keys; retention/TTL policy that ages out history anyway; status tracking so an incomplete deletion is visible and retried."
         }
       ]
     }
   ],
   "finalDesign": {
     "title": "Final Design — Feature Store",
-    "description": "Engineers define each feature once in a central registry as a versioned contract (source + transform, lifecycle, owner). That single definition drives both batch (offline/historical) and stream (online/fresh) computation, written to a dual store: an offline warehouse of values timestamped with both event and ingestion time and a low-latency online KV store of latest values. Training builds point-in-time-correct datasets via as-of joins on the offline store (no leakage, respecting late data); serving reads the online store in ms using the same feature logic (no train/serve skew), returning per-feature metadata (version, freshness, source) with missing/stale flags so inference degrades gracefully. Models pin the feature versions they trained on. A materialization layer keeps the online store fresh per-feature (batch vs stream) with checkpointed, idempotent jobs and a publish boundary; monitoring tracks freshness age, lag, drift, and online/offline skew. Stores scale independently and are governed (access control, lineage, retention/deletion for sensitive features); the online store is rebuildable derived state with graceful serving fallback.",
+    "description": "Engineers define each feature once in a central registry as a versioned contract (source + transform, lifecycle, owner). That single definition drives both batch (offline/historical) and stream (online/fresh) computation, written to a dual store: an offline warehouse of values timestamped with both event and ingestion time and a low-latency online KV store of latest values. Training is an asynchronous job: a point-in-time-correct as-of join on the offline store (no leakage, respecting late data) that publishes a manifest pinning the exact feature versions and source watermark it read, so datasets are reproducible and auditable. Serving reads the online store in ms using the same feature logic (no train/serve skew); a model feature set resolves into a pinned policy (required/optional features, defaults, max staleness) so the per-feature metadata and missing/stale flags drive a declared fallback, not an ad-hoc guess. Models pin the feature versions they trained on. A materialization layer keeps the online store fresh per-feature (batch vs stream) with checkpointed, idempotent jobs and a publish boundary, and applies backpressure so backfills never starve stream freshness; monitoring tracks freshness age, lag, drift, and online/offline skew. Stores scale independently; governance is enforced on serving and training reads (classification-based access policy, audit, lineage, retention/deletion), not just documented in the registry. The online store is rebuildable derived state with graceful serving fallback.",
     "view": {
       "nodes": [
         "Author",
@@ -1876,7 +2178,7 @@
       },
       {
         "requirement": "Historical for training",
-        "how": "Offline store + point-in-time join API.",
+        "how": "Offline store + async point-in-time join API publishing a versioned, auditable dataset manifest.",
         "steps": [
           "stores",
           "training"
@@ -1902,7 +2204,7 @@
     "nonFunctional": [
       {
         "requirement": "Train/serve consistency",
-        "how": "One definition -> both paths.",
+        "how": "One definition -> both paths; serving resolves a pinned model feature set (required/optional, defaults, max staleness).",
         "steps": [
           "registry",
           "serving"
@@ -1939,7 +2241,7 @@
       },
       {
         "requirement": "Governance & privacy",
-        "how": "Versioned contracts with lifecycle/approval; per-feature classification, access control, lineage, audit, and retention/deletion.",
+        "how": "Versioned contracts with lifecycle/approval; classification-based access policy enforced on serving/training reads, audit of reads/changes, three-way lineage, and retention/deletion propagated to both stores.",
         "steps": [
           "registry",
           "scale"
@@ -1947,6 +2249,332 @@
       }
     ]
   },
+  "technologyChoices": [
+    {
+      "concern": "Feature registry / store framework",
+      "steps": [
+        "registry"
+      ],
+      "selfHosted": [
+        {
+          "name": "Feast (open-source feature store)",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Custom registry service",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SageMaker Feature Store",
+            "icon": "assets/tech-icons/Arch_Amazon-SageMaker-AI_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Vertex AI Feature Store",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure ML managed feature store",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A managed feature platform (Tecton, SageMaker/Vertex) handles registry, materialization, and serving for you but locks the definition DSL and storage choices to the vendor.",
+        "Feast or a custom registry keeps the dual-store and compute choices open but you operate materialization, serving, and governance yourself."
+      ]
+    },
+    {
+      "concern": "Offline store (training / historical)",
+      "steps": [
+        "stores",
+        "training"
+      ],
+      "selfHosted": [
+        {
+          "name": "Iceberg / Hive tables",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Delta Lake (Databricks)",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Redshift",
+            "icon": "assets/tech-icons/Arch_Amazon-Redshift_64.png"
+          },
+          {
+            "name": "Athena",
+            "icon": "assets/tech-icons/Arch_Amazon-Athena_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "BigQuery",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Synapse Analytics",
+            "icon": "assets/tech-icons/00606-icon-service-Azure-Synapse-Analytics.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A managed warehouse (BigQuery, Snowflake) makes 1B-row PIT joins a SQL problem with elastic compute, at per-scan cost.",
+        "Open table formats (Iceberg/Delta) on object storage decouple storage from engine and avoid lock-in, but you size and tune the query engine."
+      ]
+    },
+    {
+      "concern": "Online store (serving / latest values)",
+      "steps": [
+        "serving",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Cassandra",
+          "icon": "assets/tech-icons/cassandra.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        },
+        {
+          "name": "Aerospike",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "ElastiCache (Redis)",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "In-memory KV (Redis/Memorystore) gives the lowest p99 but bounds the hot set to RAM and replicas.",
+        "SSD-backed wide-column / KV (DynamoDB, Bigtable, Cassandra, Aerospike) holds a larger 1-2 TB hot set economically and shards by entity, trading a little latency for capacity."
+      ],
+      "makesIrrelevant": [
+        "A managed autoscaling KV (DynamoDB, Bigtable) that resizes and rebalances shards removes most hand-sharding and capacity-planning work."
+      ]
+    },
+    {
+      "concern": "Batch compute (offline materialization, PIT joins)",
+      "steps": [
+        "stores",
+        "freshness"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Spark",
+          "icon": "assets/tech-icons/spark.png"
+        },
+        {
+          "name": "Apache Beam",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "EMR",
+            "icon": "assets/tech-icons/Arch_Amazon-EMR_64.png"
+          },
+          {
+            "name": "Glue",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Dataproc",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Databricks",
+            "icon": "assets/tech-icons/10787-icon-service-Azure-Databricks.svg"
+          },
+          {
+            "name": "HDInsight",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Warehouse-native SQL (BigQuery/Snowflake) is simplest when features are expressible as SQL.",
+        "Spark/Beam is more flexible for complex transforms and large backfills but is more to operate."
+      ]
+    },
+    {
+      "concern": "Stream compute (real-time materialization)",
+      "steps": [
+        "freshness",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Flink",
+          "icon": "assets/tech-icons/flink.png"
+        },
+        {
+          "name": "Kafka Streams",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Kinesis Data Analytics",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "MSK",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Streaming-for-Apache-Kafka_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Dataflow (streaming)",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Stream Analytics",
+            "icon": "assets/tech-icons/00042-icon-service-Stream-Analytics-Jobs.svg"
+          },
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Flink gives rich event-time, watermark, and exactly-once state for correct fresh aggregates, with real operational weight.",
+        "Always-on stream compute costs more than periodic batch — reserve it for features whose freshness SLO truly needs seconds, and pay the cost only there."
+      ]
+    },
+    {
+      "concern": "Orchestration & monitoring",
+      "steps": [
+        "freshness",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Airflow",
+          "icon": "assets/tech-icons/airflow.png"
+        },
+        {
+          "name": "Dagster",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Prometheus",
+          "icon": "assets/tech-icons/prometheus.png"
+        },
+        {
+          "name": "OpenTelemetry",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Great Expectations",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Managed Workflows for Airflow (MWAA)",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Composer",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Data Factory",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Airflow/Dagster schedule materialization and backfills; Prometheus/OTel track freshness age, stream lag, and skew; warehouse data-quality checks (Great Expectations) catch null-rate and drift.",
+        "Managed orchestration/monitoring cuts ops toil but couples freshness/SLO alerting to the provider's stack."
+      ]
+    }
+  ],
   "interviewScript": [
     {
       "phase": "Scope & requirements",

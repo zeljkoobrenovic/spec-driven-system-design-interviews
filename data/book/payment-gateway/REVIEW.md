@@ -5,349 +5,388 @@ Review date: 2026-06-08
 
 ## Executive Summary
 
-This is a strong, compact payment-gateway walkthrough. It teaches the right
-core themes for a Stripe-like gateway: shrinking PCI scope with tokenization,
-enforcing idempotency at the charge boundary, driving payment state through a
-persisted orchestrator, handling ambiguous PSP responses through reconciliation,
-delivering at-least-once webhooks, and closing the money loop with a ledger and
-payouts.
+The recent updates materially improved this dataset. The review is no longer
+"missing refunds, payouts, capacity, and Step 7 depth"; those areas now have
+concrete API endpoints, capacity assumptions, money-model tables, refund/payout
+flows, PSP ambiguity handling, and an option-driven scaling step. The interview
+is now a strong payment-gateway walkthrough that teaches the right correctness
+themes: PCI containment, durable idempotency, persisted charge orchestration,
+ambiguous PSP reconciliation, reliable webhooks, double-entry accounting, and
+safe failover.
+
+The remaining work is mostly about tightening precision. Some capacity numbers
+do not quite line up with the stated write amplification, Step 7 combines
+storage scaling with PSP failover instead of comparing failover strategies as
+options, and the richer ledger/payout model still needs explicit invariants,
+reconciliation line items, and operational runbooks.
 
 | Axis | Score | Notes |
 | --- | ---: | --- |
-| System design soundness | 4.0 / 5 | The core charge path is credible; refunds, ledger schema, payout state, and PSP failover need more concrete treatment. |
-| Production realism | 3.5 / 5 | Good coverage of PCI, idempotency, webhooks, and reconciliation; thin on merchant configuration, security operations, chargebacks, observability, and runbooks. |
-| Pedagogical flow | 4.0 / 5 | The progression from naive baseline to final design is clear; the last scale/resilience step is mostly prose and should become a decision step. |
-| Dataset/rendering fit | 4.0 / 5 | JSON is valid and references mostly resolve; two step views include links whose endpoints are not in the view. |
-| Overall | 4.0 / 5 | Usable and interview-ready, with several high-leverage edits that would make it production-grade. |
+| System design soundness | 4.4 / 5 | The core gateway is credible and now covers refunds, payouts, reconciliation, and failover; ledger invariants and async payment extensions need more precision. |
+| Production realism | 4.2 / 5 | Strong on PCI, idempotency, PSP ambiguity, outbox webhooks, and money flow; thinner on merchant operations, security operations, admin tooling, and incident runbooks. |
+| Pedagogical flow | 4.4 / 5 | The progression is clear and the recent flows help a lot; Step 6 and Step 7 are dense enough that they need one more teaching pass. |
+| Dataset/rendering fit | 4.7 / 5 | JSON is valid, references resolve, and the old view endpoint omissions are fixed; only minor API sequence and documentation polish remain. |
+| Overall | 4.4 / 5 | Interview-ready, with a short list of high-value refinements before calling it production-grade. |
 
 ## What Works Well
 
-- The first step is effective: it exposes both PCI blast radius and retry
-  double-charge risk before introducing solutions.
-- Tokenization is framed correctly as a boundary decision, not just a storage
-  trick. The client SDK / hosted fields option is the right default.
-- Idempotency is taught in the right place and tied to durable persistence, not
-  a best-effort cache or lock.
-- The orchestrator step correctly calls out persisted charge states and
-  ambiguous PSP responses, which are central to payment correctness.
-- Webhook delivery uses the transactional outbox pattern and explicitly accepts
-  at-least-once semantics with merchant-side deduplication.
-- The final design integrates every major component introduced in the steps and
-  maps cleanly to the `satisfies` section.
+- Capacity is now quantified: average/peak charge volume, sync latency,
+  webhook fanout, ledger write amplification, payout cadence, and retention are
+  all present.
+- The API surface now supports the operational story: charge, refund, status
+  reads, event listing, replay, webhook endpoint setup, and tokenization.
+- The data model now backs the architecture claims with `payment_attempts`,
+  `idempotency_keys`, `refunds`, ledger accounts/entries, payouts,
+  reconciliation runs, merchants, webhook endpoints, events, and delivery
+  attempts.
+- PSP ambiguity is handled with explicit sent/unknown states, PSP request IDs,
+  PSP idempotency keys, reconciliation state, and a failover flow that avoids
+  double-authorizing an ambiguous charge.
+- Step 6 is much stronger than before: it compares ledger designs and includes
+  refund and payout sequence flows.
+- Step 7 is no longer just prose. It has options, concepts, traps, a failure
+  flow, bottlenecks, and recap material.
+- Renderer-facing integrity is healthy: step-level view nodes and links resolve,
+  link endpoints are present in their views, option views resolve, highlights
+  resolve, sequence participants are declared, and `satisfies[*].steps[*]`
+  references point to real steps.
 
 ## Highest-Impact Issues
 
-### 1. Refunds and payouts are promised but under-modeled
+### 1. Capacity arithmetic needs one consistency pass
 
-The functional requirements include refunds and merchant payouts, and the API
-has `POST /v1/refunds`, but the data model only has `charges`, `card_tokens`,
-and `webhook_events`. There is no `refunds` table, no ledger entry/account
-model, no payout object, no settlement/reconciliation record, and no delivery
-attempt table. This makes the final ledger/payout claim feel conceptually right
-but underspecified.
-
-Concrete fix:
-
-- Add data-model entries for `refunds`, `ledger_accounts`, `ledger_entries`,
-  `payouts`, `settlement_reports` or `reconciliation_runs`, and optionally
-  `idempotency_keys`.
-- Make refund idempotency explicit. `POST /v1/refunds` should accept an
-  idempotency key and should define partial-refund limits against the captured
-  amount.
-- Add a sequence flow for refund -> PSP reversal/refund -> ledger reversal ->
-  webhook event.
-- Add a payout flow showing balance cutoff, reserve/available balance,
-  payout creation, PSP transfer, reconciliation, and final webhook.
-
-### 2. Capacity is qualitative, so scaling claims are hard to evaluate
-
-The capacity section says "high, spiky", "hundreds of ms", and "daily", but it
-does not translate those into work units. Step 7 then claims sharding, queues,
-and horizontal scaling without numbers that motivate them.
+The capacity section now has useful numbers, but the derived work units are not
+fully consistent. `~2k charges/sec avg` implies about 173M charges/day, while
+the text says `~150M charges/day`. That is close enough for an interview, but
+the ledger line says `~150-600M entries/day` while the note says one charge can
+create `2-6 ledger entries` plus additional rows. At 150M charges/day, that
+would be 300M-900M ledger entries/day before counting webhook, delivery
+attempt, attempt, idempotency, and reconciliation rows.
 
 Concrete fix:
 
-- Add approximate charge QPS, peak multiplier, webhook fanout, retry multiplier,
-  daily ledger entries, retention horizon, and expected storage growth.
-- Separate synchronous charge latency from asynchronous settlement, webhook
-  retries, reconciliation jobs, and payout jobs.
-- Add a short capacity note that derives ledger write amplification: a single
-  successful charge may create a charge row, idempotency row, multiple ledger
-  entries, one or more webhook events, delivery attempts, and reconciliation
-  rows.
+- Pick one baseline, e.g. 150M/day or 173M/day, and derive all downstream
+  counts from it.
+- Separate "ledger entries/day" from "total persisted rows/day"; the current
+  note mixes them.
+- Add peak write math: at 10k charges/sec and 5-10 persisted rows per charge,
+  the store must absorb roughly 50k-100k writes/sec before retries.
+- State whether webhook retry multiplier applies to events, delivery attempts,
+  or outbound HTTP calls.
 
-### 3. PSP ambiguity and failover need a stricter contract
+### 2. Step 7 still teaches storage scaling more than PSP resilience
 
-The dataset correctly says "never blindly retry" a timed-out authorize, but the
-model does not define the IDs and states required to do that safely. Multi-
-acquirer failover is also mentioned in the final design and `satisfies`, but
-there is no routing model or rule that prevents accidentally sending the same
-authorization to another acquirer while the first request is ambiguous.
-
-Concrete fix:
-
-- Add fields such as `payment_attempt_id`, `psp_request_id`,
-  `psp_idempotency_key`, `acquirer_id`, `network_trace_id`,
-  `last_psp_status`, and `reconciliation_state`.
-- Make the state machine distinguish `authorize_sent`, `authorize_unknown`,
-  `authorized`, `capture_sent`, `capture_unknown`, `captured`, `voided`,
-  `refunded`, and `failed`.
-- In Step 7, add options for single acquirer, active/passive failover, and
-  rule-based multi-acquirer routing. Call out that failover is safe only before
-  an authorization is sent, after a confirmed failure, or with a provider/network
-  idempotency contract.
-
-### 4. Merchant integration surface is incomplete
-
-The API section has create charge, refund, and tokenization, but a production
-gateway also needs merchant authentication, endpoint configuration, replay, and
-status inspection. Without those, reliable webhooks and auditability are harder
-to operate.
+Step 7 is titled "Resilience, PSP Failures, and Scale", but its three options
+are all charge-store topology choices: merchant-sharded primary, single
+regional primary, and active/passive region. PSP failover is covered in the
+concepts, traps, and sequence flow, but candidates do not get the same
+option-comparison treatment for acquirer routing that they get for storage.
 
 Concrete fix:
 
-- Add `GET /v1/charges/{id}`, `GET /v1/refunds/{id}`, `GET /v1/events`,
-  `POST /v1/events/{id}/replay`, and webhook endpoint configuration APIs.
-- Include merchant API keys, webhook signing secrets, endpoint URLs, retry
-  policy, and per-merchant rate limits in the data model.
-- Mention that merchant-side dedup is by event id, while gateway-side idempotency
-  is by merchant plus idempotency key plus request fingerprint.
+- Either split Step 7 into two steps, "Scale the payment store" and "PSP
+  resilience / multi-acquirer routing", or add a second option set if the
+  renderer supports it.
+- Compare PSP strategies directly: single acquirer, active/passive fallback,
+  rule-based multi-acquirer routing, and network-token/PSP-token constraints.
+- Name the safe routing contract in the options themselves: fail over only
+  before an authorize is sent, after confirmed failure, or with a provider or
+  network idempotency guarantee.
+- Keep the current flow; it is good. Promote its trade-offs into the decision
+  options so the step title and selected decision line up.
 
-### 5. PCI and security are scoped too narrowly
+### 3. Ledger and reconciliation are credible but still not invariant-heavy
 
-Tokenization is the right architectural move, but the vault is described mostly
-as a service with encrypted PAN storage. A gateway interview should name the
-controls that keep the PCI boundary credible.
-
-Concrete fix:
-
-- Add vault details: KMS/HSM-backed encryption, key rotation, token lifecycle,
-  least-privilege detokenization, audit logs, network segmentation, and
-  restricted service-to-vault access.
-- Add operational security for webhook signatures, API-key rotation, merchant
-  secret storage, and log redaction.
-- Consider one trap for "tokenizing but still logging PANs or storing them in
-  analytics/search/error traces."
-
-### 6. The resilience/scale step is not yet a real decision step
-
-Step 7 has no options, flows, concepts, traps, or deep dives, even though it
-carries important claims about sharding, circuit breakers, queues, and
-multi-acquirer failover. It reads like a wrap-up rather than a step that teaches
-trade-offs.
+The money model is now much better, but a ledger in a payment gateway is only
+safe if the invariants are explicit. The current schema names the right tables,
+but it does not yet show enough constraints around balanced posting, immutable
+entries, idempotent transaction groups, settlement-line matching, available vs
+pending balance derivation, and payout eligibility.
 
 Concrete fix:
 
-- Add options for scaling the charge store: single regional primary,
-  merchant-sharded store, and multi-region active/passive.
-- Add options for PSP resilience: no failover, circuit breaker with
-  reconciliation, and multi-acquirer routing.
-- Add traps for "retrying PSP calls through a different acquirer while the first
-  attempt is ambiguous" and "scaling the ledger with eventual consistency on
-  balances that determine payouts."
-- Add observability concepts: charge success rate, PSP timeout rate, unknown
-  payment count, webhook backlog age, reconciliation mismatch count, payout
-  failure count, and ledger imbalance alerts.
+- Add ledger invariants to Step 6 or the data model: each transaction group must
+  balance to zero per currency, entries are append-only, reversals are new
+  entries, and payout reads only settled available balance minus reserve.
+- Add fields such as `currency` on `ledger_entries`, `created_at`,
+  `effective_at`, `posting_state`, `idempotency_key` or unique `ref_type/ref_id`
+  constraints, and possibly `balance_version` for materialized balances.
+- Add `reconciliation_items` or `settlement_report_lines`, not just
+  `reconciliation_runs`, so mismatches can be traced to individual PSP rows.
+- Add one trap to Step 6 for mutable balances or unbalanced ledger posting; that
+  step currently has no traps despite being one of the riskiest parts of the
+  design.
+
+### 4. Merchant and security operations need more concrete treatment
+
+The API and data model now mention merchant API keys, webhook signing secrets,
+endpoint configuration, per-merchant rate limits, and vault controls. That is
+the right direction, but production operation still feels implicit. A payment
+gateway needs lifecycle and incident workflows: rotate keys, rotate webhook
+secrets, disable compromised merchants, replay events safely, redact logs,
+audit detokenization, and investigate stuck or unknown charges.
+
+Concrete fix:
+
+- Add merchant operations fields or endpoints for API-key rotation, webhook
+  endpoint update/delete, webhook secret rotation, endpoint disablement, and
+  per-merchant delivery throttling.
+- Add operational security details: key version on encrypted PANs, vault access
+  audit log, detokenization reason codes, support-tool redaction, log/trace PAN
+  scrubbers, and least-privilege service identities.
+- Add admin/runbook notes for `authorize_unknown`, reconciliation mismatches,
+  payout returns, webhook DLQ replay, and ledger imbalance alerts.
+- Tie observability to these operations: unknown payment count, stale unknown
+  age, reconciliation mismatch count, ledger imbalance, payout failure count,
+  webhook backlog age, and per-merchant throttle/drop rates.
+
+### 5. Async payment extensions are only scoped in follow-ups
+
+The follow-ups correctly call out 3DS/SCA, disputes/chargebacks, multi-currency,
+FX, KYC, and bank-account verification as extensions. That is acceptable for a
+focused interview, but the main walkthrough should explicitly say these are out
+of the core path so readers do not mistake their absence for an oversight.
+
+Concrete fix:
+
+- Add a short "Scoped out" note near requirements or follow-ups.
+- Mention where 3DS/SCA would extend the state machine, e.g.
+  `requires_action`, `authentication_pending`, `authentication_failed`.
+- Mention where disputes and chargebacks would touch the ledger: reserves,
+  evidence workflow, dispute holds, chargeback debits, and reversals.
+- Mention that payouts require merchant onboarding/KYC and verified payout
+  destinations before funds move.
 
 ## System Design Soundness
 
-The requirements are appropriate for the scope and correctly prioritize
-correctness over availability. The phrase "exactly-once" should be handled with
-care: the dataset should present this as exactly-once external effect through
-idempotency, durable state, and reconciliation, not as a generic distributed
-systems guarantee.
+The requirements are appropriate and now word the "exactly-once" claim
+carefully: exactly-once external effect through idempotency, durable state, and
+reconciliation, not generic exactly-once distributed execution. That distinction
+is important and should stay.
 
-The API is intentionally small and easy to teach, but it is missing status,
-replay, and configuration endpoints that support the later architecture. The
-charge request also lacks fields that would matter in production: merchant id
-or authenticated merchant context, payment method token, capture mode,
-description/metadata, request fingerprint, and possibly customer id.
+The API surface now supports the design much better than before. It covers the
+core charge/refund/status/event/replay/tokenization workflows. Remaining API
+polish is mostly consistency: several request examples omit `Authorization`,
+the tokenization endpoint should clearly be a vault/hosted-fields endpoint using
+a publishable client key rather than a merchant secret, and replay/update/delete
+operations should describe idempotency and authorization scope.
 
-The data model is the weakest part relative to the claims. `charges` carries
-state and idempotency, but the promised ledger, payout, refund, outbox,
-delivery-attempt, and reconciliation mechanisms are not represented as tables.
-This makes the final design less auditable than the text says it is.
+The data model has caught up with the final design. It now includes the right
+families of tables for attempts, idempotency, refunds, ledger, payouts,
+webhooks, merchants, and reconciliation. The next improvement is to encode
+invariants rather than adding more nouns: balanced ledger postings, unique
+external references, immutable entries, reconciliation item records, timestamped
+attempt histories, and payout eligibility rules.
 
-The high-level architecture has the right major services. The vault, charge
-store, orchestrator, fraud service, PSP, ledger, webhook delivery, queue, and
-payout worker are enough for a strong interview answer. The missing piece is the
-operational layer: admin/reconciliation tools, merchant configuration, alerting,
-and runbooks for unknown charges, stuck payouts, and webhook backlogs.
+The high-level architecture is coherent. The PCI vault, gateway API, charge
+orchestrator, charge/payment store, fraud service, acquirer, ledger, webhook
+delivery, queue, and payout worker are the right components for this case. The
+final design accurately integrates the chosen path.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive baseline
 
-This is a good opener because it motivates both PCI containment and idempotent
-charges. The diagram view should be fixed: it includes `charge-psp`, whose
-source endpoint is `ChargeSvc`, but `ChargeSvc` is not in this step's
-`view.nodes`. Either add `ChargeSvc` to the view or replace the link with a
-local `API -> PSP` link.
+This remains a good opener. It exposes PCI blast radius and retry double-charge
+risk before introducing the gateway mechanisms. The previous review's diagram
+endpoint problem is fixed: `ChargeSvc` is now present when `charge-psp` is
+shown.
 
-### Step 2: PCI boundary
+One optional improvement: make the baseline explicitly "intentionally wrong" in
+the prose so candidates do not treat direct bank charging as a serious option.
 
-The options are useful and realistic: hosted fields, server-side tokenization,
-and PSP/network tokenization. The default is correct. This step would be stronger
-with one added operational caveat: tokenization is not enough if logs,
-analytics, traces, screenshots, or support tools can still capture PAN data.
+### Step 2: The PCI Boundary: Tokenize Card Data
 
-### Step 3: Idempotent charges
+The options are realistic: hosted fields, server-side tokenization, and
+PSP/network tokenization. The default is correct for shrinking PCI scope. The
+added vault-security concept is useful and should stay.
 
-The chosen design is sound. The distributed lock option is a good contrast
-because it exposes why locks are unsafe around slow PSP calls. Add request-body
-fingerprinting and an idempotency retention policy so repeat keys with different
-payloads become a defined conflict rather than ambiguous behavior.
+The next improvement is to connect PCI controls to operations. Add key versions,
+audit logs, detokenization reason codes, support-tool redaction, and log/trace
+scrubbing either as concept details or a trap.
 
-### Step 4: Charge orchestration
+### Step 3: Idempotent Charges
 
-This is the strongest step. It introduces the state machine, risk gate, vault
-detokenization, and PSP ambiguity in the right order. To make it production
-complete, add explicit states for sent/unknown external calls and store PSP
-request IDs before the network call is made.
+This is strong. It includes request fingerprinting, durable idempotency,
+retention, conflict semantics, and traps for body mismatch and cache-only
+deduplication. The options teach the trade-off between a dedicated idempotency
+record, a unique charge constraint, and distributed locks.
 
-### Step 5: Reliable webhooks
+Minor polish: say what happens for an in-progress duplicate request. Returning
+`409/in_progress`, blocking until the first request completes, or replaying the
+last known response are all valid choices, but the contract should be explicit.
 
-The outbox/default option is correct and the at-least-once framing is good. The
-model should separate event records from delivery attempts and should include
-merchant endpoint configuration, signing secret version, replay, and a maximum
-backoff/DLQ policy.
+### Step 4: Charge Orchestration: Risk -> Network
 
-### Step 6: Ledger and payouts
+This is still the strongest conceptual step. It introduces the persisted state
+machine, risk gate, detokenization, PSP call, and ambiguous timeout handling in
+the right sequence. The `authorize_unknown` and `capture_unknown` states and
+PSP IDs are now reflected in the model.
 
-The step teaches the right accounting principle, but it is too compressed for a
-money system. A double-entry ledger needs accounts, immutable entries,
-transaction groups, currency, available/pending balances, fees, reserves,
-payouts, and reconciliation. This step deserves either a deep dive or a flow.
+The sequence flow is useful but compressed. It would be stronger if the flow
+showed storing `psp_request_id` before the network call, not only persisting the
+initial `created` state and final resolution.
 
-### Step 7: Resilience, PSP failures, and scale
+### Step 5: Reliable Webhooks
 
-This is high-value material but currently underdeveloped. It should become an
-option-driven step with concrete trade-offs, not just a prose summary. The view
-also includes `webhook-q`, whose source endpoint is `WebhookSvc`, but
-`WebhookSvc` is not in `view.nodes`.
+The outbox/default option is correct, and the event/delivery-attempt split in
+the data model fixes the earlier gap. The traps are good: do not promise
+exactly-once delivery, and do not dual-write DB then HTTP inline.
+
+Add one operational rule: replay should create a new delivery attempt for the
+same event ID, not a new business event. That reinforces merchant deduplication.
+
+### Step 6: Ledger and Payouts
+
+This step improved the most. It now compares double-entry ledger, mutable
+balance, and event-sourced ledger options, and it has concrete refund and payout
+flows. The available-vs-pending concept is important and well placed.
+
+The next improvement is depth. Add traps and invariants for unbalanced entries,
+mutable balance edits, payout before settlement, and stale materialized balance
+reads. The data model should also show reconciliation at the individual
+settlement-line level, not only as aggregate run counts.
+
+### Step 7: Resilience, PSP Failures, and Scale
+
+This step is now useful, but it is doing two jobs. The options teach charge
+store topology; the flow teaches PSP failover. Both are valuable, but the
+decision prompt asks about the primary acquirer going down, while the selected
+option is merchant-sharded storage. That mismatch is the main pedagogical issue
+left in the walkthrough.
+
+Split the storage and PSP-routing decisions, or add explicit PSP-routing
+options. Keep the current traps; they are exactly the traps a strong candidate
+should name.
 
 ## Final Design Review
 
-The final design is coherent and accurately summarizes the selected path. It
-includes all major nodes and links, and the caption explains the whole flow in
-one pass. The main gap is that the final text claims "double-entry ledger",
-"reconciled against PSP settlement", "scheduled payouts", and "multi-acquirer
-failover", while the dataset does not yet provide enough schema or step detail
-to substantiate those claims.
+The final design is coherent and no longer overclaims relative to the dataset.
+The components in the final diagram are introduced in prior steps, and the
+caption accurately describes tokenization, idempotent orchestration, fraud,
+acquirer authorize/capture, ledger posting, payouts, and queued webhooks.
+
+The final design would be stronger if it named the operational plane somewhere:
+merchant configuration, admin/reconciliation tools, alerting, audit logs, and
+runbooks for stuck/unknown money states. These do not need to clutter the main
+diagram, but they should exist in prose, concepts, or follow-ups.
 
 ## Concept Introduction and Learning Flow
 
-Concepts are introduced just in time: PCI tokenization before idempotency,
-idempotency before orchestration, orchestration before webhooks, and ledger
-after charges/refunds are in scope. That order is good.
+The learning order is good: PCI first, idempotency second, orchestration third,
+webhooks after state changes, ledger/payouts after money movement, and
+resilience/scale last. Concepts are introduced close to where they are used.
 
-The concept set is sparse for the later half of the interview. Add concepts for
-transactional outbox, PSP reconciliation, double-entry ledger, payout state,
-merchant webhook deduplication, and circuit breakers. The existing pattern
-chips are useful and should be preserved.
+The recent additions to patterns and concepts make the wrap-up much better:
+transactional outbox, PSP reconciliation, payout state machine, merchant
+webhook dedup, and circuit breaker/failover are now represented. The remaining
+concept gap is not naming more concepts; it is giving Step 6 and Step 7 enough
+invariants and alternatives to make those concepts interview-operational.
 
 ## Step-to-Final-Design Coherence
 
-Every final-design component appears in a prior step, which is a good sign. The
-weak transitions are from Step 6 to payout correctness and from Step 7 to
-multi-acquirer scale. Those mechanisms appear in the final design but are not
-earned through the same level of option comparison as PCI, idempotency, and
-webhooks.
+Every final-design component now has a credible step-level introduction. The
+main transition weakness is Step 7: the final design claims resilience to PSP
+failure, and the dataset has a good failover flow, but the option tabs primarily
+decide storage topology. Aligning the decision prompt, default option, and flow
+would make the final step feel earned.
+
+The `satisfies` section is accurate and references real steps. It correctly
+maps no-double-charge to idempotency and orchestration, reliable webhooks to the
+outbox step, auditable money flow to ledger, and PSP failure resilience to the
+scale step.
 
 ## Realism Compared With Production Systems
 
-The dataset is realistic on the core payment hazards: PCI scope, merchant
-retries, slow external PSP calls, ambiguous responses, outbox-based webhooks,
-and ledger-backed money movement.
+The dataset is now realistic on the core hazards of a payment gateway:
+tokenization, idempotent API contracts, external provider ambiguity, state
+machines, settlement/reconciliation, at-least-once webhook delivery, and
+ledger-backed payouts.
 
-The missing production topics are not all required for the main case, but at
-least some should be named or explicitly scoped out:
+The consciously scoped-out areas are also realistic boundaries for a 45-minute
+interview: 3DS/SCA, chargebacks/disputes, KYC, multi-currency, FX, and bank
+account verification. The dataset should keep those as follow-ups, but should
+make the scope boundary explicit near the requirements.
 
-- 3DS/SCA or asynchronous customer authentication states.
-- Disputes, chargebacks, evidence submission, and reserves.
-- KYC/merchant onboarding, merchant risk, and bank account verification for
-  payouts.
-- Multi-currency and FX.
-- Provider rate limits, brownouts, partial outages, and reconciliation SLAs.
-- Admin tooling for manual review, stuck charges, payout failures, and webhook
-  replay.
-- Observability, alerting, audit logs, and data retention.
+The most production-like additions would be operational rather than architectural:
+merchant secret rotation, webhook endpoint lifecycle, DLQs and replay controls,
+admin tools for unknown payments, reconciliation queues, incident runbooks,
+PCI audit logs, PAN redaction, and ledger imbalance alerting.
 
 ## Dataset and Renderer-Facing Observations
 
 - JSON parse validation passes.
 - Top-level schema shape is consistent with the book datasets.
 - `satisfies[*].steps[*]` references resolve to real step IDs.
-- Step-level `view.links` references resolve to known high-level links.
-- Option-level `view.nodes`, `view.links`, and highlights resolve.
-- Sequence flow participant references resolve.
-- Two step views include links whose endpoints are omitted from the same view:
-  `naive` uses `charge-psp` but omits `ChargeSvc`; `scale` uses `webhook-q` but
-  omits `WebhookSvc`. These can create implicit, unlabeled Mermaid nodes or
-  confusing diagrams.
-- `requirementsDiagram` and `capacityDiagram` are simple raw Mermaid diagrams
-  and are acceptable for overview sketches.
+- Step-level `view.nodes` references resolve to high-level nodes unless they are
+  deliberate inline option-local nodes.
+- Step-level and option-level `view.links` references resolve.
+- Displayed high-level links have both endpoints present in their step/option
+  views; the old `naive` and `scale` omissions are fixed.
+- Step-level highlights resolve to visible nodes.
+- Sequence participants are declared, including the `PSPA` and `PSPB` aliases
+  used in the PSP failover flow.
+- `requirementsDiagram` and `capacityDiagram` remain simple raw Mermaid
+  diagrams, which is acceptable for overview sketches.
+- Minor polish: the `POST /v1/charges` API sequence returns from `ChargeSvc` to
+  `Merchant` directly. For strict sequence clarity, return through `API`, or
+  explain that the diagram is collapsing the API response path.
 
 ## Recommended Edits, Prioritized
 
-### P1: Make the money model match the claims
+### P1: Align capacity math
 
-Add refund, ledger, payout, outbox/delivery-attempt, idempotency, and
-reconciliation data-model entries. Add at least one refund or payout sequence
-flow.
+Recalculate charges/day, ledger entries/day, total persisted rows/day, peak
+writes/sec, webhook event count, delivery-attempt count, and retry multiplier
+from the same baseline assumptions.
 
-### P1: Strengthen PSP ambiguity and failover
+### P1: Split or rebalance Step 7
 
-Add explicit attempt IDs, PSP idempotency keys, unknown states, reconciliation
-states, and safe/unsafe failover rules.
+Make PSP resilience a first-class option comparison, or split the current Step
+7 into storage scaling and acquirer failover decisions.
 
-### P1: Fix the two view endpoint omissions
+### P1: Add ledger/reconciliation invariants
 
-Fix `naive.view` and `scale.view` so every link endpoint appears in the view's
-node list, or replace those links with local inline links that match the shown
-nodes.
+Add balanced-by-currency posting rules, immutable reversal rules, idempotent
+transaction-group constraints, settlement-line matching, and payout eligibility
+rules.
 
-### P2: Quantify capacity
+### P2: Add merchant/security operations
 
-Replace qualitative capacity bullets with approximate QPS, retry/fanout,
-storage, queue backlog, and latency assumptions.
+Cover API-key rotation, webhook secret rotation, endpoint update/delete/disable,
+per-merchant throttling, vault audit logs, key versions, support-tool redaction,
+and incident runbooks.
 
-### P2: Turn Step 7 into an option-driven step
+### P2: Add Step 6 traps
 
-Add options, traps, and at least one sequence/deep dive for PSP failure,
-multi-acquirer routing, or store/ledger scaling.
+Add traps for mutable balance edits, unbalanced ledger entries, paying pending
+funds, and relying on stale materialized balances for payouts.
 
-### P2: Expand merchant operations APIs
+### P3: Clarify scoped-out payment features
 
-Add status, event listing/replay, webhook endpoint configuration, and webhook
-secret rotation APIs.
+Add a concise requirements-level or follow-up note for 3DS/SCA, disputes,
+chargebacks, KYC, multi-currency, FX, and verified payout destinations.
 
-### P3: Add security and compliance details around the vault
+### P3: Polish API examples and sequences
 
-Mention HSM/KMS, key rotation, audit logs, log redaction, network segmentation,
-least-privilege detokenization, and token lifecycle management.
-
-### P3: Add follow-up scope boundaries
-
-Either add or explicitly scope out 3DS/SCA, disputes/chargebacks, merchant KYC,
-reserves, multi-currency, and FX.
+Make auth headers consistent, clarify tokenization uses the client/vault trust
+boundary, and route the charge sequence response through the API for precision.
 
 ## What Not To Change
 
-- Keep the naive baseline. It is pedagogically useful and sets up the rest of
-  the design.
-- Keep client SDK / hosted fields as the default PCI decision.
-- Keep durable idempotency as a database-backed correctness mechanism, not a
-  cache-only mechanism.
-- Keep the centralized persisted orchestrator as the default for the charge
-  lifecycle; it is easier to reason about for money movement than choreography.
-- Keep at-least-once webhooks with merchant deduplication. Do not imply
-  exactly-once webhook delivery.
+- Keep the naive baseline; it is pedagogically useful.
+- Keep client SDK / hosted fields as the default PCI choice.
+- Keep durable idempotency as a database-backed correctness mechanism.
+- Keep the centralized persisted charge orchestrator as the default.
+- Keep PSP ambiguity handling strict: never blindly retry an unknown authorize.
+- Keep outbox-backed at-least-once webhooks with merchant deduplication.
+- Keep the double-entry ledger as the default money model.
+- Keep chargebacks, KYC, multi-currency, and 3DS/SCA as follow-ups unless the
+  interview is intentionally expanded beyond the core gateway.
 
 ## Bottom Line
 
-This dataset is already a strong interview walkthrough for the core charge
-path. The next improvement should be to make the claimed production mechanisms
-concrete: data models for ledger/refunds/payouts/reconciliation, explicit PSP
-attempt-state handling, quantified capacity, and a real resilience/scale
-decision step.
+This dataset has moved from a good outline to a strong, interview-ready payment
+gateway case. The next review pass should focus on precision rather than breadth:
+consistent capacity math, a cleaner PSP-failover decision step, explicit ledger
+invariants, and concrete merchant/security operations.

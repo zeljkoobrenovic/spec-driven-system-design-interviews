@@ -1,6 +1,6 @@
 {
   "title": "RAG / LLM Chat — System Design",
-  "description": "Designing a chat assistant grounded in your own documents: a conversational LLM app that retrieves relevant context from a knowledge base and answers with citations. The interesting problems are AI-era — managing a bounded context window across a long conversation, streaming tokens with low latency, the ingestion-to-retrieval pipeline (chunking, embeddings, a vector index), grounding answers to reduce hallucination, and controlling the cost and safety of an expensive, non-deterministic dependency. We build from a thin LLM proxy toward a grounded, streamed, cost-controlled RAG system.",
+  "description": "Designing a chat assistant grounded in your own documents: a conversational LLM app that retrieves relevant context from a knowledge base and answers with citations. The interesting problems are AI-era — managing a bounded context window across a long conversation, streaming tokens with low latency, building the ingestion-to-retrieval pipeline (chunking, embeddings, a vector index), grounding answers to reduce hallucination, and controlling the cost and safety of an expensive, non-deterministic dependency. We build up from a thin LLM proxy to a grounded, streamed, cost-controlled RAG system.",
   "highLevelArchitecture": {
     "nodes": [
       {
@@ -86,6 +86,16 @@
         "category": "compute",
         "traits": [],
         "description": "Doc Ingestion Pipeline: Asynchronous or background compute component that processes jobs, events, batches, or scheduled work."
+      },
+      {
+        "id": "IngestQueue",
+        "label": "Chunk-Embed Job Queue",
+        "type": "queue",
+        "category": "messaging",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Chunk-Embed Job Queue: Buffers per-chunk embedding jobs off the query path, with retry/backoff and a dead-letter queue for poison chunks."
       },
       {
         "id": "Limiter",
@@ -273,6 +283,18 @@
         "id": "ingest-chunker",
         "from": "Ingest",
         "to": "Chunker"
+      },
+      {
+        "id": "ingest-queue-enqueue",
+        "from": "Ingest",
+        "to": "IngestQueue",
+        "label": "enqueue chunk jobs"
+      },
+      {
+        "id": "queue-chunker-dequeue",
+        "from": "IngestQueue",
+        "to": "Chunker",
+        "label": "dequeue (rate-limited)"
       },
       {
         "id": "chunker-embed-embed",
@@ -564,6 +586,7 @@
       "Reduce hallucination by grounding in retrieved sources.",
       "Control cost — LLM tokens are expensive and usage is unbounded without limits.",
       "Safety: filter unsafe inputs/outputs and prevent prompt injection from documents.",
+      "Privacy & retention: prompts, retrieved chunks, and traces may hold PII or private business data — bound retention, support redaction, and honor tenant deletion/audit requests.",
       "Graceful degradation when the LLM or vector store is slow, rate-limited, or down."
     ]
   },
@@ -574,14 +597,19 @@
       "note": "Each may trigger retrieval and an LLM call — an expensive fan-out, not just request load."
     },
     {
+      "label": "Cache-miss assumption",
+      "value": "~30% hit → ~3,500 LLM-backed msgs/s",
+      "note": "Numbers below are miss-path (full retrieval + LLM) unless noted. At ~30% semantic-cache hit, ~3.5k msgs/s do real retrieval + generation; hits skip both. Tune the hit-rate assumption — it sets the whole bill."
+    },
+    {
       "label": "Tokens per request",
       "value": "~3–4k in / ~400 out",
       "note": "system ~300 + summary ~500 + recent turns ~800 + ~6 reranked chunks ~1.5k = ~3.1k input; answer ~400 output."
     },
     {
       "label": "Generated tokens/s",
-      "value": "~2M tokens/s peak",
-      "note": "5k msgs/s × ~400 output tokens — drives provider rate limits and dominates the bill."
+      "value": "~1.4M tokens/s (miss path)",
+      "note": "~3.5k miss msgs/s × ~400 output tokens. Drives provider rate limits and dominates the bill; enforce per-tenant token limits BEFORE starting a run, not after streaming begins."
     },
     {
       "label": "Concurrent streams",
@@ -590,13 +618,23 @@
     },
     {
       "label": "Retrieval / reranker QPS",
-      "value": "~5k retrievals/s + ~5k rerank calls/s",
-      "note": "Roughly one ANN query + one rerank pass per cache-miss message (1 question embed each too)."
+      "value": "~3.5k retrievals/s + ~3.5k rerank calls/s",
+      "note": "One ANN query + one rerank pass per cache-miss message (cache hits skip retrieval entirely)."
     },
     {
-      "label": "Embedding throughput",
-      "value": "ingest, sized separately",
-      "note": "A 500-page doc ≈ thousands of chunks; ingestion embedding is bursty and must not compete with query embeds."
+      "label": "Query embeddings/s",
+      "value": "~3.5k/s (miss path)",
+      "note": "One question embed per cache-miss message; latency-critical, kept on a separate rate budget from ingestion embeds."
+    },
+    {
+      "label": "Ingestion embeddings",
+      "value": "bursty, sized separately",
+      "note": "A 500-page doc ≈ thousands of chunk embeds. Queued, lower-priority, and rate-limited so a big upload never starves query embeds."
+    },
+    {
+      "label": "Degraded mode",
+      "value": "shed / fall back when provider rate-limited",
+      "note": "Past provider limits: serve from semantic cache, route to the small model, or return a clear quota/'try again' error — never queue unbounded LLM work."
     },
     {
       "label": "LLM cost",
@@ -784,9 +822,9 @@
     {
       "method": "GET",
       "path": "/v1/documents/{id}",
-      "description": "Poll a document's indexing lifecycle so the uploader knows when it is searchable, failed, or deleted.",
+      "description": "Poll a document's indexing lifecycle and chunk-level progress so the uploader knows how far a large upload has indexed, and whether it is searchable, failed, or deleted.",
       "request": "GET /v1/documents/doc_12",
-      "response": "200 OK { \"document_id\": \"doc_12\", \"indexing_status\": \"indexed\", \"version\": 3, \"indexed_at\": \"...\" }"
+      "response": "200 OK { \"document_id\": \"doc_12\", \"indexing_status\": \"indexing\", \"version\": 3, \"chunks_total\": 1840, \"chunks_indexed\": 1620, \"chunks_failed\": 2, \"indexed_at\": null }"
     },
     {
       "method": "DELETE",
@@ -920,6 +958,18 @@
           "type": "uuid FK"
         },
         {
+          "name": "last_event_seq",
+          "type": "int (last streamed delta; for optional grace-period replay)"
+        },
+        {
+          "name": "started_at",
+          "type": "timestamptz"
+        },
+        {
+          "name": "completed_at",
+          "type": "timestamptz (nullable; set on completed/failed/cancelled)"
+        },
+        {
           "name": "error",
           "type": "text (nullable; failure/cancel reason)"
         }
@@ -956,6 +1006,18 @@
         {
           "name": "indexing_status",
           "type": "enum(uploading, indexing, indexed, failed, deleted)"
+        },
+        {
+          "name": "chunks_total",
+          "type": "int (fan-out size; for progress)"
+        },
+        {
+          "name": "chunks_indexed",
+          "type": "int (upserted so far)"
+        },
+        {
+          "name": "chunks_failed",
+          "type": "int (dead-lettered chunks)"
         },
         {
           "name": "indexed_at",
@@ -1048,6 +1110,96 @@
         {
           "name": "safety_decision",
           "type": "jsonb (input/output verdicts, injection flags, policy actions)"
+        },
+        {
+          "name": "redaction_status",
+          "type": "enum(raw, redacted) — PII scrubbed from prompt/chunks"
+        },
+        {
+          "name": "retention_expires_at",
+          "type": "timestamptz (TTL; trace purged or anonymized after)"
+        }
+      ]
+    },
+    {
+      "name": "eval_sets",
+      "note": "A curated regression set per tenant/corpus: questions with expected answers / relevant chunks, used to gate prompt, chunking, embedding, reranker, and routing changes before rollout. Distinct from raw user feedback.",
+      "fields": [
+        {
+          "name": "eval_set_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "tenant_id",
+          "type": "uuid (nullable; null = global/golden set)"
+        },
+        {
+          "name": "corpus_id",
+          "type": "uuid (nullable)"
+        },
+        {
+          "name": "name",
+          "type": "varchar"
+        }
+      ]
+    },
+    {
+      "name": "eval_cases",
+      "note": "One labeled question in an eval set: the prompt plus its golden answer and the chunk ids that should be retrieved. Often seeded from sampled traces and thumbs-down feedback.",
+      "fields": [
+        {
+          "name": "eval_case_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "eval_set_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "question",
+          "type": "text"
+        },
+        {
+          "name": "expected_answer",
+          "type": "text (nullable; golden answer)"
+        },
+        {
+          "name": "expected_chunks",
+          "type": "uuid[] (relevant chunk ids for recall@k)"
+        },
+        {
+          "name": "source_trace_id",
+          "type": "uuid (nullable; if seeded from a real trace)"
+        }
+      ]
+    },
+    {
+      "name": "eval_runs",
+      "note": "One execution of an eval set against a candidate config (a prompt/model/chunking/reranker/router change). Compared against the current baseline as a release gate.",
+      "fields": [
+        {
+          "name": "eval_run_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "eval_set_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "config",
+          "type": "jsonb (prompt/model/chunking/reranker/router version under test)"
+        },
+        {
+          "name": "metrics",
+          "type": "jsonb (recall@k, faithfulness, citation_precision, refusal_accuracy, p95_latency, cost_per_answer)"
+        },
+        {
+          "name": "baseline_run_id",
+          "type": "uuid (nullable; the run this is gated against)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz"
         }
       ]
     },
@@ -1220,7 +1372,7 @@
     {
       "id": "chat-proxy",
       "title": "1. Thin LLM Proxy (the baseline)",
-      "description": "Start minimal: the client sends a message, the API forwards it to the LLM and returns the completion. This exposes the foundational truth — the model is a stateless, slow, expensive, non-deterministic dependency — before we add memory, retrieval, or streaming.",
+      "description": "Start minimal: the client sends a message, the orchestrator forwards it to the LLM and returns the completion. This exposes the foundational truth — the model is a stateless, slow, expensive, non-deterministic dependency — before we add memory, retrieval, or streaming.",
       "patterns": [
         "Stateless LLM proxy"
       ],
@@ -1463,8 +1615,17 @@
           "points": [
             "Open the stream with a stable run_id/message_id so the client and operators can reconcile partial generations.",
             "Persist a chat_runs row that moves through streaming → completed/failed/cancelled; a disconnect or cancel call marks it cancelled and stops the upstream LLM.",
-            "Make POST messages idempotent (Idempotency-Key) so a retry resumes/returns the existing run instead of double-charging or duplicating the assistant message.",
+            "Make the POST message endpoint idempotent (Idempotency-Key) so a retry resumes or returns the existing run instead of double-charging or duplicating the assistant message.",
             "Store the verified citations on the assistant message (and trace), not only in the transient stream."
+          ]
+        },
+        {
+          "title": "Disconnect & resume policy (pick one and state it)",
+          "points": [
+            "Default here: a client disconnect cancels upstream generation to stop paying for tokens nobody reads — the chat_run flips to cancelled and the partial assistant turn is persisted with status=cancelled, not silently discarded.",
+            "No mid-stream upstream resume: rather than reattaching to a live model stream, the client refetches GET /v1/conversations/{id} to see the cancelled partial turn, then starts a fresh run. The Idempotency-Key makes that retry safe — it returns the existing run if it is still in flight instead of double-charging.",
+            "Alternative if instant resume matters: keep generating for a short grace period after disconnect and persist a last_event_seq, so a quick reconnect can replay missed deltas; this trades token spend on abandoned streams for a smoother reconnect.",
+            "Record started_at/completed_at on the run so timeouts, abandoned streams, and SLA latency are all measurable from durable state."
           ]
         }
       ],
@@ -1483,8 +1644,8 @@
       "failureDrills": [
         {
           "scenario": "The connection drops mid-stream.",
-          "expectedBehavior": "No wasted spend; the partial answer is recoverable or clearly incomplete.",
-          "mitigation": "Cancel upstream generation on disconnect; persist partial output keyed by message id for resume."
+          "expectedBehavior": "No wasted spend, and the partial turn is clearly marked incomplete.",
+          "mitigation": "Disconnect cancels upstream generation; the chat_run and assistant message flip to cancelled. The client refetches the conversation to see the cancelled partial, then starts a fresh idempotent run — no live-stream resume."
         }
       ],
       "interviewerSignals": {
@@ -1671,9 +1832,19 @@
           "title": "Document lifecycle: status, deletion, reindex",
           "points": [
             "Track explicit status (uploading → indexing → indexed, or failed) so callers know when a doc is searchable; expose it via GET /v1/documents/{id}.",
+            "Expose progress counters (chunks_total, chunks_indexed, chunks_failed) so a large upload shows real indexing progress, not just a binary 'indexing' flag.",
             "The vector index is derived state that can outlive the source: on delete or access revocation, tombstone the document and remove its chunks from BOTH the chunk store and the vector index.",
             "On a new document version, index the new chunks then retire the old ones (and bump embedding_version when the embedding model changes — that forces a full reindex).",
             "Stamp tenant_id/corpus_id onto every chunk at ingestion so the retrieval-time isolation filter has something to match."
+          ]
+        },
+        {
+          "title": "Ingestion queue & backpressure",
+          "points": [
+            "A single upload can fan out into thousands of chunk-embedding jobs, so the ingestion pipeline enqueues per-chunk (or per-document) jobs rather than embedding inline — the queue absorbs the burst and decouples upload rate from embed throughput.",
+            "Workers dequeue with retry/backoff; a chunk that fails repeatedly (a 'poison' chunk) goes to a dead-letter queue and increments chunks_failed instead of blocking the rest of the document.",
+            "Keep ingestion embeddings on a separate rate limit / priority class from query embeddings, so a 500-page upload can never starve the latency-critical query path's embedding calls.",
+            "Backpressure: bound queue depth and shed or slow uploads (202 + retry-after) when embed workers are saturated, rather than letting the backlog grow unbounded and the index fall arbitrarily behind."
           ]
         }
       ],
@@ -1699,6 +1870,11 @@
           "scenario": "The embedding worker dies halfway through a document.",
           "expectedBehavior": "The corpus is never left in an ambiguous half-indexed state.",
           "mitigation": "Idempotent per-chunk jobs with retry/backoff; the document stays indexing (or flips to failed) and only becomes indexed once all chunks upsert — partial chunks are not retrievable."
+        },
+        {
+          "scenario": "A large upload hits the embedding provider's rate limit mid-ingest.",
+          "expectedBehavior": "Indexing slows but never drops chunks, and query-time embedding stays unaffected.",
+          "mitigation": "The queue retries throttled jobs with backoff; ingestion embeds run under a separate, lower-priority rate budget than query embeds, so the upload backs off while live queries keep their headroom. Repeatedly-failing chunks dead-letter and surface as chunks_failed."
         }
       ],
       "interviewerSignals": {
@@ -1722,14 +1898,16 @@
       "view": {
         "nodes": [
           "Ingest",
+          "IngestQueue",
           "Chunker",
           "Embed",
           "VectorDB",
           "DocStore"
         ],
-        "caption": "The doc ingestion pipeline feeds the chunk-and-embed worker, which calls the embedding model and upserts vectors into the vector index plus text into the document/chunk store.",
+        "caption": "The doc ingestion pipeline enqueues per-chunk jobs onto the chunk-embed queue; workers dequeue at a rate-limited pace, call the embedding model, and upsert vectors into the vector index plus text into the document/chunk store.",
         "links": [
-          "ingest-chunker",
+          "ingest-queue-enqueue",
+          "queue-chunker-dequeue",
           "chunker-embed-embed",
           "embed-chunker-vectors",
           "chunker-vectordb-upsert-vectors",
@@ -1737,6 +1915,7 @@
         ],
         "highlight": [
           "Ingest",
+          "IngestQueue",
           "Chunker",
           "Embed",
           "VectorDB",
@@ -1746,12 +1925,16 @@
       "flows": [
         {
           "name": "Document ingestion: chunk -> embed -> index",
-          "note": "Off the query path: the pipeline splits a document into passages, embeds each chunk, upserts vectors into the index, and stores chunk text + citation metadata.",
+          "note": "Off the query path: the pipeline splits a document into passages, enqueues per-chunk embedding jobs, workers embed each chunk, upsert vectors into the index, and store chunk text + citation metadata.",
           "sequence": {
             "participants": [
               {
                 "id": "Ingest",
                 "label": "Doc Ingestion Pipeline"
+              },
+              {
+                "id": "IngestQueue",
+                "label": "Chunk-Embed Queue"
               },
               {
                 "id": "Chunker",
@@ -1773,15 +1956,21 @@
             "messages": [
               {
                 "from": "Ingest",
-                "to": "Chunker",
-                "arrow": "->>",
-                "label": "document"
-              },
-              {
-                "from": "Chunker",
-                "to": "Chunker",
+                "to": "Ingest",
                 "arrow": "->>",
                 "label": "split into overlapping passages"
+              },
+              {
+                "from": "Ingest",
+                "to": "IngestQueue",
+                "arrow": "->>",
+                "label": "enqueue per-chunk jobs"
+              },
+              {
+                "from": "IngestQueue",
+                "to": "Chunker",
+                "arrow": "->>",
+                "label": "dequeue (rate-limited, retry/backoff)"
               },
               {
                 "from": "Chunker",
@@ -1822,7 +2011,7 @@
       "parent": "ingestion",
       "title": "4a. Chunking Strategy",
       "description": [
-        "How you split documents before embedding strongly determines retrieval quality, and it's an underrated decision. Chunks that are too large dilute the embedding (one vector mixes many topics, so retrieval is imprecise and you waste context tokens); too small and a chunk loses the surrounding context needed to answer.",
+        "How you split documents before embedding strongly determines retrieval quality, and it's an underrated decision. Chunks that are too large dilute the embedding — one vector mixes many topics, so retrieval is imprecise and you waste context tokens; chunks that are too small lose the surrounding context needed to answer.",
         "Prefer semantic or structural boundaries (paragraphs, sections, headings) over a fixed character count, and add a small overlap between adjacent chunks so a fact spanning a boundary isn't lost. Keep metadata (source, section, doc id) on each chunk for citations and filtering.",
         "Tune chunk size to the embedding model and the content: dense reference docs want smaller chunks; narrative or code wants boundary-aware splits. This is iterated against retrieval-quality evals, not guessed once."
       ],
@@ -1979,7 +2168,7 @@
     {
       "id": "retrieval",
       "title": "5. Retrieval & Reranking",
-      "description": "At query time, embed the question, then — scoped to the caller's tenant/corpus namespace — find the top-k most similar chunks via approximate nearest-neighbor search and rerank them for relevance. Authorization and freshness filtering come first: a chunk is eligible only if it belongs to the authorized corpus and isn't deleted/stale. Optionally combine vector search with keyword/BM25 (hybrid) for terms that embeddings miss.",
+      "description": "At query time, embed the question and find the top-k most similar chunks via approximate nearest-neighbor search, then rerank them for relevance. Authorization and freshness filtering come first: a chunk is eligible only if it belongs to the caller's tenant/corpus namespace and isn't deleted or stale. Optionally combine vector search with keyword/BM25 (hybrid) for exact terms that embeddings miss.",
       "patterns": [
         "Embedding + vector index (ANN)",
         "Retrieval-augmented generation (RAG)",
@@ -2402,8 +2591,9 @@
           "points": [
             "Key cache_entries by (tenant_id, corpus_id, corpus_version, question-similarity bucket) so a hit can never serve another tenant's answer or a pre-update answer; add a TTL as a backstop.",
             "Bumping corpus_version on any ingest/delete invalidates that corpus's cache without scanning entries.",
-            "The limiter holds per-tenant budget buckets (tokens/$ per window); check it before each LLM call and attribute realized cost back from the trace.",
-            "On budget exhaustion, return a clear quota error (or degrade to the small model) rather than silently dropping the request."
+            "The limiter holds per-tenant budget buckets (tokens/$ per window); check it before the expensive retrieval + LLM work (and enforce the provider's token limit before starting a run, not after streaming begins) and attribute realized cost back from the trace.",
+            "Cache hit rate sets the whole bill: at an assumed ~30% semantic-cache hit, only the ~70% miss path pays full retrieval + LLM, so the cost/QPS estimates are miss-path numbers.",
+            "On budget exhaustion or provider rate-limiting, degrade — serve from cache, route to the small model, or return a clear quota error — rather than silently dropping or unbounded-queuing the request."
           ]
         }
       ],
@@ -2650,16 +2840,26 @@
           "points": [
             "Treat retrieved document text as untrusted data, not instructions; clearly delimit it in the prompt.",
             "Screen outputs for policy violations and leaked system prompt before/while streaming.",
-            "Constrain tool/use and never let retrieved content trigger privileged actions directly."
+            "Constrain tool use and never let retrieved content trigger privileged actions directly."
           ]
         },
         {
           "title": "Evaluation vs feedback",
           "points": [
-            "Feedback is sparse and noisy (thumbs up/down on a few messages) — useful signal, not a quality metric on its own.",
-            "Offline eval needs sampled traces, an expected-answer / golden set, and retrieval metrics (recall@k, citation accuracy, faithfulness).",
-            "Gate prompt, model, and index changes behind a regression run against the eval set before rollout.",
-            "Mind retention/PII: prompts, retrieved chunks, and traces hold sensitive data — set a retention policy."
+            "Feedback is sparse and noisy (thumbs up/down on a few messages) — a signal to seed eval cases from, not a quality metric on its own.",
+            "Curate eval_sets of eval_cases (question + golden answer + expected chunk ids), seeded from sampled traces and thumbs-down examples, kept separate from raw feedback.",
+            "Name the metric set: retrieval recall@k, answer faithfulness (does the answer follow from the cited chunks), citation precision, refusal accuracy (says 'not found' when it should), p95 latency, and cost per successful answer.",
+            "Gate every prompt, chunking, embedding-model, reranker, and router change behind an eval_run that replays the set and compares metrics to the baseline — block rollout on a regression (e.g. a chunk-size change that lifts recall but drops faithfulness, or a router change that cuts cost but hurts answer quality).",
+            "Mind retention/PII: prompts, retrieved chunks, and traces hold sensitive data — set a retention policy (see the retention note below)."
+          ]
+        },
+        {
+          "title": "Privacy, retention & redaction",
+          "points": [
+            "Traces store prompts, retrieved chunk text, citations, and safety decisions — exactly the debugging/eval data you want, and exactly the PII/private-business data you must govern.",
+            "Bound it: a retention_expires_at TTL purges or anonymizes traces, and a redaction_status records whether PII was scrubbed from the stored prompt/chunks.",
+            "Deleting a document tombstones its chunks and removes them from retrieval, but traces keep chunk-id references and copied text — on a tenant deletion/audit request, redact or purge those traces too, not just the source.",
+            "Scope every trace to a tenant so audit and deletion requests can be answered per tenant; keep eval sets that copy customer questions under the same policy."
           ]
         }
       ],
@@ -2673,6 +2873,11 @@
           "trap": "Shipping with no evaluation",
           "why": "RAG quality regresses silently as the corpus, models, and prompts change.",
           "instead": "Log traces, collect feedback, and score against a labeled eval set continuously."
+        },
+        {
+          "trap": "Logging full prompts and retrieved chunks forever",
+          "why": "Traces capture the corpus's private/PII content verbatim; unbounded retention turns a debugging aid into a compliance liability and widens the blast radius of a breach.",
+          "instead": "Set a retention TTL, redact/scrub PII, and on tenant deletion purge or anonymize their traces — not just the source documents."
         }
       ],
       "interviewerSignals": {
@@ -2722,7 +2927,7 @@
   ],
   "finalDesign": {
     "title": "Final Design",
-    "description": "End-to-end: a chat API streams grounded answers via an orchestrator that manages conversation context (recent turns + rolling summary), retrieves and reranks chunks from a vector index fed by an async ingestion pipeline, assembles a grounded+cited prompt, routes to a small or large model behind safety guardrails, serves repeats from a semantic cache under per-tenant cost limits, and logs traces for evaluation. Threaded through it all is the control-plane state the diagram doesn't draw: every chunk, cache key, trace, and citation is scoped to a tenant/corpus so retrieval can't leak across tenants; documents carry an indexing lifecycle (indexing → indexed/failed/deleted) with tombstoning of stale vectors; and each generation is a durable chat_run (streaming → completed/failed/cancelled) so disconnects, cancels, and idempotent retries reconcile without double-charging.",
+    "description": "End-to-end: a chat API streams grounded answers via an orchestrator that manages conversation context (recent turns + rolling summary), retrieves and reranks chunks from a vector index fed by an async ingestion pipeline, assembles a grounded+cited prompt, routes to a small or large model behind safety guardrails, serves repeats from a semantic cache under per-tenant cost limits, and logs traces for evaluation. Threaded through it all is the control-plane state the diagram doesn't draw: every chunk, cache key, trace, and citation is scoped to a tenant/corpus so retrieval can't leak across tenants; documents carry an indexing lifecycle (indexing → indexed/failed/deleted) with chunk-level progress counters and tombstoning of stale vectors; ingestion fans out per-chunk embedding jobs onto a rate-limited queue (with retry/backoff and a dead-letter for poison chunks) kept on a separate priority class from query embeds; each generation is a durable chat_run (streaming → completed/failed/cancelled) so disconnects, cancels, and idempotent retries reconcile without double-charging (a disconnect cancels upstream and the client starts a fresh run rather than resuming a live stream); prompt/chunking/embedding/reranker/router changes are gated by eval_runs against curated eval sets before rollout; and traces carry a retention TTL and redaction so logging private corpus content stays within a privacy policy.",
     "view": {
       "nodes": [
         "Client",
@@ -2739,6 +2944,7 @@
         "Reranker",
         "DocStore",
         "Ingest",
+        "IngestQueue",
         "Chunker",
         "Safety",
         "Router",
@@ -2746,7 +2952,7 @@
         "LLMbig",
         "Eval"
       ],
-      "caption": "The client streams grounded answers through the API and orchestrator, which manages context (conversation store + summary builder), retrieves and reranks chunks from the vector index fed by async ingestion, checks cache/limiter, and routes safely to a small or large model with traces logged.",
+      "caption": "The client streams grounded answers through the API and orchestrator, which manages context (conversation store + summary builder), retrieves and reranks chunks from the vector index fed by async queued ingestion, checks cache/limiter, and routes safely to a small or large model with traces logged.",
       "links": [
         "client-api-message",
         "api-orchestrator",
@@ -2759,7 +2965,8 @@
         "retriever-vectordb-ann",
         "retriever-reranker",
         "reranker-docstore",
-        "ingest-chunker",
+        "ingest-queue-enqueue",
+        "queue-chunker-dequeue",
         "chunker-embed",
         "chunker-vectordb-upsert",
         "chunker-docstore",
@@ -2852,6 +3059,13 @@
         ]
       },
       {
+        "requirement": "Privacy & retention",
+        "how": "Tenant-scoped traces with a retention TTL and redaction; tenant deletion purges traces, not just source documents.",
+        "steps": [
+          "scale-safety"
+        ]
+      },
+      {
         "requirement": "Graceful degradation",
         "how": "Decline when retrieval is weak; cache and fallbacks when the LLM is slow/down.",
         "steps": [
@@ -2893,6 +3107,8 @@
       "time": "final 5 min",
       "say": [
         "Add semantic caching, per-tenant cost limits, model routing, guardrails, and evaluation.",
+        "Say that prompt, chunking, embedding, reranker, and routing changes are gated by replaying a curated eval set / sampled traces (recall@k, faithfulness, citation precision, cost per answer) before rollout — not shipped on intuition.",
+        "Note the retention/redaction policy on prompts, chunks, and traces so logging sensitive corpus data doesn't become a compliance liability.",
         "Summarize how each requirement is met and name the dominant risks (cost and hallucination)."
       ]
     }
@@ -2925,7 +3141,7 @@
   "followUps": [
     "How would you add tool/function calling and keep retrieved content from triggering privileged tools?",
     "How do you evaluate RAG quality offline and online without a ground-truth answer for every query?",
-    "How would you support multi-tenant corpora with strict isolation so one tenant can't retrieve another's docs?",
+    "Tenant/corpus isolation is in the core design — how would you go finer-grained: per-document ACLs, shared corpora with group permissions, row/section-level permissions inside a document, or per-tenant model and retention policies?",
     "How do you keep answers fresh when documents change frequently (incremental re-indexing + cache invalidation)?",
     "How would you handle very large documents or multi-hop questions needing several retrieval rounds?",
     "How do you attribute and bill cost per tenant given variable token usage and model routing?"

@@ -231,9 +231,13 @@
     "graph LR",
     "  Places[~100M places]",
     "  Q[~10K searches/s]",
-    "  Read[Read-heavy]",
+    "  Cells[tens of cells/query]",
+    "  Cand[~50-200 candidates]",
+    "  Hydr[~30 cache reads/query]",
     "  Places --> Q",
-    "  Q --> Read"
+    "  Q --> Cells",
+    "  Cells --> Cand",
+    "  Cand --> Hydr"
   ],
   "requirements": {
     "functional": [
@@ -276,6 +280,36 @@
       "label": "Result set",
       "value": "top 20-50",
       "note": "Ranked subset, not everything in radius."
+    },
+    {
+      "label": "Cells per query",
+      "value": "~9-50",
+      "note": "At ~150 m cells a 0.5 km radius covers a 3x3 ring (~9 cells); a 5 km radius needs coarser cells or many rings (tens of cells). Sized so the covering set stays a few tens of cells."
+    },
+    {
+      "label": "Candidates per query",
+      "value": "~100-1,000 raw -> ~50-200 after exact filter",
+      "note": "Dense city cells dominate; variable precision keeps each cell's list bounded so the union stays in the low thousands before the haversine filter trims it."
+    },
+    {
+      "label": "Cache reads per query",
+      "value": "~20-50 hydrations",
+      "note": "Only the ranked top-K are hydrated. 10K qps x ~30 = ~300K PlaceCache reads/sec; at 90% hit rate ~30K/sec fall through to PlaceDB."
+    },
+    {
+      "label": "Geo-index size",
+      "value": "~100M entries, a few GB",
+      "note": "cell -> place_ids for 100M places. Sharded by cell-prefix/region; hot city prefixes get dedicated shards + read replicas."
+    },
+    {
+      "label": "Hot-region skew",
+      "value": "top metros >> global average",
+      "note": "A handful of city centers carry a large share of the 10K qps, so shard sizing follows peak per-region load, not the global mean."
+    },
+    {
+      "label": "Latency budget (p99 < 200 ms)",
+      "value": "~30 geo + ~40 filter/rank + ~30 ETA (top-N only) + ~40 hydrate + ~40 network",
+      "note": "Rough split in ms. ETA runs only for a small top-N with a timeout/fallback so it can't dominate; hydration is bounded by the top-K cache reads."
     }
   ],
   "api": [
@@ -350,9 +384,9 @@
     {
       "method": "POST",
       "path": "/v1/places",
-      "description": "Create or update a place. Emits a change event that updates the geo index asynchronously.",
-      "request": "{ \"name\": \"...\", \"lat\": 37.77, \"lng\": -122.41, \"category\": \"cafe\" }",
-      "response": "{ \"placeId\": \"p_9\" }",
+      "description": "Create a place (upsert by client idempotency-key). Bumps version and emits a (place_id, version) change event that updates the geo index asynchronously; retries with the same key are no-ops.",
+      "request": "Idempotency-Key: <uuid>  { \"name\": \"...\", \"lat\": 37.77, \"lng\": -122.41, \"category\": \"cafe\", \"priceLevel\": 2 }",
+      "response": "{ \"placeId\": \"p_9\", \"version\": 1 }",
       "sequence": {
         "participants": [
           {
@@ -415,12 +449,26 @@
       "description": "Fetch full details for one place.",
       "request": "(id in path)",
       "response": "{ \"id\": \"p_9\", \"name\": \"...\", \"hours\": \"...\", \"rating\": 4.5 }"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/places/{id}",
+      "description": "Update a place's fields (including location). A location change emits a move event carrying old_cell + new_cell so the indexer removes the old geo-index entry and adds the new one. Uses If-Match / expected version for optimistic concurrency.",
+      "request": "If-Match: \"3\"  { \"lat\": 37.78, \"lng\": -122.42, \"status\": \"active\" }",
+      "response": "{ \"placeId\": \"p_9\", \"version\": 4 }"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/places/{id}",
+      "description": "Remove a place. Soft-deletes by setting status=removed (tombstone) and emits a delete event; the indexer drops it from its cell. Reads filter tombstoned ids until async cleanup completes.",
+      "request": "(id in path)",
+      "response": "{ \"placeId\": \"p_9\", \"status\": \"removed\", \"version\": 5 }"
     }
   ],
   "dataModel": [
     {
       "name": "places",
-      "note": "Authoritative place records.",
+      "note": "Authoritative place records and lifecycle. status + tombstone let stale geo-index entries be filtered safely while async cleanup catches up; version drives idempotent indexing.",
       "fields": [
         {
           "name": "place_id",
@@ -447,26 +495,92 @@
           "type": "string (index)"
         },
         {
+          "name": "price_level",
+          "type": "smallint (1-4, index) — supports the price filter"
+        },
+        {
           "name": "rating",
           "type": "float"
         },
         {
           "name": "popularity",
           "type": "float"
+        },
+        {
+          "name": "status",
+          "type": "enum active|temp_closed|removed — drives open-now and tombstoning"
+        },
+        {
+          "name": "timezone",
+          "type": "varchar (IANA tz) — needed to evaluate 'open now' in local time"
+        },
+        {
+          "name": "opening_hours",
+          "type": "jsonb (normalized weekly schedule + exceptions/holidays)"
+        },
+        {
+          "name": "source",
+          "type": "varchar (ingest source / owner) — provenance for conflict resolution"
+        },
+        {
+          "name": "version",
+          "type": "bigint (monotonic per place) — idempotency key for indexing"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp"
         }
       ]
     },
     {
       "name": "geo_index",
-      "note": "Derived: cell key -> place ids. Backed by a spatial structure.",
+      "note": "Derived: cell key -> place ids, plus the minimal fields needed to filter and rank without hydrating every candidate. Backed by a spatial structure and rebuildable from places.",
       "fields": [
         {
           "name": "cell",
-          "type": "varchar (geohash prefix / S2 cell id) PK"
+          "type": "varchar (geohash prefix / S2 / H3 cell id) PK"
         },
         {
           "name": "place_ids",
           "type": "set<place_id>"
+        },
+        {
+          "name": "entry_meta",
+          "type": "per place_id: { lat, lng, category, price_level, popularity, status } — cheap pre-rank filters live here so only the top-K hydrate full details from PlaceCache/PlaceDB"
+        }
+      ]
+    },
+    {
+      "name": "place_change_events",
+      "note": "Change log streamed to the indexer (and the durable basis for replay/backfill). Carries old/new cell so a move reliably removes the old index entry.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid PK (dedup key)"
+        },
+        {
+          "name": "place_id",
+          "type": "uuid (index)"
+        },
+        {
+          "name": "place_version",
+          "type": "bigint — index updates are idempotent on (place_id, version)"
+        },
+        {
+          "name": "op",
+          "type": "enum create|update|move|delete"
+        },
+        {
+          "name": "old_cell",
+          "type": "varchar nullable — cell to remove from on a move/delete"
+        },
+        {
+          "name": "new_cell",
+          "type": "varchar nullable — cell to add to on a create/move"
+        },
+        {
+          "name": "event_time",
+          "type": "timestamp — for ordering and lag measurement"
         }
       ]
     }
@@ -483,7 +597,7 @@
     },
     {
       "name": "Cell neighbor expansion",
-      "what": "Query the target cell plus its neighbors so results near a cell boundary aren't missed.",
+      "what": "Query the covering set of cells for the radius (the target cell plus enough neighbor rings) so results near a cell boundary aren't missed; 'cell + 8 neighbors' is the small-radius special case.",
       "whenToUse": "Grid/geohash indexes where a radius can straddle cell edges.",
       "steps": [
         "boundaries"
@@ -538,7 +652,11 @@
         "links": [
           "client-lb",
           "lb-search",
-          "place-placedb"
+          {
+            "from": "SearchSvc",
+            "to": "PlaceDB",
+            "label": "scan all places + compute distance"
+          }
         ],
         "highlight": [
           "SearchSvc",
@@ -584,7 +702,6 @@
         ],
         "caption": "The search service asks the geo index for the cells in the radius to get place ids, then hydrates details from the place cache, falling back to the place store on a miss.",
         "links": [
-          "lb-search",
           "search-geo",
           "search-cache",
           "cache-placedb"
@@ -719,6 +836,20 @@
           "whyItMatters": "Adapts cell granularity and handles sphere geometry better than a flat grid.",
           "example": "Query a covering set of S2 cells at the right level for the radius.",
           "group": "Geospatial Index: Geohash / S2 Cells"
+        },
+        {
+          "term": "H3 (hexagonal grid)",
+          "definition": "Uber's hierarchical hexagonal cell system: uniform neighbor distances (6 neighbors, no diagonal edge case) and a tunable resolution.",
+          "whyItMatters": "A practical alternative to geohash/S2 with cleaner neighbor expansion; the same covering-set idea applies.",
+          "example": "k-ring(cell, 1) gives the 6 neighbors for a small-radius cover.",
+          "group": "Geospatial Index: Geohash / S2 Cells"
+        },
+        {
+          "term": "Where filters live",
+          "definition": "The geo index is cell -> place_ids plus light per-entry metadata (category, price_level, popularity, status, lat/lng); rich details stay in PlaceDB/PlaceCache.",
+          "whyItMatters": "Cheap filters (category/price/open-now) and the first-pass score resolve from index metadata, so only the top-K hydrate full details.",
+          "example": "open-now is evaluated from the entry's hours + timezone without a detail fetch.",
+          "group": "Geospatial Index: Geohash / S2 Cells"
         }
       ],
       "probeLinks": [
@@ -743,9 +874,10 @@
       "id": "boundaries",
       "title": "3. Handle Cell Boundaries and the Radius",
       "description": [
-        "A search circle rarely sits inside one cell. Query the user's cell plus its 8 neighbors so a place just across a boundary isn't missed.",
+        "A search circle rarely sits inside one cell. The general rule is to compute the covering set: all cells that overlap the query circle, plus enough neighboring cells/rings for the chosen precision so a place just across a boundary isn't missed.",
+        "For a small radius on a fixed grid this reduces to the familiar 'target cell + its 8 neighbors', but that one-ring shortcut is only correct when the radius fits inside a cell. A larger radius (the dataset allows up to ~5 km) or finer cells span many cells, so the covering set can be several rings wide — compute it from the radius and cell size, don't assume one ring.",
         "Cells are squares and the query is a circle, so the cell union over-covers: after gathering candidates, do an exact distance filter (haversine) to drop those actually outside the radius.",
-        "Pick the cell precision so a few cells cover the typical radius — too coarse pulls in too many candidates, too fine means querying many cells."
+        "Pick the cell precision so the covering set stays a handful of cells for the typical radius — too coarse pulls in too many candidates per cell, too fine means querying many cells. Variable precision (Step 4) changes this covering logic: with mixed cell sizes you compute the cover at the level chosen for that region."
       ],
       "view": {
         "nodes": [
@@ -768,10 +900,17 @@
       "decisionPrompt": "A cafe is 50m away but in the cell next door. How do you make sure it's returned?",
       "concepts": [
         {
+          "term": "Covering set",
+          "definition": "The set of index cells that overlap the query circle, computed from the radius and the cell precision (one ring for a small radius, several rings or coarser levels for a larger one).",
+          "whyItMatters": "It's the general, correct way to find candidate cells; 'cell + 8 neighbors' is just the small-radius special case.",
+          "example": "S2/H3 region coverers return a covering cell set at the level matching the radius.",
+          "group": "Handle Cell Boundaries and the Radius"
+        },
+        {
           "term": "Neighbor expansion",
           "definition": "Including adjacent cells in a spatial query to cover boundary-straddling results.",
-          "whyItMatters": "Without it, results near a cell edge are silently dropped.",
-          "example": "Query target cell + its 8 neighbors, then exact-distance filter.",
+          "whyItMatters": "Without it, results near a cell edge are silently dropped — but one ring only suffices when the radius fits in a cell.",
+          "example": "Query target cell + its 8 neighbors when the radius is small, then exact-distance filter.",
           "group": "Handle Cell Boundaries and the Radius"
         }
       ],
@@ -795,12 +934,17 @@
           "trap": "Querying only the cell the point falls in.",
           "why": "Misses nearby places that happen to be in an adjacent cell.",
           "instead": "Expand to neighbor cells, then exact-distance filter."
+        },
+        {
+          "trap": "Assuming 'cell + 8 neighbors' always covers the requested radius.",
+          "why": "One neighbor ring only covers a radius that fits inside a cell. A 5 km radius, or a finer cell precision, spans many cells and several rings, so a fixed one-ring expansion silently drops places in the outer band.",
+          "instead": "Compute the covering set from the radius and cell size (or use an S2/H3 region coverer); treat 8-neighbors as the small-radius special case only."
         }
       ],
       "flows": [
         {
           "name": "Radius query: cover cells + neighbors + exact filter",
-          "note": "A search computes the covering cells plus neighbors, unions their place ids, then exact-distance filters because square cells over-cover a circular radius.",
+          "note": "A search computes the covering set of cells for the radius (one ring for a small radius, several for a larger one), unions their place ids, then exact-distance filters because square cells over-cover a circular radius.",
           "sequence": {
             "participants": [
               {
@@ -827,7 +971,7 @@
                 "from": "SearchSvc",
                 "to": "SearchSvc",
                 "arrow": "->>",
-                "label": "compute covering cell + 8 neighbors"
+                "label": "compute covering set for radius (cells + rings)"
               },
               {
                 "from": "SearchSvc",
@@ -867,7 +1011,8 @@
       "description": [
         "Place density varies wildly: a downtown cell may hold thousands of places while a rural cell holds none. A single fixed cell size is wrong everywhere.",
         "Use variable precision: in dense areas use finer cells (longer geohash / deeper quadtree level) so candidate lists stay small; in sparse areas use coarser cells so a query still finds something nearby.",
-        "Tree structures (quadtree/S2) do this naturally by subdividing only where density is high; with geohash you adjust prefix length by region or expand outward until enough results are found."
+        "Tree structures (quadtree/S2) do this naturally by subdividing only where density is high; with geohash you adjust prefix length by region or expand outward until enough results are found.",
+        "Mixed precision needs explicit query rules: pick the level(s) covering the radius for that region; when the cover spans both parent and child cells, dedupe candidates so a place indexed at a child level isn't also pulled in via its parent; and cap fanout (max cells / max candidates) so a pathological query can't touch the whole tree — fall back to a coarser level or expanding rings when the cap is hit."
       ],
       "view": {
         "nodes": [
@@ -1001,15 +1146,23 @@
         "before": "Fixed cell size.",
         "after": "Cell granularity tracks density; bounded candidate counts.",
         "newRisk": "Variable cells complicate neighbor logic; ranking still needed to pick the best of many candidates."
-      }
+      },
+      "traps": [
+        {
+          "trap": "Querying parent and child cells together without deduping.",
+          "why": "With mixed precision a place can be reachable via both a coarse parent and a finer child cell, so the candidate union double-counts it.",
+          "instead": "Pick one consistent level per region for the cover, or dedupe place ids across levels before filtering."
+        }
+      ]
     },
     {
       "id": "ranking",
       "title": "5. Rank and Filter Candidates",
       "description": [
-        "The index gives candidates (recall); now produce the ordered result the user wants. Apply filters (category, open-now, price) first to shrink the set.",
-        "Score remaining candidates by a blend of exact distance, rating, and popularity — distance alone isn't what users want (a great cafe 400m away beats a mediocre one next door).",
-        "Hydrate full details for the top-K from a hot place cache (cache-aside to the place store) so only the results you return cost a detail lookup."
+        "The index gives candidates (recall); now produce the ordered result the user wants. Rank in stages so cost stays bounded. Stage 1 applies cheap filters (category, price, open-now) and a blended distance/rating/popularity score using fields carried in the geo index, with no per-candidate hydration.",
+        "Score remaining candidates by a blend of exact distance, rating, and popularity — distance alone isn't what users want (a great cafe 400m away beats a mediocre one next door). Most filters resolve from index/entry metadata; open-now is computed from the place's normalized hours + timezone (precomputed where possible) rather than hydrating every candidate.",
+        "Stage 2 runs expensive signals — routing/ETA or an ML re-rank — only over a small top-N (e.g. top 20-50), never every candidate. The ETA call has a tight timeout and falls back to straight-line distance, so the routing service can never blow the p99 budget. Travel distance is approximated or cached for ranking; full turn-by-turn routing is computed only when the UI asks for directions.",
+        "Hydrate full details for the top-K from a hot place cache (cache-aside to the place store) so only the results you return cost a detail lookup. Track ranker and ETA p95/p99 separately from overall search p99 so a slow optional stage is visible."
       ],
       "view": {
         "nodes": [
@@ -1177,6 +1330,35 @@
         "after": "Filtered, ranked, hydrated top-K results.",
         "newRisk": "Ranking adds latency; index must stay fresh as places change."
       },
+      "traps": [
+        {
+          "trap": "Hydrating full details for every candidate before filtering and ranking.",
+          "why": "Dense cells can return hundreds of candidates; a detail lookup per candidate multiplies cache/DB load and breaks the bounded-cost story.",
+          "instead": "Filter and score from index/entry metadata first; hydrate full details only for the top-K you return."
+        },
+        {
+          "trap": "Calling the routing/ETA service for every candidate.",
+          "why": "Per-candidate ETA fanout turns a geo-search into a slow routing service and dominates the p99 budget.",
+          "instead": "Run ETA/ML only over a small top-N with a timeout and a straight-line-distance fallback."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The ETA/routing service is slow or down.",
+          "expectedBehavior": "Search still returns ranked results on time.",
+          "mitigation": "Tight per-call timeout; fall back to straight-line distance and rank without ETA; track ETA p99 separately."
+        },
+        {
+          "scenario": "The ranking service times out.",
+          "expectedBehavior": "User still gets a reasonable ordering.",
+          "mitigation": "Fall back to the cheap stage-1 score (distance + rating) and serve the top-K from that."
+        },
+        {
+          "scenario": "PlaceCache is down so details can't be hydrated.",
+          "expectedBehavior": "Results still return, possibly with leaner detail.",
+          "mitigation": "Fall back to PlaceDB reads for the bounded top-K (capacity-limited); shed optional fields rather than fail the query."
+        }
+      ],
       "flows": [
         {
           "name": "Candidates -> filter -> rank -> hydrate",
@@ -1277,9 +1459,11 @@
       "id": "indexing",
       "title": "6. Keep the Index Fresh (Async Write Path)",
       "description": [
-        "Place writes go to the authoritative store; the place service emits a change event onto a queue. An indexer consumes events and upserts the affected geo cells.",
-        "Decoupling indexing from the write path keeps writes fast and lets the read-heavy index scale independently; the index may lag writes by minutes, which the requirements allow.",
-        "Shard the geo index by cell-key prefix (region) so dense regions live on dedicated shards; replicate read replicas for query volume."
+        "Place writes go to the authoritative store; the place service emits a change event {place_id, event_id, place_version, op, old_cell, new_cell, event_time} onto a queue. An indexer consumes events and upserts the affected geo cells — removing old_cell and adding new_cell on a move.",
+        "The geo index is derived state, so correctness comes from replayability, not from the queue alone. Make index updates idempotent keyed by (place_id, version): apply an event only if its version is newer than what the cell already reflects, so duplicate or out-of-order deliveries are safe. Park poison events in a dead-letter queue and replay/backfill from the authoritative PlaceDB.",
+        "Support a full rebuild from PlaceDB: build a fresh index into a shadow namespace, verify counts/lag, then atomically swap it into service (alias flip) so reads never see a half-built index. Partial reconciliation jobs periodically diff cells against PlaceDB to repair drift.",
+        "Decoupling indexing from the write path keeps writes fast and lets the read-heavy index scale independently; the index may lag writes by minutes, which the requirements allow. Track that lag explicitly: queue lag, index age by region/cell-prefix, stale-result rate, and rebuild progress, with SLOs and alerts.",
+        "Shard the geo index by cell-key prefix (region) so dense regions live on dedicated shards; replicate read replicas for query volume, and split hot cells when a single cell's place list grows too large."
       ],
       "view": {
         "nodes": [
@@ -1292,7 +1476,11 @@
         ],
         "caption": "When a place changes, the place service writes the place store and emits a change event; the change queue delivers it to the index builder, which upserts the geo index.",
         "links": [
-          "lb-place",
+          {
+            "from": "Client",
+            "to": "PlaceSvc",
+            "label": "place CRUD"
+          },
           "place-placedb",
           "place-changeq",
           "changeq-indexer",
@@ -1383,6 +1571,22 @@
         }
       ],
       "decisionPrompt": "Why update the geo index asynchronously instead of synchronously on each place write?",
+      "concepts": [
+        {
+          "term": "Idempotent derived-index update",
+          "definition": "Applying a change event keyed by (place_id, version) so reprocessing the same or an out-of-order event has no extra effect.",
+          "whyItMatters": "Queues deliver at-least-once; without version-keyed idempotency replays would corrupt cell membership.",
+          "example": "Skip an event whose version <= the version already reflected in the cell.",
+          "group": "Keep the Index Fresh (Async Write Path)"
+        },
+        {
+          "term": "Rebuild + atomic swap",
+          "definition": "Building a fresh index from the source of truth into a shadow namespace and flipping an alias to it once verified.",
+          "whyItMatters": "Lets you recover from drift or schema changes without serving a half-built index.",
+          "example": "Reindex all of PlaceDB into geo_v2, verify, then point reads at geo_v2.",
+          "group": "Keep the Index Fresh (Async Write Path)"
+        }
+      ],
       "patterns": [
         "Async index update via change stream"
       ],
@@ -1397,24 +1601,43 @@
       ],
       "recap": {
         "before": "Index correctness assumed.",
-        "after": "Index updated off the write path; sharded by region; eventually fresh.",
-        "newRisk": "Index lag; a move re-keys a place across cells (delete-from-old + add-to-new must be atomic-ish)."
+        "after": "Index updated off the write path; idempotent on (place_id, version); sharded by region; rebuildable via atomic swap; lag observable.",
+        "newRisk": "Index lag; a move re-keys a place across cells (delete-from-old + add-to-new must be atomic-ish); needs lag SLOs and dead-letter handling."
       },
       "bottlenecks": [
         {
           "issue": "A dense-region index shard gets hammered by city queries.",
-          "mitigation": "Finer cells + dedicated shard + read replicas for hot regions."
+          "mitigation": "Finer cells + dedicated shard + read replicas for hot regions; split a hot cell whose place list grows too large."
         },
         {
           "issue": "A place moving location lingers in its old cell.",
-          "mitigation": "Indexer removes from the old cell and adds to the new on each change event."
+          "mitigation": "The move event carries old_cell + new_cell; the indexer removes from old and adds to new idempotently on (place_id, version)."
+        },
+        {
+          "issue": "PlaceCache serves stale details after a place update (renamed, hours changed, closed).",
+          "mitigation": "On the change event, invalidate or refresh the cached detail by place_id; use a short TTL as a backstop and filter tombstoned places at read time."
         }
       ],
       "failureDrills": [
         {
           "scenario": "The indexer falls behind during a bulk import.",
           "expectedBehavior": "Reads serve slightly stale results; the queue absorbs the backlog and catches up.",
-          "mitigation": "Eventually-consistent index + scalable consumers; bound the acceptable lag."
+          "mitigation": "Eventually-consistent index + scalable consumers; alert on queue-lag/index-age SLOs and bound the acceptable lag."
+        },
+        {
+          "scenario": "A change event is delivered twice or out of order.",
+          "expectedBehavior": "The index stays correct — a stale or duplicate event is a no-op.",
+          "mitigation": "Idempotent upserts keyed by (place_id, version); apply only if the event version is newer than the cell's recorded version."
+        },
+        {
+          "scenario": "A poison event repeatedly fails to apply.",
+          "expectedBehavior": "It stops blocking the stream and is investigated out of band.",
+          "mitigation": "Dead-letter the event after N retries; replay/backfill the affected place from PlaceDB."
+        },
+        {
+          "scenario": "The geo index is corrupted or its schema must change.",
+          "expectedBehavior": "Reads keep serving from the current index while a clean one is built.",
+          "mitigation": "Full rebuild from PlaceDB into a shadow namespace, verify, then atomic alias swap; reconciliation jobs repair drift continuously."
         }
       ],
       "flows": [
@@ -1498,7 +1721,7 @@
   ],
   "finalDesign": {
     "title": "Final Design — Geo-Indexed Nearby Search",
-    "description": "Places persist to an authoritative store and emit change events; an indexer maintains a sharded geospatial index (geohash/S2) mapping cells to place ids. A search resolves a location+radius into a covering set of cells (plus neighbors), gathers candidate place ids, exact-distance filters, ranks by distance/rating/popularity, and hydrates the top-K from a hot place cache. Cell granularity adapts to density; indexing is async so reads stay fast.",
+    "description": "Places persist to an authoritative store and emit (place_id, version) change events; an indexer maintains a sharded geospatial index (geohash/S2/H3) mapping cells to place ids with light per-entry filter metadata. A search resolves a location+radius into a covering set of cells, gathers candidate place ids, exact-distance filters, cheaply filters/scores from index metadata, runs ETA/ML only over a small top-N with a timeout fallback, and hydrates the top-K from a hot place cache. Cell granularity adapts to density. Indexing is async and idempotent on (place_id, version), with dead-letter + replay/backfill from PlaceDB, full rebuild via shadow-namespace atomic swap, and lag/index-age SLOs by region so reads stay fast and the derived index stays correct.",
     "view": {
       "nodes": [
         "Client",
@@ -1533,7 +1756,65 @@
         "query-path",
         "index-path"
       ]
-    }
+    },
+    "flows": [
+      {
+        "name": "Search flow: request -> cells -> candidates -> filter/rank -> hydrate",
+        "note": "End-to-end read path: resolve the radius to a covering set of cells, fetch candidates, exact-distance filter, cheaply filter/rank from index metadata (ETA only for the top-N with a fallback), then hydrate the top-K from the place cache.",
+        "sequence": {
+          "participants": [
+            { "id": "Client", "label": "Client" },
+            { "id": "SearchSvc", "label": "Search Service" },
+            { "id": "GeoIndex", "label": "Geo Index" },
+            { "id": "Ranker", "label": "Ranker" },
+            { "id": "ETA", "label": "Routing / ETA" },
+            { "id": "PlaceCache", "label": "Place Cache" }
+          ],
+          "messages": [
+            { "from": "Client", "to": "SearchSvc", "arrow": "->>", "label": "GET /nearby (lat,lng,radius,filters)" },
+            { "from": "SearchSvc", "to": "SearchSvc", "arrow": "->>", "label": "compute covering set for radius" },
+            { "from": "SearchSvc", "to": "GeoIndex", "arrow": "->>", "label": "candidates for covering cells" },
+            { "from": "GeoIndex", "to": "SearchSvc", "arrow": "-->>", "label": "place ids + filter metadata" },
+            { "from": "SearchSvc", "to": "SearchSvc", "arrow": "->>", "label": "haversine filter + stage-1 score/filter" },
+            { "from": "SearchSvc", "to": "Ranker", "arrow": "->>", "label": "rank candidates" },
+            { "type": "opt", "label": "top-N only, with timeout", "messages": [
+              { "from": "Ranker", "to": "ETA", "arrow": "->>", "label": "travel distance for top-N (fallback: straight-line)" }
+            ] },
+            { "from": "Ranker", "to": "SearchSvc", "arrow": "-->>", "label": "ranked top-K ids" },
+            { "from": "SearchSvc", "to": "PlaceCache", "arrow": "->>", "label": "hydrate top-K details" },
+            { "from": "SearchSvc", "to": "Client", "arrow": "-->>", "label": "200 ranked places" }
+          ]
+        },
+        "highlight": ["GeoIndex", "Ranker"]
+      },
+      {
+        "name": "Write flow: create/update/delete -> event -> idempotent index update",
+        "note": "End-to-end write path: persist the authoritative record and bump version, emit a (place_id, version) event with old/new cell, and have the indexer apply it idempotently so the change becomes query-visible.",
+        "sequence": {
+          "participants": [
+            { "id": "Client", "label": "Client" },
+            { "id": "PlaceSvc", "label": "Place Service" },
+            { "id": "PlaceDB", "label": "Place Store" },
+            { "id": "ChangeQ", "label": "Change Queue" },
+            { "id": "Indexer", "label": "Indexer" },
+            { "id": "GeoIndex", "label": "Geo Index" }
+          ],
+          "messages": [
+            { "from": "Client", "to": "PlaceSvc", "arrow": "->>", "label": "POST/PATCH/DELETE /places" },
+            { "from": "PlaceSvc", "to": "PlaceDB", "arrow": "->>", "label": "persist + bump version (tombstone on delete)" },
+            { "from": "PlaceSvc", "to": "ChangeQ", "arrow": "->>", "label": "emit {place_id, version, op, old_cell, new_cell}" },
+            { "from": "PlaceSvc", "to": "Client", "arrow": "-->>", "label": "2xx (indexed shortly)" },
+            { "from": "ChangeQ", "to": "Indexer", "arrow": "->>", "label": "deliver event (at-least-once)" },
+            { "type": "alt", "label": "event version newer than cell", "messages": [
+              { "from": "Indexer", "to": "GeoIndex", "arrow": "->>", "label": "remove old_cell, add new_cell" }
+            ], "else": { "label": "stale/duplicate", "messages": [
+              { "from": "Indexer", "to": "Indexer", "arrow": "->>", "label": "no-op (idempotent on place_id, version)" }
+            ] } }
+          ]
+        },
+        "highlight": ["ChangeQ", "Indexer", "GeoIndex"]
+      }
+    ]
   },
   "satisfies": {
     "functional": [
@@ -1546,9 +1827,10 @@
         ]
       },
       {
-        "requirement": "Filter by category / open-now",
-        "how": "Filters applied before ranking on the candidate set.",
+        "requirement": "Filter by category / price / open-now",
+        "how": "Cheap filters applied before ranking from index/entry metadata; open-now from normalized hours + timezone, no per-candidate hydration.",
         "steps": [
+          "geohash",
           "ranking"
         ]
       },
@@ -1596,9 +1878,136 @@
         "steps": [
           "indexing"
         ]
+      },
+      {
+        "requirement": "Correct, recoverable derived index",
+        "how": "Idempotent (place_id, version) updates, dead-letter + replay/backfill, and full rebuild via shadow-namespace atomic swap with lag/index-age SLOs.",
+        "steps": [
+          "indexing"
+        ]
       }
     ]
   },
+  "technologyChoices": [
+    {
+      "concern": "Geospatial index store",
+      "steps": [
+        "geohash",
+        "density"
+      ],
+      "selfHosted": [
+        "PostGIS (GiST/SP-GiST on geometry)",
+        "Elasticsearch / OpenSearch geo_point + geo_distance",
+        "S2 / H3 cell ids over Redis/Valkey or a sorted KV",
+        "MongoDB 2dsphere"
+      ],
+      "cloud": {
+        "aws": [
+          "OpenSearch Service (geo queries)",
+          "DynamoDB with geohash sort keys",
+          "Aurora PostgreSQL + PostGIS"
+        ],
+        "gcp": [
+          "AlloyDB / Cloud SQL + PostGIS",
+          "Bigtable with cell-prefix row keys"
+        ],
+        "azure": [
+          "Cosmos DB (geospatial)",
+          "Azure Database for PostgreSQL + PostGIS"
+        ]
+      },
+      "tradeoff": [
+        "PostGIS/Elasticsearch give rich geo queries out of the box but you operate and shard them; raw S2/H3 over a KV is leaner and cheaper at scale but you build covering-set and neighbor logic yourself.",
+        "A managed geo-capable DB removes index sizing/sharding toil at higher cost and less control over hot-cell splitting."
+      ],
+      "makesIrrelevant": [
+        "A managed auto-sharding geo store can remove hand-rolled cell-prefix sharding for many scales."
+      ]
+    },
+    {
+      "concern": "Change stream / indexing queue",
+      "steps": [
+        "indexing"
+      ],
+      "selfHosted": [
+        "Kafka",
+        "Debezium CDC off PlaceDB",
+        "RabbitMQ"
+      ],
+      "cloud": {
+        "aws": [
+          "MSK / Kinesis",
+          "DynamoDB Streams",
+          "SQS + DLQ"
+        ],
+        "gcp": [
+          "Pub/Sub",
+          "Datastream (CDC)"
+        ],
+        "azure": [
+          "Event Hubs",
+          "Service Bus"
+        ]
+      },
+      "tradeoff": [
+        "CDC off the place store guarantees no missed change without app-level dual-write, but couples to the DB; an app-emitted event is simpler but must be transactional with the write (outbox pattern).",
+        "A log (Kafka/Kinesis) makes replay/backfill and ordering natural; a plain queue is simpler but needs explicit replay tooling."
+      ]
+    },
+    {
+      "concern": "Place detail cache",
+      "steps": [
+        "ranking"
+      ],
+      "selfHosted": [
+        "Redis / Valkey",
+        "Memcached"
+      ],
+      "cloud": {
+        "aws": [
+          "ElastiCache (Redis/Valkey)"
+        ],
+        "gcp": [
+          "Memorystore"
+        ],
+        "azure": [
+          "Azure Cache for Redis"
+        ]
+      },
+      "tradeoff": [
+        "A managed cache removes failover/scaling toil; self-hosted Redis gives more control over eviction and geo-replication."
+      ]
+    },
+    {
+      "concern": "Routing / ETA (optional ranking signal)",
+      "steps": [
+        "ranking"
+      ],
+      "selfHosted": [
+        "OSRM",
+        "Valhalla",
+        "GraphHopper"
+      ],
+      "cloud": {
+        "aws": [
+          "Amazon Location Service (routes)"
+        ],
+        "gcp": [
+          "Google Maps Routes API"
+        ],
+        "azure": [
+          "Azure Maps Route"
+        ]
+      },
+      "tradeoff": [
+        "A managed routing API is fast to adopt but adds per-call cost and an external dependency on the hot path; self-hosted OSRM/Valhalla is cheaper per call but you host map data and tiles.",
+        "Either way, call only for the top-N with a timeout and a straight-line fallback so it can't dominate p99."
+      ],
+      "makesIrrelevant": [
+        "Caching/approximating travel distance can remove most live routing calls for ranking; live routing then only runs when the user opens directions."
+      ]
+    }
+  ],
   "interviewScript": [
     {
       "phase": "Scope & requirements",
@@ -1633,6 +2042,9 @@
       "say": [
         "Map requirements to mechanisms.",
         "Tradeoffs: cell-size tuning, index lag, dense-region hotspots.",
+        "Operational closure: idempotent events, replay/backfill, full rebuild via atomic swap, lag/index-age SLOs.",
+        "Validation & abuse: cap radius and result limits, validate coordinates, rate-limit per client/API key.",
+        "Location privacy: minimize and short-retain user-coordinate logs, restrict access.",
         "Extensions: moving objects (drivers), ETA/routing, personalization."
       ]
     }
@@ -1668,7 +2080,10 @@
     "Geohash vs S2 vs quadtree — when would you pick each in production?",
     "How do you handle a place that changes location (re-keying across cells)?",
     "How would you add ETA-aware ranking using a routing service without blowing the latency budget?",
-    "How do you keep dense-city index shards from becoming hotspots?"
+    "How do you keep dense-city index shards from becoming hotspots?",
+    "How do you rebuild the geo index from scratch (or after corruption) without serving a half-built index?",
+    "How do you protect user-location privacy — log minimization, retention, and access controls for coordinates?",
+    "How do you defend the search endpoint from abuse — radius caps, result limits, and per-client rate limits?"
   ],
   "toProbeFurther": {
     "links": [

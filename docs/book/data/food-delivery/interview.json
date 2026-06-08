@@ -110,6 +110,16 @@
         "description": "Durable state-change events published from the transactional outbox; consumed by notifications, dispatch, and saga recovery."
       },
       {
+        "id": "RealtimeGW",
+        "label": "Realtime Gateway",
+        "type": "gateway",
+        "category": "traffic",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Holds the hundreds of thousands of live WebSocket/SSE tracking connections and fans throttled position/ETA pushes out to eaters; offloads connection state from the stateless tracking service."
+      },
+      {
         "id": "Tracking",
         "label": "Tracking Service",
         "type": "service",
@@ -117,7 +127,7 @@
         "traits": [
           "stateless"
         ],
-        "description": "Serves live order/courier location + ETA to the eater."
+        "description": "Serves live order/courier location + ETA to the eater (enforces per-order access control)."
       },
       {
         "id": "ETA",
@@ -221,7 +231,10 @@
         "id": "locstream-tracking",
         "from": "LocStream",
         "to": "Tracking",
-        "label": "live position"
+        "label": "push subscription (movement updates)",
+        "render": {
+          "arrow": "-.-"
+        }
       },
       {
         "id": "locstream-lastknown",
@@ -240,6 +253,18 @@
         "from": "Eater",
         "to": "Tracking",
         "label": "track order"
+      },
+      {
+        "id": "eater-gw",
+        "from": "Eater",
+        "to": "RealtimeGW",
+        "label": "live tracking connection"
+      },
+      {
+        "id": "gw-tracking",
+        "from": "RealtimeGW",
+        "to": "Tracking",
+        "label": "subscribe order updates"
       },
       {
         "id": "tracking-eta",
@@ -298,6 +323,7 @@
           "GeoIndex",
           "LocStream",
           "LastKnown",
+          "RealtimeGW",
           "Tracking",
           "ETA"
         ]
@@ -356,7 +382,7 @@
     {
       "label": "Location write rate",
       "value": "~25K writes/s (→ stream + last-known, not DB)",
-      "note": "100K couriers / 4s = 25K location updates/s steady at peak. This is the dominant write load — it goes to the stream and geo index, never per-ping to OrderDB (which would be ~25K writes/s of order-table churn)."
+      "note": "100K couriers / 4s = 25K location updates/s steady at peak. This is the dominant write load — it goes to the stream and geo index, never per-ping to OrderDB, which would otherwise churn the order table 25K times/s."
     },
     {
       "label": "Dispatch matches",
@@ -450,7 +476,7 @@
     {
       "method": "GET",
       "path": "/v1/orders/{id}/track",
-      "description": "Get live order status, courier location, and ETA.",
+      "description": "Get live order status, courier location, and ETA. Authorization: only the eater (or courier) on this active order may read courier location; access is denied once the order is terminal and precision is reduced after delivery.",
       "request": "(id in path)",
       "response": "{ \"state\": \"in_transit\", \"courierLoc\": {...}, \"etaMin\": 8 }",
       "sequence": {
@@ -463,8 +489,8 @@
             "label": "Tracking Service"
           },
           {
-            "id": "LocStream",
-            "label": "Location Stream"
+            "id": "LastKnown",
+            "label": "Last-Known Cache"
           },
           {
             "id": "ETA",
@@ -480,7 +506,13 @@
           },
           {
             "from": "Tracking",
-            "to": "LocStream",
+            "to": "Tracking",
+            "arrow": "->>",
+            "label": "authz: eater on active order?"
+          },
+          {
+            "from": "Tracking",
+            "to": "LastKnown",
             "arrow": "->>",
             "label": "latest courier position"
           },
@@ -565,7 +597,11 @@
         },
         {
           "name": "state",
-          "type": "enum(placed, confirmed, preparing, ready, assigned, picked_up, in_transit, delivered, cancelled)"
+          "type": "enum(placed, confirmed, preparing, ready, assigned, picked_up, in_transit, delivered, rejected, cancelled, delivery_failed)"
+        },
+        {
+          "name": "cancel_reason",
+          "type": "enum(rejected_by_restaurant, cancelled_by_eater, delivery_failed, null) — disambiguates the terminal failure branch"
         },
         {
           "name": "payment_state",
@@ -884,8 +920,9 @@
       "id": "lifecycle",
       "title": "2. The Order Lifecycle State Machine",
       "description": [
-        "An order moves through explicit states: placed -> confirmed -> preparing -> ready -> assigned -> picked_up -> in_transit -> delivered (with cancel/refund branches). Model this as a state machine with allowed transitions, persisted durably as the source of truth.",
-        "Each transition is triggered by a specific party from a specific prior state. Restaurant: placed->confirmed->preparing->ready (or placed/confirmed->rejected). Courier: assigned->picked_up->in_transit->delivered. Eater: cancel is allowed pre-prep (release hold) but branches differently after capture (refund). Each transition emits an event that notifies the others; invalid transitions (wrong actor or wrong prior state) are rejected, and the order store is authoritative for 'what state is this order in'.",
+        "An order moves through explicit states: placed -> confirmed -> preparing -> ready -> assigned -> picked_up -> in_transit -> delivered, plus terminal failure branches. Model this as a state machine with allowed transitions, persisted durably as the source of truth.",
+        "Transition table (actor / from -> to / compensation): restaurant confirm: placed -> confirmed (none); restaurant reject: placed|confirmed -> rejected (release auth + notify); restaurant prep: confirmed -> preparing -> ready (none); courier accept: ready -> assigned (none); courier deliver: assigned -> picked_up -> in_transit -> delivered (capture payment); eater cancel pre-prep: placed|confirmed -> cancelled, reason=cancelled_by_eater (release hold); eater cancel post-capture: -> cancelled, reason=cancelled_by_eater (refund); delivery fails (courier disappears, undeliverable): assigned|picked_up|in_transit -> delivery_failed (refund + reassign-or-refund). The terminal states are delivered, rejected, cancelled, and delivery_failed; cancel_reason disambiguates the failure branch for support, metrics, and refunds.",
+        "Each transition is triggered by a specific party from a specific prior state, and each emits an event that notifies the others. Invalid transitions (wrong actor or wrong prior state) are rejected, and the order store is authoritative for 'what state is this order in'. For now the order service calls the notification service directly on each change; this is a deliberate simplification — Step 6 upgrades it to a transactional outbox (the OrderEvents stream) so the state write and the emitted event commit together and can never diverge.",
         "This is the backbone — dispatch, tracking, and payment all hang off state transitions, and consistency means the state machine is the one place the truth lives."
       ],
       "view": {
@@ -897,7 +934,7 @@
           "Restaurant",
           "Notify"
         ],
-        "caption": "The order service drives each state change in the order store and emits to the notification service, which pushes lifecycle updates back to the eater client.",
+        "caption": "The order service drives each state change in the order store and (as a Step-2 simplification) notifies directly; Step 6 replaces this direct call with a transactional outbox (OrderEvents) so 'state persisted' and 'event emitted' can't split-brain.",
         "links": [
           "eater-lb",
           "lb-order",
@@ -949,6 +986,7 @@
       "description": [
         "Matching needs 'which available couriers are near this restaurant right now'. Couriers stream GPS frequently; index their live positions by geo cell (geohash/S2) so a nearby query is a cheap cell + neighbor lookup, not a scan.",
         "Don't write every GPS ping to the order DB — that's a write storm (~25K writes/s at peak). Update a hot geo index (and the last-known cache) on each ping; the index is derived/ephemeral, rebuilt from the stream. Track recency: drop couriers whose `updated_at` is stale so matching never offers to a courier who went dark, and distinguish available vs on_delivery so busy couriers aren't re-offered. Don't retain full GPS history here — keep only the live position, with bounded retention elsewhere for fraud/support.",
+        "Partition the index and the location stream by region/cell so writes and nearby queries stay local; a stadium or downtown-at-dinner cell can get too dense, so the partition key must support splitting a hot cell into finer sub-cells — deferred to Step 7's scaling.",
         "This reuses the geospatial-indexing pattern (geohash cells, neighbor expansion) from proximity search, applied to moving couriers."
       ],
       "view": {
@@ -977,7 +1015,7 @@
           "name": "Geohash/S2 cell index in a KV store (default)",
           "description": "Each courier's position is encoded to a geohash/S2 cell and upserted in a KV store keyed by courier id, so a nearby query reads a cell plus its neighbors.",
           "pros": [
-            "Encode each courier's lat/lng to a geohash/S2 cell key, so 'nearby' is a cheap prefix/cell lookup.",
+            "'Nearby' becomes a cheap prefix/cell lookup plus a ring of neighbor cells — no scan.",
             "Writes are simple upserts keyed by courier id, absorbing 100K pings every 4s.",
             "Cells shard naturally by region, so dense cities scale horizontally."
           ],
@@ -1148,7 +1186,7 @@
           "name": "Greedy nearest-courier assignment (default)",
           "description": "When an order is ready, dispatch picks the single best-scoring nearby courier by distance and ETA and offers it immediately, claiming the courier atomically.",
           "pros": [
-            "When an order is ready, pick the best-scoring nearby courier (distance + ETA) and offer immediately - low latency.",
+            "Lowest latency: one scored lookup, then an immediate offer to the best courier.",
             "Simple to reason about and easy to fall back to under load.",
             "Claiming the courier atomically (compare-and-set on courier state) prevents double-booking."
           ],
@@ -1185,7 +1223,7 @@
           "name": "Batched assignment (windowed matching)",
           "description": "Dispatch collects orders and couriers over a short window and solves them together as a batch (min-cost bipartite matching) for a globally better assignment.",
           "pros": [
-            "Collect orders and couriers over a short window, then solve as a batch (e.g. min-cost bipartite matching) for a globally better assignment.",
+            "Solving the whole window at once (min-cost bipartite matching) beats grabbing each courier greedily.",
             "Naturally avoids double-booking - one solver assigns each courier once.",
             "Enables batching multiple pickups along one courier's route."
           ],
@@ -1225,7 +1263,7 @@
           "name": "Broadcast offer, couriers accept (pull)",
           "description": "Dispatch fans the order out as an offer to several nearby couriers at once, and the first to accept claims it atomically — no central optimizer decides.",
           "pros": [
-            "Offer the order to several nearby couriers and let the first to accept take it - no central optimizer.",
+            "The first courier to accept wins, so no central optimizer has to model availability.",
             "Respects courier choice and works when courier availability is uncertain.",
             "Simple to scale: dispatch just fans out offers."
           ],
@@ -1395,8 +1433,9 @@
       "id": "tracking",
       "title": "5. Live Tracking and ETA",
       "description": [
-        "Once assigned, the eater watches the courier move. The tracking service serves the courier's latest position (from the location stream's last-known store) plus a live ETA from the routing/ETA service.",
-        "Push updates to the eater (over a live connection) as the courier moves, throttled — they don't need every GPS point, just smooth movement and a stable ETA. The same location stream feeds both dispatch (matching) and tracking (display).",
+        "Once assigned, the eater watches the courier move. The tracking service serves the courier's latest position from the last-known cache (materialized from the stream — never a point read against the log or OrderDB) plus a live ETA from the routing/ETA service.",
+        "Push updates to the eater (over a live connection) as the courier moves, throttled — they don't need every GPS point, just smooth movement and a stable ETA. At a few hundred thousand concurrent deliveries, those long-lived connections need a dedicated realtime-gateway tier holding the sockets and fanning out pushes, separate from the stateless tracking logic. The same location stream feeds both dispatch (matching) and tracking (display).",
+        "Location is sensitive: tracking enforces access control — only the eater (or courier) on this active order can read the courier's position, access is revoked once the order is terminal, and precision is reduced after delivery.",
         "ETA blends remaining prep time, courier travel time, and traffic — recomputed as the courier progresses."
       ],
       "view": {
@@ -1430,7 +1469,7 @@
           "name": "Server-push over a persistent connection (default)",
           "description": "The eater app holds a persistent WebSocket/SSE to the tracking service, which reads courier positions from the location stream and pushes them on movement.",
           "pros": [
-            "The eater app holds a WebSocket/SSE to the Tracking service and receives courier positions as they stream in - no polling.",
+            "Positions arrive as they stream in, with no client polling and minimal added latency.",
             "Tracking reads live positions from the location stream, never the orders database, so map updates don't touch OrderDB.",
             "Pushes only on movement, cutting redundant traffic versus fixed-interval polls."
           ],
@@ -1442,26 +1481,22 @@
           "view": {
             "nodes": [
               "Eater",
+              "RealtimeGW",
               "Tracking",
               "LocStream",
               "LastKnown",
-              "ETA",
-              "Notify"
+              "ETA"
             ],
-            "caption": "The eater app holds a persistent connection to the tracking service, which reads the latest position from the last-known cache (materialized from the stream), computes ETAs, and pushes updates through the notification service.",
+            "caption": "The eater app holds a persistent connection to a realtime gateway that fans out throttled pushes; the gateway subscribes to the tracking service, which reads the latest position from the last-known cache (materialized from the stream) and computes ETAs.",
             "links": [
-              "eater-tracking",
+              "eater-gw",
+              "gw-tracking",
               "locstream-lastknown",
               "lastknown-tracking",
-              "tracking-eta",
-              {
-                "from": "ETA",
-                "to": "Notify",
-                "label": "ETA change"
-              },
-              "notify-eater"
+              "tracking-eta"
             ],
             "highlight": [
+              "RealtimeGW",
               "Tracking",
               "LastKnown"
             ],
@@ -1474,7 +1509,7 @@
           "name": "Client polls a cached position endpoint",
           "description": "The eater app polls a stateless endpoint every few seconds, and tracking serves the courier's last-known position from an in-memory cache rather than OrderDB.",
           "pros": [
-            "Stateless HTTP: the app polls every few seconds and Tracking serves the courier's last position from an in-memory cache.",
+            "Plain stateless HTTP: each poll is served from the in-memory last-known cache.",
             "No long-lived connections to manage - trivial to scale behind a load balancer.",
             "Polling the cache (not OrderDB) still keeps the database off the hot path."
           ],
@@ -1652,7 +1687,7 @@
           "name": "Orchestrated saga with compensations (default)",
           "description": "A central order orchestrator drives each step — authorize payment, confirm restaurant, dispatch — and runs compensating actions like voiding the auth when a later step fails.",
           "pros": [
-            "A central order orchestrator drives steps (authorize payment, confirm restaurant, dispatch) and runs compensations on failure.",
+            "One coordinator owns the whole flow, so the sequence and its compensations live in a single place.",
             "If the restaurant rejects after payment auth, the saga voids/refunds the authorization so the eater isn't charged.",
             "One place to see and reason about the order's distributed transaction state."
           ],
@@ -1689,7 +1724,7 @@
           "name": "Choreographed saga (events between services)",
           "description": "Each service reacts to events emitted by the others and emits its own, so the order flow and its compensations emerge from event handlers with no central coordinator.",
           "pros": [
-            "Each service reacts to events and emits its own - no central orchestrator to build or scale.",
+            "No central orchestrator to build, scale, or keep highly available.",
             "Loosely coupled: payment, restaurant, and dispatch evolve independently.",
             "Naturally resilient - a slow consumer just processes its events later."
           ],
@@ -1727,7 +1762,7 @@
           "name": "Auth-then-capture (delay the charge)",
           "description": "Payment is only authorized (held) at order time and captured after the restaurant confirms, so a pre-confirm rejection just releases the hold instead of refunding.",
           "pros": [
-            "Only authorize (hold) at order time and capture the charge after the restaurant confirms - a rejection just releases the hold, no refund.",
+            "A pre-confirm rejection just releases the hold — no money ever moves, so no refund.",
             "Avoids the refund path entirely for the common reject-before-confirm case.",
             "Maps cleanly to how card networks already work (auth vs capture)."
           ],
@@ -1871,6 +1906,143 @@
             "OrderSvc",
             "PaySvc"
           ]
+        },
+        {
+          "name": "Ambiguous payment callback (auth maybe succeeded)",
+          "note": "The provider call times out, so we don't know if the authorization happened. We never blind-retry — we reconcile with a stable provider idempotency token.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "OrderSvc",
+                "label": "Order Service"
+              },
+              {
+                "id": "PaySvc",
+                "label": "Payment Provider"
+              },
+              {
+                "id": "OrderDB",
+                "label": "Order Store"
+              },
+              {
+                "id": "OrderEvents",
+                "label": "Outbox"
+              }
+            ],
+            "messages": [
+              {
+                "from": "OrderSvc",
+                "to": "PaySvc",
+                "arrow": "->>",
+                "label": "authorize (provider_payment_id = idem token)"
+              },
+              {
+                "from": "PaySvc",
+                "to": "OrderSvc",
+                "arrow": "-->>",
+                "label": "timeout / no response"
+              },
+              {
+                "type": "alt",
+                "label": "reconcile: inquiry returns authorized",
+                "messages": [
+                  {
+                    "from": "OrderSvc",
+                    "to": "PaySvc",
+                    "arrow": "->>",
+                    "label": "retry with same token -> same auth (no 2nd charge)"
+                  },
+                  {
+                    "from": "OrderSvc",
+                    "to": "OrderDB",
+                    "arrow": "->>",
+                    "label": "CAS placed->confirmed + outbox event (1 txn)"
+                  },
+                  {
+                    "from": "OrderDB",
+                    "to": "OrderEvents",
+                    "arrow": "->>",
+                    "label": "publish order.confirmed"
+                  }
+                ],
+                "else": {
+                  "label": "inquiry returns not-authorized",
+                  "messages": [
+                    {
+                      "from": "OrderSvc",
+                      "to": "OrderDB",
+                      "arrow": "->>",
+                      "label": "CAS -> cancelled (payment_failed), idempotent"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "OrderSvc",
+            "PaySvc"
+          ]
+        },
+        {
+          "name": "Courier accepts then disappears before pickup",
+          "note": "An accepted courier goes dark. The offer lease expires, the order is requeued via the outbox, and a fresh courier is offered — no eater action and no double-assignment.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Courier",
+                "label": "Courier (gone)"
+              },
+              {
+                "id": "Dispatch",
+                "label": "Dispatch"
+              },
+              {
+                "id": "OrderDB",
+                "label": "Order Store"
+              },
+              {
+                "id": "OrderEvents",
+                "label": "Outbox"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Courier",
+                "to": "Dispatch",
+                "arrow": "->>",
+                "label": "accept (order->assigned)"
+              },
+              {
+                "from": "Dispatch",
+                "to": "Dispatch",
+                "arrow": "->>",
+                "label": "no pickup + location stale past lease"
+              },
+              {
+                "from": "Dispatch",
+                "to": "OrderDB",
+                "arrow": "->>",
+                "label": "CAS assigned->ready, bump assignment_attempts (compensate)"
+              },
+              {
+                "from": "OrderDB",
+                "to": "OrderEvents",
+                "arrow": "->>",
+                "label": "publish order.requeued (same txn)"
+              },
+              {
+                "from": "OrderEvents",
+                "to": "Dispatch",
+                "arrow": "->>",
+                "label": "re-offer to next fresh/available courier"
+              }
+            ]
+          },
+          "highlight": [
+            "Dispatch",
+            "OrderEvents"
+          ]
         }
       ]
     },
@@ -1888,14 +2060,16 @@
           "GeoIndex",
           "Dispatch",
           "OrderDB",
+          "LastKnown",
           "Tracking"
         ],
-        "caption": "Under load the location stream feeds the courier geo index that dispatch queries, the order service writes the order store, and tracking reads live positions from the stream.",
+        "caption": "Under load the region-partitioned location stream feeds the courier geo index that dispatch queries and materializes a last-known cache; the order service writes the order store, and tracking reads latest positions from the last-known cache (not the log).",
         "links": [
           "locstream-geo",
           "dispatch-geo",
           "order-db",
-          "locstream-tracking"
+          "locstream-lastknown",
+          "lastknown-tracking"
         ],
         "highlight": [
           "GeoIndex",
@@ -1926,15 +2100,17 @@
               "GeoIndex",
               "Dispatch",
               "OrderDB",
+              "LastKnown",
               "Tracking"
             ],
-            "caption": "Region-partitioned streams feed per-region geo indexes and dispatch workers, with orders sharded by id in the store and tracking reading regional positions.",
+            "caption": "Region-partitioned streams feed per-region geo indexes and dispatch workers and materialize per-region last-known caches; orders shard by id in the store, and tracking reads regional latest positions from the last-known cache.",
             "links": [
               "locstream-geo",
               "events-dispatch",
               "dispatch-geo",
               "order-db",
-              "locstream-tracking"
+              "locstream-lastknown",
+              "lastknown-tracking"
             ],
             "highlight": [
               "Dispatch",
@@ -2041,6 +2217,18 @@
         "after": "Regionally-sharded, spike-tolerant dispatch + tracking; rebuildable geo state; degraded-mode fallback.",
         "newRisk": "Surge/ETA degradation tradeoffs and cross-region edge cases — bounded by per-region dispatch and graceful degradation."
       },
+      "deepDives": [
+        {
+          "title": "Observability: knowing dispatch/tracking is failing before users do",
+          "points": [
+            "Dispatch health: dispatch latency (ready -> assigned), offer acceptance rate, mean assignment_attempts per order, and time-to-first-offer — a rising attempt count or falling acceptance rate signals supply starvation per region.",
+            "Location pipeline: stale-location % (couriers dropped for old updated_at), stream consumer lag, and location write rate vs the ~25K/s budget — alert when staleness crosses the freshness SLO.",
+            "Correctness: order transition failure rate (rejected CAS), saga compensation rate (refunds/reassignments per 1K orders), and outbox lag (events written but not yet published) — outbox lag growing means notifications/dispatch triggers are falling behind the state writes.",
+            "Tracking + ETA: live tracking connection count on the realtime gateway, push fanout latency, and ETA error (promised vs actual) — ETA error spiking flags routing-provider degradation before eaters complain.",
+            "These are sliced per region/cell so a single hot market surfaces, not just a global average; the worst alerts are user-visible (slow dispatch, stale tracking, ETA drift)."
+          ]
+        }
+      ],
       "bottlenecks": [
         {
           "issue": "Location-write firehose (~25K writes/s at peak).",
@@ -2052,7 +2240,7 @@
         },
         {
           "issue": "No visibility into match quality or staleness during a spike.",
-          "mitigation": "Track dispatch latency, offer-acceptance rate, stale-location %, ETA error, transition-failure rate, and saga-compensation rate as user-visible SLOs."
+          "mitigation": "Per-region SLOs on dispatch latency, offer-acceptance rate, stale-location %, ETA error, transition-failure rate, saga-compensation rate, outbox lag, and tracking connection count (see the observability deep dive)."
         }
       ]
     }
@@ -2074,11 +2262,12 @@
         "GeoIndex",
         "LocStream",
         "LastKnown",
+        "RealtimeGW",
         "Tracking",
         "ETA",
         "Notify"
       ],
-      "caption": "Clients work through the gateway and order service, which persists each transition to the order store with a transactional outbox; the order-events stream drives dispatch and notifications. Courier pings feed a region-partitioned location stream that updates the geo index (for dispatch) and a last-known cache (for tracking); the eater live-tracks the assigned courier with ETAs.",
+      "caption": "Clients work through the gateway and order service, which persists each transition to the order store with a transactional outbox; the order-events stream drives dispatch and notifications. Courier pings feed a region-partitioned location stream that updates the geo index (for dispatch) and a last-known cache (for tracking); the eater live-tracks the assigned courier — through a realtime gateway holding the live connections — with access-controlled location and recomputed ETAs. Each stream/index/dispatch box is region-partitioned.",
       "links": [
         "eater-lb",
         "lb-order",
@@ -2095,7 +2284,8 @@
         "locstream-geo",
         "locstream-lastknown",
         "lastknown-tracking",
-        "eater-tracking",
+        "eater-gw",
+        "gw-tracking",
         "tracking-eta",
         "notify-eater"
       ],
@@ -2178,7 +2368,7 @@
       },
       {
         "requirement": "Location privacy",
-        "how": "Tracking scoped to assigned active orders; bounded retention; no full GPS history in the live index; precision reduced after delivery.",
+        "how": "Tracking enforces a per-order authorization check (only the eater/courier on the active order can read courier location); access is revoked when the order is terminal and precision reduced after delivery; bounded retention and no full GPS history in the live index.",
         "steps": [
           "geo",
           "tracking"

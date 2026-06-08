@@ -5,183 +5,198 @@ Review date: 2026-06-08
 
 ## Executive Summary
 
-This is a strong, interview-ready flash-sale walkthrough. The core teaching line is coherent: start with the database-hot-row failure, move reads to the edge, add admission control, enforce fairness through a waiting room, reserve stock with an atomic counter, and move order/payment work behind a queue. The dataset is compact and focused, and the final design integrates the main mechanisms cleanly.
+This is now a strong, production-credible flash-sale walkthrough. Recent changes addressed the earlier major gaps: capacity math is concrete, admission-token semantics are explicit, reservation/payment state is modeled, order status and payment callback APIs exist, counter failover is discussed, failure drills were added, and `technologyChoices` is populated.
 
 | Axis | Rating | Notes |
 | --- | ---: | --- |
-| System design soundness | 4/5 | The main architecture is credible, especially admission + atomic reservation. It needs more precise capacity math, token semantics, and counter failover design. |
-| Production realism | 3.5/5 | Good failure framing, but the data model is too thin for reservation holds, payment retries, idempotency, and ledger rebuilds. |
-| Pedagogical flow | 4.5/5 | The step order is excellent and each step exposes the next problem. A few terms appear before they are introduced. |
-| Dataset/rendering fit | 4/5 | JSON parses and references are mostly clean. No generated-doc edits are needed for this review. |
-| Book completeness | 3.5/5 | Compared with fuller book cases, this lacks `technologyChoices`, AI visuals, and richer failure drills. |
+| System design soundness | 4.5/5 | The core design is defensible: CDN/edge offload, waiting-room admission, token-gated atomic reservation, async orders, ledger reconciliation, and fail-closed counter recovery. |
+| Production realism | 4.3/5 | Good treatment of idempotency, payment ambiguity, duplicate queue delivery, and Redis failover. Remaining gaps are mostly around waiting-room durability/abuse policy and operational runbooks. |
+| Pedagogical flow | 4.6/5 | The steps expose one problem at a time and the decision prompts are strong. The walkthrough is compact without skipping the central mechanisms. |
+| Dataset/rendering fit | 4.6/5 | JSON parses; structured views/sequences are used correctly; node, link, group, participant, pattern, satisfy, and technology step references resolve. |
+| Book completeness | 4.2/5 | Includes patterns, traps, drills, scripts, level variants, probe links, and technology choices. It still lacks optional AI visuals/comic and per-requirement illustrations. |
 
 ## What Works Well
 
-- The opening failure is exactly the right motivation: direct database contention under a known T0 spike plus oversell risk.
-- The sequence from CDN offload to admission control to fairness to atomic reservation is easy for a candidate to narrate in an interview.
-- The option sets in the waiting-room and reservation steps compare real trade-offs rather than strawmen.
-- The final design ties back to every top-level requirement through `satisfies`, and the step references resolve.
-- The dataset uses structured `view` and `sequence` objects instead of raw Mermaid in architecture steps, matching current repo conventions.
+- The capacity section now turns the scenario into usable numbers: 10M arrivals, 10K units, admitted rate, buy attempts/sec, queue/payment throughput, and hold-expiry volume.
+- The admission token is specified as identity-bound, single-use, expiring, and tied to `sale_id`, `user_id`, `admission_id`, and `max_qty`.
+- The data model now supports the claims in the design: `admissions`, `reservations`, `payment_attempts`, `orders`, and `stock_ledger_events` cover idempotency, holds, payment ambiguity, and counter rebuilds.
+- The `reserve`, `async`, and `consistency` steps are much sharper than before: guarded decrement-if-positive, duplicate queue delivery, PSP timeout ambiguity, fail-closed Redis recovery, epoch fencing, and idempotent reaping are all present.
+- `technologyChoices` is useful and domain-specific, comparing edge/waiting-room, token, counter, queue, order-store, and payment options across self-hosted and cloud stacks.
+- The final design now lines up with the requirements, APIs, data model, failure drills, and satisfies mapping.
 
 ## Highest-Impact Issues
 
-### 1. Capacity is qualitative where the design needs sizing math
+### 1. Waiting-room durability and fairness policy need one more level of precision
 
-The capacity section names "millions", "thousands", and "100-1000:1", while step prompts later use concrete examples like 10M users and 10K units. The design repeatedly depends on sizing decisions: how many users to admit per second, how many tokens to issue relative to stock, how much queue depth the waiting room needs, and whether a single inventory counter can handle the admitted write burst.
+The dataset now gives a clear token contract, but the waiting room itself is still described mostly as "durable ordered queue at the edge." At 10M arrivals in 1-2 seconds, that state is the first hard production problem. The default FIFO design needs to explain how queue entries are deduped, persisted, replicated, and recovered without losing place or admitting duplicates.
 
-Concrete fix: add a small assumptions block or richer capacity entries with numbers and derived rates. For example: 10M arrivals at T0, 10K units, admit 1-3x stock over 1-5 minutes, expected payment completion rate, waiting-room writes/sec, buy attempts/sec, queue throughput, payment-worker rate, and hold-window expiry volume. Then reference those numbers in the admission, reservation, and async steps.
+Concrete fix: add a deep dive or failure drill under Step 4 covering waiting-room state. Include `queue_entry_id`, `(sale_id, user_id)` uniqueness, shard/partition strategy, replay behavior after edge-region failure, and whether FIFO is global, per-region, or windowed. If global FIFO is too costly, say so and frame FIFO as "best effort within an arrival window."
 
-### 2. Admission tokens are central but underspecified
+### 2. Abuse prevention is named but not operationalized
 
-The API has `POST /sale/{id}/enter` with an empty request and `POST /sale/{id}/buy` with `{ token, idempotencyKey }`. The text says tokens provide fairness, anti-abuse, and one-unit semantics, but the token contract is not explicit enough to support those claims. It does not say what identity the token binds to, whether it is single-use, how it expires, how replay is blocked, or how per-user purchase limits are enforced.
+The text mentions account/session identity, bot challenge, and per-user/per-household limits. That is directionally right, but a flash-sale case lives or dies on the exact abuse boundary: account farms, device reuse, shared IPs, captcha bypass, token sharing, and multiple browser sessions.
 
-Concrete fix: describe token claims and validation rules. Include `sale_id`, `user_id` or account/session identity, queue/admission id, expiry, nonce, max quantity, and possibly bot-score/challenge result. State whether the buy path consumes the token atomically with reservation, and what happens on retry with the same idempotency key.
+Concrete fix: add one short anti-abuse drill. Example: "A reseller creates 50K fresh accounts before T0." Expected behavior could combine pre-sale account eligibility, device/risk scoring, velocity checks, household/payment-method limits, and manual override/appeal. Keep it scoped so it teaches trade-offs instead of becoming a fraud platform.
 
-### 3. The data model is too thin for reservation/payment correctness
+### 3. Admission-rate control is quantified in capacity but not fully connected to runtime feedback
 
-The model has `inventory_counter`, `stock_ledger`, and `orders`. That is enough to sketch the happy path, but not enough to support the design's harder promises: durable reservation holds, payment failure release, idempotent order creation, counter rebuild, and reconciliation.
+The capacity section says to admit about `stock / completion_rate` users, metered over 1-5 minutes. That is useful, but the runtime control loop is implicit. In production, the admission service needs to react to live reservations, payment completion, expired holds, counter value, queue backlog, and worker/payment health.
 
-Concrete fix: add explicit entities such as `admissions` or `queue_entries`, `reservations`, `payment_attempts`, and either a `stock_ledger_events` table or an order/reservation status history. Important fields include `reservation_id`, `sale_id`, `user_id`, `status`, `hold_expires_at`, `idempotency_key`, `counter_sequence` or allocation number, `payment_intent_id`, `payment_status`, and uniqueness constraints for `(sale_id, user_id)` and `(sale_id, idempotency_key)`.
+Concrete fix: add a sentence in Step 3 or Step 4: admission is a feedback controller, not a fixed constant. It should slow or pause when the counter is near zero, payment/order workers are unhealthy, or the counter epoch is uncertain; it can admit another tranche when holds expire or payment completion is lower than expected.
 
-### 4. Counter high availability is acknowledged but not designed
+### 4. Payment UX is improved but the checkout boundary is still ambiguous
 
-Step 7 says the in-memory counter can be rebuilt from the durable ledger after restart, which is the right direction. But the dataset does not explain the live failure mode: Redis primary failure, replication lag, split brain, failover during the sale, or whether the system fails closed by stopping admissions/buys until the counter is reconstructed. The follow-up asks how to make the counter highly available without overselling, but the baseline design should give at least one defensible answer.
+The API now exposes reservation polling and an internal payment callback, which fixes the biggest prior gap. The remaining ambiguity is how payment is initiated: `/buy` has only `{ token, idempotencyKey }`, while the async worker "charges the buyer." That implies a stored payment method or pre-authorized checkout context, but the dataset does not say which.
 
-Concrete fix: add a deep dive or option under "Consistency, Reconciliation, and Degradation" covering fail-closed counter recovery, fencing/leader ownership, pre-minted reservation tokens, or partitioned counters per SKU. State that availability may be sacrificed before correctness: if the counter's authority is uncertain, stop issuing buy success responses.
+Concrete fix: either add a `paymentMethodId` / `checkoutSessionId` to `/buy`, or explicitly state that the product assumes a logged-in buyer with a stored default payment method and PSP customer reference. The `payment_attempts` entity should then carry that reference or a checkout session.
 
-### 5. Payment and order status UX is missing from the API surface
+### 5. Technology choices are strong, but fallback icons remain for several chips
 
-The buy endpoint returns `reserved`, and the async step says payment happens later. There is no API for the client to check whether the reservation became `paid`, `expired`, or `cancelled`, and no gateway callback/webhook shape. The final design says "charge the buyer", but the request does not include a payment method token or checkout reference.
+This is not a design correctness issue, but it is visible in the rendered book page. Current fallback `tech.png` chips include Apigee, Azure CDN, PASETO, Keycloak, Azure Cache for Redis, Azure SQL, direct PSP API, and AWS Payment Cryptography.
 
-Concrete fix: add `GET /orders/{orderId}` or `GET /sale/{id}/reservation/{reservationId}`, plus an internal or external payment callback. If the intended UX is "reserved first, pay later", model the checkout transition. If the intended UX is "charge stored payment method asynchronously", say that and include the payment reference.
+Concrete fix: add mappings in `_media/index.yaml` for the common missing terms where real icons exist, then rerun the tech icon assignment script. For generic terms like "Direct PSP API (Stripe/Adyen/Braintree)", the fallback may be acceptable.
 
 ## System Design Soundness
 
-The architecture correctly rejects the naive database-first design. The most important insight is that the system should make failure cheap and common: a flash sale is not a normal e-commerce workload with higher QPS, it is a huge rejection problem with a tiny successful path.
+The system design is now coherent end to end. It correctly treats a flash sale as a rejection and contention problem rather than a normal e-commerce throughput problem. Reads are offloaded to the CDN, most entrants are held or shed at the edge, the purchase core only sees admitted traffic, and the scarce-inventory invariant is reduced to one guarded atomic operation.
 
-The waiting-room design is directionally sound. FIFO, lottery, and token-bucket alternatives teach meaningful trade-offs. The default FIFO position is reasonable, though the review should force one more decision: FIFO is fair only within the definition of arrival time, and may still favor low-latency users. If the product cares about equal odds among all users present at T0, the lottery option may be a stronger default.
+The best part is the explicit correctness boundary around the inventory counter. The design no longer hand-waves Redis failure: it identifies the durable ledger as authority, describes epoch fencing, and says the buy path fails closed when counter authority is uncertain. That is the right trade-off for scarce stock.
 
-The atomic-counter reservation mechanism is credible. It should be sharpened in two places: specify the exact decrement-if-positive primitive, and make retry behavior explicit. A naive `DECR` followed by checking for negative values can require compensating increment logic; a guarded Lua script, transaction, or conditional update is clearer.
+The data model now backs the architecture's promises. `admissions` supports token issuance and per-user limits; `reservations` supports holds and idempotent retries; `payment_attempts` supports PSP ambiguity; `orders` is separated from held reservations; `stock_ledger_events` supports rebuild and reconciliation.
 
-Async order creation is the right production move, but the "release unit" path should be represented as first-class data. Expiration and payment failures are among the most important flash-sale edge cases because they decide whether scarce stock is stranded, resold, or accidentally double-allocated.
+The main remaining design question is not "does this prevent oversell?" but "how does the waiting room survive the same 10M-user spike?" The answer can be shorter than the counter deep dive, but it should exist because Step 4 makes the waiting room the primary fairness mechanism.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: Everyone Hits Buy, Decrement Stock in the DB
 
-Strong opening. It names both collapse modes: overload and oversell. One minor pedagogy issue: the reused `client-buy` link is labeled "buy (with token)" even though tokens are not introduced until step 4. For this step, use a custom link label like "buy request" so the naive diagram does not leak a future mechanism.
+Strong opening. It explains why both separate read/check/decrement and DB-row locking fail under the spike. The diagram was fixed to use a local "buy request" label instead of leaking future token semantics.
 
 ### Step 2: Offload Reads to the Edge
 
-This is a good first improvement because it removes the cheapest traffic first. The step could quantify read/write split at T0, such as page loads and availability polls versus actual admitted buy attempts. That would make the later admission rate feel derived rather than asserted.
+This is the right first move. The step cleanly separates page/availability reads from admission and buy attempts. It could mention cache invalidation on sold-out state, but Step 7 already covers stale CDN availability enough for this level.
 
 ### Step 3: Admission Control at the Edge
 
-The step captures the main senior-level point: most traffic should never reach the core. It should add a concrete admitted-rate policy. For example, admit `stock / expected_completion_rate` users over a controlled interval, then stop when sold-out becomes authoritative.
+Good survival framing: most traffic cannot succeed and should fail cheaply. The step would be stronger if it tied the capacity numbers directly to an admission-control loop: admit a tranche, observe reservation/payment/expiry outcomes, then adjust.
 
 ### Step 4: Fairness: Virtual Waiting Room
 
-This is one of the best sections. The alternatives are useful and realistic. It needs sharper wording on identity and abuse: what prevents a user from opening 1,000 sessions, sharing a token, or replaying an admitted token? Tie the answer to the token data and the data model.
+This is now a strong section. The default FIFO, lottery, and token-bucket options compare real trade-offs. The token claims and single-use behavior are clear. Add one production detail on queue-state durability and recovery so "durable ordered queue" is not a black box.
 
 ### Step 5: Oversell-Proof Reservation
 
-The default option is the right hot-path design. The comparison against DB row locking and pre-minted reservation tokens is strong. The step should say exactly where idempotency is stored and how a retry maps to the same reservation instead of consuming a second unit.
+Very strong. The guarded decrement-if-positive primitive is precise, and the step correctly warns against `DECR` followed by compensating `INCR`. Idempotency is introduced exactly where it matters.
+
+One small inconsistency: the pre-minted reservation-token option says "Mint exactly 100" even the capacity scenario uses 10K units and the decision prompt says 100 units. This may be intentional for the prompt example, but the option would read cleaner as "one per unit" or "exactly N tokens."
 
 ### Step 6: Async Order Creation and Payment
 
-Good decomposition of the hot path from slow work. Add a status endpoint and payment callback/drill. The current failure drill for non-payment is useful; add at least one more for duplicate queue delivery or payment timeout after a successful charge.
+Much improved. Duplicate queue delivery and ambiguous payment timeout drills are the right production failures. The next refinement is clarifying payment initiation: stored payment method, checkout session, or separate pay-now flow.
 
 ### Step 7: Consistency, Reconciliation, and Degradation
 
-The close is right but too compressed. This is where the dataset should teach the strongest production detail: counter rebuild, fail-closed behavior, reconciliation invariants, reaper idempotency, and what users see while the system is degraded.
+This is now one of the strongest sections. It states invariants, fail-closed behavior, epoch fencing, rebuild from ledger, idempotent reaping, and CDN staleness. The only thing to avoid in future edits is expanding it into a full distributed-consensus lesson; it is currently detailed enough for a system design interview.
 
 ## Final Design Review
 
-The final design is coherent and includes the main components introduced in the steps: CDN, edge, waiting room, token service, purchase service, inventory counter, queue, order service, order store, and payment service. It accurately explains the intended flow.
+The final design integrates the introduced components cleanly: `CDN`, `Edge`, `WaitRoom`, `Token`, `BuySvc`, `Inventory`, `OrderQ`, `OrderSvc`, `OrderDB`, and `PaySvc`. It maps well to the APIs and data model.
 
-The gap is that some final-design claims have no corresponding durable model or API: reservation hold lifecycle, payment status, token consumption, and counter recovery are described in prose but not backed by schema. Adding those elements would make the final design feel production-complete rather than conceptually correct.
+The strongest improvement over the previous review is that final-design claims are now backed by durable state and API surfaces. Reservation holds, token consumption, payment status, duplicate payment handling, and counter recovery are no longer just prose.
+
+The remaining final-design gap is operational: what dashboards and kill switches does the operator use during the drop? A compact mention of admission pause, sold-out override, counter rebuild status, queue depth, payment error rate, and token issuance rate would make the design feel fully operable.
 
 ## Concept Introduction and Learning Flow
 
-Concept staging is good: static offload, load shedding, waiting room, signed token, atomic reservation, hold window, reconciliation. The best teaching property is that each new mechanism solves the `newRisk` from the previous recap.
+The concept staging is effective:
 
-Two improvements would help:
+- Static edge offload before admission.
+- Load shedding before fairness.
+- Waiting-room token before reservation.
+- Atomic decrement and idempotency before async order work.
+- Hold windows before reconciliation.
+- Fail-closed behavior after counter/ledger drift is introduced.
 
-- Introduce "idempotency" as a concept in the reservation or async step, since it appears in the API and is essential for retries.
-- Add a concept for "fail closed for scarce inventory" in the consistency step, because it is the principle that resolves counter uncertainty.
+This is a good "just in time" teaching flow. The concepts are not dumped up front, and the `recap.newRisk` fields consistently motivate the next step.
 
 ## Step-to-Final-Design Coherence
 
-All step view links and `satisfies` references resolve. The final design includes every top-level architecture node used in the main path.
+The coherence is strong. Every major final-design component is introduced by a step, and the `satisfies` mapping points to relevant steps. The strongest through-line is: DB contention fails -> edge absorbs reads -> admission caps the core -> waiting room grants fair tokens -> atomic counter prevents oversell -> async queue handles slow work -> reconciliation preserves correctness under failure.
 
-The weakest transition is from "reservation succeeds" to "durable order + charge". The steps say a reservation exists and can expire, but the model collapses too much into `orders.status`. A candidate reading this could explain the diagram but struggle to answer detailed interviewer questions about duplicate queue messages, payment timeouts, and ledger rebuilds.
+The only weak transition is between "admitted to buy" and "payment can be charged." The current design assumes a payment credential or checkout context exists. Make that assumption explicit so the async payment worker is not magically able to charge the buyer.
 
 ## Realism Compared With Production Systems
 
-Production flash-sale systems are heavily shaped by abuse, fairness policy, and operational fallback. This dataset mentions anti-bot and fairness, but it should move some of that from prose into contracts:
+The dataset now covers most production issues expected in a strong interview answer:
 
-- identity/account/session binding in admission tokens
-- bot challenge or risk score as part of entering the waiting room
-- per-user and per-household purchase limits
-- token replay and sharing prevention
-- duplicate delivery from the order queue
-- payment provider idempotency and webhook ambiguity
-- sold-out propagation delays between core truth and CDN cached state
-- fail-closed mode when inventory truth is uncertain
+- identity-bound, expiring, single-use tokens
+- per-user purchase cap via admission and reservation uniqueness
+- idempotent buy retries
+- duplicate queue delivery
+- PSP idempotency and webhook ambiguity
+- hold expiry and idempotent reaping
+- counter/ledger reconciliation
+- Redis failover and fail-closed behavior
+- CDN sold-out staleness
+- concrete cloud/self-hosted technology choices
 
-The current design is still credible, but these additions would move it from "good interview answer" to "production-realistic case study".
+The next realism upgrades are around operations and abuse: pre-sale account eligibility, account-farm handling, regional waiting-room recovery, live admission throttles, dashboards, and manual sale controls.
 
 ## Dataset and Renderer-Facing Observations
 
 - `interview.json` parses as valid JSON.
-- Step `view.nodes` string references resolve to high-level architecture nodes.
-- Step `view.links` string references resolve to high-level architecture links.
-- `satisfies[*].steps[*]` and `patterns[*].steps[*]` references resolve to real step IDs.
-- The architecture steps use structured `view` objects; no raw step-level Mermaid `diagram` fields were found.
-- The dataset is present in `data/book/index.json` under "Booking & High-Contention".
-- Optional book enhancements are absent: `technologyChoices`, `aiVisuals`, `explainerComic`, and per-requirement `aiVisual`s. That is valid schema-wise, but this case would benefit from technology choices because Redis, DynamoDB conditional writes, CDN/waiting-room products, queues, and payment providers are central trade-offs.
+- Source `data/book/flash-sale/interview.json` and built `docs/book/data/flash-sale/interview.json` are byte-identical.
+- Step, option, and final-design string `view.nodes` references resolve to high-level architecture nodes.
+- Step, option, and final-design string `view.links` references resolve to high-level architecture links.
+- High-level architecture link endpoints resolve to known nodes.
+- Sequence participants in APIs and flows resolve to canonical node IDs.
+- `satisfies[*].steps[*]`, `patterns[*].steps[*]`, and `technologyChoices[*].steps[*]` references resolve to real step IDs.
+- Architecture steps use structured `view` objects and flows use structured `sequence` objects. Raw Mermaid remains only in top-level `requirementsDiagram` and `capacityDiagram`, which matches repo conventions.
+- Optional generated visual fields are absent: `aiVisuals`, per-step `aiVisual`, per-requirement `aiVisual`, and `explainerComic`. This is valid, but this case would benefit from an AI visual or comic because the waiting-room/admission flow is easy to explain visually.
+- Several technology chips still use the fallback `assets/tech-icons/tech.png`, listed above.
 
 ## Recommended Edits, Prioritized
 
-### P1: Add concrete capacity math
+### P1: Add waiting-room state/recovery detail
 
-Add numeric assumptions and derived rates for T0 arrivals, stock, admitted users, buy path QPS, waiting-room writes, queue throughput, payment throughput, and hold expiry volume.
+Add a compact Step 4 deep dive or failure drill for durable queue entries, dedupe, edge-region failure, and whether FIFO is global or windowed.
 
-### P1: Expand the data model around reservations
+### P1: Clarify the payment initiation contract
 
-Add reservation/admission/payment/ledger-event entities and uniqueness constraints needed for idempotency, per-user limits, expiration, and counter rebuild.
+Specify whether `/buy` carries a `paymentMethodId` / `checkoutSessionId`, or whether the system assumes a logged-in buyer with a stored PSP customer/payment reference.
 
-### P1: Specify token and idempotency semantics
+### P2: Connect admission rate to runtime feedback
 
-Document token claims, expiry, replay prevention, single-use behavior, and retry handling in both API and step text.
+Explain how the admission service adjusts based on remaining counter value, reservation completion, expiry rate, queue backlog, worker health, payment health, and counter epoch status.
 
-### P2: Add a consistency deep dive
+### P2: Add one anti-abuse failure drill
 
-Cover Redis/counter failover, fail-closed behavior, reconciliation invariants, and duplicate queue delivery.
+Use an account-farm or token-sharing scenario to make the bot/per-user-limit story concrete.
 
-### P2: Add order/payment status API
+### P2: Add operator controls and observability
 
-Expose how a client learns that `reserved` became `paid`, `expired`, or `cancelled`, and how payment callbacks are handled.
+Mention sale dashboard signals and controls: admission pause, sold-out override, token issuance rate, reservation success rate, queue depth, payment failures, hold-expiry rate, counter epoch/rebuild status, and reconciliation drift.
 
-### P2: Add `technologyChoices`
+### P3: Normalize the pre-minted-token example
 
-Compare self-hosted and managed options for CDN/waiting room, inventory counter, queue, order store, and payment integration.
+Replace "Mint exactly 100" with "mint one per unit" unless the option is intentionally tied to the 100-unit decision-prompt example.
 
-### P3: Fix minor pedagogical leakage in the naive diagram
+### P3: Improve fallback technology icons
 
-Avoid showing "buy (with token)" before tokens exist.
+Map common fallback terms in `_media/index.yaml` and rerun tech icon assignment.
 
-### P3: Add more failure drills
+### P3: Consider generated visuals
 
-Add drills for duplicate queue delivery, payment timeout after charge, Redis primary failover, and stale CDN sold-out state.
+Add an explainer comic or AI visual for the admission/waiting-room/reservation path if the book page needs a more visual teaching surface.
 
 ## What Not To Change
 
-- Keep the overall step order. It is the strongest part of the dataset.
-- Keep the atomic counter as the default reservation mechanism; it is the clearest senior-level answer for a single-SKU flash sale.
-- Keep the waiting-room alternatives. FIFO, lottery, and token-bucket admission are all useful interview comparisons.
-- Keep the final design compact. The dataset should add precision without becoming a full e-commerce platform design.
+- Keep the current step order. It is the main pedagogical strength.
+- Keep the guarded atomic counter as the default reservation answer.
+- Keep the waiting-room alternatives; FIFO, lottery, and token-bucket admission teach real product trade-offs.
+- Keep the final design compact. The current dataset is focused and interview-friendly.
+- Keep fail-closed behavior explicit. It is the key senior-level correctness principle for scarce inventory.
 
 ## Bottom Line
 
-This is a good flash-sale interview and already works as a teaching walkthrough. The main improvements are not about changing the architecture; they are about making the contracts and state explicit enough to defend the architecture under retries, abuse, payment ambiguity, and inventory-counter failure.
+This dataset has moved from a good conceptual flash-sale answer to a strong book-quality walkthrough. The remaining work is not architectural overhaul; it is production sharpening around waiting-room durability, abuse handling, payment initiation, operator controls, and a few renderer/polish items.

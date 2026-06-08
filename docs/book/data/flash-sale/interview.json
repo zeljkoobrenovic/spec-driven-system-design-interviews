@@ -261,29 +261,49 @@
   },
   "capacity": [
     {
-      "label": "Concurrent users at T0",
-      "value": "millions",
-      "note": "All arriving in the same second."
+      "label": "Arrivals at T0",
+      "value": "~10M in the first 1-2 s",
+      "note": "Working example: 10M buyers for 10K units (1000:1). Most must be shed."
     },
     {
       "label": "Stock",
-      "value": "thousands",
-      "note": "Tiny relative to demand."
+      "value": "10K units",
+      "note": "Single SKU; the entire correctness budget is 10K successful reservations."
     },
     {
-      "label": "Demand:supply",
-      "value": "100-1000:1",
-      "note": "Most requests must be rejected cheaply."
+      "label": "Admitted rate",
+      "value": "~2-3x stock over 1-5 min",
+      "note": "Admit stock / completion_rate (e.g. ~70% pay) ⇒ ~14K admitted, metered at a few hundred/sec."
+    },
+    {
+      "label": "Buy attempts/sec",
+      "value": "~300-1000/sec",
+      "note": "Derived from the admitted rate, not the 10M arrivals — what the atomic counter must serve."
+    },
+    {
+      "label": "Waiting-room writes/sec",
+      "value": "~5-10M/sec at T0 (edge/CDN-absorbed)",
+      "note": "Enqueue/position writes; must live in the edge tier, never the purchase core."
+    },
+    {
+      "label": "Counter ops/sec",
+      "value": "≥ buy attempts (single hot key)",
+      "note": "One Redis key; ~300-1000 DECRs/sec is trivial — the risk is availability, not throughput."
+    },
+    {
+      "label": "Queue + payment throughput",
+      "value": "~300-1000 msg/sec; payment ~hundreds of ms each",
+      "note": "Order workers and PSP calls run async; scale workers to drain ~14K reservations in minutes."
+    },
+    {
+      "label": "Hold-window expiry volume",
+      "value": "~30% of admitted (~4K) reclaimed",
+      "note": "Non-payers (~14K admitted − ~10K paid) expire and return units to the counter."
     },
     {
       "label": "Sale window",
       "value": "seconds to minutes",
-      "note": "Often sells out almost instantly."
-    },
-    {
-      "label": "Steady-state load",
-      "value": "tiny",
-      "note": "The system is overprovisioned only for the spike — or sheds instead."
+      "note": "Often sells out almost instantly; steady-state load is tiny — provision for the spike or shed."
     }
   ],
   "api": [
@@ -297,9 +317,9 @@
     {
       "method": "POST",
       "path": "/sale/{id}/enter",
-      "description": "Request admission. Joins the virtual waiting room and may receive a signed admission token.",
-      "request": "{ }",
-      "response": "{ \"status\": \"waiting\" } | { \"status\": \"admitted\", \"token\": \"...\" }",
+      "description": "Request admission (authenticated; binds to the caller's account/session). Joins the virtual waiting room and, when admitted, returns a single-use signed token whose claims are { sale_id, user_id, admission_id (nonce/jti), max_qty, exp }. The token is the gate for /buy; expired, forged, or already-consumed tokens are rejected.",
+      "request": "{ } (identity from auth header/session; optional bot-challenge result)",
+      "response": "{ \"status\": \"waiting\", \"position\": 42001, \"etaSec\": 120 } | { \"status\": \"admitted\", \"token\": \"<signed JWT: sale_id,user_id,admission_id,max_qty,exp>\" }",
       "sequence": {
         "participants": [
           {
@@ -366,9 +386,9 @@
     {
       "method": "POST",
       "path": "/sale/{id}/buy",
-      "description": "Attempt to buy. Requires a valid admission token; reserves one unit if stock remains.",
-      "request": "{ \"token\": \"...\", \"idempotencyKey\": \"k_1\" }",
-      "response": "{ \"status\": \"reserved\", \"orderId\": \"o_1\" } | { \"status\": \"sold_out\" }",
+      "description": "Attempt to buy. Requires a valid, unexpired, unconsumed admission token. The token is consumed single-use atomically with the reservation, so a replayed/shared token cannot reserve twice. A retry with the same idempotencyKey returns the original reservation (no second unit). Reserves one unit if stock remains.",
+      "request": "{ \"token\": \"<signed>\", \"idempotencyKey\": \"k_1\" }",
+      "response": "{ \"status\": \"reserved\", \"reservationId\": \"r_1\", \"holdExpiresAt\": \"...\" } | { \"status\": \"sold_out\" } | { \"status\": \"token_invalid\" }",
       "sequence": {
         "participants": [
           {
@@ -441,12 +461,26 @@
           }
         ]
       }
+    },
+    {
+      "method": "GET",
+      "path": "/sale/{id}/reservation/{reservationId}",
+      "description": "Poll the lifecycle of a reservation. Async order/payment work means /buy returns 'reserved' before the charge resolves, so the client polls here to learn the terminal state.",
+      "request": "(reservationId in path; authenticated)",
+      "response": "{ \"status\": \"held\", \"holdExpiresAt\": \"...\" } | { \"status\": \"paid\", \"orderId\": \"o_1\" } | { \"status\": \"expired\" } | { \"status\": \"cancelled\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/internal/payment-callback",
+      "description": "PSP webhook (signature-verified) reporting the outcome of a charge. Idempotent on payment_intent_id so duplicate/replayed webhooks don't double-confirm or double-release. On success the reservation is confirmed and the order created; on failure/timeout it is released.",
+      "request": "{ \"paymentIntentId\": \"pi_1\", \"event\": \"succeeded\" | \"failed\", \"reservationId\": \"r_1\" }",
+      "response": "200 OK (ack; processing is idempotent)"
     }
   ],
   "dataModel": [
     {
       "name": "inventory_counter (in-memory)",
-      "note": "The hot atomic counter that gates reservations.",
+      "note": "The hot atomic counter that gates reservations; rebuilt from the ledger on restart.",
       "fields": [
         {
           "name": "sale_id",
@@ -454,39 +488,21 @@
         },
         {
           "name": "remaining",
-          "type": "int (atomic DECR)"
+          "type": "int (atomic DECR-if-positive)"
+        },
+        {
+          "name": "epoch",
+          "type": "int (fencing token; bumped on rebuild)"
         }
       ]
     },
     {
-      "name": "stock_ledger",
-      "note": "Durable source of truth for units allocated; reconciled against the counter.",
+      "name": "admissions",
+      "note": "One row per admitted user; backs the signed token and enforces per-user limits.",
       "fields": [
         {
-          "name": "sale_id",
-          "type": "string"
-        },
-        {
-          "name": "total",
-          "type": "int"
-        },
-        {
-          "name": "reserved",
-          "type": "int"
-        },
-        {
-          "name": "confirmed",
-          "type": "int"
-        }
-      ]
-    },
-    {
-      "name": "orders",
-      "note": "One order per successful reservation.",
-      "fields": [
-        {
-          "name": "order_id",
-          "type": "uuid PK"
+          "name": "admission_id",
+          "type": "uuid PK (token's jti / nonce)"
         },
         {
           "name": "sale_id",
@@ -494,15 +510,131 @@
         },
         {
           "name": "user_id",
-          "type": "bigint"
+          "type": "bigint (identity the token binds to)"
+        },
+        {
+          "name": "max_qty",
+          "type": "int (per-user purchase cap, e.g. 1)"
+        },
+        {
+          "name": "issued_at / expires_at",
+          "type": "timestamptz (token validity window)"
+        },
+        {
+          "name": "consumed_at",
+          "type": "timestamptz null (set when the token is spent — single-use)"
+        },
+        {
+          "name": "unique",
+          "type": "(sale_id, user_id) — one admission per user per sale"
+        }
+      ]
+    },
+    {
+      "name": "reservations",
+      "note": "First-class hold created on a successful counter decrement; the unit of inventory truth.",
+      "fields": [
+        {
+          "name": "reservation_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "sale_id / user_id",
+          "type": "string / bigint"
+        },
+        {
+          "name": "admission_id",
+          "type": "uuid FK (which token spent it)"
         },
         {
           "name": "status",
-          "type": "enum(reserved, paid, expired, cancelled)"
+          "type": "enum(held, paid, expired, cancelled)"
+        },
+        {
+          "name": "hold_expires_at",
+          "type": "timestamptz (reaper deadline)"
         },
         {
           "name": "idempotency_key",
-          "type": "varchar (dedup)"
+          "type": "varchar"
+        },
+        {
+          "name": "unique",
+          "type": "(sale_id, idempotency_key) — retries map to the same reservation"
+        }
+      ]
+    },
+    {
+      "name": "payment_attempts",
+      "note": "Each charge try against the PSP; carries the idempotency key sent to the provider.",
+      "fields": [
+        {
+          "name": "attempt_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "reservation_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "payment_intent_id",
+          "type": "string (PSP reference)"
+        },
+        {
+          "name": "payment_status",
+          "type": "enum(pending, succeeded, failed, timeout)"
+        },
+        {
+          "name": "psp_idempotency_key",
+          "type": "varchar (safe PSP retries)"
+        }
+      ]
+    },
+    {
+      "name": "orders",
+      "note": "Durable order created once a reservation is paid.",
+      "fields": [
+        {
+          "name": "order_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "reservation_id",
+          "type": "uuid FK unique (one order per reservation)"
+        },
+        {
+          "name": "sale_id / user_id",
+          "type": "string / bigint"
+        },
+        {
+          "name": "status",
+          "type": "enum(confirmed, refunded, cancelled)"
+        }
+      ]
+    },
+    {
+      "name": "stock_ledger_events",
+      "note": "Append-only allocation log; the durable source of truth the counter is rebuilt from.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "bigserial PK (allocation sequence)"
+        },
+        {
+          "name": "sale_id",
+          "type": "string"
+        },
+        {
+          "name": "reservation_id",
+          "type": "uuid"
+        },
+        {
+          "name": "type",
+          "type": "enum(reserve, confirm, release)"
+        },
+        {
+          "name": "delta",
+          "type": "int (-1 reserve, +1 release)"
         }
       ]
     }
@@ -578,9 +710,13 @@
           "BuySvc",
           "OrderDB"
         ],
-        "caption": "The buyer client sends buy (with token) to the Purchase Service, which reads and decrements the stock row in the Order Store.",
+        "caption": "The buyer client sends a buy request to the Purchase Service, which reads and decrements the stock row in the Order Store.",
         "links": [
-          "client-buy",
+          {
+            "from": "Client",
+            "to": "BuySvc",
+            "label": "buy request"
+          },
           "buy-db"
         ],
         "highlight": [
@@ -725,7 +861,7 @@
       "title": "4. Fairness: Virtual Waiting Room",
       "description": [
         "Pure load-shedding is a lottery on network timing and favors bots with fast connections. A virtual waiting room makes admission fair: users join a queue and are admitted at a controlled rate.",
-        "Admission grants a signed, time-boxed token that the buy endpoint requires. The token caps how many users can be in the purchase path at once and ties a buy attempt to an admitted identity (anti-abuse).",
+        "Admission grants a signed, time-boxed token that the buy endpoint requires. Its claims bind it to one identity — { sale_id, user_id, admission_id (nonce), max_qty, exp } — so it isn't a bearer ticket anyone can share. Abuse defenses ride on this: enter is authenticated and admissions are unique per (sale_id, user_id), so one account gets one place in line; the token is single-use (consumed atomically at buy), so a replayed or shared token can't reserve twice; and a bot-challenge/risk score can gate entry. Per-user and per-household purchase limits are enforced via max_qty plus the unique reservation constraint.",
         "Communicate position/wait so users don't hammer retry; the waiting room itself must be cheap (often edge/CDN-backed) since everyone passes through it."
       ],
       "view": {
@@ -907,9 +1043,9 @@
       "id": "reserve",
       "title": "5. Oversell-Proof Reservation",
       "description": [
-        "Admitted buyers contend for limited stock. The whole correctness requirement reduces to: at most `stock` reservations succeed. Use a single atomic counter (e.g. Redis DECR) — decrement-if-positive returns success only while units remain.",
-        "An atomic counter is the contention point but is extremely fast and trivially oversell-proof: the (stock+1)th decrement returns 'sold out'. No locking, no race.",
-        "Require the admission token and an idempotency key so a retry doesn't consume two units. Success here is a reservation, not yet a durable order."
+        "Admitted buyers contend for limited stock. The whole correctness requirement reduces to: at most `stock` reservations succeed. Use a single atomic counter — but be precise about the primitive. A plain `DECR` that goes negative and then needs a compensating `INCR` is racy; use a guarded conditional instead: a Redis Lua script (`if GET > 0 then DECR`), a `WATCH`/`MULTI` transaction, or a DynamoDB conditional write (`UpdateItem` with `ConditionExpression remaining > 0`). The decrement happens only while units remain.",
+        "An atomic counter is the contention point but is extremely fast and trivially oversell-proof: the (stock+1)th decrement is rejected by the guard and returns 'sold out'. No locking, no race.",
+        "Make idempotency explicit. The buy is keyed by (sale_id, idempotencyKey) with a unique constraint on the `reservations` row, and the admission token is consumed single-use in the same atomic step. So a retry — same key — maps back to the existing reservation and returns it, rather than consuming a second unit or a second token. Success here is a reservation (a durable hold), not yet a paid order."
       ],
       "view": {
         "nodes": [
@@ -1056,9 +1192,16 @@
       "concepts": [
         {
           "term": "Atomic decrement-if-positive",
-          "definition": "A single atomic operation that reserves a unit only while the counter is above zero.",
-          "whyItMatters": "Oversell-proof under unlimited concurrency with no locks.",
-          "example": "Redis DECR returning >= 0 = reserved; < 0 = sold out (with a guard).",
+          "definition": "A single guarded atomic operation that reserves a unit only while the counter is above zero.",
+          "whyItMatters": "Oversell-proof under unlimited concurrency with no locks and no compensating increment.",
+          "example": "Redis Lua `if GET>0 then DECR`, or DynamoDB UpdateItem with ConditionExpression remaining>0.",
+          "group": "Oversell-Proof Reservation"
+        },
+        {
+          "term": "Idempotency",
+          "definition": "Keying a write so retries produce one effect: the same (sale_id, idempotencyKey) maps to the same reservation.",
+          "whyItMatters": "Clients retry aggressively under a spike; without it a retry would consume a second unit.",
+          "example": "Unique (sale_id, idempotency_key) on reservations; a duplicate buy returns the original reservationId.",
           "group": "Oversell-Proof Reservation"
         }
       ],
@@ -1315,6 +1458,16 @@
           "scenario": "A reserved buyer never completes payment.",
           "expectedBehavior": "The reservation expires after the hold window; the unit is released (counter incremented, ledger adjusted) and can resell.",
           "mitigation": "Reaper job on reservation TTL + counter/ledger reconciliation."
+        },
+        {
+          "scenario": "The order queue delivers the same reservation twice (at-least-once delivery or a worker crash after charging but before ack).",
+          "expectedBehavior": "Exactly one order and one charge result; the duplicate is a no-op.",
+          "mitigation": "Idempotent consumer: unique order per reservation_id, and a PSP idempotency key per reservation so a re-delivered message reuses the same payment_intent rather than double-charging."
+        },
+        {
+          "scenario": "Payment times out after the charge actually succeeded at the PSP (ambiguous outcome).",
+          "expectedBehavior": "Don't blindly release — releasing a paid unit would oversell or refund-and-resell.",
+          "mitigation": "Reconcile against the PSP (query payment_intent / wait for webhook) before releasing; the webhook is idempotent on payment_intent_id so the late 'succeeded' still confirms the order."
         }
       ],
       "flows": [
@@ -1395,9 +1548,9 @@
       "id": "consistency",
       "title": "7. Consistency, Reconciliation, and Degradation",
       "description": [
-        "The in-memory counter is fast but not durable; the order store/ledger is the source of truth. Reconcile them: confirmed orders + live reservations must equal units allocated, and the counter is rebuilt from the ledger after a restart.",
-        "Released (expired) reservations increment the counter back. A reaper enforces hold-window TTLs. Periodic reconciliation catches any drift, with the durable ledger authoritative.",
-        "Degrade gracefully: if a component is overwhelmed, fall back to shedding (clear 'sold out / try later'), keep the sold-out state correct, and never oversell even under partial failure."
+        "The in-memory counter is fast but not durable; the append-only stock_ledger_events table is the source of truth. The invariant: `remaining = total − reserves + releases`, equivalently `confirmed_orders + live_reservations ≤ total`. Reconcile periodically and rebuild the counter from the ledger after a restart (`remaining = total − Σ deltas`).",
+        "But reconciliation is only half the story — the live failure mode matters. When the Redis primary dies, fails over, or its authority is uncertain (replication lag, possible split-brain), the safe default is **fail closed for scarce inventory**: stop issuing 'reserved' responses and return 'try later / sold out', rather than risk a stale or split counter overselling. A new counter epoch is minted on rebuild and carried in the token/reservation as a fence, so writes from a deposed primary are rejected. Availability of the *buy* path is sacrificed before correctness — the no-oversell guarantee is never negotiable.",
+        "Released (expired) reservations append a `release` event and increment the counter back. A reaper enforces hold-window TTLs and is itself idempotent (keyed on reservation_id) so re-running it can't double-release a unit. Degrade gracefully elsewhere too: if a component is overwhelmed, fall back to shedding (clear 'sold out / try later'), keep the sold-out state correct, and accept that the CDN-cached availability flag may lag the true counter by its TTL — the authoritative buy path still rejects oversell even when stale 'in stock' is shown."
       ],
       "view": {
         "nodes": [
@@ -1426,12 +1579,44 @@
           "term": "Counter/ledger reconciliation",
           "definition": "Keeping the fast in-memory counter consistent with the durable allocation ledger.",
           "whyItMatters": "Lets you use a fast counter as the gate while the durable store stays authoritative.",
-          "example": "On restart, remaining = total - confirmed - live_reservations (from the ledger).",
+          "example": "On restart, remaining = total − Σ ledger deltas (reserve −1, release +1).",
+          "group": "Consistency, Reconciliation, and Degradation"
+        },
+        {
+          "term": "Fail closed for scarce inventory",
+          "definition": "When inventory truth is uncertain, stop granting reservations rather than risk overselling.",
+          "whyItMatters": "Resolves counter-failover ambiguity: correctness (no oversell) outranks buy-path availability.",
+          "example": "Redis primary failover ⇒ pause /buy, return 'try later' until the counter is rebuilt and fenced.",
           "group": "Consistency, Reconciliation, and Degradation"
         }
       ],
+      "deepDives": [
+        {
+          "title": "Highly-available counter without overselling",
+          "points": [
+            "Treat the counter as a fenced leader, not just a cache: each rebuild bumps an epoch; reservations and tokens carry it so a deposed primary's writes are rejected.",
+            "On primary failure, fail closed — pause buy admissions and serve 'try later' — until the counter is reconstructed from the ledger (`remaining = total − Σ deltas`).",
+            "Prefer a synchronously-replicated or quorum store for the counter so a failover can't lose acknowledged decrements; never trust an async replica that may have missed the last reserves.",
+            "For multi-SKU drops, partition the counter per SKU so one hot key's failure or contention is isolated.",
+            "Pre-minted reservation tokens (one per unit) are an alternative that makes oversell structurally impossible at the cost of a reclaim process — a good fallback when a single HA counter is too risky."
+          ]
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The Redis counter primary fails over mid-sale and the new primary's value is uncertain (replication lag / possible split-brain).",
+          "expectedBehavior": "No oversell. The buy path pauses ('try later') rather than trusting a possibly-stale counter.",
+          "mitigation": "Fail closed; rebuild remaining from the ledger; bump the epoch and fence out the old primary before resuming."
+        },
+        {
+          "scenario": "CDN shows 'in stock' but the counter just hit zero.",
+          "expectedBehavior": "Buyers may still attempt, but the authoritative buy path returns sold_out; no oversell.",
+          "mitigation": "Short availability TTL to bound the staleness; treat the cached flag as advisory, the counter as truth."
+        }
+      ],
       "probeLinks": [
-        "redis-locks"
+        "redis-locks",
+        "dynamodb-condition"
       ],
       "patterns": [
         "Reconciliation + reaping"
@@ -1440,9 +1625,9 @@
         "Closing on reconciliation + graceful degradation shows the fast-path design stays correct under failure — the no-oversell guarantee survives."
       ],
       "recap": {
-        "before": "Fast counter trusted blindly.",
-        "after": "Counter reconciled to durable ledger; failures shed cleanly; no oversell.",
-        "newRisk": "Reconciliation lag and reaper timing — bounded by conservative holds and the durable ledger as authority."
+        "before": "Fast counter trusted blindly, even through failover.",
+        "after": "Counter reconciled to the durable ledger and fenced by epoch; on counter failure the buy path fails closed; failures shed cleanly; no oversell.",
+        "newRisk": "Reconciliation lag and reaper timing — bounded by conservative holds, idempotent reaping, and the durable ledger as authority."
       }
     }
   ],
@@ -1497,8 +1682,9 @@
       },
       {
         "requirement": "Buy one unit",
-        "how": "Token + idempotency-keyed reservation.",
+        "how": "Single-use token (max_qty) + idempotency-keyed reservation; unique (sale_id, user_id) caps per-user purchases.",
         "steps": [
+          "waitroom",
           "reserve"
         ]
       },
@@ -1528,7 +1714,7 @@
       },
       {
         "requirement": "Never oversell",
-        "how": "Single atomic decrement-if-positive; ledger reconciliation.",
+        "how": "Guarded atomic decrement-if-positive; epoch-fenced counter that fails closed on failover; ledger reconciliation.",
         "steps": [
           "reserve",
           "consistency"
@@ -1559,6 +1745,360 @@
       }
     ]
   },
+  "technologyChoices": [
+    {
+      "concern": "Static offload + edge admission / waiting room",
+      "steps": [
+        "offload",
+        "admission",
+        "waitroom"
+      ],
+      "selfHosted": [
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "HAProxy",
+          "icon": "assets/tech-icons/haproxy.png"
+        },
+        {
+          "name": "Varnish",
+          "icon": "assets/tech-icons/varnish.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudFront",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudFront_64.png"
+          },
+          {
+            "name": "WAF",
+            "icon": "assets/tech-icons/Arch_AWS-WAF_64.png"
+          },
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud CDN",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Armor",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Apigee",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "CDN",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "API Management",
+            "icon": "assets/tech-icons/10042-icon-service-API-Management-Services.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A managed CDN/edge absorbs the 10M-arrival read and waiting-room write burst that must never reach the purchase core.",
+        "Cloudflare/Fastly offer turnkey waiting-room products; self-hosting one means building durable, ordered, edge-replicated queue state yourself."
+      ],
+      "makesIrrelevant": "A managed waiting-room + WAF product removes most custom rate-limiter, bot-filter, and queue-position code at the edge."
+    },
+    {
+      "concern": "Admission token issue + verification",
+      "steps": [
+        "waitroom",
+        "reserve"
+      ],
+      "selfHosted": [
+        {
+          "name": "JWT (signed)",
+          "icon": "assets/tech-icons/jwt.png"
+        },
+        {
+          "name": "PASETO",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Keycloak",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Cognito",
+            "icon": "assets/tech-icons/Arch_Amazon-Cognito_64.png"
+          },
+          {
+            "name": "Lambda@Edge",
+            "icon": "assets/tech-icons/Arch_AWS-Lambda_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Identity Platform",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          },
+          {
+            "name": "Cloud Functions",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Microsoft Entra ID",
+            "icon": "assets/tech-icons/10231-icon-service-Entra-ID-Protection.svg"
+          },
+          {
+            "name": "Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Stateless signed tokens verify at the edge without a round-trip, but single-use consumption needs a small shared store (the admissions table / Redis) to mark them spent.",
+        "Pure JWT is cheapest; a managed identity platform adds account binding, MFA, and abuse signals for free."
+      ]
+    },
+    {
+      "concern": "Atomic inventory counter",
+      "steps": [
+        "reserve",
+        "consistency"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis (Lua)",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Redis + Sentinel/Cluster",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "etcd",
+          "icon": "assets/tech-icons/etcd.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "ElastiCache (Redis)",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "DynamoDB (conditional write)",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Memorystore (Redis)",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cache for Redis",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Redis with a guarded Lua decrement is fastest but in-memory — it needs replication, fencing, and ledger rebuild for HA.",
+        "A DynamoDB/Cosmos conditional write (remaining > 0) is durable and HA out of the box, trading a little latency for no rebuild step.",
+        "AWS MemoryDB / Redis-with-quorum avoids losing acknowledged decrements on failover."
+      ],
+      "makesIrrelevant": "A durable conditional-write store (DynamoDB/Spanner/Cosmos) removes the separate counter-vs-ledger reconciliation entirely — the counter IS the durable truth."
+    },
+    {
+      "concern": "Reservation queue + async order workers",
+      "steps": [
+        "async"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "RabbitMQ",
+          "icon": "assets/tech-icons/rabbitmq.png"
+        },
+        {
+          "name": "NATS JetStream",
+          "icon": "assets/tech-icons/nats.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "At-least-once delivery from any of these requires an idempotent consumer (unique order per reservation_id) to avoid double orders/charges.",
+        "A managed queue removes broker operations; the burst is only ~hundreds/sec, so throughput isn't the constraint — durability and ordering are."
+      ]
+    },
+    {
+      "concern": "Order store + durable stock ledger",
+      "steps": [
+        "async",
+        "consistency"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "MySQL",
+          "icon": "assets/tech-icons/mysql.png"
+        },
+        {
+          "name": "CockroachDB",
+          "icon": "assets/tech-icons/cockroach.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Aurora (PostgreSQL/MySQL)",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure SQL",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Append-only ledger events + unique constraints (sale_id+idempotency_key, one order per reservation) give correctness and the counter-rebuild source of truth.",
+        "A single SKU's order volume is tiny (≤ stock), so a plain relational DB is plenty — the value is constraints and durability, not scale."
+      ]
+    },
+    {
+      "concern": "Payment integration",
+      "steps": [
+        "async"
+      ],
+      "selfHosted": [
+        {
+          "name": "Direct PSP API (Stripe/Adyen/Braintree)",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Payment Cryptography",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Step Functions (orchestration)",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Logic Apps",
+            "icon": "assets/tech-icons/10363-icon-service-Logic-Apps-Custom-Connector.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Charge asynchronously with a PSP idempotency key per reservation so re-delivered queue messages or webhook retries don't double-charge.",
+        "Treat the webhook as the source of payment truth and reconcile ambiguous timeouts against the PSP before releasing a unit."
+      ]
+    }
+  ],
   "interviewScript": [
     {
       "phase": "Scope & requirements",

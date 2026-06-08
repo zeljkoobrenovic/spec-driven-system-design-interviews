@@ -207,12 +207,6 @@
         "label": "cached free/busy"
       },
       {
-        "id": "event-cache",
-        "from": "EventSvc",
-        "to": "Cache",
-        "label": "cached calendar views"
-      },
-      {
         "id": "event-expander",
         "from": "EventSvc",
         "to": "Expander",
@@ -243,12 +237,6 @@
         "label": "materialize busy"
       },
       {
-        "id": "event-invite",
-        "from": "EventSvc",
-        "to": "InviteSvc",
-        "label": "invite attendees"
-      },
-      {
         "id": "invite-notify",
         "from": "InviteSvc",
         "to": "Notify",
@@ -259,12 +247,6 @@
         "from": "Notify",
         "to": "Client",
         "label": "notification"
-      },
-      {
-        "id": "event-reminder",
-        "from": "EventSvc",
-        "to": "ReminderQ",
-        "label": "schedule reminder"
       },
       {
         "id": "reminder-notify",
@@ -380,9 +362,14 @@
   },
   "capacity": [
     {
-      "label": "Users / events",
-      "value": "~500M users, ~10B events",
-      "note": "~3 calendars/user, ~50 active events/calendar; ~30% of events recurring (stored as ~1 rule each, not expanded)."
+      "label": "Users / calendars",
+      "value": "~500M users, ~1.5B calendars",
+      "note": "~3 calendars/user (personal, work, shared/resource). Shard key is calendar_id."
+    },
+    {
+      "label": "Canonical events vs attendee refs",
+      "value": "~10B canonical events, ~25–30B attendee refs",
+      "note": "'10B' counts canonical organizer-owned event rows (one per series — a recurring event is a single rule, never expanded). ~50% of meetings are solo; the rest average ~4 attendees, so attendee-calendar refs (calendar_event_refs) are ~2.5–3x the canonical count. Expanded instances are transient — materialized per read window, not stored."
     },
     {
       "label": "Calendar view reads",
@@ -406,8 +393,8 @@
     },
     {
       "label": "Storage",
-      "value": "~tens of TB",
-      "note": "Event rows + attendees + overrides dominate; change-log (retained ~30–90 days), busy intervals, and reminder jobs are derived/bounded."
+      "value": "~10–15 TB authoritative + derived",
+      "note": "Rough rows: ~10B canonical events @ ~0.5 KB ≈ 5 TB; ~28B attendee refs @ ~0.2 KB ≈ 5–6 TB; overrides are a small fraction. Derived/bounded: change-log retained ~30–90 days (and tombstones with it) ≈ low TB at 30k writes/sec; busy intervals are compact merged ranges; reminder jobs only hold a rolling near-future horizon. Expanded instances are never stored."
     },
     {
       "label": "Latency targets",
@@ -419,7 +406,7 @@
     {
       "method": "POST",
       "path": "/v1/events",
-      "description": "Create an event (one-off or recurring); conflict-checks (policy), invites attendees, schedules reminders. Idempotent via Idempotency-Key.",
+      "description": "Create an event (one-off or recurring). Synchronously conflict-checks (policy) and commits the event plus an outbox row in one transaction; invite fanout, reminder materialization, busy-index, and cache updates are projector work off the change log, not part of the request. Idempotent via Idempotency-Key.",
       "request": "{ \"calendarId\": \"c_1\", \"organizerId\": \"u_1\", \"start\": \"2026-06-01T10:00\", \"tz\": \"America/Los_Angeles\", \"duration\": \"PT1H\", \"rrule\": \"FREQ=WEEKLY;BYDAY=MO\", \"visibility\": \"busy\", \"attendees\": [\"u_2\",\"u_3\"], \"reminders\": [{ \"offset\": \"PT10M\" }], \"idempotencyKey\": \"k_8f3\" }",
       "response": "{ \"eventId\": \"e_9\", \"version\": 1 }",
       "sequence": {
@@ -440,8 +427,12 @@
             "label": "Event Store"
           },
           {
-            "id": "InviteSvc",
-            "label": "Invites"
+            "id": "ChangeLog",
+            "label": "Change Log"
+          },
+          {
+            "id": "Projector",
+            "label": "Projector"
           }
         ],
         "messages": [
@@ -461,19 +452,25 @@
             "from": "EventSvc",
             "to": "EventDB",
             "arrow": "->>",
-            "label": "persist rule + outbox row (one txn)"
-          },
-          {
-            "from": "EventSvc",
-            "to": "InviteSvc",
-            "arrow": "->>",
-            "label": "invite attendees"
+            "label": "persist event/attendees + outbox row (one txn)"
           },
           {
             "from": "EventSvc",
             "to": "Client",
             "arrow": "-->>",
             "label": "201 eventId"
+          },
+          {
+            "from": "EventDB",
+            "to": "ChangeLog",
+            "arrow": "->>",
+            "label": "committed change available"
+          },
+          {
+            "from": "ChangeLog",
+            "to": "Projector",
+            "arrow": "->>",
+            "label": "async: invites, reminders, busy index, attendee refs"
           }
         ]
       }
@@ -481,9 +478,9 @@
     {
       "method": "GET",
       "path": "/v1/freebusy",
-      "description": "Find busy intervals (or free slots) across attendees over a range.",
-      "request": "?attendees=u1,u2,u3&from=...&to=...",
-      "response": "{ \"busy\": { \"u1\": [ ... ] }, \"freeSlots\": [ ... ] }",
+      "description": "Find busy intervals (or free slots) across attendees over a range. The caller is authenticated (callerId from the auth context) and authorized per attendee against calendar_acl before any interval is returned. Per attendee the response is one of: busy intervals (freebusy_only/reader rights — private events still contribute a busy block but no title/location), event detail (reader+ rights), or 'unknown' (no permission). The caller never learns more than their ACL allows.",
+      "request": "Authorization: Bearer <caller>  ?attendees=u1,u2,u3&from=...&to=...",
+      "response": "{ \"perAttendee\": { \"u1\": { \"access\": \"busy\", \"busy\": [ ... ] }, \"u2\": { \"access\": \"unknown\" } }, \"freeSlots\": [ ... over authorized attendees ... ] }",
       "sequence": {
         "participants": [
           {
@@ -503,19 +500,25 @@
             "from": "Client",
             "to": "FreeBusy",
             "arrow": "->>",
-            "label": "free/busy(attendees, range)"
+            "label": "free/busy(caller, attendees, range)"
+          },
+          {
+            "from": "FreeBusy",
+            "to": "FreeBusy",
+            "arrow": "->>",
+            "label": "authorize caller per attendee (calendar_acl)"
           },
           {
             "from": "FreeBusy",
             "to": "BusyIndex",
             "arrow": "->>",
-            "label": "busy intervals per calendar"
+            "label": "busy intervals for authorized calendars"
           },
           {
             "from": "FreeBusy",
             "to": "Client",
             "arrow": "-->>",
-            "label": "busy + free slots"
+            "label": "busy/unknown per attendee + free slots"
           }
         ]
       }
@@ -559,7 +562,7 @@
   "dataModel": [
     {
       "name": "events",
-      "note": "Authoritative events; recurring stored as a rule, not expanded instances. 'version' drives optimistic concurrency; local start + TZID preserve user intent across DST/tzdb changes.",
+      "note": "Authoritative events; recurring stored as a rule, not expanded instances. 'version' drives optimistic concurrency; local start + TZID preserve user intent across DST/tzdb changes. A 'this and following' edit is a series split: the old row gets an UNTIL-bounded rrule and the new series is a new row with split_from_event_id pointing back.",
       "fields": [
         {
           "name": "event_id",
@@ -600,6 +603,10 @@
         {
           "name": "version",
           "type": "int (optimistic concurrency)"
+        },
+        {
+          "name": "split_from_event_id",
+          "type": "uuid | null (set on the new series of a 'this and following' split)"
         }
       ]
     },
@@ -623,7 +630,7 @@
     },
     {
       "name": "attendees",
-      "note": "Invite + RSVP state per event. response_at + event_version let an RSVP merge cleanly with concurrent organizer edits.",
+      "note": "Invite + RSVP state per event (organizer-side roster). response_at + event_version let an RSVP merge cleanly with concurrent organizer edits. The per-attendee-calendar projection used for attendee reads/busy/sync lives in calendar_event_refs.",
       "fields": [
         {
           "name": "event_id",
@@ -644,6 +651,48 @@
         {
           "name": "event_version",
           "type": "int (version the response was made against)"
+        }
+      ]
+    },
+    {
+      "name": "calendar_event_refs",
+      "note": "Attendee-calendar projection: one row per (attendee calendar, event) so an attendee's calendar reads, busy index, reminders, and delta sync work without scanning organizer-owned events. Maintained by the projector off the change log; the organizer event stays the source of truth for details.",
+      "fields": [
+        {
+          "name": "calendar_id",
+          "type": "bigint (attendee's calendar = shard key)"
+        },
+        {
+          "name": "event_id",
+          "type": "uuid (organizer-owned event)"
+        },
+        {
+          "name": "organizer_calendar_id",
+          "type": "bigint (where the canonical event lives)"
+        },
+        {
+          "name": "attendee_user_id",
+          "type": "bigint"
+        },
+        {
+          "name": "response",
+          "type": "enum(needs_action, accepted, declined, tentative)"
+        },
+        {
+          "name": "blocks_time",
+          "type": "bool (does this copy contribute a busy interval — false when declined)"
+        },
+        {
+          "name": "visibility_override",
+          "type": "enum(inherit, busy, private, hidden) | null"
+        },
+        {
+          "name": "local_reminder_overrides",
+          "type": "json (per-attendee reminder offsets) | null"
+        },
+        {
+          "name": "last_seen_event_version",
+          "type": "int (organizer version this ref reflects)"
         }
       ]
     },
@@ -688,6 +737,22 @@
         {
           "name": "state",
           "type": "enum(scheduled, leased, sent, failed, cancelled, superseded)"
+        },
+        {
+          "name": "lease_until",
+          "type": "timestamp | null (visibility timeout while a worker holds the job)"
+        },
+        {
+          "name": "attempt_count",
+          "type": "int (retries; drives backoff and dead-lettering)"
+        },
+        {
+          "name": "channel",
+          "type": "enum(push, email, sms)"
+        },
+        {
+          "name": "recipient_id",
+          "type": "bigint (who to notify)"
         }
       ]
     },
@@ -819,7 +884,7 @@
       "title": "1. Naive: One Row per Occurrence, Local-String Times",
       "description": [
         "Start with the simplest thing that works. Store each event as a row with a plain local time string (e.g. '2026-06-01 09:00'). For a recurring event, pre-create a row for every occurrence up front — a 'daily standup' becomes thousands of rows.",
-        "This is intuitive and breaks on the two things that make calendars hard. Recurrence: a rule with no end date is infinite, so you can't pre-create its occurrences at all, and even bounded ones explode into huge instance sets — and editing the series means rewriting every row. Time: storing a bare local string with no zone means you can't compare or order events across timezones, and DST quietly corrupts everything — a 'daily 9am' either drifts by an hour after a DST change or lands on times that don't exist (spring-forward) or repeat (fall-back).",
+        "This is intuitive and breaks on the two things that make calendars hard. Recurrence: a rule with no end date is infinite, so you can't pre-create its occurrences at all; even bounded ones explode into huge instance sets, and editing the series means rewriting every row. Time: storing a bare local string with no zone means you can't compare or order events across timezones, and DST quietly corrupts everything — a 'daily 9am' either drifts by an hour after a DST change or lands on a time that doesn't exist (spring-forward) or repeats (fall-back).",
         "So the baseline motivates the real model: store a recurring event as a rule and expand it to concrete instances only for the window being viewed, and store times in UTC with the original timezone, expanding recurrence in local wall-clock so 9am stays 9am across DST."
       ],
       "view": {
@@ -1054,7 +1119,8 @@
       "description": [
         "The most error-prone requirement. Store event times in UTC plus the original timezone, and convert at the edges (display, recurrence expansion). But a recurring 'every day at 9am local' is anchored to wall-clock local time, not a fixed UTC offset — across a DST change, 9am local shifts in UTC.",
         "So recurrence must expand in the event's local timezone (apply the rule on local wall-clock, then convert each instance to UTC), or DST transitions produce wrong instance times. Handle the gnarly DST edge cases: a 2:30am event on a spring-forward day doesn't exist; a fall-back hour repeats.",
-        "Keep the original tz on the event (not just UTC) so edits and expansion stay correct, and so '9am' stays 9am after DST."
+        "Keep the original tz on the event (not just UTC) so edits and expansion stay correct, and so '9am' stays 9am after DST.",
+        "Operational policy for tzdb updates: because future UTC instants are derived from local-time + TZID, a government rule change (or tzdb release) must not corrupt stored events. Recompute lazily — future instances are derived at read time from the live tz database, so they're already correct. Then run a background reindex of the affected zones' derived busy index, materialized windows, and scheduled reminder jobs, so derived state and already-scheduled reminders pick up the new offsets. The authoritative local-time + TZID rows never change."
       ],
       "view": {
         "nodes": [
@@ -1062,7 +1128,7 @@
           "Expander",
           "EventDB"
         ],
-        "caption": "The Event Service hands the stored event and its RRULE to the expander, which generates the local-time occurrences attached to the event's IANA time zone.",
+        "caption": "The Event Service hands the stored event and its RRULE to the expander, which generates the local-time occurrences attached to the event's IANA timezone.",
         "links": [
           "event-expander",
           "event-db"
@@ -1178,8 +1244,8 @@
       "title": "4. Free/Busy Availability",
       "description": [
         "Scheduling assistants and meeting-finders need 'when are these N people free?'. Computing that by expanding every attendee's full calendar per query is slow. Maintain a per-calendar busy-interval index: the merged busy time ranges, kept current as events change.",
-        "Free/busy then becomes a fast range query: pull each attendee's busy intervals over the window, merge them, and the gaps are the mutually-free slots. The index hides event details (privacy) — it only exposes busy/free, which is also what cross-organization free/busy sharing needs.",
-        "The busy index is derived from events (including expanded recurrence) and rebuildable; it's updated when events are created/edited."
+        "Free/busy then becomes a fast range query: pull each attendee's busy intervals over the window, merge them, and the gaps are the mutually-free slots. The index exposes only busy/free, never event details — but it is privacy-preserving only when the caller is authorized against the calendar ACL before any interval is returned (busy-only for a colleague, 'unknown' for someone with no permission). That same ACL check is what cross-organization free/busy sharing needs.",
+        "Per-attendee, the index must reflect that attendee's own copy, not just the organizer's event: it's built from the attendee calendar's refs (see Step 5), so a declined or hidden invite contributes no busy block while an accepted one does. The busy index is derived from events + attendee refs (including expanded recurrence) and rebuildable; the projector updates it off the change log when events or RSVPs change."
       ],
       "view": {
         "nodes": [
@@ -1315,7 +1381,7 @@
       "flows": [
         {
           "name": "Multi-attendee free/busy via the busy-interval index",
-          "note": "Instead of expanding every attendee's full calendar, pull each attendee's merged busy intervals from the index over the window and merge; the gaps are the mutually-free slots.",
+          "note": "The caller is authorized per attendee against calendar_acl before any interval is read — busy-only for freebusy_only/reader, 'unknown' where the caller has no permission. For authorized calendars, pull merged busy intervals from the index over the window and merge; the gaps are the mutually-free slots. Private events still contribute a busy block but expose no title/location, so the index is privacy-preserving only because the ACL check happens first.",
           "sequence": {
             "participants": [
               {
@@ -1339,9 +1405,15 @@
               },
               {
                 "from": "FreeBusy",
+                "to": "FreeBusy",
+                "arrow": "->>",
+                "label": "authorize caller per attendee (calendar_acl)"
+              },
+              {
+                "from": "FreeBusy",
                 "to": "BusyIndex",
                 "arrow": "->>",
-                "label": "busy intervals per calendar"
+                "label": "busy intervals for authorized calendars"
               },
               {
                 "from": "FreeBusy",
@@ -1353,7 +1425,7 @@
                 "from": "FreeBusy",
                 "to": "Client",
                 "arrow": "-->>",
-                "label": "candidate free slots"
+                "label": "candidate free slots (+ unknown attendees)"
               }
             ]
           },
@@ -1417,29 +1489,35 @@
       "id": "invites",
       "title": "5. Invites and RSVPs",
       "description": [
-        "A meeting with attendees lives on multiple calendars. The invite service fans the event out to each attendee's calendar (or external system) and tracks RSVP state (accepted/declined/tentative) per attendee.",
-        "RSVPs and organizer edits must propagate: when an attendee responds or the organizer changes the time, all attendees' views update and are notified. There's one organizer-owned source event; attendee copies/references reflect it. Cross-provider invites use the iCalendar/iTIP standard.",
-        "Concurrency: organizer edits and attendee RSVPs can race; the organizer's event is authoritative for the event details, attendee rows for responses."
+        "A meeting with attendees lives on multiple calendars. The default keeps one organizer-owned source event (no per-attendee copy write-storm), but each attendee still needs that event to show up in their own calendar reads, busy index, reminders, and delta sync — without scanning every organizer-owned event they might appear on. That's the attendee-calendar projection: a lightweight per-(attendee calendar, event) reference (calendar_event_refs) that the projector maintains off the change log.",
+        "So an organizer edit doesn't call attendees directly: it commits the new version plus an outbox row, and the projector fans the change into each affected attendee calendar's refs — updating its busy intervals, local reminder state, and that calendar's sync cursor — then notifies. The ref carries per-attendee state the organizer event shouldn't: response, blocks_time (false when declined), visibility_override, and local reminder overrides. Cross-provider invites use the iCalendar/iTIP standard.",
+        "Concurrency: organizer edits and attendee RSVPs can race; the organizer's event is authoritative for the event details, the attendee row / ref for that attendee's response and local overrides. RSVPs are idempotent and version-stamped so an update fanout never erases a just-recorded response."
       ],
       "view": {
         "nodes": [
           "EventSvc",
+          "ChangeLog",
+          "Projector",
           "InviteSvc",
           "Notify",
           "Client"
         ],
-        "caption": "The Event Service tells the Invite/RSVP Service to invite attendees; it notifies clients of invites and updates, and RSVP replies flow back to update the event.",
+        "caption": "Each event write commits an outbox row to the change log; a projector fans the change out into every attendee calendar's refs and notifies clients, while RSVP replies flow back to update the organizer's event.",
         "links": [
-          "event-invite",
+          "event-changelog",
+          "changelog-projector",
+          "projector-invite",
           "invite-notify",
           "notify-client",
           "invite-event"
         ],
         "highlight": [
+          "Projector",
           "InviteSvc"
         ],
         "groups": [
           "collab",
+          "pipeline",
           "events"
         ]
       },
@@ -1460,22 +1538,28 @@
           "view": {
             "nodes": [
               "EventSvc",
+              "ChangeLog",
+              "Projector",
               "InviteSvc",
               "Notify",
               "Client"
             ],
-            "caption": "Attendees reference a single organizer-owned event, so the Invite Service sends notifications and writes RSVP changes back onto that one event.",
+            "caption": "Attendees reference one organizer-owned event; a projector replays each event change into the attendees' calendar refs and notifications, and RSVP changes write back onto that single event.",
             "links": [
-              "event-invite",
+              "event-changelog",
+              "changelog-projector",
+              "projector-invite",
               "invite-notify",
               "notify-client",
               "invite-event"
             ],
             "highlight": [
+              "Projector",
               "InviteSvc"
             ],
             "groups": [
               "collab",
+              "pipeline",
               "events"
             ]
           }
@@ -1506,7 +1590,11 @@
             ],
             "caption": "The Invite Service writes one event copy per attendee into per-attendee storage and notifies each client, instead of sharing a single organizer event.",
             "links": [
-              "event-invite",
+              {
+                "from": "EventSvc",
+                "to": "InviteSvc",
+                "label": "fan out on invite"
+              },
               {
                 "from": "InviteSvc",
                 "to": "AttendeeDB",
@@ -1539,6 +1627,13 @@
           "whyItMatters": "Keeps event details consistent across many calendars while letting each attendee respond.",
           "example": "Organizer moves the time -> propagate to attendees -> notify; RSVPs preserved.",
           "group": "Invites and RSVPs"
+        },
+        {
+          "term": "Attendee-calendar projection",
+          "definition": "A lightweight per-(attendee calendar, event) reference (calendar_event_refs) the projector maintains off the change log, carrying response, blocks_time, visibility, and reminder overrides.",
+          "whyItMatters": "Lets an attendee's calendar reads, busy index, reminders, and delta sync work locally without scanning organizer-owned events — and connects invites to free/busy and sync.",
+          "example": "Organizer event v5 → projector updates u2's ref (blocks_time=true) → u2's busy index and sync cursor advance.",
+          "group": "Invites and RSVPs"
         }
       ],
       "recap": {
@@ -1548,8 +1643,8 @@
       },
       "flows": [
         {
-          "name": "Organizer edit propagates to attendees",
-          "note": "The organizer's event is authoritative; an edit fans out to each attendee's calendar via the invite service and notifies them, while RSVP state per attendee is preserved.",
+          "name": "Organizer edit propagates to attendees (via change log)",
+          "note": "The organizer's event is authoritative. The edit commits the new version plus an outbox row in one transaction; a projector replays the change into each attendee calendar's refs (updating its busy intervals and local reminder state), then the invite service notifies them. Per-attendee RSVP state is preserved — the projection updates the time/details, not the response.",
           "sequence": {
             "participants": [
               {
@@ -1558,6 +1653,14 @@
               {
                 "id": "EventSvc",
                 "label": "Event Service"
+              },
+              {
+                "id": "ChangeLog",
+                "label": "Change Log"
+              },
+              {
+                "id": "Projector",
+                "label": "Projector"
               },
               {
                 "id": "InviteSvc",
@@ -1573,13 +1676,25 @@
                 "from": "Client",
                 "to": "EventSvc",
                 "arrow": "->>",
-                "label": "organizer moves time +1h"
+                "label": "organizer moves time +1h (v5)"
               },
               {
                 "from": "EventSvc",
+                "to": "ChangeLog",
+                "arrow": "->>",
+                "label": "event upsert @ v5 (in write txn)"
+              },
+              {
+                "from": "ChangeLog",
+                "to": "Projector",
+                "arrow": "->>",
+                "label": "consume change"
+              },
+              {
+                "from": "Projector",
                 "to": "InviteSvc",
                 "arrow": "->>",
-                "label": "propagate updated event"
+                "label": "update each attendee ref (RSVPs kept)"
               },
               {
                 "from": "InviteSvc",
@@ -1591,11 +1706,12 @@
                 "from": "Notify",
                 "to": "Client",
                 "arrow": "->>",
-                "label": "notify attendees (RSVPs kept)"
+                "label": "notify attendees"
               }
             ]
           },
           "highlight": [
+            "Projector",
             "InviteSvc",
             "Notify"
           ]
@@ -1947,7 +2063,120 @@
           "pipeline"
         ]
       },
-      "decisionPrompt": "Everyone has a 9am meeting reminder. What happens at 8:50am across millions of users?",
+      "options": [
+        {
+          "name": "Shard by calendar (default)",
+          "description": "Partition the event store, change log, and busy index by calendar_id, so a calendar's authoritative events, its ordered change log (= sync cursor), and its derived busy intervals all live on the same shard.",
+          "pros": [
+            "A calendar read, its delta-sync cursor, and its busy index are all shard-local — no cross-shard join for the common day/week view.",
+            "The per-calendar change log gives a natural monotonic sync cursor and projector partition.",
+            "Resource calendars (rooms) are first-class shards you can isolate or cache when hot."
+          ],
+          "cons": [
+            "A multi-attendee free/busy still fans out across each attendee's calendar shard and merges (cap attendee count, parallelize).",
+            "A user with many calendars spreads across shards, so 'all my calendars' is a scatter-gather.",
+            "Hot shared/resource calendars are hotspots needing a dedicated partition or write-through cache."
+          ],
+          "view": {
+            "nodes": [
+              "EventSvc",
+              "EventDB",
+              "ChangeLog",
+              "BusyIndex"
+            ],
+            "caption": "Events, the per-calendar change log, and the busy index are co-located on the calendar's shard, so reads and the sync cursor stay local.",
+            "links": [
+              "event-db",
+              "event-changelog",
+              {
+                "from": "ChangeLog",
+                "to": "BusyIndex",
+                "label": "per-calendar projector"
+              }
+            ],
+            "highlight": [
+              "EventDB",
+              "ChangeLog"
+            ]
+          }
+        },
+        {
+          "name": "Shard by user",
+          "description": "Partition by user_id so all of a user's calendars and their attendee refs sit on one shard; a user's full view is one shard-local read.",
+          "pros": [
+            "'All my calendars' and a user's whole device sync are a single shard-local read.",
+            "Per-user reminder and sync state co-locate with the user.",
+            "Simple owner-based routing for personal-calendar-heavy workloads."
+          ],
+          "cons": [
+            "Shared and resource calendars have no single owner — they fit awkwardly or get duplicated across member shards.",
+            "A meeting spanning many users still fans out across user shards for free/busy.",
+            "Power users / large org calendars become individual hotspots."
+          ],
+          "view": {
+            "nodes": [
+              "EventSvc",
+              "EventDB",
+              "BusyIndex"
+            ],
+            "caption": "All of a user's calendars and attendee refs live on the user's shard, so a user's full calendar view is one local read.",
+            "links": [
+              "event-db",
+              {
+                "from": "EventDB",
+                "to": "BusyIndex",
+                "label": "per-user busy index"
+              }
+            ],
+            "highlight": [
+              "EventDB"
+            ]
+          }
+        },
+        {
+          "name": "Hybrid: calendar-sharded + isolated resource/shared calendars",
+          "description": "Shard by calendar by default, but pull hot shared/resource calendars (popular rooms, large org calendars) onto dedicated partitions with write-through caches and stricter conflict policy.",
+          "pros": [
+            "Keeps shard-local reads/sync for personal calendars while removing the room-calendar hotspot.",
+            "Conflict policy (room double-booking) is enforced at one authoritative partition.",
+            "Lets you scale the few hot calendars independently of the long tail."
+          ],
+          "cons": [
+            "Two routing rules to operate (default hash + hot-calendar override list).",
+            "Promoting a calendar to its own partition is a migration, not a config flip.",
+            "Cross-shard free/busy fan-out is unchanged for mixed-attendee meetings."
+          ],
+          "view": {
+            "nodes": [
+              "EventSvc",
+              "EventDB",
+              "ChangeLog",
+              "Cache",
+              "BusyIndex"
+            ],
+            "caption": "Default calendars shard by calendar_id; hot resource/shared calendars get a dedicated partition fronted by a write-through cache.",
+            "links": [
+              "event-db",
+              "event-changelog",
+              {
+                "from": "EventSvc",
+                "to": "Cache",
+                "label": "write-through (hot resource cal)"
+              },
+              {
+                "from": "ChangeLog",
+                "to": "BusyIndex",
+                "label": "per-calendar projector"
+              }
+            ],
+            "highlight": [
+              "Cache",
+              "EventDB"
+            ]
+          }
+        }
+      ],
+      "decisionPrompt": "Everyone has a 9am meeting reminder. What happens at 8:50am across millions of users — and how should you shard so the busy index, sync cursor, and reminders stay local?",
       "patterns": [
         "Durable change log + idempotent projectors"
       ],
@@ -2002,7 +2231,7 @@
   ],
   "finalDesign": {
     "title": "Final Design — Calendar System",
-    "description": "Events persist authoritatively (recurring ones as RRULE rules, never expanded instances), with single-instance edits/cancellations as overrides keyed by a stable recurrence id and 'this and following' modeled as a series split. Reads expand rules for the queried window in the event's local timezone (DST-correct, with explicit nonexistent/ambiguous-time policies) and apply overrides. Every event write commits with an outbox row into a per-calendar change log; idempotent projectors replay that log to keep the busy-interval index, reminder jobs, invite fanout, device-sync cursors, and read cache current — so all of those are derived and rebuildable. A per-calendar busy-interval index makes multi-attendee free/busy a fast range-merge. Invites fan out with organizer-authoritative, versioned details and idempotent RSVPs; reminders are fired once via lease + dedup (at-least-once delivery), local-tz, and devices stay current via cursor-based delta sync with tombstones. Events shard by calendar; reminder bursts are absorbed by the scheduler queue; projector lag is the bounded eventual-consistency budget.",
+    "description": "Events persist authoritatively (recurring ones as RRULE rules, never expanded instances), with single-instance edits/cancellations as overrides keyed by a stable recurrence id and 'this and following' modeled as a series split. Reads expand rules for the queried window in the event's local timezone (DST-correct, with explicit nonexistent/ambiguous-time policies) and apply overrides. Every event write commits with an outbox row into a per-calendar change log; idempotent projectors replay that log to keep the busy-interval index, reminder jobs, invite fanout, device-sync cursors, and read cache current — so all of those are derived and rebuildable. A per-calendar busy-interval index makes multi-attendee free/busy a fast range-merge, and the Free/Busy service authorizes the caller against calendar ACLs before returning intervals (busy-only / unknown / detail). Invites stay organizer-authoritative with versioned details and idempotent RSVPs; the projector maintains a lightweight attendee-calendar projection (calendar_event_refs) so each attendee's reads, busy index, reminders, and sync cursor work without scanning organizer-owned events. Reminders are fired once via lease + dedup (at-least-once delivery), local-tz, and devices stay current via cursor-based delta sync with tombstones. Events shard by calendar; reminder bursts are absorbed by the scheduler queue; projector lag is the bounded eventual-consistency budget.",
     "view": {
       "nodes": [
         "Client",
@@ -2039,7 +2268,6 @@
         "projector-cache",
         "invite-notify",
         "notify-client",
-        "event-reminder",
         "reminder-notify",
         "client-sync",
         "sync-changelog",
@@ -2109,9 +2337,10 @@
       },
       {
         "requirement": "Consistent propagation",
-        "how": "Organizer-authoritative events + invite/sync paths.",
+        "how": "Organizer-authoritative events; projector fans changes into attendee-calendar refs (calendar_event_refs) for reads, busy index, and sync.",
         "steps": [
-          "invites"
+          "invites",
+          "scale"
         ]
       },
       {
@@ -2148,7 +2377,7 @@
       },
       {
         "requirement": "Free/busy privacy",
-        "how": "Busy-interval index exposes only busy/free; calendar ACLs gate detail visibility.",
+        "how": "Caller authorized against calendar ACLs before any interval is returned (busy-only / unknown / detail); private events contribute a busy block but no title/location.",
         "steps": [
           "freebusy"
         ]

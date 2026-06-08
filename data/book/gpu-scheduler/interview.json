@@ -120,6 +120,26 @@
           "stateful"
         ],
         "description": "Stores job container images pulled by worker nodes."
+      },
+      {
+        "id": "Checkpoints",
+        "label": "Checkpoint Store",
+        "type": "object-storage",
+        "category": "state",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Object store for preemption/restart checkpoints; agents write here and jobs resume from checkpoint_uri."
+      },
+      {
+        "id": "Events",
+        "label": "Log / Event Store",
+        "type": "object-storage",
+        "category": "state",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Append-only job_events + log sink backing status and /jobs/{id}/events queries."
       }
     ],
     "links": [
@@ -202,10 +222,16 @@
         "label": "report usage/health"
       },
       {
-        "id": "metrics-res",
-        "from": "Metrics",
+        "id": "agent-res",
+        "from": "Agent",
         "to": "ResManager",
-        "label": "free-on-completion"
+        "label": "status events: launched / exited / lease renew"
+      },
+      {
+        "id": "agent-jobdb",
+        "from": "Agent",
+        "to": "JobDB",
+        "label": "attempt + event records"
       },
       {
         "id": "sched-preempt",
@@ -224,6 +250,18 @@
         "from": "Metrics",
         "to": "Quota",
         "label": "usage for fair-share"
+      },
+      {
+        "id": "agent-checkpoints",
+        "from": "Agent",
+        "to": "Checkpoints",
+        "label": "write/read checkpoint"
+      },
+      {
+        "id": "agent-events",
+        "from": "Agent",
+        "to": "Events",
+        "label": "append job events/logs"
       }
     ],
     "types": [
@@ -244,7 +282,9 @@
         "nodes": [
           "Nodes",
           "Agent",
-          "Registry"
+          "Registry",
+          "Checkpoints",
+          "Events"
         ]
       }
     ]
@@ -287,37 +327,57 @@
   },
   "capacity": [
     {
-      "label": "GPUs",
-      "value": "1,000s",
-      "note": "Across many nodes (e.g. 8 GPUs/node)."
+      "label": "GPUs / nodes",
+      "value": "1K–10K GPUs ≈ 125–1,250 nodes",
+      "note": "At 8 GPUs/node. Node count, not GPU count, drives heartbeat and free-list size."
     },
     {
-      "label": "Jobs per day",
-      "value": "10K+",
-      "note": "Mix of short inference and long multi-day training."
+      "label": "Submit rate",
+      "value": "~0.12/sec avg, ~10–50/sec burst",
+      "note": "10K jobs/day is trivial average QPS; the API is not the bottleneck — bursts and scans are."
     },
     {
-      "label": "Largest job",
-      "value": "100s of GPUs",
-      "note": "Distributed training needs all GPUs at once (gang)."
+      "label": "Scheduling loop",
+      "value": "1–10 decisions/sec",
+      "note": "One scheduler loop suffices at this scale; shard by pool only when scoring can't keep the queue drained."
     },
     {
-      "label": "Cost per GPU-hour",
-      "value": "$$$",
-      "note": "Why utilization is the headline metric."
+      "label": "Placement work",
+      "value": "~10–100 candidates scored/job",
+      "note": "Indexed free-lists by (type, mem, topology) avoid a full 1K-node scan; topology scoring is the costly part."
+    },
+    {
+      "label": "Heartbeats",
+      "value": "~125–1,250/5s (node cadence)",
+      "note": "~25–250 hb/sec at a 5s cadence — well within one resource manager; per-GPU would be 8× that."
+    },
+    {
+      "label": "Pending queue",
+      "value": "1K–10K jobs deep under burst",
+      "note": "Big gangs at head-of-line can hold the queue deep; backfill keeps GPUs busy meanwhile."
+    },
+    {
+      "label": "Checkpoint I/O",
+      "value": "10s–100s GB/checkpoint",
+      "note": "Preemption is storage-bandwidth bound: a 200GB checkpoint at 5 GB/s ≈ 40s drain before a GPU frees."
     },
     {
       "label": "Walltime range",
       "value": "minutes to days",
-      "note": "Drives preemption + checkpoint design."
+      "note": "Drives preemption + checkpoint design; long jobs amplify wasted work on kill-restart."
+    },
+    {
+      "label": "Cost per GPU-hour",
+      "value": "$$$",
+      "note": "Why utilization is the headline metric — every idle GPU-hour is burned money."
     }
   ],
   "api": [
     {
       "method": "POST",
       "path": "/v1/jobs",
-      "description": "Submit a job with its resource request. Returns once queued.",
-      "request": "{ \"gpus\": 8, \"gpuType\": \"a100\", \"memGB\": 80, \"walltime\": \"24h\", \"priority\": \"prod\", \"team\": \"vision\", \"image\": \"...\" }",
+      "description": "Submit a job with its resource request. Idempotency-Key header dedups client retries. Returns once queued.",
+      "request": "{ \"idempotencyKey\": \"sub-9af3\", \"gpus\": 8, \"gpuType\": \"a100\", \"memGB\": 80, \"walltime\": \"24h\", \"priority\": \"prod\", \"team\": \"vision\", \"image\": \"reg/trainer:1.4\", \"command\": [\"python\",\"train.py\"], \"gang\": { \"minReplicas\": 8 }, \"constraints\": { \"topology\": \"same-nvlink\", \"migProfile\": null, \"nodeSelector\": {} }, \"retryPolicy\": { \"maxRetries\": 3 }, \"preemptible\": true, \"maxPreemptions\": 5, \"checkpoint\": { \"enabled\": true, \"uri\": \"s3://ck/vision/j771\", \"intervalMin\": 30 }, \"logSink\": \"s3://logs/vision/j771\" }",
       "response": "{ \"jobId\": \"j_771\", \"state\": \"pending\" }",
       "sequence": {
         "participants": [
@@ -378,14 +438,21 @@
     {
       "method": "GET",
       "path": "/v1/jobs/{id}",
-      "description": "Get job status and placement.",
+      "description": "Get job status, placement, and attempt/checkpoint history.",
       "request": "(id in path)",
-      "response": "{ \"jobId\": \"j_771\", \"state\": \"running\", \"nodes\": [\"n12\",\"n13\"] }"
+      "response": "{ \"jobId\": \"j_771\", \"state\": \"running\", \"nodes\": [\"n12\",\"n13\"], \"attempt\": 2, \"preemptionCount\": 1, \"checkpointUri\": \"s3://ck/vision/j771/step-4200\", \"logSink\": \"s3://logs/vision/j771\" }"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/jobs/{id}/events",
+      "description": "Stream the job's lifecycle/log events (queued -> scheduled -> started -> checkpointed -> ...), each carrying a log-sink pointer.",
+      "request": "(id in path; optional ?since=cursor)",
+      "response": "{ \"events\": [ { \"ts\": \"...\", \"kind\": \"preempted\", \"logSink\": \"s3://logs/vision/j771/attempt-1\" } ] }"
     },
     {
       "method": "DELETE",
       "path": "/v1/jobs/{id}",
-      "description": "Cancel a job; frees its GPUs back to the resource manager.",
+      "description": "Cancel a job. A queued job is marked cancelled so the scheduler skips it even if a stale queue reference remains; a running job is drained and its GPUs freed back to the resource manager.",
       "request": "(id in path)",
       "response": "{ \"state\": \"cancelled\" }"
     }
@@ -421,17 +488,41 @@
         },
         {
           "name": "state",
-          "type": "enum(pending, scheduled, running, succeeded, failed, preempted)"
+          "type": "enum(pending, scheduled, running, succeeded, failed, preempted, cancelled)"
         },
         {
           "name": "placement",
           "type": "list<node_id,gpu_idx>"
+        },
+        {
+          "name": "idempotency_key",
+          "type": "string unique (dedups client retries)"
+        },
+        {
+          "name": "preemptible",
+          "type": "bool"
+        },
+        {
+          "name": "max_preemptions",
+          "type": "int (anti-thrash cap)"
+        },
+        {
+          "name": "preemption_count",
+          "type": "int (live)"
+        },
+        {
+          "name": "checkpoint_uri",
+          "type": "string | null (last successful checkpoint)"
+        },
+        {
+          "name": "constraints",
+          "type": "json (mig_profile, topology, node_selector, taints)"
         }
       ]
     },
     {
       "name": "gpus",
-      "note": "Resource manager's inventory (one row per physical GPU).",
+      "note": "Resource manager's inventory (one row per physical GPU). Indexed by (gpu_type, mem_gb, node, topology_domain, health) so placement is a free-list lookup, not a full scan.",
       "fields": [
         {
           "name": "gpu_id",
@@ -446,8 +537,16 @@
           "type": "int"
         },
         {
+          "name": "mig_profile",
+          "type": "string | null (partition if MIG-sliced)"
+        },
+        {
           "name": "allocated_to",
           "type": "job_id | null"
+        },
+        {
+          "name": "health",
+          "type": "enum(healthy, degraded, failed)"
         },
         {
           "name": "node_state",
@@ -457,7 +556,7 @@
     },
     {
       "name": "quotas",
-      "note": "Per-team guaranteed + burst limits used for fair-share.",
+      "note": "Per-team guaranteed + burst limits and rolling usage used for fair-share.",
       "fields": [
         {
           "name": "team",
@@ -474,6 +573,156 @@
         {
           "name": "used_gpus",
           "type": "int (live)"
+        },
+        {
+          "name": "usage_window",
+          "type": "rolling GPU-seconds (e.g. 24h decay)"
+        },
+        {
+          "name": "weight",
+          "type": "float (relative fair-share weight)"
+        }
+      ]
+    },
+    {
+      "name": "allocations",
+      "note": "Authoritative allocation lifecycle — who owns which GPUs, leased and fenced. The resource manager is source of truth for freeing capacity, not metrics.",
+      "fields": [
+        {
+          "name": "alloc_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "job_id",
+          "type": "uuid (index)"
+        },
+        {
+          "name": "gpu_ids",
+          "type": "list<(node_id, idx)>"
+        },
+        {
+          "name": "scheduler_epoch",
+          "type": "int (fencing token — rejects stale schedulers)"
+        },
+        {
+          "name": "lease_expires_at",
+          "type": "timestamp (agent must renew)"
+        },
+        {
+          "name": "launch_token",
+          "type": "uuid (idempotent launch ack)"
+        },
+        {
+          "name": "state",
+          "type": "enum(reserved, acked, running, freed)"
+        }
+      ]
+    },
+    {
+      "name": "reservations",
+      "note": "Future-start reservation for a head-of-line gang — holds a planned start, never partial GPUs. Backfill jobs must finish before this start.",
+      "fields": [
+        {
+          "name": "res_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "job_id",
+          "type": "uuid (the waiting gang)"
+        },
+        {
+          "name": "gpus_needed",
+          "type": "int"
+        },
+        {
+          "name": "planned_start",
+          "type": "timestamp (est. when enough free)"
+        },
+        {
+          "name": "priority",
+          "type": "fair-share score at reservation time"
+        }
+      ]
+    },
+    {
+      "name": "job_attempts",
+      "note": "One row per launch attempt — retries, preemptions, and restarts are auditable and counted.",
+      "fields": [
+        {
+          "name": "attempt_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "job_id",
+          "type": "uuid (index)"
+        },
+        {
+          "name": "attempt_no",
+          "type": "int"
+        },
+        {
+          "name": "outcome",
+          "type": "enum(succeeded, failed, preempted, node_lost)"
+        },
+        {
+          "name": "checkpoint_uri",
+          "type": "string | null (resume point)"
+        }
+      ]
+    },
+    {
+      "name": "job_events",
+      "note": "Append-only lifecycle/log-pointer event stream backing status and log queries.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "job_id",
+          "type": "uuid (index)"
+        },
+        {
+          "name": "ts",
+          "type": "timestamp"
+        },
+        {
+          "name": "kind",
+          "type": "enum(queued, scheduled, started, checkpointed, preempted, succeeded, failed, cancelled)"
+        },
+        {
+          "name": "log_sink_uri",
+          "type": "string (object-store prefix for this attempt's logs)"
+        }
+      ]
+    },
+    {
+      "name": "nodes",
+      "note": "Node-level inventory: health, drain state, topology domain, and the agent lease the scheduler reconciles against.",
+      "fields": [
+        {
+          "name": "node_id",
+          "type": "string PK"
+        },
+        {
+          "name": "topology_domain",
+          "type": "string (NVLink island / rack / zone)"
+        },
+        {
+          "name": "gpu_count",
+          "type": "int (e.g. 8)"
+        },
+        {
+          "name": "state",
+          "type": "enum(up, draining, down)"
+        },
+        {
+          "name": "last_heartbeat",
+          "type": "timestamp (failure detector)"
+        },
+        {
+          "name": "taints",
+          "type": "list<string> (driver/runtime/maintenance)"
         }
       ]
     }
@@ -534,13 +783,174 @@
       "group": "Reliability: Reconciliation and Failure Recovery"
     }
   ],
+  "technologyChoices": [
+    {
+      "concern": "Scheduling framework / control plane",
+      "steps": [
+        "queueing",
+        "placement",
+        "gang"
+      ],
+      "selfHosted": [
+        "Kubernetes + Volcano",
+        "Kubernetes + Kueue",
+        "Slurm",
+        "Ray",
+        "HashiCorp Nomad",
+        "Custom scheduler"
+      ],
+      "cloud": {
+        "aws": [
+          "AWS Batch",
+          "SageMaker Training",
+          "EKS + Karpenter"
+        ],
+        "gcp": [
+          "Vertex AI Training",
+          "GKE + Kueue"
+        ],
+        "azure": [
+          "Azure ML",
+          "AKS + Kueue"
+        ]
+      },
+      "tradeoff": [
+        "Kubernetes + Volcano/Kueue: cloud-native, gang scheduling and quotas built in, but you operate the cluster and the GPU device plugins.",
+        "Slurm: battle-tested HPC scheduler with mature gang/backfill/fair-share, but container-native and multi-tenant cloud workflows are bolted on.",
+        "Ray: great for Python ML and elastic jobs, weaker as a general multi-tenant cluster scheduler.",
+        "Managed (Batch/SageMaker/Vertex): least ops, but less control over packing policy, preemption semantics, and topology-aware placement."
+      ],
+      "makesIrrelevant": [
+        "A fully managed training platform can absorb queueing, retries, and checkpointing, removing much of the bespoke control plane — at the cost of policy control."
+      ]
+    },
+    {
+      "concern": "Durable job / allocation store",
+      "steps": [
+        "queueing",
+        "reliability"
+      ],
+      "selfHosted": [
+        "PostgreSQL",
+        "etcd",
+        "FoundationDB"
+      ],
+      "cloud": {
+        "aws": [
+          "Aurora PostgreSQL",
+          "DynamoDB"
+        ],
+        "gcp": [
+          "Cloud SQL",
+          "Spanner"
+        ],
+        "azure": [
+          "Azure Database for PostgreSQL",
+          "Cosmos DB"
+        ]
+      },
+      "tradeoff": [
+        "Relational (Postgres/Aurora): easy transactional state machine, attempts, and fair-share queries; shard or read-replica as the cluster grows.",
+        "etcd: natural fit if the control plane is Kubernetes-native (it already backs the API), but not ideal for large history/audit tables.",
+        "Spanner/FoundationDB: strong consistency at scale for very large clusters, heavier to operate."
+      ]
+    },
+    {
+      "concern": "Priority queue",
+      "steps": [
+        "queueing"
+      ],
+      "selfHosted": [
+        "In-DB priority index",
+        "Redis sorted sets",
+        "RabbitMQ priority queues"
+      ],
+      "cloud": {
+        "aws": [
+          "Amazon SQS",
+          "Amazon MQ"
+        ],
+        "gcp": [
+          "Cloud Tasks",
+          "Pub/Sub"
+        ],
+        "azure": [
+          "Azure Service Bus"
+        ]
+      },
+      "tradeoff": [
+        "Keeping the queue as a DB index (default) avoids a second system and keeps the store authoritative.",
+        "A dedicated broker lowers dispatch latency but reintroduces DB/queue reconciliation — rarely worth it at ~0.12 submits/sec average."
+      ],
+      "makesIrrelevant": [
+        "If the store is authoritative and submit rate is low, a separate durable broker is often unnecessary."
+      ]
+    },
+    {
+      "concern": "Checkpoint / log / artifact storage",
+      "steps": [
+        "preemption",
+        "reliability"
+      ],
+      "selfHosted": [
+        "MinIO",
+        "Ceph",
+        "NFS / Lustre"
+      ],
+      "cloud": {
+        "aws": [
+          "Amazon S3",
+          "FSx for Lustre"
+        ],
+        "gcp": [
+          "Cloud Storage",
+          "Filestore"
+        ],
+        "azure": [
+          "Azure Blob Storage",
+          "Azure NetApp Files"
+        ]
+      },
+      "tradeoff": [
+        "Object storage (S3/GCS/Blob): cheap, durable, scales to huge checkpoints, but bandwidth caps how fast preemption can drain a GPU.",
+        "Parallel filesystems (Lustre/FSx): much higher checkpoint bandwidth for large models, but costly and operationally heavier."
+      ]
+    },
+    {
+      "concern": "Leader election / coordination",
+      "steps": [
+        "reliability"
+      ],
+      "selfHosted": [
+        "etcd",
+        "ZooKeeper",
+        "Consul"
+      ],
+      "cloud": {
+        "aws": [
+          "DynamoDB lock",
+          "EKS lease objects"
+        ],
+        "gcp": [
+          "GKE lease objects"
+        ],
+        "azure": [
+          "AKS lease objects"
+        ]
+      },
+      "tradeoff": [
+        "Kubernetes Lease objects (etcd-backed) are the simplest path if the control plane already runs on K8s.",
+        "Standalone etcd/ZooKeeper/Consul give leader election + the fencing epoch for any deployment, at the cost of running a quorum service."
+      ]
+    }
+  ],
   "steps": [
     {
       "id": "naive",
       "title": "1. Naive: FIFO Queue onto the Next Free GPU (the baseline)",
       "description": [
         "Start with the simplest thing that works. Jobs go into one first-in-first-out queue; the scheduler takes the head job and assigns it to the next free GPU, one job per GPU.",
-        "This is correct for a single team with single-GPU jobs — and it exposes the problems the rest of the design exists to solve. There is no notion of priority or fairness, so one team's flood of jobs starves everyone behind it and a production job waits behind hours of best-effort work. A distributed job needing 64 GPUs at once can't be expressed — FIFO would hand it GPUs one at a time and two such jobs deadlock holding half the cluster each. And matching a job only to 'a free GPU' ignores GPU type and memory, so jobs land on hardware that can't run them and capacity fragments.",
+        "This is genuinely fine for a tiny single-team lab cluster with single-GPU jobs — which is worth saying, because it frames the rest of the complexity as justified only at shared-cluster scale. But it exposes the problems the rest of the design exists to solve. There is no notion of priority or fairness, so one team's flood of jobs starves everyone behind it and a production job waits behind hours of best-effort work. A distributed job needing 64 GPUs at once can't be expressed — FIFO would hand it GPUs one at a time and two such jobs deadlock holding half the cluster each. And matching a job only to 'a free GPU' ignores GPU type and memory, so jobs land on hardware that can't run them and capacity fragments.",
         "So the baseline motivates everything that follows: priority/fair-share queueing, constrained bin-packing, gang scheduling, and preemption."
       ],
       "view": {
@@ -593,8 +1003,9 @@
       "title": "2. Accept and Queue Jobs by Priority",
       "description": [
         "The submission API validates the resource request against the team's quota, persists the job as pending in the job store, and enqueues it into a priority queue.",
+        "Submission is idempotent: the client supplies an Idempotency-Key, stored as a unique idempotency_key on jobs, so a retried POST returns the existing job rather than creating a duplicate.",
         "Separate queues (or one priority-ordered queue) per priority class — prod, batch, best-effort — so the scheduler always pulls the most important runnable job.",
-        "Persisting before enqueueing means a crash never loses an accepted job; the queue is rebuildable from pending jobs in the store."
+        "Persisting before enqueueing means a crash never loses an accepted job; the queue is rebuildable from pending jobs in the store. Cancellation flips the durable state to cancelled, so the scheduler skips it even if a stale queue reference lingers."
       ],
       "view": {
         "nodes": [
@@ -705,9 +1116,104 @@
       "whyNow": [
         "Submission/queueing is the entry point; making the store authoritative here is what lets the scheduler crash and recover later."
       ],
+      "flows": [
+        {
+          "name": "Idempotent submit + cancel",
+          "note": "A retried POST with the same Idempotency-Key returns the existing job. Cancellation flips durable state so the scheduler skips a stale queue reference.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "User",
+                "label": "Client"
+              },
+              {
+                "id": "API",
+                "label": "Submission API"
+              },
+              {
+                "id": "JobDB",
+                "label": "Job Store"
+              },
+              {
+                "id": "Queues",
+                "label": "Priority Queues"
+              },
+              {
+                "id": "Scheduler",
+                "label": "Scheduler"
+              }
+            ],
+            "messages": [
+              {
+                "from": "User",
+                "to": "API",
+                "arrow": "->>",
+                "label": "POST /jobs (Idempotency-Key: k)"
+              },
+              {
+                "type": "alt",
+                "label": "key k already seen",
+                "messages": [
+                  {
+                    "from": "API",
+                    "to": "JobDB",
+                    "arrow": "->>",
+                    "label": "lookup by idempotency_key"
+                  },
+                  {
+                    "from": "API",
+                    "to": "User",
+                    "arrow": "-->>",
+                    "label": "200 existing jobId (no dup)"
+                  }
+                ],
+                "else": {
+                  "label": "new key",
+                  "messages": [
+                    {
+                      "from": "API",
+                      "to": "JobDB",
+                      "arrow": "->>",
+                      "label": "insert pending (unique key)"
+                    },
+                    {
+                      "from": "API",
+                      "to": "Queues",
+                      "arrow": "->>",
+                      "label": "enqueue by priority"
+                    }
+                  ]
+                }
+              },
+              {
+                "from": "User",
+                "to": "API",
+                "arrow": "->>",
+                "label": "DELETE /jobs/{id} (cancel)"
+              },
+              {
+                "from": "API",
+                "to": "JobDB",
+                "arrow": "->>",
+                "label": "state=cancelled"
+              },
+              {
+                "from": "Scheduler",
+                "to": "Queues",
+                "arrow": "->>",
+                "label": "dequeue -> sees cancelled in store -> skip"
+              }
+            ]
+          },
+          "highlight": [
+            "API",
+            "JobDB"
+          ]
+        }
+      ],
       "recap": {
         "before": "Nothing.",
-        "after": "Jobs durably accepted and ordered by priority.",
+        "after": "Jobs durably accepted (idempotently) and ordered by priority.",
         "newRisk": "Queue ordering alone doesn't place jobs — need a scheduler that respects hardware constraints."
       },
       "traps": [
@@ -722,7 +1228,7 @@
       "id": "placement",
       "title": "3. Place Jobs: Bin-Packing onto GPUs",
       "description": [
-        "The scheduler loop pulls the top candidate and asks the resource manager for a set of free GPUs matching the request (count, GPU type, memory).",
+        "The scheduler loop pulls the top candidate and asks the resource manager for a set of free GPUs matching the request (count, GPU type, memory). The resource manager keeps indexed free-lists — by GPU type, memory, node, topology domain, and health — so this is a lookup over ~10–100 candidates, not a full scan of every node on each decision.",
         "This is multi-dimensional bin-packing: pack jobs to minimize fragmentation so large jobs can still find contiguous capacity later. Prefer filling partially-used nodes (best-fit) over scattering.",
         "On placement, mark the GPUs allocated, update the job to scheduled, and hand it to the node agent to launch the container."
       ],
@@ -974,8 +1480,8 @@
       "title": "4. Gang Scheduling for Distributed Jobs",
       "description": [
         "A distributed training job needs all N GPUs simultaneously. If the scheduler grants GPUs incrementally, two big jobs can each hold half the cluster and deadlock waiting for the rest.",
-        "Gang scheduling allocates all-or-nothing: only place the job when every GPU it needs is available at once; otherwise leave it pending and don't hold any GPUs.",
-        "To stop large gangs from starving behind a stream of small jobs, reserve capacity for the head-of-line gang (backfill smaller jobs only into the gaps)."
+        "Gang scheduling allocates all-or-nothing: only place the job when every GPU it needs is available at once; otherwise leave it pending and hold no GPUs. A partial gang never starts and never sits on idle GPUs.",
+        "To stop a large gang from starving behind a stream of small jobs, give it a future-start reservation: a planned start time and priority position, not held GPUs. Backfill then runs only small jobs whose walltime guarantees they finish before that planned start — they fill time, never the gang's reserved capacity."
       ],
       "view": {
         "nodes": [
@@ -1039,17 +1545,17 @@
           }
         },
         {
-          "name": "Incremental acquire with backfill + timeout",
-          "description": "GPUs are granted to a large job as they free up while smaller jobs backfill the gaps, with a hold timeout releasing a stuck partial reservation.",
+          "name": "Partial reservation with timeout (rejected)",
+          "description": "GPUs are granted to a large gang as they free up and held in a partial reservation, with a timeout releasing the hold if the full set never assembles. Rejected: held GPUs are wasted compute and two big gangs can still deadlock.",
           "pros": [
-            "GPUs are granted as they free up, so utilization stays high instead of sitting idle waiting for a full set.",
-            "Smaller jobs backfill the gaps while a big job accumulates its allocation.",
-            "A hold timeout releases a stuck partial reservation, preventing permanent deadlock."
+            "GPUs are grabbed the moment they free up, so the gang assembles without waiting for one simultaneous window.",
+            "A hold timeout eventually releases a stuck partial reservation, avoiding permanent deadlock.",
+            "Conceptually simple to start — just keep acquiring until you have enough."
           ],
           "cons": [
-            "Without all-or-nothing semantics, two big jobs can still livelock acquiring and releasing each other's GPUs.",
-            "A distributed job can't actually start until every worker is up, so partially-held GPUs are wasted compute.",
-            "Timeout tuning is delicate — too short thrashes, too long wastes capacity."
+            "A distributed job can't start until every worker is up, so partially-held GPUs are pure wasted compute the whole time.",
+            "Two big gangs can each grab half the cluster and live-lock acquiring and releasing each other's GPUs.",
+            "Timeout tuning is delicate — too short thrashes, too long wastes capacity. This is the failure mode all-or-nothing exists to avoid."
           ],
           "view": {
             "nodes": [
@@ -1060,17 +1566,17 @@
               "Nodes",
               {
                 "id": "Reservation",
-                "label": "Partial Reservation + Timeout"
+                "label": "Partial Hold + Timeout"
               }
             ],
-            "caption": "The scheduler incrementally acquires GPUs into a partial reservation with a timeout, backfilling small jobs onto held capacity until the gang is complete.",
+            "caption": "Rejected: the scheduler incrementally holds GPUs in a partial reservation with a timeout — those GPUs idle until the gang completes, and two big gangs can deadlock.",
             "links": [
               "sched-queues",
               "sched-res",
               {
                 "from": "Scheduler",
                 "to": "Reservation",
-                "label": "hold acquired GPUs"
+                "label": "hold partial GPUs (idle)"
               },
               "sched-agent",
               "res-nodes",
@@ -1093,9 +1599,9 @@
         },
         {
           "term": "Backfill",
-          "definition": "Running small jobs in gaps while reserving capacity for a large head-of-line job.",
-          "whyItMatters": "Keeps utilization high without starving big jobs.",
-          "example": "Reserve for the 64-GPU gang; let 1-GPU jobs use the leftover until it can start.",
+          "definition": "Running short jobs around a large job's future-start reservation, only if they provably finish before its planned start.",
+          "whyItMatters": "Keeps utilization high without delaying the reserved gang — and crucially never runs on GPUs held by a partial gang (there are none).",
+          "example": "The 64-GPU gang is reserved to start at T+10min; a 5-min 1-GPU job backfills the gap, finishing before T+10min.",
           "group": "Gang Scheduling for Distributed Jobs"
         }
       ],
@@ -1113,20 +1619,20 @@
       ],
       "recap": {
         "before": "Incremental allocation could deadlock big jobs.",
-        "after": "Distributed jobs start atomically; small jobs backfill gaps.",
-        "newRisk": "Reserving for a gang can idle GPUs briefly; large gangs may wait long under load — enter preemption/fairness."
+        "after": "Distributed jobs start atomically; a future-start reservation protects head-of-line gangs while short backfill jobs keep GPUs busy.",
+        "newRisk": "Large gangs may still wait long under load, and best-effort work must yield to production — enter preemption/fairness."
       },
       "traps": [
         {
-          "trap": "Allocating GPUs to a multi-node job as they free up.",
-          "why": "Two big jobs can hold half the cluster each and neither can start — deadlock with idle GPUs.",
-          "instead": "All-or-nothing gang placement plus reservation/backfill."
+          "trap": "Allocating GPUs to a multi-node job as they free up, or backfilling onto a gang's partially-held GPUs.",
+          "why": "Two big jobs can hold half the cluster each and neither can start — deadlock with idle GPUs. And a partial gang's held GPUs are idle compute, not free room to backfill.",
+          "instead": "All-or-nothing gang placement; give the gang a future-start reservation (no GPUs held) and backfill only short jobs that finish before that start."
         }
       ],
       "flows": [
         {
           "name": "Gang scheduling: all-or-nothing placement",
-          "note": "A distributed job is placed only when every GPU it needs is free at once; otherwise it stays pending holding nothing, and small jobs backfill the reserved gaps.",
+          "note": "A distributed job is placed only when every GPU it needs is free at once; otherwise it stays pending holding nothing. It gets a future-start reservation, and only short backfill jobs that finish before that planned start run in the meantime — never on the gang's reserved capacity.",
           "sequence": {
             "participants": [
               {
@@ -1179,7 +1685,13 @@
                       "from": "Scheduler",
                       "to": "ResManager",
                       "arrow": "->>",
-                      "label": "reserve for gang; backfill small jobs into gaps"
+                      "label": "reserve future start for gang (no GPUs held)"
+                    },
+                    {
+                      "from": "Scheduler",
+                      "to": "Agent",
+                      "arrow": "->>",
+                      "label": "backfill: run only short jobs that finish before planned start"
                     }
                   ]
                 }
@@ -1197,8 +1709,9 @@
       "title": "5. Fairness and Quotas Across Teams",
       "description": [
         "Each team has a guaranteed share and a burst ceiling. A team may use idle capacity beyond its guarantee, but must yield it when others need their guaranteed share.",
-        "Compute scheduling priority from fair-share: a team far under its share gets boosted; a team over its guarantee using burst capacity gets deprioritized.",
-        "Dominant-resource fairness generalizes this when jobs differ in their bottleneck resource (GPU count vs GPU memory vs specific type)."
+        "Compute scheduling priority from fair-share. A concrete sketch: score = priorityClass + teamWeight × (guaranteed − rollingUsage) / guaranteed + ageBoost. A team far under its share (or with a starving, aged job) floats up; a team over its guarantee on burst capacity sinks. rollingUsage is GPU-seconds over a decaying window (the quotas.usage_window field), so a team that just finished a big run is briefly deprioritized.",
+        "Dominant-resource fairness generalizes this when jobs differ in their bottleneck resource: fairness is computed on each team's dominant share — the max of its GPU-count share, GPU-memory share, and scarce-type (e.g. A100) share — not on a single resource.",
+        "Guard against gaming: bill against requested walltime/size (not just used), reclaim overruns, and cap how much any team can borrow regardless of idle capacity."
       ],
       "view": {
         "nodes": [
@@ -1320,9 +1833,10 @@
       "id": "preemption",
       "title": "6. Preemption with Checkpointing",
       "description": [
-        "When a high-priority job has no room, the preemption controller selects victims among lower-priority/best-effort jobs and evicts them to free GPUs.",
-        "Evict gracefully: signal the job to checkpoint, give it a grace period, then kill and requeue it so it resumes from the checkpoint rather than restarting.",
-        "Choose victims to minimize wasted work (least progress, lowest priority, best fit for the incoming job)."
+        "When a high-priority job has no room, the preemption controller selects victims among lower-priority/best-effort jobs and evicts them to free GPUs. Only jobs that advertised preemptible:true are eligible.",
+        "Evict gracefully: send SIGTERM, the agent checkpoints to the checkpoint store (writing checkpoint_uri back), and a bounded grace window elapses before SIGKILL. Because checkpoint I/O is storage-bandwidth bound (a 200GB checkpoint can take tens of seconds), the grace window and concurrent-preemption count must be bounded so eviction doesn't stall the incoming job.",
+        "Choose victims to minimize wasted work: lowest priority first, then least progress / cheapest to redo, then best fit for the incoming job's shape (so one eviction frees exactly the GPUs needed).",
+        "Throttle thrashing: each job has a max_preemptions cap (after which it becomes non-preemptible for a cooldown), and a recently-preempted job gets a brief anti-thrash grace before it can be evicted again."
       ],
       "view": {
         "nodes": [
@@ -1330,20 +1844,24 @@
           "Preempt",
           "Agent",
           "Nodes",
-          "JobDB"
+          "JobDB",
+          "Checkpoints"
         ],
-        "caption": "When the scheduler needs room it calls the preemption controller, which tells the agent to evict a victim on a node before the scheduler updates job state.",
+        "caption": "When the scheduler needs room it calls the preemption controller, which tells the agent to checkpoint and evict a victim; the agent writes to the checkpoint store and the scheduler requeues the job.",
         "links": [
           "sched-preempt",
           "preempt-agent",
           "agent-nodes",
+          "agent-checkpoints",
           "sched-jobdb"
         ],
         "highlight": [
-          "Preempt"
+          "Preempt",
+          "Checkpoints"
         ],
         "groups": [
-          "control-plane"
+          "control-plane",
+          "data-plane"
         ]
       },
       "options": [
@@ -1366,20 +1884,24 @@
               "Preempt",
               "Agent",
               "Nodes",
-              "JobDB"
+              "JobDB",
+              "Checkpoints"
             ],
-            "caption": "Checkpoint-and-requeue: the preemption controller has the agent checkpoint and evict the victim, and the scheduler requeues it in the job store to resume later.",
+            "caption": "Checkpoint-and-requeue: the preemption controller has the agent checkpoint to the checkpoint store and evict the victim, and the scheduler requeues it in the job store to resume later.",
             "links": [
               "sched-preempt",
               "preempt-agent",
               "agent-nodes",
+              "agent-checkpoints",
               "sched-jobdb"
             ],
             "highlight": [
-              "Preempt"
+              "Preempt",
+              "Checkpoints"
             ],
             "groups": [
-              "control-plane"
+              "control-plane",
+              "data-plane"
             ]
           }
         },
@@ -1457,6 +1979,10 @@
               {
                 "id": "Agent",
                 "label": "Node Agent"
+              },
+              {
+                "id": "Checkpoints",
+                "label": "Checkpoint Store"
               }
             ],
             "messages": [
@@ -1470,24 +1996,31 @@
                 "from": "Preempt",
                 "to": "Agent",
                 "arrow": "->>",
-                "label": "SIGTERM victim (checkpoint)"
+                "label": "SIGTERM victim (grace window)"
+              },
+              {
+                "from": "Agent",
+                "to": "Checkpoints",
+                "arrow": "->>",
+                "label": "write checkpoint, set checkpoint_uri"
               },
               {
                 "from": "Agent",
                 "to": "Preempt",
                 "arrow": "-->>",
-                "label": "checkpointed + exited"
+                "label": "checkpointed + exited (or SIGKILL on timeout)"
               },
               {
                 "from": "Preempt",
                 "to": "Scheduler",
                 "arrow": "-->>",
-                "label": "GPUs freed"
+                "label": "GPUs freed; job requeued"
               }
             ]
           },
           "highlight": [
-            "Preempt"
+            "Preempt",
+            "Checkpoints"
           ]
         }
       ],
@@ -1508,30 +2041,32 @@
       "id": "reliability",
       "title": "7. Reliability: Reconciliation and Failure Recovery",
       "description": [
-        "Node agents heartbeat usage and health to telemetry; the resource manager frees GPUs when a job ends or a node goes down, and reschedules affected jobs.",
-        "The scheduler is a reconciliation loop: desired state (jobs that should run) is in the durable store, actual state is reported by agents. On scheduler restart it rebuilds from the store and re-reconciles — no scheduling state lives only in memory.",
-        "Distinguish a dead node from a slow one (heartbeat timeout + failure detector) before rescheduling, to avoid double-running a job."
+        "Capacity is freed by authoritative agent status events to the resource manager (job exited / node lost) plus durable attempt records — not by a metrics signal. Metrics observes utilization and health; it must never be the source of truth for freeing a GPU, or a slow/partitioned node looks idle and its job gets double-run.",
+        "The scheduler is a reconciliation loop: desired state (jobs that should run) is in the durable store, actual state is reported by agents. On restart it rebuilds from the store and re-reconciles — no scheduling state lives only in memory.",
+        "Allocations are leased and fenced. Each allocation carries the scheduler_epoch that made it and a lease the agent must renew; a launch_token makes the launch idempotent so a retried placement can't double-run. A single active scheduler is chosen by leader election, and its epoch fences a stale or partitioned former leader — its writes are rejected as old.",
+        "Distinguish a dead node from a slow one (heartbeat timeout + failure detector) before rescheduling, and resume from the last checkpoint where available."
       ],
       "view": {
         "nodes": [
           "Scheduler",
           "JobDB",
           "Agent",
-          "Metrics",
           "ResManager",
-          "Nodes"
+          "Nodes",
+          "Events"
         ],
-        "caption": "Agents report usage and health to metrics, which frees resources on completion in the resource manager and updates node capacity, while the scheduler keeps job state durable.",
+        "caption": "Agents send authoritative status events to the resource manager, write attempt records to the job store, and append lifecycle/log events to the event store; the resource manager frees capacity from those events while the scheduler reconciles desired state under a fenced lease.",
         "links": [
           "sched-jobdb",
-          "agent-metrics",
-          "metrics-res",
+          "agent-res",
+          "agent-jobdb",
+          "agent-events",
           "res-nodes",
           "agent-nodes"
         ],
         "highlight": [
-          "Metrics",
-          "ResManager"
+          "ResManager",
+          "JobDB"
         ],
         "groups": [
           "control-plane",
@@ -1546,6 +2081,13 @@
           "whyItMatters": "Makes the control plane self-healing and crash-tolerant.",
           "example": "On restart, the scheduler reads running/pending jobs from the store and resumes placement.",
           "group": "Reliability: Reconciliation and Failure Recovery"
+        },
+        {
+          "term": "Lease + fencing token",
+          "definition": "An allocation carries a monotonic scheduler_epoch and a time-bounded lease the owner must renew; a higher epoch fences out a stale writer.",
+          "whyItMatters": "Stops a partitioned old scheduler or a duplicate launch from double-acting on the same GPUs.",
+          "example": "Resource manager rejects a free/launch stamped with epoch 7 once epoch 8 has been elected.",
+          "group": "Reliability: Reconciliation and Failure Recovery"
         }
       ],
       "probeLinks": [
@@ -1559,6 +2101,67 @@
       ],
       "whyNow": [
         "Tying it back to durable state + reconciliation shows the whole control plane survives crashes — the reliability requirement."
+      ],
+      "flows": [
+        {
+          "name": "Scheduler restart recovery",
+          "note": "A new leader is elected with a fresh epoch, loads desired state from the store, reconciles actual allocations against live agent status, and fences any stale-epoch writes. Running jobs are untouched.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Scheduler",
+                "label": "New Leader (epoch N+1)"
+              },
+              {
+                "id": "JobDB",
+                "label": "Job Store"
+              },
+              {
+                "id": "ResManager",
+                "label": "Resource Mgr"
+              },
+              {
+                "id": "Agent",
+                "label": "Node Agents"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Scheduler",
+                "to": "JobDB",
+                "arrow": "->>",
+                "label": "win election; load desired state (epoch N+1)"
+              },
+              {
+                "from": "Scheduler",
+                "to": "ResManager",
+                "arrow": "->>",
+                "label": "list allocations + leases"
+              },
+              {
+                "from": "Agent",
+                "to": "ResManager",
+                "arrow": "->>",
+                "label": "status: still running these jobs"
+              },
+              {
+                "from": "Scheduler",
+                "to": "ResManager",
+                "arrow": "->>",
+                "label": "fence epoch <= N; requeue jobs with expired leases"
+              },
+              {
+                "from": "Scheduler",
+                "to": "JobDB",
+                "arrow": "->>",
+                "label": "resume placing pending jobs"
+              }
+            ]
+          },
+          "highlight": [
+            "Scheduler"
+          ]
+        }
       ],
       "recap": {
         "before": "In-memory scheduling state.",
@@ -1580,14 +2183,18 @@
       "bottlenecks": [
         {
           "issue": "One scheduler is a throughput/availability bottleneck.",
-          "mitigation": "Shard by pool or run hot-standby with leader election."
+          "mitigation": "Shard by pool, or run hot-standby with leader election plus epoch fencing so the failover leader's writes are authoritative and the old leader is fenced out."
+        },
+        {
+          "issue": "Freeing GPUs from a metrics signal risks double-running or stranding capacity.",
+          "mitigation": "Free only on authoritative agent status events + durable attempt state, guarded by allocation leases; metrics stays observe-only."
         }
       ]
     }
   ],
   "finalDesign": {
     "title": "Final Design — Multi-Tenant GPU Scheduler",
-    "description": "Jobs are validated against quota, persisted, and enqueued by priority. A reconciliation-loop scheduler does constrained bin-packing onto GPUs via the resource manager, gang-schedules distributed jobs all-or-nothing with backfill, blends priority with fair-share across teams, and preempts lower-priority work (checkpoint + requeue) when needed. Node agents launch containers from the registry and heartbeat health/usage; durable job and allocation state makes the control plane crash-tolerant.",
+    "description": "Jobs are validated against quota, persisted (idempotently), and enqueued by priority. A reconciliation-loop scheduler does constrained bin-packing onto GPUs via the resource manager, gang-schedules distributed jobs all-or-nothing with future-start reservations and bounded backfill, blends priority with fair-share across teams, and preempts lower-priority work (checkpoint + requeue to the checkpoint store) when needed. Node agents launch containers from the registry, write checkpoints and lifecycle/log events, and send authoritative status to the resource manager. Durable job/allocation/attempt state plus leased, epoch-fenced allocations make the control plane crash-tolerant — capacity is freed from agent status, never from metrics.",
     "view": {
       "nodes": [
         "User",
@@ -1601,9 +2208,11 @@
         "Agent",
         "Nodes",
         "Registry",
+        "Checkpoints",
+        "Events",
         "Metrics"
       ],
-      "caption": "End to end: the API persists jobs and enqueues them past quota, the scheduler matches priority queues to resource-manager capacity, places via agents that pull images and report metrics, with preemption and fair-share closing the loop.",
+      "caption": "End to end: the API persists jobs and enqueues them past quota, the scheduler matches priority queues to resource-manager capacity under leased allocations, places via agents that pull images, checkpoint, and report status/events, with preemption and fair-share closing the loop.",
       "links": [
         "user-api",
         "api-quota",
@@ -1619,8 +2228,10 @@
         "res-nodes",
         "agent-nodes",
         "agent-registry",
+        "agent-checkpoints",
+        "agent-events",
         "agent-metrics",
-        "metrics-res",
+        "agent-res",
         "metrics-quota"
       ],
       "groups": [
@@ -1654,8 +2265,17 @@
       },
       {
         "requirement": "Lifecycle + retry",
-        "how": "Durable job state machine; reconciliation reschedules on failure.",
+        "how": "Durable job state machine + job_attempts; reconciliation reschedules on failure with a retry policy.",
         "steps": [
+          "reliability"
+        ]
+      },
+      {
+        "requirement": "Cancellation + status/logs",
+        "how": "DELETE marks a job cancelled so the scheduler skips stale queue refs and drains a running job; GET /jobs and /jobs/{id}/events expose status, attempts, and a log-sink pointer backed by the job_events stream.",
+        "steps": [
+          "queueing",
+          "preemption",
           "reliability"
         ]
       }
@@ -1685,8 +2305,17 @@
       },
       {
         "requirement": "Resilient to crashes",
-        "how": "Durable state + reconciliation loop + failure detection.",
+        "how": "Durable state + reconciliation loop + leases/fencing + failure detection.",
         "steps": [
+          "reliability"
+        ]
+      },
+      {
+        "requirement": "Low scheduling latency",
+        "how": "Indexed free-lists make placement a lookup not a scan, priority queues surface the next runnable job, and a single loop keeps decisions/sec well ahead of submit rate; throughput/packing are prioritized over per-job ms.",
+        "steps": [
+          "queueing",
+          "placement",
           "reliability"
         ]
       }

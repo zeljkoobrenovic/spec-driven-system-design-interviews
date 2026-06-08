@@ -292,7 +292,12 @@
     {
       "label": "Peak submit QPS",
       "value": "~200 submits/sec",
-      "note": "Bursty: ~24 images/sec average, but diurnal + viral peaks push 5–10× the mean for short windows."
+      "note": "Bursty: ~24 images/sec average, but diurnal + viral peaks push 5–10× the mean for short windows. At ~200 submits/sec with n≈2 that's ~400 images/sec incoming."
+    },
+    {
+      "label": "Admission / backlog policy",
+      "value": "provision for SLO, queue the rest",
+      "note": "Serving 400 images/sec immediately would need ~357 GPUs (400 ÷ 1.6 ÷ 0.7) — far above the ~21-GPU steady fleet. We don't size for peak: reserve a realtime/paid slice (steady fleet + a burst pool to ~100 GPUs) and let free-tier queue or shed under burst. Realtime/paid are admission-limited to their reserved capacity; free is best-effort with ETA or throttling."
     },
     {
       "label": "Seconds per image",
@@ -307,7 +312,7 @@
     {
       "label": "Queue wait by tier",
       "value": "realtime <2 s p95 · paid <30 s p95 · free best-effort",
-      "note": "Realtime/paid hold a reserved GPU slice; free drains from the remaining capacity and absorbs backlog (minutes under burst)."
+      "note": "These SLOs are enforced by admission control, not by over-provisioning: realtime/paid are capped to their reserved GPU slice so their waits stay bounded; free drains from the remaining capacity and absorbs backlog (minutes under burst), with an ETA shown rather than dropped work."
     },
     {
       "label": "Result size & storage",
@@ -329,7 +334,7 @@
     {
       "method": "POST",
       "path": "/v1/generations",
-      "description": "Submit a generation job. Returns a job id immediately; processing is async. An Idempotency-Key header dedupes client retries (same key + fingerprint returns the original job, never a new one). Optional callbackUrl registers a completion webhook.",
+      "description": "Submit a generation job. Returns a job id immediately; processing is async. An Idempotency-Key header dedupes client retries (same key + fingerprint returns the original job, never a new one). Optional callbackUrl registers a per-job completion webhook: on completion the service POSTs a signed event { eventId, jobId, status, images? } to that URL, HMAC-signed with the caller's secret and retried with backoff (dead-lettered after N attempts); consumers dedupe on eventId. For callers that prefer not to register a URL per request, an account-level endpoint can be configured out of band — the per-request callbackUrl is the in-scope path here.",
       "request": "Idempotency-Key: c_4f2\n{ \"prompt\": \"a red bicycle\", \"size\": \"1024\", \"n\": 1, \"model\": \"sdxl\", \"tier\": \"paid\", \"callbackUrl\": \"https://caller/hook\" }",
       "response": "{ \"jobId\": \"j_9\", \"status\": \"queued\", \"createdAt\": \"2026-06-08T10:00:00Z\" }",
       "sequence": {
@@ -411,6 +416,20 @@
       "description": "Poll job status / get result URLs when ready. Authorized to the owning user (or API client); returns status, reason, timestamps, model version, and per-image delivery metadata. Image URLs are short-lived signed CDN links scoped to the owner.",
       "request": "(id in path; Authorization: Bearer <token>)",
       "response": "{ \"jobId\": \"j_9\", \"status\": \"done\", \"statusReason\": null, \"modelVersion\": \"sdxl-1.0.3\", \"createdAt\": \"...\", \"completedAt\": \"...\", \"images\": [{ \"url\": \"https://cdn/...?sig=...\", \"expiresAt\": \"2026-06-08T11:00:00Z\", \"contentType\": \"image/png\", \"sizeBytes\": 1572864 }] }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/generations/{id}:cancel",
+      "description": "Cancel a queued or running job (owner-authorized). If still queued, it's removed from the queue and marked canceled — no GPU is spent. If inference has already started, cancellation is best-effort: the current attempt's lease is allowed to finish (the GPU pass is non-preemptible mid-batch) but the result is discarded and not delivered. Idempotent: canceling an already-terminal job returns its current state.",
+      "request": "(id in path; Authorization: Bearer <token>)",
+      "response": "{ \"jobId\": \"j_9\", \"status\": \"canceled\", \"canceledAt\": \"...\" }"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/generations/{id}",
+      "description": "User-requested deletion of a generation and its images (owner-authorized). Tombstones the generated_images rows (sets deleted_at), purges the objects from the result store, and invalidates CDN cache / outstanding signed URLs. The job record is retained (in a deleted state) for audit/billing until its retention window expires.",
+      "request": "(id in path; Authorization: Bearer <token>)",
+      "response": "{ \"jobId\": \"j_9\", \"status\": \"deleted\", \"deletedAt\": \"...\" }"
     }
   ],
   "dataModel": [
@@ -452,7 +471,7 @@
         },
         {
           "name": "status",
-          "type": "enum(queued, running, done, blocked_input, blocked_output, failed)"
+          "type": "enum(queued, running, done, blocked_input, blocked_output, failed, canceled, deleted)"
         },
         {
           "name": "blocked_reason",
@@ -541,6 +560,32 @@
       ]
     },
     {
+      "name": "outbox_events",
+      "note": "Transactional outbox bridging the JobDB→queue gap: written in the same transaction as the job, so an accepted job always has a durable, recoverable path into scheduling even if the API crashes before publishing.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "job_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "payload",
+          "type": "json (job_id + tier only; worker fetches the rest from JobDB)"
+        },
+        {
+          "name": "status",
+          "type": "enum(pending, published)"
+        },
+        {
+          "name": "created_at / published_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
       "name": "generated_images",
       "note": "Per-image artifact metadata; replaces the opaque result_keys list.",
       "fields": [
@@ -609,6 +654,40 @@
         {
           "name": "decided_at",
           "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "model_versions",
+      "note": "Model catalog and rollout state; the model_version pinned on a job (at submit) resolves here so batching, safety policy, and reproducibility are version-aware.",
+      "fields": [
+        {
+          "name": "model_version",
+          "type": "text PK (e.g. sdxl-1.0.3)"
+        },
+        {
+          "name": "model_family",
+          "type": "text (sdxl, sd3, ...)"
+        },
+        {
+          "name": "status",
+          "type": "enum(active, canary, deprecated, disabled)"
+        },
+        {
+          "name": "safety_policy_version",
+          "type": "text (compatible output-safety policy)"
+        },
+        {
+          "name": "artifact_path",
+          "type": "text (weights in ModelStore)"
+        },
+        {
+          "name": "rollout_pct",
+          "type": "smallint (canary traffic share)"
+        },
+        {
+          "name": "worker_pool",
+          "type": "text (pinned pool for this version/size)"
         }
       ]
     },
@@ -735,7 +814,7 @@
       "title": "1. Naive: Run the Model Synchronously in the Request",
       "description": [
         "Start with the simplest thing: when a prompt arrives, the API calls the diffusion model right there inside the request handler, waits for the GPU to produce the image (seconds), and returns it in the HTTP response. No queue, no job id — request in, image out.",
-        "It collapses immediately because GPUs are slow and scarce. Each request holds an HTTP connection (and a GPU) for many seconds, so a burst of requests instantly exhausts the GPU pool while everyone else's connections pile up and time out. There's no place to absorb the burst, no way to prioritize a paying user over a flood of free traffic, and no safety gate before expensive compute.",
+        "This is acceptable only for a toy demo or internal prototype — a single user, no bursts, no safety requirements. For bursty user-facing traffic it collapses immediately because GPUs are slow and scarce. Each request holds an HTTP connection (and a GPU) for many seconds, so a burst instantly exhausts the GPU pool while everyone else's connections pile up and time out. There's no place to absorb the burst, no way to prioritize a paying user over a flood of free traffic, and no safety gate before expensive compute.",
         "So the synchronous call motivates the whole async pipeline: accept and enqueue a job fast, schedule scarce GPUs fairly, batch inference, and screen for safety before and after generation."
       ],
       "view": {
@@ -786,7 +865,8 @@
       "description": [
         "Generation takes seconds, so it can't be synchronous. The API validates the request, checks the user's quota, persists a job record, and enqueues it — returning a job id immediately (202).",
         "Persisting before enqueueing means a crash never loses an accepted job; the queue is rebuildable from queued jobs. The client polls or subscribes for completion.",
-        "Make submit idempotent: a client Idempotency-Key (or a user_id + prompt/params fingerprint) is stored with the job so a retry returns the original job id instead of spawning a duplicate GPU run. Guard the gap between DB write and queue publish — a crash there must not strand a queued job. Use a transactional outbox (write the job and an outbox row in one transaction, a relay publishes to the queue) or a periodic sweeper that re-enqueues jobs stuck in queued with no live attempt.",
+        "Make submit idempotent: a client Idempotency-Key (or a user_id + prompt/params fingerprint) is stored with the job so a retry returns the original job id instead of spawning a duplicate GPU run.",
+        "The durability invariant: every accepted job (every 202) has exactly one durable JobDB record and at least one recoverable path into scheduling. JobDB is the source of truth; the queue is operational and rebuildable. The failure-prone part is the write→publish bridge — if the API writes the job but crashes before publishing to the queue, the job must not be stranded. Close that gap with a transactional outbox: write the job and an outbox_events row in one DB transaction, then have a relay publish pending outbox rows to the queue and mark them published. Back it with a periodic sweeper that re-enqueues jobs stuck in queued with no live attempt. The queue message carries only job_id (+ tier); the worker fetches the authoritative prompt/params from JobDB, so a duplicate or stale queue message can't desync the source of truth.",
         "This async-job shape is the backbone: it decouples request rate from the (much smaller) GPU throughput."
       ],
       "view": {
@@ -934,7 +1014,8 @@
         "Safety is mandatory and bookends the pipeline. Screen the prompt before any GPU work: a disallowed prompt is rejected at intake, saving expensive compute and preventing policy violations.",
         "Screen the output too: classify the generated image and block/flag unsafe results before they're delivered, since a benign-looking prompt can still produce disallowed content.",
         "Input screening is cheap and synchronous at intake; output screening runs right after inference, before the result is stored/served. Blocked is a terminal state with reason codes: distinguish blocked_input from blocked_output, and store the policy version, classifier version, decision, score, and reason for each check in a safety_decisions audit log so support, abuse review, and compliance can explain any block.",
-        "Operational policy: handle adversarial/jailbreak prompts and throttle repeat violators using abuse telemetry. Decide what happens to an unsafe generated image — delete immediately, or route to a restricted review bucket keyed by classifier metadata — and whether manual review/appeals exist. When the safety service is down, too slow, or returns uncertain, fail closed (block or route to review) rather than fail open; never ship an unscreened image."
+        "Operational policy: handle adversarial/jailbreak prompts and throttle repeat violators using abuse telemetry. Decide what happens to an unsafe generated image — delete immediately, or route to a restricted review bucket keyed by classifier metadata. When the safety service is down, too slow, or returns uncertain, fail closed (block or route to review) rather than fail open; never ship an unscreened image.",
+        "Scope note: for this 45-minute case, keep the automated gates and the audit log (safety_decisions records the uncertain/manual_review outcome and reviewer/appeal_state) as first-class, but treat the human moderation console and the user-facing appeals workflow as a follow-up — the design routes to review and records the decision, and a separate ops surface acts on that bucket."
       ],
       "view": {
         "nodes": [
@@ -1014,7 +1095,7 @@
         "A scheduler pulls from the queues honoring priority + fairness and assigns work to GPU workers. Its inputs per job: tier, remaining user quota, model + size (batchability), deadline/SLO, age in queue, and expected runtime. Quotas/rate limits at intake keep any one user from monopolizing the fleet.",
         "Make fairness measurable, because one 'request' isn't one unit of work — n images, larger resolution, and pricier models cost very differently. Account fair-share in GPU-seconds (or normalized model cost), not raw request count, using per-tier weights with fair-share floors and per-user deficit counters / token buckets. Separate the concerns: priority policy, admission control (quota), batch formation, and worker leasing are distinct.",
         "Assign work via leases, not permanent ownership: a job is leased to a worker with a visibility timeout (the assignment lease) and a scheduler epoch/fencing token; the worker heartbeats while running. If the lease expires (crash, hang), the job is reassigned, and a late completion from the original worker is rejected by epoch so the job isn't double-completed.",
-        "When demand exceeds capacity, queue depth grows and you communicate wait/ETA — or shed/deprioritize free-tier — rather than dropping work."
+        "Tie the policy to the capacity numbers: realtime/paid get a reserved GPU slice sized to their SLOs (realtime <2 s, paid <30 s p95) and are admission-limited to it, while free gets a fair-share floor that drains from the remaining capacity. When incoming work exceeds the available GPU-seconds — e.g. a viral burst pushing ~400 images/sec against a ~21-GPU steady fleet plus burst pool — realtime/paid stay within their reserved slice and only the free-tier queue grows. Then communicate wait/ETA, throttle, or shed free work rather than dropping accepted jobs or letting free starve paid."
       ],
       "view": {
         "nodes": [
@@ -1180,8 +1261,9 @@
       "description": [
         "Running one prompt per GPU pass wastes the hardware: model load and per-call overhead dominate. The scheduler batches compatible jobs (same model/size) into one GPU pass, dramatically raising throughput per GPU.",
         "Workers keep the model weights resident (loaded from the model store once) and process batches; trade a little latency (waiting to fill a batch) for large utilization gains — a tunable batch window.",
-        "Batch compatibility is the real constraint: a batch must share model + version, image size, precision, and any LoRA/control settings. Mixed traffic batches poorly, so the scheduler groups by these keys and falls back to smaller (even single-job) passes when no compatible peers are waiting. Cap the batch by GPU memory and close it on a fill-window timeout so the first arrival isn't starved waiting for a full batch; on an OOM, split the batch and retry with a smaller one.",
-        "Output goes through the safety filter — typically a separate classifier fleet so the safety model doesn't compete for the diffusion GPUs (or co-located only if it fits in spare memory) — then to the result store. Workers report status back to the job store, recording the model_version actually run."
+        "Batch compatibility is the real constraint: a batch must share model + version, image size, precision, and any LoRA/control settings — version, not just family, because a canary build or different precision can't share a forward pass. Mixed traffic batches poorly, so the scheduler groups by this compatibility key and falls back to smaller (even single-job) passes when no compatible peers are waiting. Cap the batch by GPU memory and close it on a fill-window timeout so the first arrival isn't starved waiting for a full batch; on an OOM, split the batch and retry with a smaller one.",
+        "Model version is part of the compatibility key, so it must be pinned before scheduling. Pin it at submit by resolving the model catalog entry (including any canary rollout_pct): this gives reproducibility and lets the scheduler form version-coherent batches. Route hot model+version+size combos to dedicated warm worker pools so common traffic always finds a compatible peer. A canary version draws a small rollout share onto its own pool without contaminating the active version's batches; rollback flips the catalog status so no new jobs schedule onto it while in-flight jobs finish.",
+        "Output then goes through the safety filter — typically a separate classifier fleet so the safety model doesn't compete for the diffusion GPUs (co-located only if it fits in spare memory), using the safety policy version compatible with the model that produced the image — and on to the result store. Workers report status back to the job store, recording the model_version actually run."
       ],
       "view": {
         "nodes": [
@@ -1347,6 +1429,13 @@
           "mitigation": "Group by compatibility key; fall back to smaller/single passes; route hot model+size combos to dedicated warm pools."
         }
       ],
+      "failureDrills": [
+        {
+          "scenario": "A canary model version spikes the blocked-output or OOM rate.",
+          "expectedBehavior": "Only the canary's rollout share is affected; the active version keeps serving normally. Rollback flips the catalog status to deprecated/disabled so no new jobs schedule onto the canary, while in-flight canary jobs finish (or re-queue onto the active version) — existing job semantics are preserved.",
+          "mitigation": "Per-version worker pools and rollout_pct isolate the canary; monitor blocked-output and OOM rate per model_version; rollback is a catalog status flip, not a redeploy."
+        }
+      ],
       "flows": [
         {
           "name": "Batched GPU inference + output safety",
@@ -1436,7 +1525,7 @@
       "title": "6. Result Delivery",
       "description": [
         "Generated images (MBs each) go to object storage; serve them via CDN so the read fanout doesn't hit the workers or origin. The job record holds the result keys/URLs.",
-        "Notify the client on completion: a push/stream for realtime UIs, or polling for simple clients. For interactive use, you can stream progress (intermediate diffusion previews). Treat push/SSE/WebSocket as a hint, not a guarantee — on reconnect the client replays state from job status (the durable JobDB record), never from an in-memory stream, so a dropped connection can't lose a completion.",
+        "Notify the client on completion: a push/stream for realtime UIs, or polling for simple clients. For interactive use, you can stream progress as intermediate diffusion previews. Treat push/SSE/WebSocket as a hint, not a guarantee — on reconnect the client replays state from job status (the durable JobDB record), never from an in-memory stream, so a dropped connection can't lose a completion.",
         "For server-to-server webhooks, sign the payload (HMAC), include a stable event id for consumer idempotency, retry on failure with backoff, and dead-letter after N attempts with operator escalation. Make consumers idempotent on the event id.",
         "Results are user data: serve them through short-lived signed CDN URLs scoped to the owner (per-user signed URLs minted by the API, not public guessable links), with an explicit expires_at returned in the API. Retention and deletion are part of the design — shorter windows for free than paid, and honor user-requested deletion by tombstoning the generated_images row and purging the object + CDN cache."
       ],
@@ -1612,9 +1701,10 @@
       "id": "reliability",
       "title": "7. Reliability, Utilization, and Cost",
       "description": [
-        "Make jobs idempotent and retryable (keyed by job id + attempt): each run is a job_attempts row with a worker lease and heartbeat. A worker crash lets the lease expire, so the job re-enters the queue and another worker re-runs it; the partial output is discarded and a late completion from the dead worker is fenced out by epoch so the job isn't double-completed. Dead-letter jobs past a retry threshold for inspection.",
-        "Keep GPUs busy: autoscale workers from queue depth (and queue age by tier), keep warm model pools to avoid cold starts — note model-load latency can dominate autoscale response, so scale on a leading signal and pre-warm — and consider cheaper spot/preemptible GPUs for free-tier batch work (with re-queue on preemption).",
-        "Track a full operational picture, not just GPU utilization and queue wait: queue age by tier, batch fill ratio, GPU memory OOMs, worker cold-start time, model cache hit rate, retry/dead-letter counts, blocked-output rate, and cost per image attributed by tier and model. The whole design exists to keep the scarce, expensive GPUs near-fully utilized while honoring fairness and safety."
+        "This step has two halves: crash-safe execution (don't lose or double-run a job) and fleet utilization/cost (keep the scarce GPUs busy and cheap). Present them in that order.",
+        "Crash-safe execution. Make jobs idempotent and retryable (keyed by job id + attempt): each run is a job_attempts row with a worker lease and heartbeat. A worker crash lets the lease expire, so the job re-enters the queue and another worker re-runs it; the partial output is discarded and a late completion from the dead worker is fenced out by epoch so the job isn't double-completed. Dead-letter jobs past a retry threshold for inspection.",
+        "Fleet utilization and cost. Keep GPUs busy: autoscale workers from queue depth (and queue age by tier), keep warm model pools to avoid cold starts — note model-load latency can dominate autoscale response, so scale on a leading signal and pre-warm — and consider cheaper spot/preemptible GPUs for free-tier batch work (with re-queue on preemption).",
+        "Track a full operational picture, not just GPU utilization and queue wait, and tie each signal to a concrete response: queue age by tier → scale up / preempt or shed free-tier; OOM rate → lower the batch cap; model cache miss (cold-start) rate → pre-warm the pool for that version/size; batch fill ratio low → widen the fill window or consolidate pools; blocked-output spike → safety incident / canary rollback; retry/dead-letter count → inspect the dead-letter queue; cost per image (attributed by tier and model) → rebalance spot vs on-demand. The whole design exists to keep the scarce, expensive GPUs near-fully utilized while honoring fairness and safety."
       ],
       "view": {
         "nodes": [
@@ -1677,7 +1767,7 @@
   ],
   "finalDesign": {
     "title": "Final Design — Text-to-Image Generation Platform",
-    "description": "The API screens the prompt (input safety), enforces quota, persists a job, and enqueues it by tier — returning a job id fast. A fair-share priority scheduler pulls from per-tier queues and assigns batched, compatible jobs to GPU workers that keep model weights resident. Outputs pass the output-safety filter, land in object storage, and are served via CDN; the client is notified or polls. Jobs are idempotent and retryable so worker/spot failures re-queue without loss; the GPU fleet autoscales from queue depth with warm model pools to maximize utilization of the scarce, expensive hardware.\n\nWorked example — a paid request for 4 images at 1024px arrives while ~20K free-tier images are backlogged. Intake: idempotency-key checked (new), prompt screened by input safety (allowed), job + 4-image fan-out persisted, enqueued on the paid queue, 202 returned in ~50 ms. Scheduling: the fair-share scheduler favors the paid queue (realtime > paid > free) and charges the user's GPU-seconds budget; the free backlog keeps draining on its floor so it isn't starved but also can't block the paid job. Batch formation: the 4 images (same model + 1024px) coalesce with other compatible paid jobs into a ≤16-image batch, closed by a ~50 ms fill window or memory cap. Inference: a worker with resident weights runs the batch in ~10 s under an assignment lease with heartbeats. Output safety: each image is screened (fail-closed if the classifier is down); safe images are written to the result store with metadata. Delivery: the job is marked done, a push notification (backed by status replay) fires, and the client fetches via short-lived signed CDN URLs. Failure path: if the worker crashes mid-batch, the lease expires, the job re-queues, another worker re-runs it idempotently, and a late completion from the dead worker is fenced out.",
+    "description": "The API screens the prompt (input safety), enforces quota, persists a job, and enqueues it by tier — returning a job id fast. Two invariants anchor the design: (1) every accepted job has exactly one durable JobDB record and a recoverable path into scheduling — the job and an outbox row are written in one transaction and a relay (plus a re-enqueue sweeper) bridges the write→publish gap, with JobDB as source of truth and the queue carrying only job_id; and (2) model_version is pinned at submit from a model catalog, so batches are version-coherent, output safety uses the matching policy version, and canary/rollback is a catalog status flip onto isolated worker pools rather than a redeploy. A fair-share priority scheduler pulls from per-tier queues and assigns batched, compatible jobs (same model+version+size) to GPU workers that keep model weights resident. Outputs pass the output-safety filter, land in object storage, and are served via CDN; the client is notified or polls. Jobs are idempotent and retryable so worker/spot failures re-queue without loss; the GPU fleet autoscales from queue depth with warm model pools to maximize utilization of the scarce, expensive hardware.\n\nWorked example — a paid request for 4 images at 1024px arrives while ~20K free-tier images are backlogged. Intake: idempotency-key checked (new), prompt screened by input safety (allowed), job + 4-image fan-out persisted, enqueued on the paid queue, 202 returned in ~50 ms. Scheduling: the fair-share scheduler favors the paid queue (realtime > paid > free) and charges the user's GPU-seconds budget; the free backlog keeps draining on its floor so it isn't starved but also can't block the paid job. Batch formation: the 4 images (same model + 1024px) coalesce with other compatible paid jobs into a ≤16-image batch, closed by a ~50 ms fill window or memory cap. Inference: a worker with resident weights runs the batch in ~10 s under an assignment lease with heartbeats. Output safety: each image is screened (fail-closed if the classifier is down); safe images are written to the result store with metadata. Delivery: the job is marked done, a push notification (backed by status replay) fires, and the client fetches via short-lived signed CDN URLs. Failure path: if the worker crashes mid-batch, the lease expires, the job re-queues, another worker re-runs it idempotently, and a late completion from the dead worker is fenced out.",
     "view": {
       "nodes": [
         "Client",

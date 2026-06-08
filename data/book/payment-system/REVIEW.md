@@ -1,545 +1,451 @@
 # Review: Payment System - System Design
 
-Reviewed file: `data/book/payment-system/interview.json`  
+Reviewed file: `data/book/payment-system/interview.json`
 Review date: 2026-06-08
 
 ## Executive Summary
 
-This is a strong correctness-first payment-system walkthrough. The case has the
-right spine for a serious interview: naive synchronous charge, idempotency,
-double-entry ledger, outbox-driven async capture, signature-verified webhooks,
-line-item reconciliation, payout safety, ledger sharding, and consistency
-budgeting. The step order is coherent and teaches why each new mechanism exists.
+The recent changes moved this from a strong correctness-first outline to a
+near-flagship payment-system walkthrough. The earlier high-impact gaps are now
+mostly addressed: the data model includes `payment_events`,
+`ledger_transactions`, `refunds`, `payouts`, `psp_events`, and
+`reconciliation_breaks`; Step 4 has an explicit `capture_unknown` recovery
+flow; Step 5 persists signed PSP events before dispatch; Step 7 reserves funds
+in the authoritative ledger before bank transfer; reconciliation has a break
+lifecycle; `technologyChoices` is present; and requirement traceability now
+covers all functional and non-functional bullets.
 
-The main gaps are production-depth and traceability issues rather than a broken
-architecture. Refunds, disputes, payouts, settlement breaks, and external PSP
-ambiguity are mentioned, but the data model and flows do not yet carry enough
-state to make those workflows fully operational. The payout sequence also reads
-like it can transfer based on the read model before reserving funds in the
-authoritative ledger, which conflicts with the later consistency guidance. The
-dataset would benefit from a more explicit operational/security layer and a
-book-style `technologyChoices` section.
+The remaining issues are not architecture-breaking. They are mostly alignment
+problems between the newly strengthened prose and the API/diagram surfaces. The
+largest remaining risk is that the API example still makes capture look
+synchronously final while the core design teaches asynchronous capture and
+in-doubt recovery. The webhook diagram also still routes event application
+through the `Capture` node, even though the text now correctly separates
+capture execution from PSP event handling.
 
 | Dimension | Rating | Notes |
 | --- | ---: | --- |
-| System design soundness | 4.2 / 5 | Strong core patterns; refund/dispute/payout/recon state needs more concrete modeling. |
-| Production realism | 3.8 / 5 | Good failure drills, but PSP ambiguity, finance-ops workflows, PCI/fraud/security, and observability are thin. |
-| Pedagogical flow | 4.5 / 5 | Clear problem-by-problem buildup with useful options, traps, and interviewer signals. |
-| Final design coherence | 4.1 / 5 | Final diagram integrates the major components, but some important guarantees are still prose-only. |
-| Dataset/rendering fit | 4.2 / 5 | JSON parses and most references resolve; one option-only node lacks canonical metadata, and traceability could be tighter. |
+| System design soundness | 4.7 / 5 | Correct core patterns and much richer lifecycle state; API semantics and cross-shard protocol need final tightening. |
+| Production realism | 4.5 / 5 | PSP ambiguity, payouts, recon, security, and observability are now represented; a few ops tables/fields remain thin. |
+| Pedagogical flow | 4.7 / 5 | Strong step-by-step escalation with useful options, traps, and deep dives. |
+| Final design coherence | 4.6 / 5 | Major components line up with the steps; webhook/capture ownership could be clearer in the diagram. |
+| Dataset/rendering fit | 4.7 / 5 | JSON parses and checked references resolve; old `Snapshot` and `technologyChoices` findings are fixed. |
 
-Recommendation: keep the step order and core framing. Focus edits on state
-shape, external-boundary ambiguity, payout safety, operations/security, and
-renderer metadata.
+Recommendation: preserve the step order and most content. Spend the next edit
+on API/state wording, separating inbound event workers from capture workers in
+views, and adding a small amount of operational metadata to the schema.
 
 ## What Works Well
 
-- The framing is unusually clear for payments: correctness beats availability,
-  and "exactly-once effect" is distinguished from impossible exactly-once
-  delivery.
-- The capacity section ties directly to design choices: ~2k charge tps, ~4k
-  ledger writes, ~50k balance reads, and append-only ledger growth motivate the
-  ledger, projection, and sharding steps.
-- The API section covers the essential boundaries: idempotent payment creation,
-  idempotent refunds, status lookup, balance lookup, and inbound PSP webhooks.
-- The double-entry ledger step is the strongest part of the case. It teaches the
-  zero-sum invariant, immutability, reversing entries, and why mutable balances
-  are dangerous.
-- The outbox step correctly avoids dual writes and teaches at-least-once relay
-  plus idempotent consumers.
-- The webhook step handles signature verification, dedupe, fast ack, duplicate
-  delivery, and out-of-order events.
-- The reconciliation step names line-item matching and compensating entries,
-  which is the right production instinct for money systems.
-- Step 8a is a useful senior/staff-level addition. It forces candidates to say
-  where strong consistency is required and where eventual consistency is fine.
+- The case keeps the right payment-system headline: correctness beats
+  availability, and exactly-once effect is the target rather than impossible
+  exactly-once delivery.
+- Requirements and capacity are now better aligned. The capacity section calls
+  out that ledger writes exceed the two-row minimum once fees, reserves,
+  refunds, chargebacks, payouts, and corrections are included, and it separates
+  webhook/payout/reconciliation bursts from the charge path.
+- The API includes the important starter endpoints: idempotent payment create,
+  idempotent refund, payment status/history, balance read, and PSP webhook.
+- The data model now carries the guarantees the prose teaches: event history,
+  transaction headers, refund and payout state, webhook inbox, reconciliation
+  break workflow, idempotency fingerprinting, and outbox relay metadata.
+- Step 4's in-doubt PSP recovery flow is a major improvement. It names stable
+  PSP idempotency keys, `capture_unknown`, status lookup, webhook recovery,
+  settlement reconciliation, and deduped ledger posting.
+- Step 5 now teaches the right inbound-event pattern: verify signature, persist
+  raw event, dedupe by PSP event id, defer out-of-order events, and dispatch by
+  event type.
+- Step 7 now fixes the previous payout safety issue. The sequence preflights
+  the read model, reserves funds strongly in the ledger, calls bank rails with a
+  stable reference, then finalizes or reverses.
+- Reconciliation is treated as an operating model, not only a compare job:
+  break states, owners, approvals, correcting transactions, stale-file alerts,
+  and aging thresholds are present.
+- The new `technologyChoices` section is payment-specific and useful: ledger
+  stores, idempotency stores, queues/outbox, reconciliation ingestion, balance
+  projection, secrets/compliance, and observability.
 
 ## Highest-Impact Issues
 
-### 1. Refunds, disputes, and chargebacks are under-modeled
+### 1. The API example still makes capture look synchronously final
 
-The requirements and API promise full and partial refunds, PSP disputes, late
-failures, and settlement outcomes. In the dataset, those mostly appear as
-phrases:
+`POST /v1/payments` accepts `"capture": true` and returns `201 Created` with
+`"status": "captured"`. That is a valid product shape for a simple synchronous
+gateway, but it conflicts with the main walkthrough after Step 4, where capture
+is intentionally asynchronous and can enter `capturing` or `capture_unknown`.
 
-- `POST /v1/payments/{id}/refunds` exists, but there is no `refunds` entity.
-- The `payments.status` enum has only `authorized`, `captured`, `refunded`,
-  and `failed`, which is too flat for partial refunds, partial captures,
-  chargebacks, dispute reversals, and late settlement failures.
-- `GET /v1/payments/{id}` returns an `events` array, but the data model has no
-  payment events/status history table.
-- Webhooks mention disputes and late failures, but the flow routes everything to
-  the capture worker and does not show event-specific handlers or state
-  transitions.
-- The follow-ups ask about disputes and partial captures, which implies those
-  are out of scope, but the functional requirements already include PSP
-  asynchronous disputes.
+Why it matters: the dataset now teaches that PSP capture is ambiguous and that
+ledger posting must be recovered by PSP reference/webhook/reconciliation. The
+front-door API should not imply the service can always synchronously know and
+return final captured state.
 
-Why it matters: a production payment system is mostly lifecycle edge cases after
-the initial charge. Without explicit refund/dispute/capture state, candidates
-can explain the happy path but cannot reason about "captured then partially
-refunded", "disputed weeks later", or "PSP says settled but our ledger does not".
+Concrete fix: choose and document one of these shapes:
 
-Concrete fix: add a compact state model rather than a large schema rewrite:
+- Return `authorized`, `processing`, or `capturing` from `POST /payments` when
+  capture is asynchronous, with `GET /payments/{id}` showing later transitions.
+- Add a separate `POST /v1/payments/{id}/capture` endpoint if the design wants
+  explicit auth-then-capture.
+- If the API keeps `"capture": true`, show that the response may be
+  `captured`, `capturing`, or `capture_unknown`, and include the PSP reference
+  used for recovery.
 
-- Add `refunds` with `refund_id`, `payment_id`, `amount`, `status`,
-  `idempotency_key`, `psp_reference`, and `ledger_transaction_id`.
-- Add `payment_events` or `payment_state_transitions` with event type, source,
-  PSP event id, old/new status, and timestamps.
-- Expand status vocabulary or document that status is aggregate while detailed
-  lifecycle lives in event rows.
-- Add one refund/dispute flow showing webhook -> state transition -> reversing
-  ledger transaction -> reconciliation.
+### 2. Webhook event application is still visually conflated with capture
 
-### 2. The data model is too small for the guarantees it teaches
+The prose and traps now correctly say that capture execution and PSP event
+application are distinct. The architecture view still routes inbound webhooks
+from `Queue` to `Capture`, and the final design includes `queue-capture`.
+One sequence aliases the `Capture` participant as "Event Worker", but the node
+identity remains `Capture`.
 
-The current model has `accounts`, `ledger_entries`, `payments`,
-`idempotency_keys`, and `outbox`. That is a good starter model, but several
-guarantees in the prose need more durable state:
+Why it matters: candidates should learn that outbound capture workers drive our
+own requested capture, while inbound PSP event workers apply external truth
+such as settlement, dispute, refund result, chargeback, or late failure. Using
+one node for both can reintroduce the exact trap Step 5 warns against.
 
-- There is no `ledger_transactions` header row to group entries, store
-  idempotency key/event id, source object, reason code, reversal link, and
-  balanced/write status.
-- `ledger_entries` has no `direction`/entry type, `available_at`,
-  `pending/available` bucket, shard key, or external reference.
-- `idempotency_keys` lacks request fingerprint/hash, expiry, `locked_until`,
-  owner/merchant scope as structured columns, and recovery metadata for
-  `in_progress`.
-- The outbox table has no unique aggregate sequence, retry/error columns, or
-  relay ownership fields.
-- There is no `psp_events` or webhook inbox table, even though the webhook step
-  says out-of-order events must be persisted and retried.
-- There is no reconciliation break/exception table, even though the recon step
-  says breaks are surfaced for repair.
+Concrete fix: add a separate canonical node such as `EventWorker` or
+`PspEventWorker`, connect `WebhookSvc -> Queue -> EventWorker -> DB/Ledger`,
+and keep `Capture` for `Queue -> Capture -> PSP -> Router/Ledger`. The final
+diagram can still stay compact, but the ownership distinction should be visible.
 
-Why it matters: the interview teaches the right invariants, but the schema does
-not yet show where those invariants are enforced or audited. A candidate could
-hand-wave idempotent recovery, ledger dedupe, and finance ops because the model
-does not force them to name the records.
+### 3. The data model is much better, but a few operational records are still implicit
 
-Concrete fix: add a few targeted entities, not an exhaustive banking schema:
+The model now includes the right major entities. A few details are still
+prose-only or partially represented:
 
-- `ledger_transactions` for balanced transaction headers.
-- `psp_events` / webhook inbox for signed, deduped, out-of-order external
-  events.
-- `reconciliation_breaks` for unmatched/mismatched settlement lines, owner,
-  state, reason, and resolution ledger transaction.
-- Optional `payouts` and `refunds` state rows if the case keeps those flows in
-  scope.
+- Reconciliation deep dives mention settlement-file import metadata, but the
+  model only has `reconciliation_breaks.statement_file_id`; there is no
+  `statement_files` / `settlement_imports` entity with sequence, completeness,
+  provider, file hash, and processing status.
+- `reconciliation_breaks.amount_delta` lacks currency, which matters in any
+  payment system.
+- `psp_events` has `status` but no attempts, `last_error`, deferred-until time,
+  or dead-letter/escalation marker.
+- `payouts` has the core reserve/finalize IDs, but no failure reason,
+  callback/event id, or retry ownership fields.
+- `payments` carries amount/currency/status but does not store `order_id` or a
+  tokenized source reference, even though the API request includes both.
 
-### 3. PSP ambiguity is acknowledged but not fully carried through the flows
+Why it matters: these fields are where real operators recover stuck money
+movement. The design does not need a banking-grade schema, but the records that
+drive replay, escalation, and audit should be visible.
 
-The dataset correctly says the PSP is outside the transaction boundary. Step 2
-also has a failure drill for crashing after claiming an idempotency key, and
-Step 4 has a drill for crashing after PSP capture but before ledger posting.
-Those are the right hazards.
+Concrete fix: add a small `statement_files` entity, add currency to recon
+breaks, and add retry/error/callback metadata to `psp_events` and `payouts`.
+Add `order_id` and `source_token` or explicitly say those live in an adjacent
+orders/tokenization system.
 
-The visuals and API sequences still make the external boundary look cleaner
-than it is:
+### 4. Cross-shard ledger semantics need one more level of precision
 
-- `POST /payments` shows `authorize + capture` followed by immediate ledger
-  posting and `201 captured`.
-- The async capture flow says the PSP capture is idempotent, but the request
-  labels do not show the PSP idempotency key/correlation id that makes that
-  possible.
-- The in-doubt state after timeout or unknown PSP response is not represented
-  as a payment state.
-- Webhook processing uses the capture worker as the generic consumer, which
-  blurs capture execution with PSP event application.
+Step 8 gives a credible default: shard by account, use clearing accounts, and
+handle cross-shard transfers as sagas checked by reconciliation. That is good
+interview material. The remaining ambiguity is how the system prevents a
+cross-shard half-write from becoming available money before the matching side
+appears.
 
-Why it matters: payment correctness depends on handling "we do not know whether
-the external PSP did the thing" as a first-class state. This is where many real
-double-charge or missing-ledger incidents happen.
+Why it matters: "reconciliation catches it later" is useful as a safety net,
+but a payment system should also define the write protocol and visibility rule
+for pending cross-shard ledger transactions.
 
-Concrete fix: add a short deep dive or flow for the in-doubt window:
+Concrete fix: add a short note in the cross-shard deep dive:
 
-- Persist intent before the PSP call.
-- Send a stable PSP idempotency key/correlation id.
-- If the call times out, mark `requires_reconciliation` or `capture_unknown`.
-- Recover by querying PSP status, consuming webhook, or reconciling settlement.
-- Only post ledger entries once, keyed by PSP reference/event id.
+- Each side writes a shard-local entry with the same global `transaction_id`.
+- Entries stay `pending` or non-available until both sides are observed.
+- A coordinator/outbox record retries the missing side.
+- Reconciliation pages immediately on aged half-transactions.
+- Balance projections ignore pending/incomplete transactions.
 
-### 4. The payout path conflicts with the "read model is not authority" lesson
+### 5. The wrap-up teaching material should catch up with the stronger core
 
-Step 7 correctly warns that the balance read model is eventually consistent and
-must not be the source of truth for money decisions. The failure drill says
-payouts re-check the authoritative ledger transactionally.
+The interview script and level variants are still useful, but they read closer
+to the older version of the case. They do not explicitly ask candidates to name
+the new `capture_unknown` recovery path, payout reservation before bank rails,
+webhook inbox/event dispatch, or reconciliation break operating model.
 
-The main payout sequence still shows:
+Why it matters: these are now the differentiating senior/staff signals in the
+dataset. If the wrap-up does not mention them, interviewers may underuse the
+best parts of the case.
 
-1. Payout service reads `Balance`.
-2. It transfers to bank rails.
-3. It posts ledger entries.
+Concrete fix: revise the script and level variants lightly:
 
-That visual order is risky. It can be read as "transfer first, account later",
-and it appears to rely on the read model for available funds. The final design
-also links payout to `Balance` and bank transfer, but does not show a reserve or
-strong ledger debit before the external bank call.
-
-Why it matters: payout is a double-spend problem. The safe sequence is usually
-reserve/debit available funds in the authoritative ledger or payout state first,
-then call bank rails idempotently, then finalize based on bank result.
-
-Concrete fix: update the payout flow and view to show:
-
-- `request payout (Idempotency-Key)`.
-- Strong ledger transaction or lock that moves funds from merchant available to
-  payout pending/reserved.
-- Bank transfer with a stable payout reference.
-- Bank callback/reconciliation updates payout state.
-- Final ledger entries or reversal if the transfer fails.
-
-The read model can still serve dashboards and preflight checks, but the final
-guard should be a ledger transaction.
-
-### 5. Reconciliation lacks an operating model
-
-The reconciliation step has the right conceptual advice: line-item matching,
-timing breaks, compensating entries, and late/partial file handling. What is
-missing is the workflow around the breaks:
-
-- No persisted settlement file/import metadata.
-- No `reconciliation_breaks` table or state machine.
-- No owner/assignment/escalation path for finance ops.
-- No threshold for alerting on break count, unmatched amount, stale files, or
-  aging breaks.
-- No distinction between automated resolution, timing deferral, and manual
-  approval.
-
-Why it matters: reconciliation is not just a nightly comparison job. It is an
-operational workflow with SLAs, controls, approvals, and audit evidence.
-
-Concrete fix: add a small "Break lifecycle" deep dive or data model entity with
-states such as `detected`, `timing`, `investigating`, `auto_corrected`,
-`manual_approved`, `resolved`, and `written_off`, plus metrics for stale and
-high-value breaks.
-
-### 6. Security, compliance, and observability are mostly follow-up material
-
-The webhook step covers signature verification, and the ledger is auditable.
-That is necessary but not sufficient for a payment-system flagship. The main
-walkthrough is light on:
-
-- PCI/tokenization boundaries for card/source data.
-- Fraud/risk checks before authorization and payout.
-- Merchant onboarding, KYC/AML, payout holds, and sanctions constraints.
-- Secret/key rotation for PSP credentials and webhook signatures.
-- Operator/admin actions, approval workflows, and audit logs.
-- SLOs and alerts for idempotency conflicts, stuck `in_progress` keys, queue
-  lag, outbox relay lag, PSP timeout rate, webhook duplicate/out-of-order rate,
-  ledger imbalance, projection lag, payout failures, and reconciliation breaks.
-
-Why it matters: the case is aimed at correctness, and production correctness is
-not only data structures. It also depends on controls, monitoring, and response
-paths when money movement is abnormal.
-
-Concrete fix: add one operations/security wrap-up or Step 8 deep dive. Keep it
-small: a table of `signal`, `why it matters`, `page/degrade threshold`, and
-`operator action` would be enough.
-
-### 7. Book-specific polish is missing
-
-This dataset has patterns, traps, failure drills, interviewer signals, an
-interview script, level variants, and probe links. It does not have
-`technologyChoices`, even though newer book datasets use that section to teach
-implementation trade-offs.
-
-Good payment-specific concerns would be:
-
-- Ledger store: Postgres/CockroachDB/Spanner/Aurora vs ledger SaaS.
-- Idempotency and locks: primary DB unique constraints vs Redis/DynamoDB.
-- Queue/outbox relay: Kafka/Debezium/SQS/Pub/Sub/Event Hubs.
-- Reconciliation ingestion: object storage + batch engine + workflow queue.
-- Balance projection: stream processor plus read-optimized store.
-- Secrets and compliance: KMS/HSM, vaults, audit log storage.
-- Observability: metrics, tracing, log retention, alerting.
-
-This is not required for rendering, but it would make the payment-system case
-feel current with the rest of the book group.
+- Senior: must explain PSP in-doubt recovery and distinguish capture worker
+  from event worker.
+- Staff+: must define the payout consistency guard, recon break workflow,
+  cross-shard pending visibility, and money-movement observability signals.
+- Follow-ups should separate "covered in the main design" from "extension
+  topics" such as multi-currency FX, multi-PSP routing, fraud, and partial
+  capture product semantics.
 
 ## System Design Soundness
 
 ### Requirements and Capacity
 
-The requirements are well scoped and put correctness first. The functional list
-covers charge, refund, ledger, payout, status/balance, and async PSP events. The
-non-functional list correctly prioritizes no duplicate effects, durability,
-strong consistency for money, reconciliation, and idempotent APIs.
+The requirements are now well scoped and traceable. All six functional and all
+six non-functional bullets have corresponding `satisfies` rows. The capacity
+section also now avoids an earlier simplification by saying `~4,000+ tps`
+ledger writes is only the minimum and by calling webhook/payout/recon workloads
+separate, bursty dimensions.
 
-The capacity section is useful but could be sharpened:
-
-- `~2,000 tps peak` for charges and `~4,000 tps` for ledger writes assumes the
-  minimum two entries per movement. That is fine as a baseline, but fees,
-  reserves, refunds, chargebacks, payouts, and reconciliation corrections can
-  create more than two entries.
-- `~150M entries/day` implies average write volume far below the peak, which is
-  plausible. It would help to label it as daily average/retention sizing while
-  the tps number is peak path sizing.
-- Webhook, payout, and reconciliation volumes are not sized separately. Those
-  are the workloads that often stress idempotency, queue lag, and finance ops.
+Further improvement would be optional: add merchant/account cardinality,
+refund/chargeback ratios, webhook retry spikes, and settlement-file sizes if
+the case needs more capacity math. The current level is sufficient for most
+system-design interviews.
 
 ### API
 
-The API covers the necessary starter surface. `Idempotency-Key` on payments and
-refunds is the right teaching point, and the webhook endpoint names signature
-verification and event-id dedupe.
+The API surface is strong but should align with the asynchronous state machine.
+The payment create response should not always be `captured` if the main design
+uses an outbox and capture worker. Refund response examples are better now:
+`remaining_refundable`, `psp_reference`, and partial refund state are visible.
+Payment status now includes an event history that maps to `payment_events`.
 
-The API should expose more lifecycle structure if refunds/disputes remain in
-scope:
-
-- Include merchant/account scope in idempotency examples.
-- Include PSP reference/correlation ids in responses or event history.
-- Show partial refund semantics: remaining refundable amount, multiple refunds,
-  and failure states.
-- Clarify whether `/v1/payments` with `capture: true` returns final captured
-  state or accepted/processing when capture is asynchronous.
+Add merchant/account scope to idempotency examples if you want to make tenant
+isolation explicit.
 
 ### Data Model
 
-The model is a strong minimal seed, especially `ledger_entries` and
-`idempotency_keys`. It is currently too compressed for the full set of promised
-behaviors. Add only the state that carries important invariants: transaction
-headers, webhook inbox, refunds/payouts, reconciliation breaks, and status
-history.
+The data model is now one of the strengths of the case. The new entities give
+the learner concrete places to attach invariants:
+
+- `ledger_transactions` groups balanced entries and dedupes by idempotency key
+  or PSP event id.
+- `payment_events` backs lifecycle history.
+- `refunds` and `payouts` make post-charge money movement explicit.
+- `psp_events` is the webhook inbox and replay source.
+- `reconciliation_breaks` turns finance discrepancies into work items.
+- `idempotency_keys` includes scope, request fingerprint, lock lease, response,
+  and expiry.
+- `outbox` includes aggregate ordering and retry/error columns.
+
+The remaining data-model work is operational polish rather than missing core
+architecture: statement import rows, currency on breaks, callback/retry fields,
+and explicit source/order correlation.
 
 ### Architecture
 
-The architecture components are appropriate: gateway, payment service,
-idempotency store, payments DB, outbox, queue, capture worker, webhook receiver,
-ledger, reconciliation service, balance model, payout service, bank rails, and
-sharded ledgers.
+The architecture has the right components: gateway, payment service,
+idempotency store, payments DB, outbox, queue, capture worker, PSP, webhook
+receiver, ledger router, sharded ledgers, reconciliation service, settlement
+file, balance read model, payout service, and bank rails.
 
-The main architectural gap is that several important ownership boundaries are
-not represented:
-
-- Who owns PSP in-doubt recovery?
-- Who owns webhook event application versus capture execution?
-- Who owns payout state and bank callbacks?
-- Who owns finance-ops break resolution?
-- Where do observability and audit controls live?
-
-These do not all need new top-level nodes, but they need named responsibilities
-in steps or deep dives.
+The one architectural ownership issue is inbound PSP event processing. A
+separate event worker would make the final design match the now-strong prose.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Synchronous Charge
 
-This is a good baseline. It exposes the unsafe external call and makes
-idempotency feel necessary. Consider making the "crash after PSP charge but
-before DB write" hazard visible in the caption or as a failure drill here, since
-it is the motivating failure for the whole case.
+Good baseline. It exposes the unsafe external PSP call and the crash-after-PSP
+hazard through the trap. This step should remain intentionally naive.
 
 ### Step 2: Idempotency Keys
 
-Strong step. It explains client-supplied keys, atomic claims, concurrent retry
-races, in-progress recovery, and replaying stored responses. Improve the data
-model with request fingerprint, expiry, and recovery timestamps so the concept
-is grounded in schema.
+Strong step. It covers client-supplied keys, atomic claims, replayed responses,
+request fingerprinting, and the trade-off between primary DB and dedicated key
+store. This is now grounded by a richer `idempotency_keys` model.
 
 ### Step 3: Double-Entry Ledger
 
-This is the best step in the dataset. The default option, mutable-balance
-counter-option, traps, and balanced-entry invariant are all concrete. Add a
-`ledger_transactions` entity so the invariant has an obvious enforcement and
-dedupe point.
+Still the strongest conceptual step. The double-entry option, mutable-balance
+counter-option, traps, and balanced-entry invariant are concrete and useful.
+The new `ledger_transactions` entity makes the invariant much easier to teach.
 
 ### Step 4: Asynchronous Capture & State Machine
 
-The outbox lesson is correct and well motivated. The state machine needs a bit
-more surface area: `authorized -> capturing -> captured/failed` is enough for a
-diagram, but the dataset should mention `capture_unknown` or similar for PSP
-timeouts and in-doubt recovery. The flow should show the PSP idempotency key.
+Substantially improved. The in-doubt flow is exactly the kind of production
+realism this case needed: persist intent, send stable PSP idempotency key,
+enter `capture_unknown`, recover through lookup/webhook/settlement, and post
+ledger entries once by PSP reference.
 
-### Step 5: Webhooks
+The main API example should now be updated so this step does not contradict the
+front-door response shape.
 
-Good coverage of signature verification, dedupe, fast ack, duplicates, and
-out-of-order delivery. The main issue is that all events visually flow to the
-capture worker. Consider renaming the consumer to `Payment Event Worker` or
-adding labels that distinguish capture result, settlement, dispute, and late
-failure handlers.
+### Step 5: Webhooks & Exactly-Once Inbound Events
 
-### Step 6: Reconciliation
+The content is strong: signature verification, fast ack, dedupe, raw inbox,
+deferred out-of-order events, and dispatch by event type. The remaining issue is
+diagram/node naming. Make `EventWorker` a visible node so the diagram teaches
+the same distinction as the deep dive.
 
-Conceptually strong but operationally thin. Add persisted file/import metadata,
-break state, owner, aging, and resolution path. This can stay as a deep dive if
-the main step should remain compact.
+### Step 6: Reconciliation Against the PSP
+
+This moved from conceptual to operational. The break lifecycle, owners,
+approval path, correcting ledger transaction, and alert thresholds are good
+senior-level material. Add a `statement_files` data-model row if you want the
+schema to fully match the deep dive.
 
 ### Step 7: Payouts & Balance Read Model
 
-The read model explanation is good, and the traps are exactly right. The payout
-sequence needs to be reordered so a strong ledger reservation/debit happens
-before the bank transfer. Otherwise the visual contradicts the warning that the
-read model is not authority.
+The previous safety issue is fixed. The flow now correctly treats the read
+model as a preflight hint, then reserves funds strongly in the ledger before the
+bank transfer and finalizes or reverses based on the result.
+
+Consider adding failure/callback metadata to `payouts` so the recovery behavior
+is visible in the schema, not only the sequence.
 
 ### Step 8: Scaling the Ledger
 
-Sharding by account with per-shard clearing accounts is a credible default. The
-cross-shard saga caveat is honest. Add a short note on hot merchants/accounts,
-resharding, shard-local sequence numbers, and how reconciliation sees all
-shards.
+Sharding by account with clearing accounts is a credible default, and the
+single-primary counter-option is a fair comparison. The hot-account,
+resharding, shard-local ordering, and all-shards reconciliation deep dive is a
+good addition.
+
+Tighten the cross-shard visibility rule so pending half-transactions cannot
+pollute available balances.
 
 ### Step 8a: Where Money Demands Strong Consistency
 
-This is a valuable sub-step. It should cross-reference the payout flow once that
-flow is fixed: payout guard is the canonical example of a strong money path,
-while balance display is the canonical eventual read.
+This remains a valuable sub-step. The security/compliance and observability
+deep dives now make the case feel much more production-realistic. This step
+should stay near the end because it lets the candidate classify the design
+choices they have already made.
 
 ## Final Design Review
 
-The final design integrates the main components and is coherent at the diagram
-level. It includes idempotent APIs, DB/outbox/queue, capture worker, PSP,
-webhook receiver, sharded ledgers, reconciliation, balance projection, payouts,
-and bank rails.
+The final design is coherent and much stronger than the previous review
+described. It includes the major components introduced in the steps and the
+description now explicitly names:
 
-What is still missing is the state-management layer behind some final-design
-claims:
+- balanced transaction headers,
+- `capture_unknown`,
+- persisted `psp_events`,
+- reconciliation break lifecycle,
+- rebuildable balance read model,
+- payout reservation before bank transfer,
+- lifecycle state in `payment_events`, `refunds`, `payouts`, and
+  `reconciliation_breaks`.
 
-- Final design says idempotent payouts, but there is no payout state machine or
-  bank callback/reconciliation path.
-- It says daily reconciliation, but there is no break workflow.
-- It says signature-verified webhooks, but there is no persisted webhook inbox
-  in the data model.
-- It says sharded ledger, but the data model does not show shard key or
-  transaction header metadata.
-
-The final design should not become crowded. Add the missing details in the data
-model and step deep dives, then keep the final diagram as the clean overview.
+The final diagram itself stays clean, which is the right choice. The only
+change I would make is to split the capture/event-worker ownership. Optionally
+update the final diagram caption to mention "reserve before bank transfer" so
+the payout ordering remains visible even when someone only scans the diagram.
 
 ## Concept Introduction and Learning Flow
 
-The learning flow is strong. Each step solves a problem exposed by the previous
-step:
+The learning flow is excellent:
 
-- Synchronous charge exposes unsafe retries and external uncertainty.
-- Idempotency handles client/network retries.
-- Ledger handles auditability and mutable-balance corruption.
+- Synchronous charge exposes external uncertainty.
+- Idempotency handles safe retries.
+- Double-entry ledger establishes the source of truth.
 - Outbox and async capture handle long-running PSP workflows.
+- In-doubt recovery handles ambiguous external outcomes.
 - Webhooks handle external asynchronous truth.
-- Reconciliation handles drift between internal and external records.
-- Read model and payouts handle scalable reads and merchant withdrawal.
+- Reconciliation handles drift and finance-ops repair.
+- Balance read model and payouts handle scalable reads without giving up money
+  correctness.
 - Sharding and consistency choices handle scale and correctness budgets.
 
-The only conceptual gap is lifecycle breadth. Refunds, disputes, payouts, and
-reconciliation breaks are introduced early as requirements, but the core steps
-mostly optimize charge/capture. Add one or two small flows so the learner sees
-how the same primitives apply after the happy path.
+The concepts are introduced just in time. The recent additions make the case
+more realistic without bloating the early steps.
 
 ## Step-to-Final-Design Coherence
 
-The step-to-final progression is mostly coherent:
+Most step components appear cleanly in the final design:
 
-- `Idem` introduced in Step 2 appears in the final design.
-- `Ledger` introduced in Step 3 evolves into `LedgerA` and `LedgerB`.
-- `Outbox`, `Queue`, and `Capture` introduced in Step 4 appear in final design.
-- `WebhookSvc` introduced in Step 5 appears in final design.
-- `Recon` and `Statement` introduced in Step 6 appear in final design.
-- `Balance`, `Payout`, and `Bank` introduced in Step 7 appear in final design.
-- `Router`, `LedgerA`, and `LedgerB` introduced in Step 8 appear in final
-  design.
+- `Idem` from Step 2 appears in final design.
+- `Ledger` evolves into `LedgerA` and `LedgerB`.
+- `Outbox`, `Queue`, and `Capture` from Step 4 appear in final design.
+- `WebhookSvc` from Step 5 appears in final design.
+- `Recon` and `Statement` from Step 6 appear in final design.
+- `Balance`, `Payout`, and `Bank` from Step 7 appear in final design.
+- `Router`, `LedgerA`, and `LedgerB` from Step 8 appear in final design.
 
-The weakest link is payout consistency: Step 7 says the read model is not the
-source of truth, Step 8a says payout guard needs strong consistency, but the
-flow and final diagram do not make the strong ledger guard visible.
+The one weak transition is `Capture`: it represents outbound capture in Step 4
+and inbound event application in Step 5. Split that role and the coherence issue
+goes away.
 
 ## Realism Compared With Production Systems
 
-The dataset has good instincts about external PSPs, reconciliation, and
-idempotency. The next layer of realism should focus on operational controls:
+This now compares well with production payment architecture at the interview
+level. The dataset covers the high-value realities: PSP boundaries are
+ambiguous, retries are normal, ledger writes must be idempotent, webhooks are
+untrusted and duplicated, reconciliation is required, payouts are guarded by
+available funds, and operational signals matter.
 
-- Treat every PSP call as ambiguous until correlated by idempotency key,
-  reference lookup, webhook, or settlement file.
-- Keep signed raw PSP events for audit and replay.
-- Represent payouts as their own state machine, not just a service call.
-- Treat reconciliation breaks as work items with owners and SLAs.
-- Include PCI/tokenization boundaries so the system does not appear to store raw
-  payment source data.
-- Include fraud/risk and payout holds, at least as explicit out-of-scope or
-  extension points.
-- Add metrics and runbook triggers for stuck money movement.
+The remaining realism gaps are small and specific:
+
+- The API should expose asynchronous or in-doubt states honestly.
+- A settlement-file import table should back the reconciliation workflow.
+- PSP event and payout rows should carry retry/error/callback state.
+- Cross-shard pending visibility should be explicit.
+- Fraud/risk and KYC/AML are present in security notes, but they remain
+  extension points rather than flow participants. That is acceptable if the
+  case stays focused on ledger correctness.
 
 ## Dataset and Renderer-Facing Observations
 
 - `python3 -c "import json; json.load(...)"` succeeds for
   `data/book/payment-system/interview.json`.
-- Top-level step views, final-design views, `satisfies[*].steps[*]`, pattern
-  step links, and parent references resolve.
-- The payout option "Periodic balance snapshots + delta" references
-  `Snapshot`, but `Snapshot` is not in `highLevelArchitecture.nodes`. Add a
-  canonical node with a suitable type, likely `database` or `index`, so the
-  option diagram has stable label/type metadata.
-- `satisfies.nonFunctional` has five rows while `requirements.nonFunctional`
-  has six bullets. The idempotent-API requirement is covered implicitly by the
-  exactly-once row, but traceability would be clearer with a dedicated row or
-  wording that explicitly includes idempotent APIs.
-- The high-level architecture includes short alias nodes such as `C`, `X`, `K`,
-  and `L` in addition to fuller nodes such as `Client`, `PSP`, `Bank`, and
-  `Ledger`. This does not break current rendering, but it can make the canonical
-  architecture catalog harder to scan. Prefer sequence-local aliases unless the
-  nodes are needed in architecture views.
-- No `technologyChoices` section is present. That is valid, but it is a missed
-  book-feature opportunity for a flagship payment case.
+- Checked step `view.nodes`, step `view.links`, final-design `view.nodes`,
+  final-design `view.links`, and `satisfies[*].steps[*]`; references resolve.
+- The prior missing `Snapshot` node issue is fixed. `Snapshot` is now a
+  canonical high-level node with type `database`.
+- The prior `technologyChoices` issue is fixed. The dataset now has seven
+  payment-specific technology choice concerns.
+- `satisfies.functional` and `satisfies.nonFunctional` now each have six rows,
+  matching the six functional and six non-functional requirements.
+- The high-level architecture still includes sequence-friendly alias nodes
+  (`C`, `X`, `K`, `L`) alongside full nodes (`Client`, `PSP`, `Bank`,
+  `Ledger`). This does not break rendering, but keeping aliases sequence-local
+  would make the canonical node catalog cleaner.
+- Technology choices currently render as bare strings. That is schema-valid; if
+  visual polish is desired, run the tech-icon assignment workflow separately.
 - Do not rebuild `docs/` for this review-only file; `REVIEW.md` is repo-only.
 
 ## Recommended Edits, Prioritized
 
-### P1: Make payout safety explicit
+### P1: Align API semantics with async capture
 
-Update Step 7 and final-design wording so payout reserves/debits available funds
-in the authoritative ledger before calling bank rails. Add payout state and
-stable bank reference/idempotency.
+Update `POST /v1/payments` so it can return `authorized`, `capturing`,
+`processing`, or `capture_unknown`, or add a separate capture endpoint. Make
+the API example reflect the Step 4 state machine.
 
-### P1: Add state for external event and lifecycle correctness
+### P1: Split capture worker from PSP event worker
 
-Add `ledger_transactions`, `payment_events` or `payment_state_transitions`,
-`psp_events`, and minimal `refunds`/`payouts` entities. These carry the
-invariants already taught in prose.
+Add a distinct inbound event worker/dispatcher node and route webhook events to
+it in Step 5 and the final design. Keep `Capture` for outbound capture work.
 
-### P1: Add an in-doubt PSP recovery flow
+### P2: Add operational schema fields
 
-Show timeout/unknown PSP response recovery using PSP idempotency key,
-correlation id, webhook, PSP lookup, and reconciliation.
+Add `statement_files`, currency on reconciliation breaks, retry/error/deferred
+metadata on `psp_events`, callback/failure metadata on `payouts`, and
+order/source correlation on `payments` or explicitly scope it elsewhere.
 
-### P2: Operationalize reconciliation
+### P2: Tighten cross-shard pending visibility
 
-Add settlement import metadata and `reconciliation_breaks` with lifecycle,
-owner, state, amount, aging, resolution, and audit trail.
+Explain how cross-shard ledger writes remain pending/non-available until both
+sides are posted and observed, and how aged half-transactions are retried and
+alerted.
 
-### P2: Add security, compliance, and observability coverage
+### P2: Refresh script and level variants
 
-Add a compact operations/security table: PCI/tokenization, fraud/risk, PSP
-credential handling, audit logs, queue/outbox lag, stuck idempotency keys,
-ledger imbalance, projection lag, payout failure rate, and reconciliation
-break aging.
+Update interviewer script and level expectations to call out `capture_unknown`,
+webhook inbox/event dispatch, payout reservation, reconciliation break
+workflow, and money-movement observability.
 
-### P2: Add `technologyChoices`
+### P3: Renderer and presentation polish
 
-Cover ledger database options, idempotency store, outbox/queue implementation,
-reconciliation batch/workflow stack, balance projection, secrets/KMS, and
-observability.
-
-### P3: Fix renderer metadata and traceability polish
-
-Add the missing `Snapshot` node metadata, tighten `satisfies.nonFunctional`,
-and consider removing architecture-global alias nodes that are only useful for
-sequence diagrams.
+Consider sequence-local aliases instead of global alias nodes, add tech icons
+for the new technology choices, and optionally add AI visuals if this dataset
+is meant to match image-rich flagship cases.
 
 ## What Not To Change
 
 - Keep the correctness-first framing.
-- Keep the step order. It builds naturally from simple charge to ledger,
-  asynchrony, external truth, reconciliation, reads/payouts, and scale.
-- Keep double-entry ledger as the core source of truth.
+- Keep the step order. It now builds naturally from naive charge to safe
+  retries, ledger, outbox, webhooks, reconciliation, payouts, sharding, and
+  consistency budgeting.
+- Keep double-entry ledger as the source of truth.
 - Keep transactional outbox and webhook dedupe as explicit steps.
-- Keep Step 8a as a sub-step under ledger scaling; it is a useful senior-level
-  discussion without bloating the main path.
-- Keep reconciliation as a first-class step, not a footnote.
+- Keep the in-doubt PSP recovery flow.
+- Keep reconciliation as a first-class step.
+- Keep Step 8a as a sub-step under ledger scaling; it is a good senior/staff
+  discussion without bloating the main spine.
 
 ## Bottom Line
 
-This is already a strong payment-system interview and has the right conceptual
-center of gravity. To make it flagship-quality, the dataset should turn the
-remaining prose guarantees into explicit state: refund/dispute lifecycle, PSP
-in-doubt recovery, payout reservation, reconciliation breaks, and operational
-controls. The architecture does not need a rewrite; it needs the data and flows
-that make its correctness claims auditable.
+The recent changes addressed the main correctness and production-realism gaps.
+This is now a strong payment-system interview with a credible money-movement
+story. The next improvements are targeted: make the API honest about async
+capture, split inbound event processing from capture execution in diagrams, and
+add a few operational fields that make recovery and finance-ops workflows fully
+auditable.

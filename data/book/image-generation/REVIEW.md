@@ -9,8 +9,9 @@ This revision is a strong book-group interview case. The recent changes close
 the biggest gaps from the previous review: capacity is now numeric, the API has
 idempotency and webhook registration, the data model includes attempts,
 dedupe, generated-image metadata, safety audit state, webhook delivery state,
-and richer quotas, and `technologyChoices` now covers GPU serving,
-orchestration, queue/job state, storage/CDN, safety, and observability.
+and richer quotas, and `technologyChoices` now covers the edge/quota layer,
+job state and outbox, dispatch queues, GPU serving and orchestration, model
+rollout, result delivery, safety, notifications, and observability.
 
 The learning spine is coherent: synchronous generation fails, so the candidate
 moves to async intake, input/output safety, tier-aware scheduling, batched GPU
@@ -61,7 +62,7 @@ focus on the remaining production edges, not another broad rewrite.
 - Delivery is realistic: push/stream is treated as a hint backed by durable
   status replay, webhooks have signing/retry/idempotency, and CDN URLs are
   scoped and expiring.
-- `technologyChoices` is now present and useful for this case. It covers the
+- `technologyChoices` is now present and useful for this case. It covers ten
   areas that materially affect cost and operability for GPU platforms.
 
 ## Highest-Impact Issues
@@ -385,7 +386,7 @@ The remaining realism improvements are targeted:
 - `dataModel` contains seven entities: `jobs`, `job_attempts`,
   `idempotency_keys`, `generated_images`, `safety_decisions`,
   `webhook_deliveries`, and `quotas`.
-- `technologyChoices` contains six concerns and has dataset-local tech icons
+- `technologyChoices` contains ten concerns and has dataset-local tech icons
   under `assets/tech-icons/`.
 - Main step `view.nodes` and `view.links` references resolve.
 - Option view nodes and links resolve.
@@ -396,7 +397,8 @@ The remaining realism improvements are targeted:
 - There are no generated AI visual or comic fields in this dataset. That is
   acceptable because those assets are optional, but adding them would improve
   the book experience if visual consistency with other flagship cases matters.
-- No `docs/` rebuild is needed for this review-only update.
+- Source data changes should be followed by a `docs/book` rebuild; this review
+  file itself remains repo-only.
 
 ## Recommended Edits, Prioritized
 

@@ -109,6 +109,36 @@
           "stateful"
         ],
         "description": "Durable state machine for external movements (pending_external -> settled / failed / reversed), reconciled against provider reports."
+      },
+      {
+        "id": "Coordinator",
+        "label": "Transfer Coordinator",
+        "type": "orchestrator",
+        "category": "compute",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Drives a cross-shard transfer saga from a durable cross_shard_transfers table: posts each shard-local leg through a per-shard clearing account, resumes idempotently after a crash, and compensates if a leg fails."
+      },
+      {
+        "id": "ShardA",
+        "label": "Ledger Shard A (source)",
+        "type": "database",
+        "category": "state",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Source account's ledger shard. Leg 1 debits the source account and credits shard A's clearing account in one local transaction."
+      },
+      {
+        "id": "ShardB",
+        "label": "Ledger Shard B (destination)",
+        "type": "database",
+        "category": "state",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Destination account's ledger shard. Leg 2 debits shard B's clearing account and credits the destination account in one local transaction."
       }
     ],
     "links": [
@@ -201,6 +231,31 @@
         "from": "Recon",
         "to": "ExtSettle",
         "label": "match provider reports"
+      },
+      {
+        "id": "api-coord",
+        "from": "API",
+        "to": "Coordinator",
+        "label": "cross-shard transfer"
+      },
+      {
+        "id": "coord-shardA",
+        "from": "Coordinator",
+        "to": "ShardA",
+        "label": "leg 1: debit src, credit clearing (pending)"
+      },
+      {
+        "id": "coord-shardB",
+        "from": "Coordinator",
+        "to": "ShardB",
+        "label": "leg 2: debit clearing, credit dst (posted)"
+      },
+      {
+        "id": "coord-compensate",
+        "from": "Coordinator",
+        "to": "ShardA",
+        "label": "compensate on leg-2 failure",
+        "arrow": "-.-"
       }
     ],
     "types": [
@@ -223,6 +278,15 @@
           "Recon",
           "Audit",
           "ExtSettle"
+        ]
+      },
+      {
+        "id": "cross-shard",
+        "label": "Cross-Shard Saga",
+        "nodes": [
+          "Coordinator",
+          "ShardA",
+          "ShardB"
         ]
       }
     ]
@@ -316,7 +380,7 @@
     {
       "method": "POST",
       "path": "/v1/transfers",
-      "description": "Move funds from one account to another. Idempotent on the provided key.",
+      "description": "Move funds from one account to another. Idempotent on the provided key. The decimal-string amount (\"10.00\") is canonicalized to integer minor units (1000) before validation and request-hashing, so equivalent representations (\"10\", \"10.0\", \"10.00\") hash identically. Errors: 409 idempotency_key_reused_with_different_request (key reused with a different payload), 422 insufficient_funds, 422 unsupported_currency, 423 account_frozen, 404 account_not_found.",
       "request": "{ \"idempotencyKey\": \"k_9\", \"from\": \"a_1\", \"to\": \"a_2\", \"amount\": \"10.00\", \"currency\": \"USD\" }",
       "response": "{ \"transactionId\": \"t_88\", \"status\": \"posted\" }",
       "sequence": {
@@ -382,9 +446,15 @@
               "messages": [
                 {
                   "from": "API",
+                  "to": "IdemStore",
+                  "arrow": "->>",
+                  "label": "compare stored request_hash"
+                },
+                {
+                  "from": "API",
                   "to": "Client",
                   "arrow": "-->>",
-                  "label": "200 (original result)"
+                  "label": "same hash -> 200 (original); different hash -> 409 reused_with_different_request"
                 }
               ]
             }
@@ -402,14 +472,14 @@
     {
       "method": "POST",
       "path": "/v1/withdrawals",
-      "description": "Withdraw to an external rail. Places a hold on the balance, then settles or reverses on the provider callback.",
+      "description": "Withdraw to an external rail. Places a hold against available_balance (not a posted debit), then captures the hold on a settled callback or releases it on failure. Returns the hold id. Errors: 422 insufficient_funds (against available_balance), 423 account_frozen, 422 unsupported_currency.",
       "request": "{ \"idempotencyKey\": \"k_11\", \"account\": \"a_1\", \"amount\": \"20.00\", \"currency\": \"USD\", \"destination\": \"bank_ref_456\" }",
-      "response": "{ \"movementId\": \"m_6\", \"status\": \"pending_external\" }"
+      "response": "{ \"movementId\": \"m_6\", \"holdId\": \"h_3\", \"status\": \"pending_external\" }"
     },
     {
       "method": "POST",
       "path": "/v1/settlements/callback",
-      "description": "Provider webhook / settlement-event ingestion. Advances a movement to settled, failed, or reversed and posts the corresponding (or compensating) entries. Idempotent on provider event id; signature-verified.",
+      "description": "Provider webhook / settlement-event ingestion. Advances a movement to settled (capture the hold, post the debit), failed (release the hold), or reversed (compensating entry). Signature-verified and idempotent on a UNIQUE (provider, provider_event_id): a re-sent callback is processed exactly once. Error: 409 provider_event_already_seen.",
       "request": "{ \"providerEventId\": \"evt_9\", \"movementId\": \"m_6\", \"outcome\": \"settled\" }",
       "response": "{ \"movementId\": \"m_6\", \"status\": \"settled\" }"
     },
@@ -498,8 +568,42 @@
       ]
     },
     {
+      "name": "accounts",
+      "note": "Account metadata so status, ownership, currency policy, and shard assignment are explicit (not just prose). Lets the write path enforce frozen/KYC restrictions and route shard-locally.",
+      "fields": [
+        {
+          "name": "account_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "owner_id",
+          "type": "bigint (user/tenant owner)"
+        },
+        {
+          "name": "tenant_id",
+          "type": "bigint (multi-tenant isolation)"
+        },
+        {
+          "name": "status",
+          "type": "enum(active, frozen, closed, kyc_pending)"
+        },
+        {
+          "name": "currency_policy",
+          "type": "varchar (allowed currencies)"
+        },
+        {
+          "name": "shard_id",
+          "type": "int (ledger shard assignment)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
       "name": "account_balances",
-      "note": "Derived, materialized balance per (account, currency) for fast reads. Durable table, rebuildable from the journal.",
+      "note": "Derived, materialized balance per (account, currency) for fast reads. Durable table, rebuildable from the journal. available = posted - held; withdrawals/transfers check available, not posted.",
       "fields": [
         {
           "name": "account_id",
@@ -510,8 +614,16 @@
           "type": "char(3)"
         },
         {
-          "name": "balance",
-          "type": "bigint (integer minor units)"
+          "name": "posted_balance",
+          "type": "bigint (integer minor units; sum of journal entries through watermark)"
+        },
+        {
+          "name": "held_amount",
+          "type": "bigint (sum of active holds)"
+        },
+        {
+          "name": "available_balance",
+          "type": "bigint (posted_balance - held_amount; spendable)"
         },
         {
           "name": "version",
@@ -528,16 +640,62 @@
       ]
     },
     {
-      "name": "idempotency_keys",
-      "note": "Dedup table: a request key + request hash -> its committed result. Reusing a key with a different payload is rejected.",
+      "name": "holds",
+      "note": "Reservations against available balance (withdrawals, future authorizations). A hold reduces available_balance without a posting; capture posts the debit, release/expire/reverse frees it. Prevents spending the same funds twice while an external rail settles.",
       "fields": [
         {
+          "name": "hold_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "account_id",
+          "type": "bigint"
+        },
+        {
+          "name": "currency",
+          "type": "char(3)"
+        },
+        {
+          "name": "amount",
+          "type": "bigint (integer minor units)"
+        },
+        {
+          "name": "status",
+          "type": "enum(created, captured, released, expired, reversed)"
+        },
+        {
+          "name": "movement_id",
+          "type": "uuid NULL (external_settlements row, for withdrawals)"
+        },
+        {
+          "name": "transaction_id",
+          "type": "uuid NULL (ledger txn once captured)"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamp (auto-release if abandoned)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "idempotency_keys",
+      "note": "Dedup table: a scoped request key + request hash -> its committed result. Key scope is (tenant_id, client_id, account_id, operation, idempotency_key) — a global key would collide across tenants. Reusing a key with a different request_hash returns 409 idempotency_key_reused_with_different_request. Retained at least as long as the client retry + dispute/settlement window; older rows TTL-pruned.",
+      "fields": [
+        {
+          "name": "scope",
+          "type": "varchar (tenant_id:client_id:account_id:operation)"
+        },
+        {
           "name": "idempotency_key",
-          "type": "varchar PK"
+          "type": "varchar"
         },
         {
           "name": "request_hash",
-          "type": "bytes (hash of request body)"
+          "type": "bytes (hash of canonicalized request body)"
         },
         {
           "name": "transaction_id",
@@ -550,16 +708,24 @@
         {
           "name": "created_at",
           "type": "timestamp"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamp (TTL >= retry/dispute window)"
+        },
+        {
+          "name": "_pk",
+          "type": "PRIMARY KEY (scope, idempotency_key)"
         }
       ]
     },
     {
       "name": "outbox_events",
-      "note": "Durable outbox written in the posting transaction; a relay tails and publishes it, then marks delivered (pruned later).",
+      "note": "Durable outbox written in the posting transaction; a leased relay tails undelivered rows in event_id order, publishes at-least-once, then marks delivered (archived/pruned later). Index (status, event_id) for the undelivered scan.",
       "fields": [
         {
           "name": "event_id",
-          "type": "bigint PK (monotonic)"
+          "type": "bigint PK (monotonic; publish/dedup order)"
         },
         {
           "name": "transaction_id",
@@ -570,6 +736,26 @@
           "type": "json (domain event)"
         },
         {
+          "name": "status",
+          "type": "enum(pending, delivered, dead_letter)"
+        },
+        {
+          "name": "attempt_count",
+          "type": "int (retry counter)"
+        },
+        {
+          "name": "next_attempt_at",
+          "type": "timestamp (backoff schedule)"
+        },
+        {
+          "name": "locked_by",
+          "type": "varchar NULL (relay instance lease)"
+        },
+        {
+          "name": "locked_until",
+          "type": "timestamp NULL (lease expiry)"
+        },
+        {
           "name": "delivered_at",
           "type": "timestamp NULL"
         }
@@ -577,7 +763,7 @@
     },
     {
       "name": "external_settlements",
-      "note": "State machine for funding/withdrawals through the external rail. Bridges internal finality and provider settlement.",
+      "note": "State machine for funding/withdrawals through the external rail. Bridges internal finality and provider settlement. Index (status, expected_by) for the pending-settlement scan.",
       "fields": [
         {
           "name": "movement_id",
@@ -604,12 +790,108 @@
           "type": "enum(pending_external, settled, failed, reversed)"
         },
         {
+          "name": "hold_id",
+          "type": "uuid NULL (withdrawal hold; captured/released on settle)"
+        },
+        {
           "name": "provider_ref",
           "type": "varchar (PSP/bank reference)"
         },
         {
+          "name": "expected_by",
+          "type": "timestamp (flag if still pending past this)"
+        },
+        {
           "name": "transaction_id",
           "type": "uuid NULL (the ledger txn once posted)"
+        }
+      ]
+    },
+    {
+      "name": "settlement_events",
+      "note": "Ingested provider callbacks. UNIQUE (provider, provider_event_id) makes webhook delivery idempotent so a re-sent settlement callback is processed once.",
+      "fields": [
+        {
+          "name": "provider",
+          "type": "varchar"
+        },
+        {
+          "name": "provider_event_id",
+          "type": "varchar"
+        },
+        {
+          "name": "movement_id",
+          "type": "uuid FK -> external_settlements"
+        },
+        {
+          "name": "outcome",
+          "type": "enum(settled, failed, reversed)"
+        },
+        {
+          "name": "received_at",
+          "type": "timestamp"
+        },
+        {
+          "name": "_uniq",
+          "type": "UNIQUE (provider, provider_event_id)"
+        }
+      ]
+    },
+    {
+      "name": "cross_shard_transfers",
+      "note": "Coordinator state for transfers whose accounts live on different shards. The durable record the saga is driven from; enables idempotent resume after a coordinator crash.",
+      "fields": [
+        {
+          "name": "transfer_id",
+          "type": "uuid PK (also the leg idempotency key)"
+        },
+        {
+          "name": "source_account_id",
+          "type": "bigint"
+        },
+        {
+          "name": "dest_account_id",
+          "type": "bigint"
+        },
+        {
+          "name": "source_shard",
+          "type": "int"
+        },
+        {
+          "name": "dest_shard",
+          "type": "int"
+        },
+        {
+          "name": "amount",
+          "type": "bigint (integer minor units)"
+        },
+        {
+          "name": "currency",
+          "type": "char(3)"
+        },
+        {
+          "name": "state",
+          "type": "enum(pending_source_posted, pending_destination_posted, posted, compensating, compensated, failed)"
+        },
+        {
+          "name": "source_leg_txn",
+          "type": "uuid NULL"
+        },
+        {
+          "name": "dest_leg_txn",
+          "type": "uuid NULL"
+        },
+        {
+          "name": "retry_count",
+          "type": "int"
+        },
+        {
+          "name": "terminal_reason",
+          "type": "varchar NULL"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp"
         }
       ]
     }
@@ -660,6 +942,51 @@
         "concurrency"
       ],
       "group": "Concurrency Control on Balances"
+    },
+    {
+      "name": "Transactional outbox",
+      "what": "Write a downstream event into an outbox table in the same transaction as the postings; a relay tails and publishes it at-least-once.",
+      "whenToUse": "Reliably emitting events for a state change without a dual-write that can diverge on a crash.",
+      "steps": [
+        "events"
+      ],
+      "group": "Reliable Downstream Events (Outbox)"
+    },
+    {
+      "name": "Clearing account",
+      "what": "A per-shard in-transit account that temporarily holds value so each shard-local leg of a cross-shard transfer balances on its own.",
+      "whenToUse": "Moving money between accounts on different shards without a distributed transaction.",
+      "steps": [
+        "cross-shard"
+      ],
+      "group": "Concurrency Control on Balances"
+    },
+    {
+      "name": "Saga with compensation",
+      "what": "Split a multi-step operation into locally-atomic steps driven by a coordinator that compensates earlier steps if a later one fails.",
+      "whenToUse": "Cross-shard or cross-service operations that can't share one transaction but must stay consistent.",
+      "steps": [
+        "cross-shard"
+      ],
+      "group": "Concurrency Control on Balances"
+    },
+    {
+      "name": "Hold / reservation",
+      "what": "Reserve funds against available balance without posting, then capture, release, expire, or reverse the hold.",
+      "whenToUse": "Withdrawals and authorizations that wait on an asynchronous external rail before becoming final.",
+      "steps": [
+        "audit"
+      ],
+      "group": "Reconciliation, Audit, and Settlement"
+    },
+    {
+      "name": "Settlement state machine",
+      "what": "Model an external movement's lifecycle (pending_external -> settled / failed / reversed) so internal and provider finality stay distinct and reconcilable.",
+      "whenToUse": "Funding/withdrawals through a bank or PSP that settle asynchronously.",
+      "steps": [
+        "audit"
+      ],
+      "group": "Reconciliation, Audit, and Settlement"
     },
     {
       "name": "Reconciliation",
@@ -726,7 +1053,7 @@
       "title": "2. Model Money as a Double-Entry Ledger",
       "description": [
         "Don't store a mutable 'balance' field and add/subtract it — that loses history and is impossible to audit. Instead record every movement as balanced double-entry postings: each transaction writes a debit on one account and an equal credit on another.",
-        "The journal is append-only and immutable: the source of truth is the full list of postings, and a balance is the sum of an account's entries. Corrections are new compensating entries, never edits.",
+        "The journal is append-only and immutable: the source of truth is the full list of postings, and a balance is the sum of an account's entries. Corrections are new compensating entries, never edits. A transaction header (one row per logical movement) groups its balanced entries and gives them business meaning — type, status, reference, provenance — so any movement is explainable, not just a pair of orphan postings.",
         "Use integer minor units (cents) or fixed-point decimals — never floating point — so amounts are exact. Postings must balance per currency, not just in aggregate: a transaction's debits and credits sum to zero within each currency, so a multi-currency movement (e.g. an FX leg) is modeled as balanced postings per currency, never a single mixed-currency total."
       ],
       "view": {
@@ -857,7 +1184,7 @@
       "description": [
         "Networks retry. Without protection, a retried transfer posts twice and moves money twice. The client supplies an idempotency key; the API records key -> result in an idempotency table within the same transaction as the posting.",
         "A repeat of the same key returns the original result without posting again. Also store a hash of the request body and reject a reused key whose payload differs — a key replayed with a different amount or recipient must fail, not silently succeed. This turns at-least-once clients into effectively-once money movement.",
-        "The idempotency table lives in the same ledger database/shard as the journal, so the dedup record and the postings commit in one local transaction; if they were separate stores this would require a distributed (2PC) commit. Scope the key to the operation so a crash can't lose the dedup record while keeping the posting (or vice versa)."
+        "The idempotency table lives in the same ledger database/shard as the journal, so the dedup record and the postings commit in one local transaction — a crash can't lose the dedup record while keeping the posting (or vice versa); if they were separate stores, keeping them atomic would require a distributed (2PC) commit. Scope the key to the operation (tenant, client, account, operation) so a key reused across tenants or operations can't collide."
       ],
       "view": {
         "nodes": [
@@ -1177,7 +1504,7 @@
         "Two transfers debiting the same account at once can both read the old balance and write back conflicting values — a lost update, and possibly an overdraft. The journal stays correct, but the derived balance and any balance-check would be wrong.",
         "Guard the balance update with concurrency control: optimistic (version the row; the second writer's compare-and-set fails and retries) or pessimistic (row lock / serialized per-account writes).",
         "Enforce business invariants here too — e.g. reject a transfer that would overdraw, atomically within the same transaction that checks and decrements.",
-        "A transfer touches two balance rows (debit and credit), so the transaction updates both under control. With pessimistic locking, always acquire the two account locks in a deterministic order (e.g. by account id) so two opposing transfers can't deadlock; with optimistic CAS, both rows' version checks must pass or the whole transaction retries. The base design assumes both accounts live in one ledger shard so this stays a single local transaction; when they don't, see the cross-shard sub-step."
+        "A transfer touches two balance rows (debit and credit), so the transaction updates both under control. With pessimistic locking, always acquire the two account locks in a deterministic order (e.g. by account id) so two opposing transfers can't deadlock; with optimistic CAS, both rows' version checks must pass or the whole transaction retries. Bound that retry: a hot account can livelock on repeated CAS failures, so cap retries with exponential backoff and shed or queue beyond the budget — this is the same hot-account write limit the capacity section calls out. The base design assumes both accounts live in one ledger shard so this stays a single local transaction; when they don't, see the cross-shard sub-step."
       ],
       "view": {
         "nodes": [
@@ -1441,44 +1768,41 @@
       "title": "5a. Transfers Across Two Shards",
       "description": [
         "The base design appends a transfer's debit and credit in one local transaction, which works only when both accounts live in the same ledger shard. Sharding by account id means a transfer between two arbitrary accounts often spans two shards, and there is no single local transaction that can atomically touch both.",
-        "Default approach — pending/posted via a clearing account: split the transfer into two locally-atomic legs joined by a transfer coordinator. On shard A, debit the source and credit an in-transit clearing account (state: pending). On shard B, debit the same clearing account and credit the destination (state: posted). The clearing account makes each leg balance locally; the coordinator drives the saga and, on a failed second leg, posts a compensating entry on shard A to reverse the first. The wallet's invariant holds because every leg is itself balanced double-entry.",
+        "Default approach — saga with per-shard clearing accounts driven by a coordinator: a transfer coordinator records the transfer in a durable cross_shard_transfers table (transfer_id, source/destination shard, state, leg ids, retry count, terminal reason) and splits the move into two locally-atomic legs. Leg 1 on shard A debits the source and credits shard A's clearing account in one local transaction; leg 2 on shard B debits shard B's clearing account and credits the destination in another. Each shard owns its own clearing account (a single ledger account belongs to one shard, so there is no account writable on both); the global in-transit position is the sum of the per-shard clearing accounts, which the coordinator and reconciliation audit. The coordinator drives the saga through states pending_source_posted -> pending_destination_posted -> posted, and on a failed second leg posts a compensating credit back to the source on shard A (compensating -> compensated). Every leg is itself balanced double-entry, so the wallet's invariant always holds.",
+        "Each leg carries the transfer_id as its idempotency/leg id, so a retried or replayed leg is a no-op — the coordinator can crash and resume from cross_shard_transfers without ever double-posting. Client-visible semantics during the pending window: the source funds are unavailable as soon as leg 1 commits (debited or held), and the destination is not credited until leg 2 posts — surfaced either as 'in transit' or a clearly-marked pending credit, never as spendable on both sides.",
         "Alternative — two-phase commit: a coordinator runs prepare/commit across both shards so the two postings commit together. It is strongly consistent and conceptually simplest, but it holds locks across shards for the duration, blocks on coordinator or participant failure, and ties throughput to the slowest shard — usually the wrong trade for a high-throughput wallet.",
         "Either way, declare it explicitly: the same-shard path is the fast common case; the cross-shard path accepts a brief pending window (saga) or cross-shard locking (2PC) as the cost of spanning shards. Colocating frequently-transacting accounts on one shard keeps most transfers on the fast path."
       ],
       "view": {
         "nodes": [
           "API",
-          "LedgerSvc",
-          "LedgerDB"
+          "Coordinator",
+          "ShardA",
+          "ShardB"
         ],
-        "caption": "A cross-shard transfer is split into two locally-atomic legs via an in-transit clearing account, coordinated as a saga with a compensating entry if the second leg fails.",
+        "caption": "A cross-shard transfer is driven by a coordinator (backed by a durable cross_shard_transfers table) as two locally-atomic legs through per-shard clearing accounts: leg 1 debits the source and credits shard A's clearing; leg 2 debits shard B's clearing and credits the destination; a failed leg 2 triggers a compensating credit on shard A.",
         "links": [
-          "api-ledger",
-          {
-            "from": "LedgerSvc",
-            "to": "LedgerDB",
-            "label": "leg 1: debit src, credit clearing (pending)"
-          },
-          {
-            "from": "LedgerSvc",
-            "to": "LedgerDB",
-            "label": "leg 2: debit clearing, credit dst (posted)"
-          }
+          "api-coord",
+          "coord-shardA",
+          "coord-shardB",
+          "coord-compensate"
         ],
         "highlight": [
-          "LedgerSvc"
+          "Coordinator",
+          "ShardA",
+          "ShardB"
         ],
         "groups": [
-          "write-core"
+          "cross-shard"
         ]
       },
       "decisionPrompt": "The debit and credit accounts of a transfer live on different shards. There is no local transaction that spans both — how do you move the money without ever creating or losing a cent?",
       "concepts": [
         {
           "term": "Clearing (in-transit) account",
-          "definition": "An internal account that temporarily holds value mid-transfer so each shard-local leg balances on its own.",
-          "whyItMatters": "Turns one cross-shard transfer into two locally-atomic double-entry postings the coordinator can drive and compensate.",
-          "example": "Shard A: debit a_1, credit clearing (pending). Shard B: debit clearing, credit a_2 (posted).",
+          "definition": "A per-shard internal account that temporarily holds value mid-transfer so each shard-local leg balances on its own; the global in-transit position is the sum across shards.",
+          "whyItMatters": "Turns one cross-shard transfer into two locally-atomic double-entry postings the coordinator can drive, resume, and compensate — no account is writable on both shards.",
+          "example": "Shard A: debit a_1, credit A.clearing (pending). Shard B: debit B.clearing, credit a_2 (posted).",
           "group": "Concurrency Control on Balances"
         }
       ],
@@ -1489,16 +1813,32 @@
       "whyNow": [
         "A wallet transfer naturally touches two accounts; once accounts are sharded, choosing the cross-shard model (saga + clearing account vs 2PC) is the highest-signal staff-level decision in this design."
       ],
+      "patterns": [
+        "Clearing account",
+        "Saga with compensation"
+      ],
       "recap": {
         "before": "Both accounts assumed colocated in one shard.",
-        "after": "Cross-shard transfers move via a clearing account as two locally-atomic legs, with compensation on failure.",
-        "newRisk": "A brief pending window where value sits in the clearing account; the coordinator must drive every saga to a terminal state."
+        "after": "Cross-shard transfers move via per-shard clearing accounts as two locally-atomic legs, coordinated from a durable transfers table with compensation on failure.",
+        "newRisk": "A brief pending window where value sits in the per-shard clearing accounts; the coordinator must drive every saga to a terminal state and resume idempotently after a crash."
       },
       "traps": [
         {
           "trap": "Assuming a single SQL transaction can atomically debit and credit accounts on different shards.",
           "why": "A local transaction can't span shards; the second write can fail after the first commits, leaving money created or destroyed.",
-          "instead": "Split into locally-atomic legs through a clearing account (saga + compensation) or pay for cross-shard 2PC."
+          "instead": "Split into locally-atomic legs through per-shard clearing accounts (saga + compensation) or pay for cross-shard 2PC."
+        },
+        {
+          "trap": "Using one shared clearing account that both shards write to.",
+          "why": "A ledger account belongs to a single shard; writing it from another shard re-introduces the cross-shard write you were trying to avoid.",
+          "instead": "Give each shard its own clearing account and audit the global in-transit position as their sum."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "Leg 1 (source debit + clearing credit on shard A) commits, then the coordinator crashes before posting leg 2.",
+          "expectedBehavior": "On restart the coordinator reads cross_shard_transfers, finds the transfer in pending_source_posted, and idempotently resumes — re-posting leg 2 (a no-op if it already landed via the transfer_id leg key) or compensating leg 1 if leg 2 is unrecoverable. Money never sits lost: it is in shard A's clearing account until a terminal state is reached.",
+          "mitigation": "Drive every saga from the durable coordinator table; make each leg idempotent on transfer_id; reconcile clearing-account balances to flag any transfer stuck pending past its window."
         }
       ]
     },
@@ -1661,7 +2001,7 @@
         "stripe-idempotency"
       ],
       "patterns": [
-        "Immutable append-only ledger"
+        "Transactional outbox"
       ],
       "whyNow": [
         "Money systems must never have an event without a posting or vice versa; the outbox is the standard guarantee and reuses the ledger's atomicity."
@@ -1676,9 +2016,10 @@
       "id": "audit",
       "title": "7. Reconciliation, Audit, and Settlement",
       "description": [
-        "Reconcile at two cadences: a continuous, cheap invariant check (system-wide debits == credits, per-account materialized balance == sum of journal entries past its watermark) plus a scheduled full reconciliation that recomputes every balance from the journal and matches external provider reports. Any mismatch raises an alert with a defined threshold; the journal is authoritative, so repair means rebuilding derived state from it or posting a compensating entry — never editing history. Keep a documented replay/rebuild procedure: a balance table can always be regenerated by replaying the journal.",
+        "Reconcile at two cadences. A continuous, cheap invariant check (system-wide debits == credits, and per-account materialized balance == sum of journal entries through its watermark — entries after the watermark are unapplied tail work, not drift). Plus a scheduled full reconciliation that recomputes every balance from the journal and matches external provider reports. Any mismatch raises an alert with a defined threshold; the journal is authoritative, so repair means rebuilding derived state from it or posting a compensating entry — never editing history. Keep a documented replay/rebuild procedure: a balance table can always be regenerated by replaying the journal.",
+        "Disaster recovery has a precise replay boundary: pick a recovery checkpoint of {journal commit position, balance watermark (last_entry_id), outbox event id, settlement report watermark}. After a partial restore, region failover, or relay replay, rebuild each balance from journal entries through the checkpoint and then tail forward; re-drive outbox from its last delivered event id (consumers dedup on transaction id); resume the settlement tracker from the last matched provider report. Idempotency records must be retained at least as long as the client retry window and restored consistently with the committed transactions they dedup, or a post-restore retry could double-post. The invariant after restore is: balance equals the sum through its watermark; anything past the watermark is tail work to replay, not an error.",
         "Export immutable statements/audit records for compliance; the append-only journal makes any historical balance reconstructable on demand.",
-        "Model external movements as a state machine, not just a reconciliation correction. A top-up or withdrawal opens as pending_external; the rail settles asynchronously and can confirm (-> settled, post the entries), fail (-> failed, release the hold), or reverse a prior settlement (-> reversed, post a compensating entry). Internal ledger finality and external settlement finality are different things, and the settlement tracker is what bridges them. Scheduled reconciliation matches the tracker against the provider's settlement report and flags any movement stuck pending past its expected window."
+        "Model external movements as a state machine, not just a reconciliation correction. A top-up or withdrawal opens as pending_external; a withdrawal places a hold against available_balance. The rail settles asynchronously and can confirm (-> settled: capture the hold and post the entries), fail (-> failed: release the hold), or reverse a prior settlement (-> reversed: post a compensating entry). Internal ledger finality and external settlement finality are different things, and the settlement tracker is what bridges them. Scheduled reconciliation matches the tracker against the provider's settlement report and flags any movement stuck pending past its expected window."
       ],
       "view": {
         "nodes": [
@@ -1718,7 +2059,9 @@
         }
       ],
       "patterns": [
-        "Reconciliation"
+        "Reconciliation",
+        "Settlement state machine",
+        "Hold / reservation"
       ],
       "whyNow": [
         "Closing on reconciliation + audit + external settlement completes the correctness story: even bugs and external mismatches are detectable and fixable."
@@ -1733,6 +2076,11 @@
           "scenario": "An external withdrawal is reported failed after the wallet already debited.",
           "expectedBehavior": "Reconciliation flags the mismatch; a compensating credit reverses the debit.",
           "mitigation": "Match internal postings to settlement reports; post compensating entries, never edit history."
+        },
+        {
+          "scenario": "Restore from a backup where outbox delivery is ahead of the balance watermark (more events were published than the restored balances reflect).",
+          "expectedBehavior": "Rebuild balances from the journal through the checkpoint and tail forward; re-drive outbox from its last delivered event id. Re-published events are deduped downstream by event/transaction id, so no double effects — the journal, not the restored derived state, is authoritative.",
+          "mitigation": "Restore to a consistent checkpoint {journal position, balance watermark, outbox event id, settlement watermark}; replay by journal position; dedup downstream on event/transaction id."
         }
       ],
       "flows": [
@@ -1818,7 +2166,7 @@
   ],
   "finalDesign": {
     "title": "Final Design — Double-Entry Wallet Ledger",
-    "description": "The wallet API enforces idempotency (key + request hash -> result) and posts every transfer as balanced double-entry entries into an immutable journal — the source of truth. The journal, idempotency table, materialized balance table, and outbox table all live in the same ledger database/shard, so a single local transaction appends the postings, updates the per-account balance (guarded by optimistic concurrency and overdraft invariants), records the idempotency result, and writes the outbox row together — no distributed commit on the hot path. Balance reads hit the materialized table; a relay streams outbox events at-least-once; a reconciliation worker recomputes balances from the journal, asserts debits==credits, exports immutable statements, and matches external-rail settlements via a settlement tracker, correcting drift only via compensating entries. Scope: this single-transaction path assumes both accounts in a transfer share one ledger shard; a transfer whose debit and credit accounts live on different shards uses the cross-shard path below. External top-ups and withdrawals are not internally final until the rail settles — they move through pending_external / settled / failed / reversed states, with a compensating entry on failure or reversal.",
+    "description": "The wallet API enforces idempotency (scoped key + request hash -> result) and posts every transfer as balanced double-entry entries into an immutable journal — the source of truth. The journal, idempotency table, materialized balance table, holds, and outbox table all live in the same ledger database/shard, so a single local transaction appends the postings, updates the per-account balance (guarded by optimistic concurrency and overdraft invariants against available_balance), records the idempotency result, and writes the outbox row together — no distributed commit on the hot path. Balance reads hit the materialized table; a leased relay streams outbox events at-least-once; a reconciliation worker recomputes balances from the journal, asserts debits==credits, exports immutable statements, and matches external-rail settlements via a settlement tracker, correcting drift only via compensating entries. Synchronous vs asynchronous. Synchronous — invariants that hold inside the posting transaction: journal entries balance per currency, the idempotency result commits, the balance row updates, the outbox row exists, and the overdraft invariant holds against available balance. Asynchronous — eventual workflows: outbox relay delivery, reconciliation scans, statement export, provider settlement, and cross-shard saga completion. Scope: this single-transaction path assumes both accounts in a transfer share one ledger shard; a transfer whose debit and credit accounts live on different shards uses the cross-shard saga (per-shard clearing accounts + a coordinator driven from cross_shard_transfers, with compensation on a failed leg). External top-ups and withdrawals are not internally final until the rail settles — a withdrawal places a hold against available_balance and they move through pending_external / settled / failed / reversed states, with a compensating entry on failure or reversal. After a disaster, derived state is rebuilt to a consistent checkpoint {journal position, balance watermark, outbox event id, settlement watermark} and replayed forward.",
     "view": {
       "nodes": [
         "Client",
@@ -1831,9 +2179,12 @@
         "Recon",
         "Audit",
         "External",
-        "ExtSettle"
+        "ExtSettle",
+        "Coordinator",
+        "ShardA",
+        "ShardB"
       ],
-      "caption": "The client's transfers go through the wallet API (idempotency-checked) to the ledger service, which in one ledger-shard transaction appends double-entry rows, updates the balance table, and writes an outbox row; a relay streams outbox events, a reconciliation worker verifies balances and exports audits, and external funding/withdrawals move through a settlement tracker reconciled against the rail.",
+      "caption": "The client's transfers go through the wallet API (idempotency-checked) to the ledger service, which in one ledger-shard transaction appends double-entry rows, updates the balance table, and writes an outbox row; a relay streams outbox events, a reconciliation worker verifies balances and exports audits, external funding/withdrawals move through a settlement tracker reconciled against the rail, and cross-shard transfers are driven by a coordinator through per-shard clearing accounts on shards A and B.",
       "links": [
         "client-api",
         "api-idem",
@@ -1849,11 +2200,16 @@
         "api-external",
         "api-settle",
         "external-settle",
-        "settle-ledger"
+        "settle-ledger",
+        "api-coord",
+        "coord-shardA",
+        "coord-shardB",
+        "coord-compensate"
       ],
       "groups": [
         "write-core",
-        "derived"
+        "derived",
+        "cross-shard"
       ]
     }
   },
@@ -1868,7 +2224,7 @@
       },
       {
         "requirement": "Atomic transfers",
-        "how": "Balanced debit/credit postings in one transaction (same shard); cross-shard via clearing account + compensation.",
+        "how": "Balanced debit/credit postings in one transaction (same shard); cross-shard via per-shard clearing accounts + a coordinator saga with compensation.",
         "steps": [
           "double-entry",
           "concurrency",
@@ -1877,7 +2233,7 @@
       },
       {
         "requirement": "Top up / withdraw via external rail",
-        "how": "External funding/withdrawal as a pending_external -> settled/failed/reversed state machine, reconciled to postings.",
+        "how": "External funding/withdrawal as a pending_external -> settled/failed/reversed state machine; withdrawals hold funds against available_balance until the rail settles, reconciled to postings.",
         "steps": [
           "audit"
         ]

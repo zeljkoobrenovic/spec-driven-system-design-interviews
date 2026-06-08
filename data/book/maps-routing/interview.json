@@ -261,9 +261,9 @@
   ],
   "capacityDiagram": [
     "graph LR",
-    "  Nodes[100s of M road nodes]",
-    "  Queries[High route QPS]",
-    "  Fast[ms-level routing]",
+    "  Nodes[~300M nodes / ~600M edges]",
+    "  Queries[~50k route QPS / ~1M+ tile reads/sec]",
+    "  Fast[p99 < 100 ms routing]",
     "  Nodes --> Queries",
     "  Queries --> Fast"
   ],
@@ -280,43 +280,49 @@
       "Scale to a continental graph (hundreds of millions of nodes/edges) and high query volume.",
       "Tiles served fast globally (mostly static, CDN-cached).",
       "Traffic reasonably fresh (minutes) and reflected in routing.",
-      "Mostly read-heavy; the graph changes slowly, traffic changes continuously."
+      "Mostly read-heavy; the graph changes slowly, traffic changes continuously.",
+      "Privacy: GPS probes are opt-in, anonymized, short-retention; operators see only aggregated edge speeds, never raw traces."
     ]
   },
   "capacity": [
     {
-      "label": "Road nodes/edges",
-      "value": "100s of millions",
-      "note": "Continental network; too big for naive Dijkstra per query."
+      "label": "Graph size",
+      "value": "~300M nodes, ~600M directed edges",
+      "note": "~50–80 B/edge -> ~50 GB base graph; CH shortcuts add ~1.5–2x edges. Fits in RAM per region shard, not one machine continent-wide."
     },
     {
       "label": "Route QPS",
-      "value": "high",
-      "note": "Each must be ms-level."
+      "value": "~50k/sec global, ~5k/sec hot region",
+      "note": "p99 < 100 ms budget split: gateway ~5 ms, geocode/snap ~10 ms, CH query ~20 ms, traffic overlay ~15 ms, shortcut unpack + geometry ~30 ms."
     },
     {
       "label": "Tile reads",
-      "value": "massive",
-      "note": "Mostly static; served from CDN."
+      "value": "~1M+ reads/sec, 95–99% CDN hit",
+      "note": "Mostly static; only ~10–50k/sec origin QPS after cache misses (cold viewports, new tile versions)."
     },
     {
-      "label": "Traffic freshness",
-      "value": "minutes",
-      "note": "From aggregated GPS probes."
+      "label": "Probe ingestion",
+      "value": "~10M+ devices, ~1M probes/sec",
+      "note": "Aggregated in 1–5 min windows into per-edge speeds; ~1–5M edge-speed updates/min. Sparse roads fall back to historical speed."
     },
     {
-      "label": "Graph updates",
-      "value": "slow (days)",
-      "note": "Roads change rarely; preprocessing is offline."
+      "label": "Freshness SLOs",
+      "value": "traffic 2–5 min; closures sec–min; base graph hrs–days",
+      "note": "Three distinct cadences: live speeds, urgent overlays (closures/incidents), and offline base-graph + CH rebuilds."
+    },
+    {
+      "label": "Storage / replication",
+      "value": "graph+CH ~150 GB/continent, sharded by region",
+      "note": "Per-region shard ~5–20 GB held in RAM, 3x replicated read-only across the fleet for the immutable versioned index."
     }
   ],
   "api": [
     {
       "method": "GET",
       "path": "/v1/route",
-      "description": "Compute the fastest route between two points, traffic-aware.",
-      "request": "?from=37.77,-122.41&to=34.05,-118.24&mode=drive",
-      "response": "{ \"distanceKm\": 615, \"etaMin\": 360, \"geometry\": [ ... ] }",
+      "description": "Compute the fastest route between two points, traffic-aware, with turn-by-turn.",
+      "request": "?from=37.77,-122.41&to=34.05,-118.24&mode=drive&departure_time=now&traffic_model=best_guess&alternatives=2&waypoints=36.6,-121.9&avoid=tolls,highways&locale=en-US",
+      "response": "{ \"route_id\": \"r_8f2\", \"distanceKm\": 615, \"duration\": 21000, \"duration_in_traffic\": 23400, \"polyline\": \"_p~iF~ps|U...\", \"legs\": [ { \"steps\": [ { \"maneuver\": \"turn-right\", \"instruction\": \"Turn right onto US-101 S\", \"distanceM\": 1200, \"durationS\": 75, \"polyline\": \"...\" } ] } ], \"warnings\": [\"toll road on alternative\"], \"graph_version\": \"g-2026-06-01\", \"traffic_version\": \"t-1733650200\" }",
       "sequence": {
         "participants": [
           {
@@ -325,6 +331,10 @@
           {
             "id": "RouteSvc",
             "label": "Routing Service"
+          },
+          {
+            "id": "Geocode",
+            "label": "Geocoder"
           },
           {
             "id": "CH",
@@ -348,68 +358,104 @@
           },
           {
             "from": "RouteSvc",
-            "to": "CH",
+            "to": "Geocode",
             "arrow": "->>",
-            "label": "query shortcuts"
+            "label": "snap endpoints to graph nodes"
+          },
+          {
+            "from": "RouteSvc",
+            "to": "RouteSvc",
+            "arrow": "->>",
+            "label": "pin graph_version + traffic_version"
           },
           {
             "from": "RouteSvc",
             "to": "TrafficSvc",
             "arrow": "->>",
-            "label": "live edge speeds"
+            "label": "live edge speeds (corridor)"
+          },
+          {
+            "from": "RouteSvc",
+            "to": "CH",
+            "arrow": "->>",
+            "label": "query shortcuts (dynamic weights)"
           },
           {
             "from": "RouteSvc",
             "to": "GraphStore",
             "arrow": "->>",
-            "label": "expand path geometry"
+            "label": "unpack shortcuts -> base edges + geometry"
           },
           {
             "from": "RouteSvc",
             "to": "Client",
             "arrow": "-->>",
-            "label": "route + ETA"
+            "label": "polyline + legs/steps + ETA + versions"
           }
         ]
       }
     },
     {
       "method": "GET",
-      "path": "/v1/tiles/{z}/{x}/{y}",
-      "description": "Fetch a map tile by zoom/coordinate (CDN-served).",
-      "request": "(z/x/y in path)",
-      "response": "(tile image / vector)"
+      "path": "/v1/tiles/{style}/{v}/{z}/{x}/{y}.{fmt}",
+      "description": "Fetch a versioned map tile by style/version/zoom/coordinate (CDN-served, immutable).",
+      "request": "style=streets, v=2026-06-01 (tile version), z/x/y, fmt=pbf (vector) or png (raster)",
+      "response": "Tile bytes (vector pbf or raster png). Headers: Cache-Control: public, max-age=31536000, immutable; Content-Type per fmt. New map data = new version path, so URLs are immutable and CDN never serves stale tiles."
     },
     {
       "method": "GET",
       "path": "/v1/geocode",
-      "description": "Resolve an address/place to coordinates + nearest graph node.",
-      "request": "?q=1600+Amphitheatre+Pkwy",
-      "response": "{ \"lat\": 37.42, \"lng\": -122.08, \"nodeId\": 9981 }"
+      "description": "Resolve an address/place to coordinates + nearest graph node (snapping).",
+      "request": "?q=1600+Amphitheatre+Pkwy&region=us",
+      "response": "{ \"lat\": 37.42, \"lng\": -122.08, \"nodeId\": 9981, \"snappedEdgeId\": 44021, \"regionId\": \"us-west\" }"
     }
   ],
   "dataModel": [
     {
-      "name": "road_graph",
-      "note": "Nodes (intersections) and directed weighted edges (road segments).",
+      "name": "road_graph (edge)",
+      "note": "Directed weighted edges (road segments) keyed by a stable edge_id so traffic, geometry, and turn-by-turn all attach to it.",
       "fields": [
         {
-          "name": "node_id",
-          "type": "bigint PK"
+          "name": "edge_id",
+          "type": "bigint PK (stable across rebuilds)"
         },
         {
-          "name": "lat_lng",
-          "type": "point"
+          "name": "from_node / to_node",
+          "type": "bigint (directed; one-way = single edge)"
         },
         {
-          "name": "edges",
-          "type": "list<to_node, base_time, length, road_class>"
+          "name": "base_time",
+          "type": "float (free-flow travel time)"
+        },
+        {
+          "name": "length, road_class",
+          "type": "float, enum (motorway..residential)"
+        },
+        {
+          "name": "geometry_ref",
+          "type": "polyline ref (for drawing the route line)"
+        },
+        {
+          "name": "turn_restrictions",
+          "type": "list<via_edge, banned|penalty>"
+        },
+        {
+          "name": "access_flags",
+          "type": "bitmask (toll, highway, ferry, hov, vehicle class)"
+        },
+        {
+          "name": "region_id",
+          "type": "string (owning region shard)"
+        },
+        {
+          "name": "graph_version",
+          "type": "string (immutable artifact id)"
         }
       ]
     },
     {
       "name": "ch_index",
-      "note": "Preprocessed contraction-hierarchy shortcuts for fast queries.",
+      "note": "Preprocessed contraction-hierarchy shortcuts; each shortcut records the edges it skips so the route can be unpacked back to base geometry and maneuvers.",
       "fields": [
         {
           "name": "node_id",
@@ -421,25 +467,49 @@
         },
         {
           "name": "shortcuts",
-          "type": "list<to_node, weight> (skip edges)"
+          "type": "list<to_node, weight, skipped_edge_ids[]> (unpack tree)"
+        },
+        {
+          "name": "index_version, graph_version",
+          "type": "string (CH artifact id + compatible base graph id)"
         }
       ]
     },
     {
       "name": "edge_speed (traffic)",
-      "note": "Live speed per edge, updated from probes.",
+      "note": "Live + time-bucketed speed per edge with confidence, so stale/sparse edges fall back to historical speed rather than free-flow.",
       "fields": [
         {
           "name": "edge_id",
-          "type": "bigint"
+          "type": "bigint (FK road_graph)"
         },
         {
           "name": "live_speed",
-          "type": "float (vs free-flow)"
+          "type": "float (fraction of free-flow)"
+        },
+        {
+          "name": "time_bucket",
+          "type": "enum (dow x 15-min, for departure-time ETAs)"
+        },
+        {
+          "name": "historical_speed",
+          "type": "float (by time_bucket + road_class fallback)"
+        },
+        {
+          "name": "confidence, sample_count",
+          "type": "float, int (probe coverage quality)"
+        },
+        {
+          "name": "source",
+          "type": "enum (probe | historical | incident)"
+        },
+        {
+          "name": "incident_override",
+          "type": "nullable (closure/restriction, expires_at)"
         },
         {
           "name": "updated_at",
-          "type": "timestamp"
+          "type": "timestamp (freshness)"
         }
       ]
     }
@@ -506,7 +576,7 @@
       "title": "1. Naive: Dijkstra/A* Over the Whole Graph Per Request",
       "description": [
         "Start with the textbook answer: load the road network into a graph and run Dijkstra (or A* with a straight-line heuristic) from the origin to the destination on every request, expanding edges by travel time until the destination is settled. For a single city this is correct and even fast enough.",
-        "It fails on latency at continental scale. A long route — say coast to coast — forces the search to settle a huge share of hundreds of millions of nodes before it reaches the destination, taking seconds, not the tens-of-milliseconds budget. A* helps near the goal but still explores far too much of the graph on long routes, and it must do this work from scratch for every query.",
+        "It fails on latency at continental scale. A long route — say coast to coast — forces the search to settle a huge share of hundreds of millions of nodes before it reaches the destination: plain Dijkstra can settle tens of millions of nodes and take seconds, whereas a CH query touches only a few thousand nodes and answers in single-digit milliseconds. A* helps near the goal but still explores far too much of the graph on long routes, and it must do this work from scratch for every query.",
         "The saving grace is that the road graph changes only slowly (roads are added over days, not seconds). That makes it worth paying a large one-time, offline cost to precompute structures that let online queries skip almost all of the graph. So the baseline motivates the next two steps: first pin down the graph model, then make shortest-path fast with preprocessing."
       ],
       "view": {
@@ -613,6 +683,7 @@
       "description": [
         "Naive Dijkstra/A* explores too much of a continental graph to hit a ms latency budget for long routes. Because the graph changes slowly, precompute structures that let queries skip most of it.",
         "Contraction hierarchies: rank nodes and add 'shortcut' edges that bypass less-important nodes, so a long route is found by touching a tiny fraction of the graph (a bidirectional search up the hierarchy). Hub labeling is an even faster (more storage) alternative. Build these offline; queries use the precomputed index.",
+        "One subtlety: the CH query returns a path of shortcuts, not base roads. Each shortcut records the edges it skipped, so after finding the path you must unpack shortcuts back into base edges to produce the actual road geometry and turn-by-turn maneuvers — stopping at 'shortest distance' isn't a usable route.",
         "This preprocessing is the key idea: trade offline build time + storage for ms-level online queries on a massive graph."
       ],
       "view": {
@@ -837,8 +908,8 @@
       "title": "4. Serving Map Tiles",
       "description": [
         "Rendering the map is a separate, mostly-static problem. The world is divided into tiles by zoom level and x/y coordinate; tiles are pre-rendered (raster or vector) from map data and stored.",
-        "Serve tiles from a CDN — they're static, read-heavy, and identical for all users, so the CDN absorbs essentially all the load and the origin is rarely touched. The client requests tiles by z/x/y as the user pans/zooms.",
-        "Tiles are re-rendered only when the underlying map data changes (rare). This is the metadata/blob/CDN pattern applied to map imagery."
+        "Serve tiles from a CDN — they're static, read-heavy, and identical for all users, so the CDN absorbs essentially all the load and the origin is rarely touched. The client requests tiles by style/version/z/x/y as the user pans/zooms, with long-lived immutable cache headers.",
+        "Tiles are re-rendered only when the underlying map data changes (rare). Publishing a new tile_version makes a fresh immutable URL path rather than purging the CDN, so there's never a stale-cache window; the origin sits behind the CDN with request coalescing so a popular cold area doesn't stampede it. This is the metadata/blob/CDN pattern applied to map imagery."
       ],
       "view": {
         "nodes": [
@@ -1074,9 +1145,10 @@
       "id": "traffic",
       "title": "5. Live Traffic from GPS Probes",
       "description": [
-        "Free-flow travel times are wrong during congestion. Devices send anonymized GPS probes; a traffic aggregator maps probes to road edges and computes live speeds per edge (vs free-flow), updated every few minutes.",
-        "Routing uses dynamic edge weights: combine the static base time with a live-traffic multiplier at query time, so ETAs and the chosen route reflect current conditions. The traffic service serves these live speeds to the router.",
-        "Crucially, live traffic doesn't require re-preprocessing the whole contraction hierarchy — it adjusts edge weights within the query (customizable/time-dependent CH techniques handle this), so updates stay cheap."
+        "Free-flow travel times are wrong during congestion. Devices send opt-in, anonymized GPS probes. The aggregator does map matching — snapping each noisy probe to the most likely road edge, filtering bad GPS fixes, and deduping by anonymized session — then computes a live speed per edge with a confidence/sample_count, updated every 1–5 minutes.",
+        "Routing uses dynamic edge weights: at query time the router overlays the live multiplier on the static base time for the candidate corridor, so ETAs and the chosen route reflect current conditions. When an edge has too few probes or stale data, it falls back to the historical speed for that time-of-day and road class — not free-flow — and incidents/closures push an override (banned/heavily penalized) within seconds.",
+        "Crucially, live traffic doesn't require re-preprocessing the whole contraction hierarchy. Plain CH assumes fixed weights, so the practical approaches are: customizable CH (a cheap per-update customization phase keeps the hierarchy valid under new weights), time-dependent CH for departure-time ETAs, or a hybrid that runs CH on base weights to find a candidate corridor then repairs it with local A* under live weights. All keep the expensive offline build untouched.",
+        "Privacy is first-class: probes are short-retention, never exposed as raw traces; operators and the routing service read only aggregated per-edge speeds."
       ],
       "view": {
         "nodes": [
@@ -1204,6 +1276,23 @@
         "Probe aggregation (live traffic)",
         "Dynamic edge weights"
       ],
+      "traps": [
+        {
+          "trap": "Treating a probe as a direct edge-speed measurement.",
+          "why": "Raw GPS is noisy and ambiguous between parallel roads; without map matching and quality filtering you assign speeds to the wrong segment.",
+          "instead": "Map-match probes to candidate edges, filter bad fixes, and weight by confidence/sample_count."
+        },
+        {
+          "trap": "Falling back to free-flow speed when traffic data is missing or stale.",
+          "why": "On a busy road with sparse probes, free-flow gives wildly optimistic ETAs.",
+          "instead": "Fall back to historical speed by time-of-day and road class; only use free-flow as a last resort."
+        },
+        {
+          "trap": "Storing or exposing raw GPS traces.",
+          "why": "Individual location histories are highly sensitive; retaining them is a privacy and compliance liability.",
+          "instead": "Keep probes opt-in, anonymized, short-retention; expose only aggregated per-edge speeds."
+        }
+      ],
       "whyNow": [
         "Live traffic is what makes maps useful and is the dynamic counterpart to the static preprocessed graph; applying it without re-preprocessing is the key nuance."
       ],
@@ -1283,8 +1372,9 @@
       "title": "6. Scaling: Region Partitioning",
       "description": [
         "A continental graph and tile set are too big for one machine. Partition by geography: shard the road graph and tiles into regions, serve them from region-local clusters/CDN edges, and route within/across regions.",
-        "Most routes are local (within a region) and served entirely region-locally; long inter-region routes use the upper levels of the contraction hierarchy (the few high-rank shortcuts spanning regions), so cross-region queries stay cheap. Probe ingestion and traffic aggregation are also regional.",
-        "Geo partitioning gives locality (low latency near the user), independent scaling, and fault isolation — a region's issue doesn't take down the planet."
+        "The hard part is boundaries — routes regularly cross them. Each region owns its local graph; border vertices on the cut are duplicated/coordinated between neighbors, and a thin inter-region overlay graph holds the high-rank CH shortcuts that span regions. A cross-region query plans on the overlay first (source region -> border -> destination region) and only unpacks locally inside the two endpoint regions, so it never fans out synchronously to every region.",
+        "Partition by traffic/topology, not raw administrative borders, and split hot metros (a dense city can dominate load and shouldn't be one shard with a quiet rural region). Probe ingestion and traffic aggregation are also regional.",
+        "Geo partitioning gives locality (low latency near the user), independent scaling, and fault isolation. Degradation is graceful: if one region's graph shard, traffic feed, or tile origin is unavailable, routes wholly inside other regions are unaffected, traffic there falls back to historical/free-flow, and only routes that must traverse the failed region are degraded or rejected."
       ],
       "view": {
         "nodes": [
@@ -1317,11 +1407,12 @@
           "pros": [
             "Most routes are local and served entirely by a region-local cluster and CDN edge.",
             "Each region's graph and tiles fit on its own cluster, so no single machine holds everything.",
-            "Long inter-region routes use the few high-rank CH shortcuts that span regions, keeping cross-region queries cheap."
+            "Long inter-region routes plan on a thin overlay graph of high-rank cross-region shortcuts, then unpack locally — no synchronous fanout to every region.",
+            "Failure is isolated: a dead region only degrades routes that traverse it."
           ],
           "cons": [
-            "Routes crossing partition boundaries need cross-region stitching logic.",
-            "Region boundaries must be chosen carefully to avoid splitting dense metros badly.",
+            "Border vertices must be duplicated/coordinated and an inter-region overlay graph maintained.",
+            "Region boundaries should follow traffic/topology, not administrative lines, and hot metros need their own splits.",
             "Probe ingestion and traffic aggregation must also be partitioned per region."
           ],
           "view": {
@@ -1392,10 +1483,10 @@
       ],
       "concepts": [
         {
-          "term": "Geo region sharding",
-          "definition": "Partition graph/tiles/traffic by geography; long routes use high-level shortcuts across regions.",
-          "whyItMatters": "Locality + independent scaling + fault isolation at planet scale.",
-          "example": "West-coast routes served regionally; NYC->LA uses cross-region shortcuts.",
+          "term": "Geo region sharding + overlay graph",
+          "definition": "Partition graph/tiles/traffic by geography with duplicated border nodes; long routes plan on a thin inter-region overlay of high-rank shortcuts, then unpack locally.",
+          "whyItMatters": "Locality + independent scaling + fault isolation at planet scale, without synchronous fanout across regions.",
+          "example": "West-coast routes served regionally; NYC->LA plans on the overlay then unpacks in the NY and CA shards.",
           "group": "Scaling: Region Partitioning"
         }
       ],
@@ -1409,9 +1500,10 @@
       "id": "ops",
       "title": "7. Graph Updates, Caching, and Reliability",
       "description": [
-        "Map data changes (new roads, closures) and preprocessing (contraction hierarchies) is expensive, so rebuild offline on a cadence (days) and swap in the new index atomically; the routing service is read-only against an immutable, versioned graph/index.",
-        "Cache aggressively: popular routes and tiles are cached/CDN'd; geocoding results cache too. The routing service is stateless and horizontally scaled; the preprocessed index is replicated read-only across the fleet.",
-        "Reliability: the graph/index and tiles are derived, rebuildable artifacts; traffic degrades gracefully (fall back to free-flow weights if the probe pipeline lags) so routing still works, just less traffic-aware."
+        "Treat the graph and CH index as immutable, versioned artifacts. The build pipeline ingests map changes, validates topology, builds the CH (which carries the compatible graph_version), runs a route-regression suite, then publishes. Roll it out by canarying a region and watching route metrics (latency, failure rate, distance/ETA deltas); roll back to the previous version on regression. The routing service is read-only; a request pins one graph_version + index_version through the CH query, shortcut unpacking, and geometry expansion so it never mixes incompatible artifacts.",
+        "Separate cadences: urgent changes (closures, restrictions, incidents) push through a fast overlay/restriction store in seconds–minutes as edge overrides, while the expensive base-graph + CH rebuild stays on a slow (hours–days) offline cadence. Tiles are versioned immutable assets — a new tile_version path, not a CDN purge.",
+        "Cache aggressively: route cache keys include origin/destination cells, mode, avoid flags, graph_version, and a traffic-freshness bucket; tiles and geocoding results cache too. The routing service is stateless and horizontally scaled; the preprocessed index is replicated read-only across the fleet.",
+        "Reliability: the graph/index and tiles are derived, rebuildable artifacts; traffic degrades gracefully (fall back to historical, then free-flow weights, if the probe pipeline lags) so routing still works, just less traffic-aware."
       ],
       "view": {
         "nodes": [
@@ -1440,11 +1532,21 @@
       "whyNow": [
         "Closing on offline rebuild + caching + graceful traffic fallback shows the system stays fresh, fast, and available — the operational reality."
       ],
+      "concepts": [
+        {
+          "term": "Immutable versioned map artifacts",
+          "definition": "Graph, CH index, and tiles are published as immutable versioned artifacts; a request pins one compatible (graph_version, index_version) through query, unpack, and geometry expansion.",
+          "whyItMatters": "Version pinning is a correctness property, not just ops — mismatched graph/index or a half-published rollout yields invalid routes.",
+          "example": "g-2026-06-01 + matching CH; canary one region, watch route metrics, roll back on regression.",
+          "group": "Graph Updates, Caching, and Reliability"
+        }
+      ],
       "probeLinks": [
         "osrm-docs",
         "s2-docs",
         "postgis-docs",
-        "google-routes"
+        "google-routes",
+        "sre-monitoring"
       ],
       "recap": {
         "before": "Static, single-version assumptions.",
@@ -1457,22 +1559,110 @@
           "mitigation": "Offline build on a cadence; atomic versioned index swap; incremental/customizable CH for traffic."
         },
         {
+          "issue": "Urgent closures can't wait for a base rebuild.",
+          "mitigation": "Push closures/restrictions as edge overrides through a fast overlay store in seconds–minutes; base graph/CH rebuild stays slow."
+        },
+        {
           "issue": "Hot routes/tiles.",
-          "mitigation": "Route + tile caching; CDN for tiles."
+          "mitigation": "Route cache keyed by od-cells/mode/avoid/graph_version/freshness; CDN for versioned immutable tiles."
         }
       ],
       "failureDrills": [
         {
           "scenario": "The traffic probe pipeline lags or fails.",
-          "expectedBehavior": "Routing falls back to free-flow base weights; routes still compute, just less congestion-aware.",
+          "expectedBehavior": "Routing falls back to historical then free-flow base weights; routes still compute, just less congestion-aware.",
           "mitigation": "Static base graph as the always-available fallback; traffic as an overlay."
+        },
+        {
+          "scenario": "A bad graph/index is published (broken topology, regressed routes) or a region's index publishes only partially.",
+          "expectedBehavior": "Canary route-metric regression halts the rollout; the fleet keeps serving the previous pinned version; no request mixes a half-published index.",
+          "mitigation": "Route-regression suite + canary by region before fleet-wide; immutable versioned artifacts with one-click rollback; requests pin a single graph_version/index_version end to end."
+        }
+      ],
+      "flows": [
+        {
+          "name": "Offline build -> validate -> canary publish",
+          "note": "Map changes are built into immutable versioned artifacts, regression-tested, then canaried by region before the fleet swaps to the new version.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "GraphStore",
+                "label": "Road Graph"
+              },
+              {
+                "id": "TrafficAgg",
+                "label": "Build Pipeline"
+              },
+              {
+                "id": "CH",
+                "label": "CH Index (versioned)"
+              },
+              {
+                "id": "RouteSvc",
+                "label": "Routing Fleet"
+              }
+            ],
+            "messages": [
+              {
+                "from": "GraphStore",
+                "to": "TrafficAgg",
+                "arrow": "->>",
+                "label": "ingest map changes -> new graph_version"
+              },
+              {
+                "from": "TrafficAgg",
+                "to": "TrafficAgg",
+                "arrow": "->>",
+                "label": "validate topology + build CH"
+              },
+              {
+                "from": "TrafficAgg",
+                "to": "CH",
+                "arrow": "->>",
+                "label": "publish immutable (graph+index)_version"
+              },
+              {
+                "type": "alt",
+                "label": "regression suite passes",
+                "messages": [
+                  {
+                    "from": "CH",
+                    "to": "RouteSvc",
+                    "arrow": "->>",
+                    "label": "canary one region, watch route metrics"
+                  },
+                  {
+                    "from": "RouteSvc",
+                    "to": "RouteSvc",
+                    "arrow": "->>",
+                    "label": "metrics OK -> atomic fleet-wide swap"
+                  }
+                ],
+                "else": {
+                  "label": "regression / bad metrics",
+                  "messages": [
+                    {
+                      "from": "RouteSvc",
+                      "to": "CH",
+                      "arrow": "-->>",
+                      "label": "roll back to previous version"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "CH",
+            "RouteSvc"
+          ]
         }
       ]
     }
   ],
   "finalDesign": {
     "title": "Final Design — Maps Routing & Serving",
-    "description": "Roads are a weighted directed graph; an offline-built contraction-hierarchy index lets the stateless routing service answer cross-continental shortest-path queries in milliseconds, expanding geometry from the graph store. Live GPS probes are aggregated into per-edge speeds the router applies as dynamic weights (traffic-aware ETAs without re-preprocessing). Map tiles are pre-rendered by z/x/y and served from CDN. Graph, tiles, and traffic are geo-partitioned for locality and scale, with long routes using high-level cross-region shortcuts. The graph/index is rebuilt offline on a cadence and swapped atomically; routing degrades gracefully to free-flow weights if the traffic pipeline lags.",
+    "description": "Roads are a weighted directed graph; an offline-built contraction-hierarchy index lets the stateless routing service answer cross-continental shortest-path queries in milliseconds. A request pins one compatible (graph_version, index_version) through the CH query, then unpacks shortcuts back into base edges to produce route geometry and turn-by-turn maneuvers. Live GPS probes are map-matched and aggregated into per-edge speeds the router overlays as dynamic weights (traffic-aware ETAs without re-preprocessing), falling back to historical then free-flow speed when traffic is sparse or stale; raw probes are short-lived, privacy-controlled, and never read directly by routing. Closures/restrictions take a fast overlay path while base graph/CH artifacts are rebuilt, regression-tested, and canaried offline. Map tiles are versioned immutable assets served from CDN with origin protection. Graph, tiles, and traffic are geo-partitioned for locality and scale, with long routes planned on an inter-region overlay/border graph of high-rank shortcuts before local unpacking; a failed region only degrades routes that traverse it.",
     "view": {
       "nodes": [
         "Client",
@@ -1524,10 +1714,11 @@
         ]
       },
       {
-        "requirement": "Geometry/distance/ETA",
-        "how": "Expand path geometry + traffic-aware time.",
+        "requirement": "Geometry/distance/ETA + turn-by-turn",
+        "how": "Unpack CH shortcuts to base edges, expand geometry, emit legs/steps/maneuvers with traffic-aware duration.",
         "steps": [
           "graph",
+          "preprocess",
           "traffic"
         ]
       },
@@ -1584,9 +1775,16 @@
       },
       {
         "requirement": "Available updates",
-        "how": "Offline rebuild + atomic versioned swap; graceful fallback.",
+        "how": "Immutable versioned artifacts, route-regression + canary rollout, fast closure overlays, graceful fallback.",
         "steps": [
           "ops"
+        ]
+      },
+      {
+        "requirement": "Probe privacy",
+        "how": "Opt-in, anonymized, short-retention probes; only aggregated per-edge speeds are read by routing/operators.",
+        "steps": [
+          "traffic"
         ]
       }
     ]

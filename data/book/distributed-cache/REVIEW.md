@@ -5,441 +5,401 @@ Review date: 2026-06-08
 
 ## Executive Summary
 
-This is a strong, compact distributed-cache walkthrough. It teaches the right
-main arc: local cache limitations, cache-aside, keyspace sharding, eviction,
-write consistency, hot-key protection, and failure handling. The options,
-traps, recaps, and probe links are useful and mostly interview-ready.
+This is now a strong distributed-cache walkthrough. The recent edits resolved
+the previous highest-impact gaps: the default cache-aside path is mostly cleanly
+separated from read-through, capacity now includes useful sizing math, the
+eviction view no longer references a hidden client-library node, and failover
+now has an explicit async-replication/config-epoch story plus a sequence flow.
 
-The main gaps are not in the topic selection. They are in precision. Several
-views and captions blur cache-aside with read-through by showing the cache node
-loading from the database even when the default design says the application
-loads and backfills. Capacity gives headline numbers but does not translate
-them into node count, memory overhead, per-node QPS, network bandwidth, or
-residual database load. Failover is directionally correct but needs a more
-explicit replication and promotion contract.
+The remaining work is no longer about basic correctness. It is about production
+depth and teaching precision: make operational control loops explicit, extend
+the API/data model with the knobs the prose already depends on, clarify
+topology-change behavior beyond consistent hashing, and make the final diagram
+less likely to read as "all alternatives are default."
 
 | Area | Rating | Notes |
 | --- | ---: | --- |
-| System design soundness | 4.05 / 5 | Correct core mechanisms; needs sharper cache-aside/read-through boundary, capacity math, and replication semantics. |
-| Production realism | 3.75 / 5 | Hot keys, eviction, consistency, and failover are covered; operations, observability, backpressure, and resharding are still thin. |
-| Pedagogical flow | 4.35 / 5 | Excellent step order and useful trade-off options; a few diagrams contradict the prose. |
-| Dataset/rendering fit | 4.15 / 5 | JSON parses and step references resolve; one step view references a hidden node through a reused link. |
-| Overall | 4.05 / 5 | A good book case that would become much stronger with focused precision and operations hardening. |
+| System design soundness | 4.45 / 5 | Cache-aside, sharding, eviction, consistency, hot keys, and failover are coherent; API/data model still understate versioning, tenancy, and topology metadata. |
+| Production realism | 4.10 / 5 | Capacity and failover are much better; needs a clearer operations/backpressure loop and resharding/warmup behavior. |
+| Pedagogical flow | 4.55 / 5 | Excellent seven-step progression with just-in-time concepts and realistic trade-offs; a few labels can still confuse cache-aside vs read-through. |
+| Dataset/rendering fit | 4.40 / 5 | JSON parses, references resolve, and structured views fit the renderer; final view is visually busy and option labels are generic. |
+| Overall | 4.35 / 5 | Book-ready in core shape, with targeted production-hardening edits still worth doing. |
 
 ## What Works Well
 
-- The step sequence is natural. Each step exposes the next problem: local maps
-  are not shared, one cache node cannot scale, sharded nodes need eviction,
-  cache/DB divergence needs a consistency strategy, hot keys break uniform
-  sharding, and node loss creates a cold-shard DB spike.
-- The default design stays scoped. It does not turn the cache into the source
-  of truth; the database remains authoritative and the cache is explicitly
-  best-effort.
-- The option sets are practical. Cache-aside vs read-through, client-side
-  hashing vs proxy, LRU vs LFU vs TTL-only, invalidate vs write-through vs
-  write-back, and hot-key mitigations are all real interview trade-offs.
-- The dataset calls out important senior signals: read-miss/write races,
-  synchronized expiries, request coalescing, local L1 cache trade-offs,
-  virtual nodes, and cold-shard protection.
-- `satisfies`, `interviewScript`, `levelVariants`, and `followUps` are aligned
-  with the main story and make the case usable as teaching material.
-- The external probes are credible for this topic, especially Facebook
-  Memcache, Redis Cluster, Redis client-side caching, Tail at Scale, and SRE
-  overload handling.
+- The prior cache-aside/read-through mismatch has been largely fixed. Default
+  views now show `App -> DB` miss load and `App -> CacheA` backfill; the
+  `CacheA -> DB` link is labeled as read-through and kept out of the default
+  final path.
+- Capacity is now interview-useful: residual DB load, node count, per-node QPS,
+  bandwidth, and latency-budget notes make the architecture feel sized rather
+  than merely described.
+- The failover step now teaches a real contract: async cache replication, config
+  epochs, client refresh, bounded stale replicas, split-brain risk, and
+  rate-limited DB fallback.
+- The step sequence remains concise and natural. Each step exposes the next
+  problem: local cache limits, cache-aside, sharding, eviction, consistency,
+  hot keys, and node failure.
+- Option sets are practical rather than strawman-heavy: cache-aside vs
+  read-through, client hashing vs proxy, LRU vs LFU vs TTL-only,
+  invalidate-on-write vs write-through/write-back, and hot-key mitigations.
+- The dataset teaches strong senior signals: read-miss/write races, virtual
+  nodes, scan pollution, TTL jitter, request coalescing, warm failover, epoch
+  drift, and DB-fallback budgets.
 
 ## Highest-Impact Issues
 
-### 1. Cache-aside and read-through are mixed in diagrams and captions
+### 1. Operations and backpressure are still compressed into prose
 
-The default design is cache-aside: the application checks the cache, loads from
-the database on a miss, and backfills the cache. Several diagram captions and
-links imply a different contract where `CacheA` loads directly from `DB`.
+The final design now mentions hit-rate SLOs, DB-fallback budget, hot-key alerts,
+evictions, memory headroom, replica lag, and config-epoch drift. That is the
+right set of signals, but it is mostly a single final-design sentence rather
+than a teachable operating model.
 
-Examples:
-
-- Step `cache-aside` says the app loads from the DB on a miss, but its view
-  caption says "on a miss the node loads from the backing database."
-- The default cache-aside option includes the high-level link `a-db`, whose
-  label is `miss -> load`, even though the prose says the app does the load.
-- Step `hotkeys` and `failover` continue to use `a-db`, again implying cache
-  node to DB loading.
-- The final design includes both `app-db` and `a-db`, so it looks like the
-  system has both cache-aside and read-through loaders in the default path.
-
-Why it matters: this is the central contract of the design. In cache-aside,
-cache failure degrades to DB reads by the app and cache nodes do not need DB
-credentials/loaders. In read-through, the cache tier owns loading and cache
-failure has different blast radius. Candidates should not learn those as one
-merged mechanism.
+Why it matters: distributed caches fail by overload and feedback loops. A miss
+storm can take down the DB; a bad config epoch can split traffic; hot-key
+replication can waste memory; warm failover can still become cold if backfill is
+uncontrolled. Candidates should be able to describe what the system does when
+metrics cross thresholds, not only what metrics exist.
 
 Concrete fix:
 
-- Reserve `CacheA -> DB` links for the read-through and write-back options.
-- For the default cache-aside path, show `App -> DB` for the miss load and
-  `App -> CacheA` for the backfill or invalidation.
-- Update captions that say the node loads from DB unless the selected option
-  is explicitly read-through.
-- In the final design, choose one default. If it remains cache-aside, remove
-  `a-db` from the default final view or relabel it as an optional read-through
-  path.
+- Add an "Operations, Backpressure, and Warmup" section or eighth step.
+- Include explicit actions: rate-limit DB backfill, shed optional cache-fill
+  work, serve stale for eligible keys, jitter TTLs, cap per-key single-flight
+  waiters, and throttle rewarming after node add/failover.
+- Name alerts by symptom and owner: DB fallback QPS over budget, per-shard QPS
+  skew, high evictions/sec, replica lag, stale config epoch across clients, and
+  rising p99 cache-hit latency.
+- Add one failure drill for "DB fallback budget exhausted during cache cold
+  start" with expected degradation behavior.
 
-### 2. Capacity is a headline, not a sizing model
+### 2. API and data model do not yet carry the production knobs the story uses
 
-The capacity section lists useful targets: about 1M reads/s, 95%+ hit rate, TBs
-of RAM, KB-sized values, and sub-ms hit latency. It stops before the interview
-math that would justify the architecture.
-
-Missing pieces:
-
-- Residual DB load: at 1M reads/s and 95% hit rate, the DB still sees about
-  50k read misses/s before writes and stampedes.
-- Memory sizing: `TBs` should be translated into approximate node count using
-  per-node RAM, usable memory after fragmentation/metadata, replication factor,
-  and safety headroom.
-- Per-node throughput: the design should estimate QPS per node under uniform
-  load and explain how much skew/hot-key headroom is needed.
-- Network bandwidth: 1M ops/s with KB-sized values can become multiple GB/s
-  across clients, caches, replicas, and DB backfills.
-- Latency budget: "sub-ms reads on a hit" should distinguish same-AZ network
-  round trip, client serialization, cache CPU, connection pooling, and p99 tail
-  behavior.
-
-Concrete fix:
-
-- Add 4-6 capacity rows or notes deriving node count, residual DB miss load,
-  per-node QPS, memory overhead, replication cost, and bandwidth.
-- Explicitly state that 95% hit rate may be insufficient if the backing DB
-  cannot absorb 50k misses/s.
-- Add one line for headroom under hot-key skew and cache warmup.
-
-### 3. Replication and failover need a clearer contract
-
-The failover step is directionally right: a dead cache node can cold-spike the
-database, so replicas and membership updates help. But the design does not yet
-define how replication works or how failover is made safe enough for a cache.
-
-Ambiguities:
-
-- Is replication synchronous or asynchronous?
-- Does the client write to primary only, primary plus replica, or a proxy that
-  fans out?
-- Who promotes the replica: config service, router, client library, or an
-  operator?
-- What happens if the primary is suspected dead but still serving traffic?
-- How stale may a warm replica be, and how is that bounded by TTL/version?
-- Does failover reroute to one replica, or does consistent hashing spread the
-  failed shard across many peers?
-
-The current `Replica -> App` link also reads oddly: applications normally route
-through the client library or router, not by receiving service directly from a
-replica.
-
-Concrete fix:
-
-- Add one sequence flow for primary failure: health check fails, config epoch
-  advances, clients refresh, reads route to replica or remapped owners, and DB
-  backfill is rate-limited.
-- Add a short note that cache replication may be async because the DB is
-  authoritative, but stale replicas must be bounded by TTL/version and miss
-  fallback.
-- Change the failover diagram to route through `ClientLib` or `Router` rather
-  than `Replica -> App`.
-
-### 4. Operations and observability are underrepresented
-
-The final design says the cache improves performance without becoming a new
-single point of failure, but the dataset has no explicit operations step or
-wrap-up section for the signals that prove this in production.
-
-Important missing signals:
-
-- Hit rate, miss rate, negative-cache hit rate, and DB fallback QPS.
-- Evictions/sec, memory fragmentation, used memory, large-value distribution,
-  and item age distribution.
-- Per-shard QPS, hot-key detection, single-flight wait time, and rejected or
-  shed requests.
-- p50/p95/p99 latency for hits, misses, sets, deletes, replication, and config
-  refresh.
-- Ring/config epoch drift across clients, failed health checks, failover time,
-  warmup progress, and replica lag/staleness.
-
-Concrete fix:
-
-- Either add an eighth "Operations, Backpressure, and Observability" step or
-  expand `failover` with an operations subsection.
-- Include overload behavior: rate-limit DB backfill, serve stale for eligible
-  keys, use TTL jitter, and shed cache-fill work before taking down the DB.
-- Add `technologyChoices` for self-hosted Redis/Memcached/Dragonfly/KeyDB and
-  managed ElastiCache/Memorystore/Azure Cache options.
-
-### 5. API and data model are intentionally small, but missing production knobs
-
-The simple `get`, `set`, and `delete` API is fine as a baseline. For a
-production distributed cache, the dataset should name a few optional controls
-because later steps depend on them.
+The public API is intentionally small, which is good for an interview baseline.
+But the prose now depends on concepts that are not represented in API or data
+model fields: versioned keys, config epochs, replica ownership, value sizing,
+tenant/namespace isolation, and high-throughput batched reads.
 
 Useful additions:
 
-- Namespace or tenant/key prefix so quotas, auth, and invalidation can be
-  scoped.
-- Conditional set/CAS token or version check for callers that need safer
-  write-through/update behavior.
-- `multiGet` or pipelining for high-throughput callers.
-- TTL semantics: absolute vs relative expiry, max TTL, jitter, and whether TTL
-  is refreshed on read.
-- Value size limits and optional compression guidance.
-- Entry metadata such as `created_at`, `last_accessed`, `frequency`, `version`,
-  `size_bytes`, and `flags`.
-- Ring metadata with config epoch, replica owner, node zone, and node state.
+- `namespace` or tenant/key prefix so quotas, auth, metrics, and invalidation
+  can be scoped.
+- `multiGet(keys)` or pipelining as an explicit high-throughput read path.
+- TTL semantics: relative vs absolute expiry, max TTL, jitter policy, and
+  whether reads refresh TTL.
+- Optional CAS/version token for callers that need safer invalidate/backfill
+  races.
+- Value-size limits and optional compression guidance.
+- Entry metadata: `size_bytes`, `created_at`, `last_accessed`,
+  `frequency_count`, `version`, and flags such as negative-cache marker.
+- Ring/topology metadata: `epoch`, primary owner, replica owner, zone, node
+  state, and last health transition.
 
 Concrete fix:
 
-- Keep the public API compact, but add an "advanced knobs" note or one extra
-  API row for `multiGet`.
-- Extend the data model enough to support eviction accounting, versioned
-  invalidation, and membership epochs.
+- Keep `get/set/delete` as the simple core API, but add one "advanced controls"
+  API card and expand the two data-model entries.
+- Align the failover text's "TTL/version" and "config epoch" language with
+  concrete fields in the data model.
+
+### 3. Resharding and topology-change behavior is still too implicit
+
+The sharding step correctly teaches consistent hashing and virtual nodes. It
+also says adding/removing a node moves only that node's share of keys. What is
+missing is the production workflow around that remap.
+
+Ambiguities:
+
+- How are new nodes warmed before taking real traffic?
+- Are keys actively migrated, lazily reloaded on miss, or both?
+- How is DB fallback throttled during planned resharding?
+- How are virtual nodes assigned across zones so a zone event does not remove a
+  primary and its replica together?
+- What happens to long-lived clients that lag behind a ring update?
+
+Concrete fix:
+
+- Add a short topology-change flow: add node, publish new epoch, gradually move
+  token ranges, warm key ranges, throttle misses, and alert on client epoch
+  drift.
+- In the failover or sharding step, state the placement rule: primary and
+  replica should not share the same host/rack/AZ fault domain.
+- Clarify whether this cache relies on lazy refill only, active key migration,
+  or a hybrid.
+
+### 4. The final view still mixes default and optional paths visually
+
+The final design prose is now explicit: the default is client-library
+cache-aside, while the proxy/router tier and read-through/write-through are
+alternatives. The final view still includes both `clientlib-a` and
+`clientlib-router` plus router-to-node links in one diagram. Because generated
+flowchart links are rendered as plain lines without arrowheads, the optional
+proxy path can look as authoritative as the default direct path.
+
+Why it matters: the final diagram is what many readers will remember. It should
+make the default architecture visually dominant and alternatives visibly
+secondary.
+
+Concrete fix:
+
+- Either remove `Router` from the default final view and keep it in the
+  sharding option, or mark router links with a dotted/optional render style if
+  the renderer supports that for generated views.
+- If both paths remain, add a final-design option tab: "Client library default"
+  vs "Proxy routing variant."
+- Keep `a-db` out of the default view; it is correctly reserved for explicit
+  read-through/write-back alternatives.
+
+### 5. A few labels still blur cache vocabulary
+
+The main diagrams now distinguish cache-aside and read-through, but one flow is
+named "Read-through with hit/miss" while its note and messages describe
+cache-aside. In cache-system terminology, read-through usually means the cache
+tier loads from the backing store, so this label can reintroduce the confusion
+the recent edits otherwise fixed.
+
+Concrete fix:
+
+- Rename the `cache-aside` flow to "Cache-aside hit/miss" or "Cache-aside read
+  with backfill."
+- Consider giving option titles explicit names instead of relying on generic
+  tab labels: "Cache-aside", "Read-through", "Client-side hashing", "Proxy
+  routing", "LRU", "LFU", and "TTL-only."
 
 ## System Design Soundness
 
-The core architecture is sound for a read-heavy, stale-tolerant cache in front
-of an authoritative database. Cache-aside is the right default because it keeps
-correctness in the application/database path and makes cache outages a
-performance event rather than a correctness event.
+The default architecture is sound: cache-aside in front of an authoritative DB,
+consistent-hashing shards with virtual nodes, per-node eviction, delete-on-write
+invalidation, request coalescing, hot-key replication, and async warm replicas.
+The recent edits made the source-of-truth boundary much clearer. Cache failure
+now degrades to DB reads by the application rather than implying cache nodes
+must have DB loaders in the default path.
 
-Sharding with consistent hashing and virtual nodes is the right scaling answer
-for a key-value cache. The dataset correctly warns against modulo hashing and
-explains why topology changes should not remap the whole keyspace.
+The capacity model is now strong enough for an interview. The new residual miss
+load note is especially important: 95% hit rate at 1M reads/sec still sends
+about 50k reads/sec to the DB before writes and stampedes. The node-count,
+per-node QPS, bandwidth, and p99 latency rows make the sharding and hot-key
+steps feel motivated by numbers.
 
-Eviction coverage is good. LRU, LFU, and TTL-only are compared honestly. The
-TTL-only option correctly says TTL alone does not protect memory under pressure.
-The next improvement is to add concrete memory accounting and scan-resistant
-variants such as segmented LRU or TinyLFU as an advanced note, not as a core
-step.
+The consistency step is good but can be grounded further. It names the
+read-miss/write interleaving race and mentions versioned keys, but neither the
+API nor data model carries a version/CAS concept. Adding that field would make
+the mitigation concrete without bloating the case.
 
-The consistency step is strong conceptually. It names invalidate-on-write,
-write-through, write-back, and the read-miss/write interleaving race. The main
-fix is to align the diagrams so the default invalidate/cache-aside path does
-not look like read-through.
-
-Hot-key handling is also sound. Request coalescing, hot-key replication, tiny
-local L1 cache, refresh-before-expiry, and TTL jitter are the right mechanisms.
-The missing piece is operational: how hot keys are detected, how long keys stay
-replicated, and what happens when the hot-key list itself changes rapidly.
+The failover story is now credible for a cache. Async replication is acceptable
+because the DB is authoritative, stale replicas are bounded by TTL/version, and
+config epochs prevent split-brain routing. The next level is placement and
+resharding: where replicas live, how epochs roll out under planned changes, and
+how warmup is throttled.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: 1. Naive: An In-Process Local Cache
 
 This is a clean baseline. It makes the limitations of per-instance memory
-obvious: duplication, stale invalidations, heap limits, and cold deploys. It is
-especially useful because the later L1 hot-key option can refer back to this
-step as a deliberately tiny and short-TTL exception.
+obvious: duplicate caches, stale invalidations, heap limits, and cold deploys.
+It also sets up the later local L1 option as a deliberately tiny exception, not
+the main cache.
 
 No major change needed.
 
 ### Step 2: 2. Cache-Aside in Front of the Database
 
-This is the most important step and the main place to tighten precision. The
-description, option pros/cons, and sequence correctly explain cache-aside: the
-application loads from DB and backfills. The view caption and reused `a-db` link
-make the cache node look responsible for loading from DB.
+This step is much stronger after the recent changes. The default view, option,
+API sequence, and captions now show the application loading from the DB and
+backfilling the cache. The read-through alternative is properly framed as a
+different contract where the cache tier owns the loader.
 
-Fixing this step will clarify the entire dataset. Split the default
-cache-aside view from the read-through option view, and use the read-through
-option to teach why centralizing loaders is useful but operationally more
-coupled.
+Recommended polish: rename the flow currently called "Read-through with
+hit/miss" because its actual behavior is cache-aside. Explicit option titles
+would also make the tabbed UI more teachable.
 
 ### Step 3: 3. Shard the Keyspace with Consistent Hashing
 
-This is a strong sharding step. The client-side hashing and proxy/router
-options are realistic, and the trade-offs are stated well: latency and fewer
-tiers vs thin clients and centralized routing.
+This is a strong sharding step. It explains why modulo hashing is dangerous and
+why virtual nodes reduce cache churn. The client-side hashing vs proxy trade-off
+is realistic: lower latency and fewer tiers vs thin clients and centralized
+metrics/quotas.
 
-Possible improvement: connect the routing choice to observability and
-backpressure. A proxy can enforce quotas and collect central metrics; client
-libraries need shared telemetry and consistent config refresh logic.
+Add a bit more topology-change realism. The step should say how node add/remove
+is rolled out: epoch publishing, gradual token movement, lazy refill vs active
+warming, and throttled DB fallback during planned resharding.
 
 ### Step 4: 4. Eviction: Make Room When Memory Is Full
 
-The teaching content is good, but this step has a renderer-facing issue: the
-default view includes visible nodes `App`, `CacheA`, `Eviction`, and `DB`, while
-its link list includes `clientlib-a`, whose source node is `ClientLib`. Since
-`ClientLib` is not in the step view, the generated diagram can introduce or
-reference a hidden node inconsistently.
+This step now fits the renderer and the architecture. The previous hidden
+`ClientLib` link issue is fixed with an inline `App -> CacheA` read/backfill
+link. LRU, LFU, and TTL-only are compared honestly, and the capacity section now
+supports the memory-pressure story.
 
-Fix the view by either adding `ClientLib` to `view.nodes` or replacing
-`clientlib-a` with an inline `App -> CacheA` link, matching the option views.
-
-Conceptually, this step would also benefit from one capacity note: memory
-pressure comes from value bytes plus metadata, fragmentation, replication, and
-reserved headroom, not only number of keys.
+Possible improvement: add one advanced sentence about scan-resistant policies
+such as segmented LRU or TinyLFU. Keep it as an advanced note, not a new main
+step.
 
 ### Step 5: 5. Cache/DB Consistency on Writes
 
-This is one of the stronger steps. It chooses invalidate-on-write as the
-default, keeps write-through/write-back as trade-offs, and names the read-miss
-backfill race.
+This remains one of the stronger steps. It chooses invalidate-on-write as the
+default, keeps write-through/write-back as trade-offs, and names the
+read-miss/backfill race.
 
-The main improvement is to add a version/CAS or monotonic timestamp mitigation
-as a concrete option for the race. The current prose mentions versioned keys,
-but the API and data model do not carry a version field.
+The main improvement is to make the race mitigation concrete. Add version/CAS
+fields in the API/data model, or show a short flow where a stale backfill is
+rejected because its version is older than the current DB value.
 
 ### Step 6: 6. Hot Keys and Thundering Herds
 
 This step is strong and interview-relevant. It correctly says consistent
-hashing does not spread one hot key and introduces request coalescing, key
+hashing cannot spread one key, then introduces request coalescing, key
 replication, and tiny local L1 caching.
 
-Possible improvement: add the operating loop. How does the system detect a hot
-key, decide replica count, invalidate every hot-key replica, and avoid memory
-waste after the spike ends?
+The next improvement is operational: how hot keys are detected, when a key is
+promoted to replicated status, how replica count is chosen, how invalidation
+fans out, and how the system demotes keys after a spike.
 
 ### Step 7: 7. Replication, Failover, and Failure Modes
 
-This is the right closing step, but it is too compressed for the amount of
-production responsibility it carries. The failover mechanics, config epoch,
-stale replica tolerance, and DB backfill throttle should be more explicit.
+This step improved materially. It now explains async replication, bounded
+staleness, config-owned promotion, epoch fencing, cache-empty correctness, and
+rate-limited backfill. The new sequence flow and split-brain drill are exactly
+the right additions.
 
-Add one sequence flow and consider one more failure drill for config-service
-staleness or split-brain routing, because that is the subtle failure mode of
-client-side hashing.
+Further improvement should focus on placement and warmup. State that primary
+and replica must sit in different fault domains, and describe how the system
+warms or slowly admits traffic after a primary failure or planned node add.
 
 ## Final Design Review
 
-The final design integrates all main concepts: cache-aside, client library or
-proxy routing, consistent hashing, virtual nodes, per-node eviction, write
-invalidation, hot-key replication, request coalescing, and warm failover.
+The final design now integrates the chosen mechanisms coherently:
 
-The final diagram should be made more opinionated. It currently includes both
-direct client hashing (`clientlib-a`) and proxy routing (`clientlib-router`),
-and both app-to-DB and cache-to-DB paths. That is acceptable if the goal is to
-show alternatives, but the final design should usually show the chosen default
-and mention alternatives in text.
+- Cache-aside default with application DB fallback and cache backfill.
+- Client library using consistent hashing and virtual nodes.
+- Optional proxy/router alternative.
+- Per-node LRU/LFU/TTL eviction with jitter.
+- Delete-on-write invalidation for bounded staleness.
+- Request coalescing and hot-key replication.
+- Async warm replicas, config epochs, and rate-limited fallback.
+- Operational signals for hit rate, DB fallback, shard skew, evictions, replica
+  lag, and config drift.
 
-Recommended final-design stance:
-
-- Default to cache-aside with app DB fallback and app cache backfill.
-- Choose client-side hashing or proxy as the main route. If both remain, label
-  the proxy as optional.
-- Route failover through `ClientLib`/`Router` based on config epoch, not
-  directly from `Replica` to `App`.
-- Add a concise operations sentence covering hit-rate SLOs, DB fallback budget,
-  TTL jitter, backfill throttling, and hot-key alerts.
+The remaining issue is visual clarity. The final diagram includes both the
+direct client-library path and the optional proxy path. That is acceptable if
+the caption is read carefully, but it weakens the diagram as a default design.
+Prefer either a default-only final diagram plus option views, or two final
+options that let the reader compare "client-library routing" and "proxy
+routing" explicitly.
 
 ## Concept Introduction and Learning Flow
 
-The concept staging is good. The dataset introduces concepts just before they
-are needed, and the `whyNow` and `recap` fields help each step hand off to the
-next one.
-
-The strongest teaching moments are:
+The concept staging is excellent. The dataset introduces concepts at the moment
+they become necessary:
 
 - Local cache limitations motivate a shared cache tier.
-- Consistent hashing is introduced as protection against cache-wide churn, not
-  just as a sharding buzzword.
-- Eviction is tied to hit rate, not treated as an implementation detail.
-- The write consistency step names a real race.
-- The hot-key step explains why uniform sharding assumptions fail.
+- Cache-aside establishes the source-of-truth and fallback contract.
+- Consistent hashing solves horizontal growth and topology churn.
+- Eviction connects finite memory to hit-rate behavior.
+- Consistency handles stale cache entries after DB writes.
+- Hot-key handling corrects the uniform-load assumption.
+- Failover closes the cold-shard and split-brain scenarios.
 
-The one concept that needs more careful separation is cache-aside vs
-read-through. Once that boundary is clean, the rest of the walkthrough will
-read much more consistently.
+The `whyNow`, `recap`, `traps`, and concepts fields do real teaching work. The
+only remaining concept-flow weakness is terminology polish around
+"read-through" vs "cache-aside" labels.
 
 ## Step-to-Final-Design Coherence
 
-The steps build toward the final design well:
+The steps build cleanly toward the final design:
 
 - `naive` motivates moving out of process.
-- `cache-aside` introduces the read path and fallback contract.
-- `sharding` explains how the cache grows horizontally.
-- `eviction` addresses bounded memory.
-- `consistency` handles DB/cache divergence on writes.
+- `cache-aside` introduces the read path and DB fallback.
+- `sharding` explains horizontal scale and routing.
+- `eviction` keeps memory bounded.
+- `consistency` handles writes and stale entries.
 - `hotkeys` handles skew and stampedes.
-- `failover` closes the node-loss scenario.
+- `failover` handles node loss and cold-start protection.
 
-The coherence gap is the final design's diagram surface. It accumulates
-mechanisms from all steps but does not clearly distinguish chosen defaults from
-alternatives. The final prose says cache-aside and optional proxy, while the
-view includes read-through-looking `CacheA -> DB` and both direct/proxy routing.
+The final design now reflects these steps better than the previous review
+version described. Its one coherence issue is not conceptual but visual: it
+accumulates both default and optional routing paths in the same diagram.
 
 ## Realism Compared With Production Systems
 
-The dataset is realistic on the core cache mechanics. It would be more
-production-realistic if it added:
+The dataset is realistic on the core cache mechanics. It now covers several
+production concerns that weaker cache interviews miss: DB miss budget,
+bandwidth, p99 latency, hot-key replication, request coalescing, stale replica
+tolerance, config epochs, and split-brain routing.
 
-- Resharding/rebalancing behavior when nodes are added or removed, including
-  warmup and migration throttles.
-- Config epoch handling and client refresh behavior.
-- Backpressure when the DB fallback path approaches its budget.
-- Hot-key detection and expiration of hot-key replication decisions.
-- Observability dashboards and alerts for hit rate, evictions, hot shards,
-  stale config, failover time, replica lag, and stampedes.
-- Security/tenancy basics: namespacing, authn/authz, TLS, quotas, and limits on
-  value size.
-- A technology-choice section covering common self-hosted and managed cache
-  options.
+Remaining realism gaps:
 
-These do not all need full steps. A focused operations step or a practical
-`technologyChoices` wrap-up would cover most of the gap without bloating the
-case.
+- Backpressure and degradation policy when DB fallback exceeds budget.
+- Hot-key detection, replica-count control, and demotion.
+- Planned resharding, node warmup, and active/lazy key migration.
+- Replica placement across fault domains.
+- Security and tenancy basics: namespace isolation, authn/authz, TLS, quotas,
+  and value-size limits.
+- Technology choices and managed-service trade-offs.
+
+These do not all need full steps. One operations section plus expanded API/data
+model cards would cover most of the gap.
 
 ## Dataset and Renderer-Facing Observations
 
 - `interview.json` parses as valid JSON.
 - Top-level `patterns[*].steps` and `satisfies[*].steps` references resolve to
   real step IDs.
-- Step and option views use structured `view` objects rather than raw Mermaid,
-  matching current project conventions.
-- The targeted endpoint check found one issue: step `eviction` references
-  `clientlib-a`, whose endpoint `ClientLib` is not listed in that view's
-  `nodes`.
-- The inline `L1` node in the local-cache option appears intentional and
-  acceptable as a local view node, but it is worth keeping such local nodes
-  rare so the final architecture remains coherent.
+- Step, option, and final-design views use structured `view` objects rather
+  than raw Mermaid, matching project conventions.
+- High-level link IDs referenced by step, option, and final views resolve.
+- Link endpoints used by step, option, and final views are present in those
+  views' `nodes`.
+- Step highlights resolve to visible nodes.
+- The old eviction endpoint mismatch is fixed.
+- `a-db` remains in `highLevelArchitecture.links`, but default views no longer
+  use it for cache-aside. It is now correctly scoped to read-through/write-back
+  variants.
 - No `technologyChoices` field is present. That is optional, but this dataset
-  is a good candidate because cache product choices materially affect routing,
-  replication, persistence, and operational burden.
+  is a strong candidate because cache product choices materially affect
+  persistence, clustering, replication, client libraries, and operations.
 - No `aiVisual`, `aiVisuals`, or `explainerComic` assets are wired. That is not
   a correctness issue.
 
 ## Recommended Edits, Prioritized
 
-### P1: Align cache-aside diagrams with the default contract
+### P1: Add an operations/backpressure section
 
-Fix `cache-aside`, `hotkeys`, `failover`, and `finalDesign` so default diagrams
-do not imply cache-node DB loading unless the selected option is read-through.
+Cover DB fallback budget, cache cold-start behavior, rate-limited backfill,
+serve-stale eligibility, per-key single-flight limits, hot-shard alerts,
+replica lag, epoch drift, and failover/warmup dashboards.
 
-### P1: Fix the eviction view link endpoint mismatch
+### P1: Extend API and data model fields
 
-In step `eviction`, either add `ClientLib` to `view.nodes` or replace
-`clientlib-a` with an inline `App -> CacheA` link.
+Add namespace/tenant scope, `multiGet` or pipelining, TTL/jitter semantics,
+optional CAS/version, value-size limits, entry metadata, and ring/config epoch
+fields.
 
-### P1: Add capacity math
+### P2: Clarify topology changes and resharding
 
-Expand capacity with residual DB load, per-node QPS, node count, memory
-overhead, replication cost, bandwidth, and latency-budget notes.
+Describe node add/remove rollout, epoch propagation, lazy refill vs active
+warming, token movement throttling, client epoch drift, and replica placement
+across fault domains.
 
-### P2: Clarify replication and failover semantics
+### P2: Make the final diagram default-first
 
-Add one sequence flow and specify async/sync replication, config epochs,
-promotion/rerouting ownership, replica staleness bounds, and backfill
-throttling.
+Either remove the optional router path from the default final view, use a
+visibly optional/dotted style for router links, or add final-design option tabs
+for client-library routing vs proxy routing.
 
-### P2: Add operations and observability
+### P2: Rename the cache-aside flow and option tabs
 
-Add either a short operations step or expand failover with monitoring,
-overload/backpressure, warmup, hit-rate SLOs, and hot-key alerts.
-
-### P2: Extend API/data model with production knobs
-
-Add namespace/tenant scope, optional CAS/version field, value-size limits,
-`multiGet`/pipelining, TTL jitter semantics, and ring config epochs.
+Rename "Read-through with hit/miss" to a cache-aside term and add explicit
+option titles for the tabbed choices.
 
 ### P3: Add technology choices
 
 Include self-hosted and managed choices such as Memcached, Redis Cluster,
-Dragonfly, KeyDB, ElastiCache, Memorystore, Azure Cache for Redis, and relevant
-trade-offs around persistence, clustering, replication, and client libraries.
+Dragonfly, KeyDB, ElastiCache, Memorystore, and Azure Cache for Redis, with
+trade-offs around persistence, clustering, replication, failover, and client
+library behavior.
 
 ## What Not To Change
 
@@ -448,16 +408,15 @@ trade-offs around persistence, clustering, replication, and client libraries.
 - Keep the seven-step progression. It is concise and teaches one problem at a
   time.
 - Keep read-through, write-through, write-back, proxy routing, and local L1 as
-  alternatives rather than forcing them into the default final design.
-- Preserve the hot-key and stampede material. It is one of the strongest parts
-  of the dataset.
-- Keep the case focused on a cache, not a durable distributed KV store. Durable
-  write semantics belong in the adjacent KV-store dataset.
+  alternatives rather than forcing them into the default.
+- Preserve the new capacity math. It materially improves the interview.
+- Preserve the new failover contract around async replication, config epochs,
+  and cache-empty correctness.
+- Keep the case focused on a cache, not a durable distributed KV store.
 
 ## Bottom Line
 
-This dataset is already a useful distributed-cache interview. The next edit
-should focus on precision rather than breadth: clean up cache-aside vs
-read-through diagrams, add real sizing math, make failover mechanics explicit,
-and fix the one renderer-facing link mismatch. After that, an operations and
-technology-choice pass would make it book-ready.
+The recent changes moved this from a good draft to a strong book case. The next
+pass should not broaden the architecture much; it should make the production
+controls explicit: operations, backpressure, topology changes, concrete
+version/epoch metadata, and a default-first final diagram.

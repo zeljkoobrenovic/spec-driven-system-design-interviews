@@ -5,401 +5,399 @@ Review date: 2026-06-08
 
 ## Executive Summary
 
-This is a strong, coherent Dynamo-style key-value store walkthrough. It stays
-focused on the right core ideas: consistent hashing, virtual nodes,
-leaderless replication, tunable quorums, vector clocks, hinted handoff,
-anti-entropy repair, and gossip membership. The step order is natural and the
-options compare real design choices instead of strawmen.
+This review reflects the current hardened version of the distributed KV-store
+dataset. The major issues from the earlier review have mostly been addressed:
+capacity now includes concrete workload assumptions, the API exposes caller
+consistency knobs and version contexts, deletes are modeled as tombstone writes,
+conflict resolution has a sibling merge write-back flow, failure repair is
+bounded with hint TTLs/quotas and repair budgets, membership now includes a
+join/bootstrap state machine, and the walkthrough ends with an explicit
+operations/security/backup step plus `technologyChoices`.
 
-The main gaps are not in the headline architecture. They are in production
-contracts: capacity numbers are too qualitative, the API does not expose the
-consistency and versioning knobs described in the text, deletes and conflict
-resolution need sharper semantics, and operations are mostly left to follow-up
-questions rather than being visible in the design.
+The case is now a strong book-ready Dynamo-style interview. The remaining gaps
+are narrower: one capacity estimate needs correction, the API should choose a
+single consistency-parameter convention and reflect keyspace/tenant scope, and
+some operational mechanisms would benefit from one concrete sequence or example
+instead of prose only.
 
 | Area | Rating | Notes |
 | --- | --- | --- |
-| System design soundness | 4.0/5 | Correct Dynamo lineage and trade-offs; missing derived sizing, delete semantics, and some repair/rebalancing detail. |
-| Production realism | 3.75/5 | Covers core failure mechanisms, but needs clearer hint limits, repair scheduling, observability, security, and backup/restore contracts. |
-| Pedagogical flow | 4.25/5 | The progression is clear and teaches one major concern at a time; a few transitions would benefit from concrete examples and APIs. |
-| Dataset/rendering fit | 4.75/5 | JSON parses cleanly; node/link references, highlights, sequences, and `satisfies` step references resolve. |
-| Overall | 4.1/5 | A credible book case that needs a production-hardening pass more than a conceptual rewrite. |
+| System design soundness | 4.55/5 | Correct AP/Dynamo lineage with partitioning, replication, quorum tuning, versioning, repair, membership, and operations now integrated. |
+| Production realism | 4.35/5 | Much stronger after adding tombstones, bounded repair, zone placement, security, backup/restore, and technology choices; remaining issue is API/control-plane precision. |
+| Pedagogical flow | 4.5/5 | Steps expose one problem at a time and now close with operations; a few prose-only sections could use visual or flow support. |
+| Dataset/rendering fit | 4.8/5 | JSON parses cleanly; node/link/highlight references and `satisfies` step references resolve. |
+| Overall | 4.5/5 | A credible, senior-level KV-store case with only focused polish left. |
 
 ## What Works Well
 
-- The scope is explicit: opaque byte values, AP leaning, no master node, and a
-  Dynamo/Cassandra family architecture. That keeps the interview from drifting
-  into SQL, range-query, or transaction-system territory.
-- The step sequence is well staged. A single-node baseline exposes capacity
-  and availability limits, partitioning solves capacity, replication solves
-  survival, quorums expose the consistency dial, conflicts explain the cost of
-  availability, and repair/membership close the loop.
-- The partitioning options are useful. Consistent hashing with vnodes, range
-  partitioning, and modulo hashing are all real alternatives with clear
-  trade-offs.
-- The quorum section is honest about the limits of `W + R > N`. It avoids
-  falsely promising full linearizability and introduces sloppy quorum as a
-  separate availability-maximizing behavior.
-- The conflict step chooses the right default for an opaque-value AP store:
-  vector clocks plus siblings. Last-write-wins and CRDTs are framed as
-  workload-specific alternatives.
-- The failure drills in step `failures` are realistic enough to start a good
-  interview discussion about node recovery and partition healing.
-- Renderer-facing structure is in good shape: structured views are used, raw
-  Mermaid is limited to overview diagrams, canonical node types are valid, and
-  cross-references resolve.
+- The hardening pass directly fixed the earlier production-contract gaps:
+  quantified capacity, caller-selected `W/R`, version contexts on writes and
+  deletes, tombstone GC, vector-clock pruning, bounded hinted handoff, read
+  repair, anti-entropy scheduling, zone-aware replica placement, operations,
+  and technology choices are all now represented.
+- The step order is excellent for teaching. Single-node storage exposes the
+  need for partitioning and replication; replication creates disagreement;
+  quorums expose the consistency dial; conflicts explain why versioning is
+  required; failures introduce repair; membership handles topology; operations
+  closes the production loop.
+- Step `choosing-nwr` is a useful sub-step. It gives concrete `N=3` examples
+  and explains which settings survive one node failure.
+- Step `conflicts` is now much stronger. It includes the read-siblings,
+  app-merge, write-back lifecycle and warns against immediate physical delete.
+- Step `failures` now describes the real operating constraints: hint TTLs,
+  per-destination quotas, replay rate limits, Merkle-tree repair, read repair,
+  and repair bandwidth budgets.
+- Step `membership` now has the missing join/bootstrap/decommission state
+  machine and explicitly ties replica placement to zone/rack metadata.
+- Step `operations` is the right kind of late-stage production pass: metrics,
+  admission control, auth, encryption, audit, and per-token-range backup/restore
+  are tied to the requirements instead of being left as follow-up trivia.
+- `technologyChoices` is relevant and practical. It compares self-hosted
+  Cassandra/Scylla/Riak-style systems, managed DynamoDB/Bigtable/Cosmos-style
+  choices, and CP alternatives when linearizability is required.
 
 ## Highest-Impact Issues
 
-### 1. Capacity is too qualitative to justify the design
+### 1. The per-node request-rate estimate does not match the stated assumptions
 
-The capacity section says "billions" of keys, "100s" of nodes, replication
-factor `N=3`, typical `W=2,R=2`, and single-digit millisecond storage latency.
-Those are directionally useful, but they do not let a candidate size the system
-or defend operational choices.
+The capacity section now has the right ingredients: 10B keys, 1 KB average
+values, 500k reads/s, 100k writes/s, `N=3`, typical `R=2,W=2`, and about 30
+nodes. But the "Per-node request rate" row says `~50k read + ~30k write/s`.
+Using the visible assumptions, the rough replica work is closer to:
 
-This matters because the architecture makes several expensive promises:
-replication multiplies storage and write traffic, anti-entropy consumes
-background bandwidth, hinted handoff needs bounded temporary storage, and
-rebalancing can saturate the network. The interview should convert at least a
-few workload assumptions into design decisions.
+- Reads: `500k * R=2 / 30 ~= 33k replica reads/s per node`.
+- Writes: `100k * N=3 / 30 ~= 10k replica writes/s per node`.
 
-Concrete fix:
-
-- Add read/write QPS, read/write ratio, value-size distribution, key-count,
-  hot-key skew, retention, and per-zone deployment assumptions.
-- Add derived estimates: raw storage, replicated storage, write fanout,
-  read-repair or anti-entropy bandwidth, and approximate per-node request rate.
-- Tie the numbers to decisions: vnode count, replication factor, per-node
-  storage budget, repair throttling, hinted-handoff quota, and whether the
-  store needs a cache for hot keys.
-- Keep the math compact. A small "back-of-the-envelope" subsection is enough.
-
-### 2. The API does not expose the consistency and versioning contract
-
-The API descriptions say the coordinator waits for `W` acknowledgments on
-write and `R` responses on read, but the request shapes do not show how callers
-choose `R` or `W`. `PUT` carries a vector-clock context, while `GET` returns
-context and siblings, but `DELETE` returns only `{ "ok": true }`.
-
-That weakens the teaching because tunable consistency and causal context are
-central to the design. The API should make those choices visible:
-per-operation consistency level, timeout behavior, returned version context,
-and the shape of conflict responses.
+The current numbers may be intended to include headroom, hot-key skew,
+coordination overhead, compaction/repair, or uneven vnode ownership, but that is
+not stated. Because this row is used to justify cluster size and latency, it
+should be either corrected or explicitly labeled as a peak/headroom budget.
 
 Concrete fix:
 
-- Add a query parameter or header such as `consistency=ONE|QUORUM|ALL` or
-  explicit `r`/`w` values to `GET`, `PUT`, and `DELETE`.
-- Make `DELETE` return an updated context because it is a tombstone write, not
-  a metadata-free command.
-- Clarify whether `PUT` without context means "blind write" and therefore may
-  create siblings.
-- Add one short response example for a conflicted `GET` with multiple siblings.
-- Add request timeout semantics: return success after quorum, continue best
-  effort to remaining replicas, and repair stale replicas later.
+- Change the row to the derived steady-state numbers, or state a multiplier
+  such as "budget 1.5x for imbalance and headroom."
+- Separate coordinator request rate from replica storage-engine work.
+- Mention hot-key skew as a separate capacity risk because vnodes smooth range
+  ownership, not one key's traffic.
 
-### 3. Conflict resolution needs a concrete merge and tombstone story
+### 2. The API consistency contract is visible but slightly ambiguous
 
-Step `conflicts` correctly introduces vector clocks and siblings, but the
-walkthrough stops before the full lifecycle is clear. In production, the hard
-questions are how a client resolves siblings, how the resolved value is written
-back, how vector clocks are pruned, and how deletes interact with old versions.
+The API now exposes the consistency knobs, which is a big improvement. The
+remaining issue is that `PUT` and `GET` show both numeric parameters and a
+symbolic level in the same path, for example `/kv/{key}?w=2&consistency=QUORUM`
+and `/kv/{key}?r=2&consistency=QUORUM`. `DELETE` only shows `w=2`.
 
-Deletes are especially important because the functional requirements include
-`delete(key)`. A delete-as-tombstone design must describe retention, garbage
-collection, resurrection risks, and how anti-entropy treats tombstones.
+That leaves unanswered questions a real API must settle: which parameter wins
+if both are provided, whether symbolic levels map to numeric `R/W` per
+keyspace, whether reads and writes should use separate names, and whether
+`DELETE` accepts the same consistency vocabulary as `PUT`.
 
 Concrete fix:
 
-- Add a small flow: read returns siblings, application merges them, client
-  writes the merged value with both sibling contexts, replicas converge.
-- Add a sibling limit or vector-clock pruning note so metadata growth is not
-  left open-ended.
-- Add delete semantics: tombstone has a version context, tombstones replicate
-  and repair like values, and GC happens only after a safe grace period.
-- Add a trap about deleting by physically removing the value immediately; that
-  can resurrect data when a stale replica later repairs the key.
+- Pick one convention for examples: either `consistency=ONE|QUORUM|ALL` or
+  explicit `r`/`w`, then mention the alternate representation in prose.
+- If both are supported, define precedence and validation.
+- Make `DELETE` mirror `PUT` because it is a tombstone write.
+- Include timeout semantics consistently across all three operations.
 
-### 4. Failure repair and rebalancing need operational bounds
+### 3. Keyspace/tenant scope appears in operations but not in the API/data model
 
-The failure and membership steps name the right mechanisms: hinted handoff,
-Merkle-tree anti-entropy, read repair, gossip, and throttled rebalancing. The
-remaining gap is that the design does not say how those background mechanisms
-are bounded.
+Step `operations` correctly says clients are authorized per keyspace/tenant and
+that keys should not be one flat namespace. The API and data model still use
+plain `/kv/{key}` and a per-node record keyed only by `key`.
 
-Without bounds, the system can preserve correctness while destroying latency:
-hint stores can fill, repair can compete with foreground reads and writes, and
-bootstrap streaming can overload a node that just joined.
+This is a coherence gap rather than a conceptual flaw. If per-keyspace auth is
+part of the design, the request path, routing hash, tombstone identity, quotas,
+backup boundaries, and audit logs should all agree on what a keyspace or tenant
+is.
 
 Concrete fix:
 
-- Add hint TTL, per-destination hint quotas, and overload behavior when a
-  replica remains down too long.
-- Add anti-entropy scheduling: per-range Merkle trees, low-priority repair
-  bandwidth, and operator-triggered repair after incidents.
-- Add read-repair behavior on quorum reads that discover stale replicas.
-- Expand step `membership` with a join/leave state machine: assign tokens,
-  stream ranges, mark ownership active, then remove old ownership.
-- Make zone/rack-aware replica placement explicit in the ring or membership
-  metadata, not only in prose.
+- Change paths to something like `/keyspaces/{keyspace}/kv/{key}` or add a
+  required tenant/keyspace header.
+- Add `keyspace_id` or `tenant_id` to the key-value record and clarify whether
+  the partition key is `hash(keyspace_id, key)`.
+- Tie admission control, backup/restore, and auth checks to that namespace.
+- Note whether vector clocks are per `(keyspace, key)`.
 
-### 5. Operations, security, and disaster recovery are mostly absent
+### 4. Some production mechanisms are prose-only and would teach better as flows
 
-The dataset currently has no explicit observability, admin, security, or
-backup/restore surface. That is acceptable for a short interview, but this is
-a book case and already has a follow-up about backing up a token range. The
-final answer would be stronger if a few production controls were included in
-the core design.
+The dataset has strong prose for join/bootstrap, read repair, backup/restore,
+and operations. It already includes sequence flows for replication, quorum
+reads/writes, sibling merge, hinted handoff, and read repair. The remaining
+high-value flow to add is membership/rebalancing or restore.
 
 Concrete fix:
 
-- Add an operations subsection or final step covering metrics: per-consistency
-  latency, quorum failure rate, stale-read rate, sibling count, hinted-handoff
-  backlog, repair bytes, gossip convergence, and rebalance progress.
-- Add basic security assumptions: authentication, authorization by keyspace or
-  tenant, TLS, encryption at rest, and audit logs for administrative actions.
-- Add backup/restore: snapshots per token range, incremental logs or SSTable
-  backups, restore into replacement nodes, and validation through repair.
-- Add rate limits or admission control for hot keys, large values, and repair
-  jobs so background work cannot starve foreground traffic.
+- Add one sequence flow to step `membership`: new node joins, gossips
+  `joining`, streams ranges, becomes pending, marks ownership active, old owner
+  drops ranges.
+- Or add one sequence flow to step `operations`: restore a token range from
+  snapshot, replay incrementals, run anti-entropy validation, rejoin serving.
+- Keep it compact. One flow is enough to make the operational state machine
+  interview-ready.
 
 ## System Design Soundness
 
-The core architecture is sound for the chosen AP-leaning problem. Masterless
-coordinators, a consistent-hash ring, `N` replicas, tunable quorums, version
-vectors, hinted handoff, anti-entropy repair, and gossip are the right building
-blocks.
+The design is now sound for the stated AP-leaning, Dynamo/Cassandra-lineage
+problem. It avoids broadening into transactions, SQL, or range-query storage,
+and it is clear that opaque byte values drive the conflict-resolution choice.
 
-The design is also appropriately honest about its consistency model. It says
-`W + R > N` gives strong-ish overlap reads, not full linearizability. It also
-recognizes that sloppy quorum weakens strict quorum overlap and therefore needs
-conflict reconciliation.
+Partitioning is handled with consistent hashing and virtual nodes, with range
+partitioning and modulo hashing presented as meaningful alternatives. Replication
+uses a preference list across distinct zones, which correctly connects the
+whole-zone failure requirement to placement metadata rather than just saying
+`N=3`.
 
-The largest soundness gap is the API/data-model boundary. The text depends on
-caller-selected `R/W`, vector-clock context, sibling resolution, and tombstone
-propagation, but those contracts are only partially visible in the API and data
-model. Tightening that boundary would make the whole design more defensible.
+The consistency model is mostly precise. The walkthrough says `W+R>N` gives
+overlap/read-your-writes, not full linearizability, and explicitly calls out
+that sloppy quorum weakens the strict-overlap guarantee. The CP-store
+technology-choice comparison also helps readers understand when this AP design
+is the wrong answer.
 
-The data model is intentionally minimal and mostly right: per-node records,
-vector clocks, ring/token map, and membership. It should add tombstone metadata
-or explicitly make `value: bytes (or tombstone)` carry deletion context,
-deletion timestamp, and GC eligibility. If zone survival is a requirement, the
-ring or membership model should also include zone/rack placement metadata.
+Conflict handling is strong. Vector clocks plus siblings are the right default
+for opaque values, and the dataset now covers sibling merge write-back, metadata
+pruning, tombstones, and tombstone GC. That is enough for a serious interview
+answer.
+
+The data model now supports the promised behavior: local records carry value,
+deleted flag, vector clock, and update timestamp; ring and membership records
+include zone fields; membership includes lifecycle states. The one missing
+schema contract is keyspace/tenant identity, because operations now depends on
+it.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: A Single-Node Key-Value Store
 
-This is a clear baseline. It shows the simplest read/write path and uses the
-trap to reject "just use a bigger box." Keep it short.
+This remains a clean baseline. The diagram and trap are short, and the recap
+sets up partitioning and replication. No major change needed.
 
-Suggested improvement: name the two failures the next steps solve in one line:
-capacity through partitioning, and durability/availability through replication.
-The recap already does this; the step could make it even more explicit.
+Possible polish: mention the local storage engine choice only lightly here,
+then let `technologyChoices` carry RocksDB/SSTable detail. The current balance
+is already reasonable.
 
 ### Step 2: Partition the Keyspace with Consistent Hashing
 
-This is one of the strongest steps. The alternatives are useful, and the modulo
-hashing option teaches the core reason consistent hashing exists.
+This is a strong partitioning step. The options compare consistent hashing with
+range partitioning and modulo hashing in a way candidates can use in an
+interview. It correctly favors hash partitioning for an opaque KV workload.
 
-Suggested improvement: add one sentence distinguishing range-query use cases
-from this opaque KV scope. That would explain why the design willingly gives up
-ordered scans. Also mention that hot individual keys still need a separate
-mitigation because virtual nodes spread ranges, not one key's traffic.
+Possible polish: explicitly say virtual nodes smooth range ownership but do not
+solve a single hot key. Step `operations` later covers hot-key rate limiting;
+cross-linking that concern here would make the limitation visible earlier.
 
 ### Step 3: Replicate Each Key to N Nodes
 
-The step introduces the preference list at the right time. It also correctly
-mentions spreading replicas across failure domains.
+This step now connects replication to distinct nodes/zones and sets up quorum
+choice cleanly. The replication flow is useful.
 
-Suggested improvement: make replica placement concrete. For example, "choose
-the next N distinct physical nodes, preferably in distinct zones/racks, skipping
-duplicate vnodes for the same physical node." Add a short note that an ack means
-the replica durably recorded the write, not merely received it in memory.
+Possible polish: make the "ack" durability level explicit in the prose or flow:
+does a replica ack after WAL/fsync, after memtable append, or after enqueueing?
+For a system design interview, a short "durably recorded locally" phrase is
+enough.
 
 ### Step 4: Tunable Consistency with Quorums
 
-The leaderless quorum default is the right choice for the stated AP-leaning
-requirements. The alternatives help candidates explain why a leader-per-key
-design is easier to reason about but less available during partitions.
+This step is conceptually correct and now tied to caller-visible API knobs. The
+leader-per-key and sloppy-quorum alternatives teach real trade-offs.
 
-Suggested improvement: connect the step directly to the API. A reader should
-see how a caller asks for `ONE`, `QUORUM`, or `ALL`, and what error or timeout
-means when fewer than `W` or `R` replicas respond.
+Suggested improvement: clean up the API examples so readers do not see both
+`w=2` and `consistency=QUORUM` as competing knobs without a rule.
 
 ### Step 4a: Choosing N, W, and R
 
-This sub-step is useful and belongs under the quorum step. It makes the
-interview stronger because many candidates can recite `W + R > N` but struggle
-to choose values.
+This sub-step is valuable. It gives specific `N=3` combinations and explains
+behavior under one node failure, which is exactly where candidates often get
+hand-wavy.
 
-Suggested improvement: include a compact table:
-`W=1,R=1` for low latency but stale reads, `W=2,R=2` for common quorum,
-`W=3,R=1` for write durability/read latency trade-off, and `W=1,R=3` for
-write availability/read cost. Include how each behaves during one node failure.
+Possible polish: include a compact table in the prose if the renderer supports
+it well, or keep the current paragraph and add one more example for `ONE` vs
+`QUORUM` latency under partial failure.
 
 ### Step 5: Detect and Reconcile Conflicting Writes
 
-This step is conceptually correct and uses good alternatives. Vector clocks are
-the right default for an opaque-value AP store; last-write-wins and CRDTs are
-correctly framed as narrower choices.
+This is now one of the strongest steps. It explains vector clocks, siblings,
+merge write-back, clock-pruning, tombstone writes, and LWW/CRDT alternatives.
 
-Suggested improvement: add the merge write-back lifecycle and tombstone
-semantics. Without that, candidates may leave the system returning siblings
-forever or accidentally resurrect deleted values during repair.
+No major change needed. The remaining improvement would be to connect the
+conflicted `GET` API response directly to the sequence flow by using the same
+example clocks in both places.
 
-### Step 6: Tolerate Failures: Hinted Handoff and Anti-Entropy
+### Step 6: Tolerate Failures: Hinted Handoff & Anti-Entropy
 
-This step introduces the right repair mechanisms and has useful failure drills.
-It also correctly pairs hinted handoff with anti-entropy and read repair rather
-than treating any one mechanism as sufficient.
+This step now has the right production bounds: hint TTL, per-destination quota,
+replay throttling, Merkle-tree anti-entropy, read repair, repair scheduling, and
+operator-triggered repair after incidents.
 
-Suggested improvement: add operational limits. Hints need TTLs, quotas, replay
-rate limits, and a policy for a permanently lost replica. Anti-entropy needs a
-schedule and bandwidth budget. Read repair deserves a short flow because it is
-mentioned in final prose but not represented as strongly as hinted handoff.
+No major conceptual gap remains. A small improvement would be to state what
+happens when hints expire before replay: the system relies on anti-entropy or
+replacement-node bootstrap, and the write's durability depends on the number of
+replicas that actually accepted it before the failure.
 
 ### Step 7: Membership, Gossip, and Rebalancing
 
-The decentralized membership choice fits the no-SPOF requirement and the
-central coordinator alternative is a fair trade-off.
+The membership step is much better than the previous version. It now treats
+joining/leaving as a state machine and includes zone-aware placement.
 
-Suggested improvement: make rebalancing a state machine rather than just a
-concept. A production answer should cover joining, bootstrapping token ranges,
-streaming data, serving as a pending replica, marking ownership active, and
-cleaning up old owners. This is also where zone-aware placement should be made
-explicit.
+Suggested improvement: add a compact flow or visual option for bootstrap. The
+current prose is correct, but this is a subtle operational lifecycle and would
+benefit from the same structured treatment as replication and read repair.
+
+### Step 8: Operate It: Observability, Security, and Backup/Restore
+
+This new step is the biggest review-driven improvement. It gives the design a
+production operating surface: metrics, alerts, admission control, background I/O
+budgets, auth, encryption, audit, and backup/restore.
+
+Suggested improvement: reflect keyspace/tenant identity in the API and data
+model so this step is not the only place where that namespace exists. Consider a
+short restore flow if the dataset needs one more production example.
 
 ## Final Design Review
 
-The final design accurately integrates the components introduced by the steps:
-client/SDK, coordinator, ring, replicas, local storage, membership/gossip,
-hinted handoff, and anti-entropy. It is a good final diagram for the core
-walkthrough.
+The final design now integrates the components introduced by the steps:
+client/SDK, coordinator-as-role, hash ring, replica nodes, per-replica local
+storage, membership/gossip, hinted handoff, anti-entropy/read repair,
+observability/admin, and backup storage.
 
-The diagram has a few teaching limitations:
+This fixes several earlier visual gaps. The final description explicitly says
+the coordinator is a role, every replica has local storage, replicas are placed
+across zones, deletes are tombstones, repair is bounded, and backups are
+per-token-range.
 
-- `Coord` appears as a component, but the text says any node can coordinate.
-  Consider labelling it "Any node acting as coordinator" or showing the role
-  inside the replica nodes.
-- `Storage` is linked only from `NodeA`, which can visually imply only one
-  replica has local storage. Either show local storage inside each replica or
-  label it as "per-replica local storage."
-- Read repair appears in prose but not as a node, link, or flow. It is a key
-  repair path and should be visible somewhere.
-- Observability, admin controls, backup/restore, and security are absent from
-  the final design. Even a small operations node or final-design note would
-  improve production realism.
+One small diagram caveat remains: the `Storage` and `Backup` links are anchored
+to `NodeA` only. The labels explain that storage and snapshots are
+per-replica/per-range, so this is not misleading enough to block the dataset,
+but a future visual could show storage as nested under each replica or label the
+links as representative.
 
 ## Concept Introduction and Learning Flow
 
-Concepts are introduced at the right time. Consistent hashing and virtual nodes
-arrive with partitioning, quorum math arrives with replication, vector clocks
-arrive after quorum conflicts become unavoidable, and hinted handoff plus
-anti-entropy arrive after failures are in scope.
+Concepts are staged well:
 
-The best next improvement is to add concrete examples at concept boundaries:
-a token placement example, a `W/R` failure example, a sibling merge example,
-and a tombstone repair example. Those examples would turn good definitions into
-interview-ready explanations.
+- Consistent hashing and virtual nodes appear when partitioning is introduced.
+- Quorum math appears only after replication creates multiple copies.
+- Vector clocks appear after quorum writes/read paths create divergence.
+- Hinted handoff, anti-entropy, and read repair appear after failure is in
+  scope.
+- Gossip and zone-aware placement appear when membership/topology becomes the
+  problem.
+- Admission control, security, and backup/restore appear at the end, where they
+  naturally distinguish a production design from a textbook mechanism list.
+
+The learning flow is now strong enough for a book case. The best remaining
+pedagogical improvement is not another concept; it is one more operational
+example for bootstrap or restore.
 
 ## Step-to-Final-Design Coherence
 
-The steps mostly build directly toward the final design. Every major final
-component is introduced before the wrap-up, and `satisfies` maps the core
-requirements back to the right steps.
+The coherence is strong. Every major final-design node is introduced by a step:
 
-Two coherence gaps remain:
+- `Coord`, `NodeA`, and `Storage` begin in the naive/replication path.
+- `Ring` comes from partitioning.
+- `NodeB` and `NodeC` come from replication and quorums.
+- `Hint` and `AntiEntropy` come from failure repair.
+- `Membership` comes from gossip and rebalancing.
+- `Ops` and `Backup` come from the new operations step.
 
-- Read repair is named in the final description but does not get the same
-  structured treatment as hinted handoff and anti-entropy.
-- Backup/restore and observability appear only as follow-up-level concerns,
-  even though they affect how a production KV store is operated.
+The `satisfies` section also maps the added production concerns back to real
+steps, including predictable latency under background work and operability /
+recoverability. That is a meaningful improvement over the previous review.
 
-Neither gap breaks the interview, but both are worth addressing before calling
-the case fully book-ready.
+The only coherence gap is the keyspace/tenant scope: it appears in operations
+but not in the earlier API/data-model contract.
 
 ## Realism Compared With Production Systems
 
-The dataset captures the core production architecture of Dynamo-like stores,
-but production systems spend a large amount of engineering effort on bounding
-the background work. The current text should be more explicit that repair,
-hint replay, compaction, tombstone GC, and rebalancing are throttled and
-observable.
+The current case is much closer to a production Dynamo-style system than the
+previous version. It now treats background work as bounded and observable,
+acknowledges vector-clock/tombstone lifecycle issues, separates strict and
+sloppy quorum behavior, and includes backup/restore and security.
 
-Security and multi-tenancy are also thin. Even if the interview is not about
-building a managed cloud database, it should state whether keys belong to
-keyspaces or tenants, how clients authenticate, who can change ring state, and
-how data is encrypted.
+The technology choices are also realistic. They tell readers when to adopt an
+existing system instead of building the custom design, and they make the CP/AP
+fork explicit. This is important because a distributed KV interview should not
+imply Dynamo-style eventual consistency is always the right answer.
 
-Finally, the store promises whole-zone failure survival. That requires
-placement rules, not just `N=3`. The dataset should say replicas are selected
-across failure domains and that membership knows node location.
+Remaining realism improvements are about exact contracts:
+
+- Define the capacity headroom math.
+- Define API consistency parameter precedence.
+- Define keyspace/tenant identity in routing and storage.
+- Optionally define ack durability and restore/bootstrap sequencing.
 
 ## Dataset and Renderer-Facing Observations
 
 - `interview.json` parses as valid JSON.
 - Top-level structure is complete for a walkthrough dataset: requirements,
-  capacity, API, data model, steps, final design, satisfies, interview script,
-  level variants, follow-ups, and probe links.
+  capacity, API, data model, patterns, steps, final design, satisfies,
+  technology choices, interview script, level variants, follow-ups, and probe
+  links.
 - Structured architecture views are used for steps, options, and final design.
-  The raw Mermaid diagrams are limited to requirements and capacity overview
-  sketches, which matches project conventions.
+  Raw Mermaid remains limited to requirements and capacity overview diagrams,
+  matching repo conventions.
 - `view.highlight` IDs resolve inside their view nodes.
-- String `view.links` resolve to `highLevelArchitecture.links`; inline option
-  links reference nodes that exist inside those option views.
-- Sequence participants referenced by messages are present in their sequences.
+- String `view.links` references used by step views resolve to
+  `highLevelArchitecture.links`.
 - `satisfies.functional[*].steps` and `satisfies.nonFunctional[*].steps`
   resolve to real step IDs.
-- The dataset does not include `technologyChoices`. That is optional, but a
-  compact section would be useful for a book case: Cassandra/Scylla/Riak-style
-  self-hosted options, DynamoDB/Bigtable/Cosmos DB managed options, and CP
-  alternatives such as etcd/FoundationDB/Raft-backed stores when
-  linearizability is required.
+- Canonical node types used in the high-level architecture are valid:
+  `client`, `service`, `database`, `worker`, `cache`, `observability`, and
+  `object-storage`.
+- No `aiVisual` or `explainerComic` assets are present. Those are optional; the
+  dataset is complete without them.
+- `technologyChoices` uses plain string chips rather than icon objects. That is
+  valid, though running the icon assignment workflow would improve polish if
+  visual parity with other book cases is desired.
 
 ## Recommended Edits, Prioritized
 
-### P1: Make the production contract explicit
+### P1: Fix capacity arithmetic and name the headroom model
 
-Add capacity math, API-level consistency knobs, conflict/sibling examples,
-delete/tombstone semantics, and hint/repair bounds. These edits would remove
-the biggest ambiguity from the current case.
+Correct the per-node request-rate row or document the multiplier behind it.
+This is the only current issue that can make a reader question the design's
+math.
 
-### P2: Add an operations hardening pass
+### P2: Tighten the external API contract
 
-Add metrics, alerts, throttles, backup/restore, security/keyspace assumptions,
-and a clearer rebalancing state machine. This can be a new late step or a
-stronger final-design/wrap-up section.
+Choose either symbolic consistency levels or explicit `r/w` query parameters in
+the examples, mirror the write consistency contract on `DELETE`, and define
+timeout/partial-success semantics consistently.
 
-### P3: Improve visual and pedagogical examples
+### P3: Add keyspace/tenant identity to API and storage
 
-Make the final design reflect coordinator-as-role, per-replica storage, read
-repair, and zone-aware placement. Add compact examples for token placement,
-quorum choices, sibling merge, and tombstone GC.
+Operations now depends on per-keyspace/tenant authorization. Add that namespace
+to the path/header and data model so routing, quotas, backups, and audit all use
+the same identity.
 
-### P4: Add Technology Choices
+### P4: Add one operational sequence flow
 
-For the book group, add `technologyChoices` comparing self-hosted Dynamo-style
-stores, managed cloud KV stores, and CP stores. Keep it focused on when each
-choice changes or removes parts of the custom design.
+Prefer membership bootstrap or token-range restore. This would convert the last
+prose-heavy production mechanism into a concrete interview flow.
+
+### P5: Optional visual polish
+
+Add technology icons and, if desired, AI visuals/comic assets. This is polish,
+not a correctness issue.
 
 ## What Not To Change
 
-- Keep the AP-leaning scope. Do not broaden this into a transactional database
-  or ordered range-store interview unless the requirements change.
+- Keep the AP-leaning scope and avoid turning this into a transactional or
+  range-query database case.
 - Keep vector clocks plus siblings as the default conflict answer for opaque
-  values. It is the right teaching choice for this lineage.
-- Keep the leader-per-key and range-partitioning alternatives. They are useful
-  because they show when a different requirement set would lead to a different
-  architecture.
-- Keep the step order. The current sequence teaches the design in a defensible
-  progression.
+  values.
+- Keep the leader-per-key, range-partitioning, LWW, CRDT, and central
+  coordinator alternatives. They are useful contrast points, not strawmen.
+- Keep the new operations step. It is doing real work and should remain part of
+  the main walkthrough rather than being pushed entirely to follow-ups.
+- Keep the technology choices. They make the build-vs-adopt and AP-vs-CP
+  trade-offs explicit.
 
 ## Bottom Line
 
-This is a solid distributed KV-store interview with the right conceptual core.
-The next pass should make the implicit production contracts explicit: quantified
-capacity, caller-visible consistency, conflict/delete lifecycles, bounded
-repair, and operating controls. With those additions, it would be a strong
-book-ready case.
+The recent hardening changes moved this from a solid conceptual Dynamo
+walkthrough to a production-aware book case. The remaining work is targeted:
+fix one capacity estimate, make the API/tenant contract precise, and consider
+one more operational flow. No conceptual rewrite is needed.

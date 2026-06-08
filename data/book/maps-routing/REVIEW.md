@@ -5,491 +5,479 @@ Review date: 2026-06-08
 
 ## Executive Summary
 
-This is a clear, compact routing-and-map-serving case. It teaches the main
-interview arc well: naive graph search fails on a continental road network,
-road data becomes a weighted directed graph, preprocessing makes shortest-path
-queries fast, tiles are better served as mostly static CDN content, live traffic
-comes from probe aggregation, and scale is handled through geographic
-partitioning plus offline graph/index rebuilds.
+The recent revision materially strengthens this case. The dataset now has
+quantitative capacity assumptions, a route API that exposes turn-by-turn output
+and graph/traffic versions, a road graph model with stable edge IDs and shortcut
+unpacking, a traffic model with confidence and historical fallback, privacy as a
+non-functional requirement, region overlay language, and a versioned
+build/canary/rollback story. Those changes address most of the previous review's
+P1 findings.
 
-The dataset is structurally healthy. The JSON parses, generated architecture
-views use structured `view` objects, step and option link references resolve,
-sequence participants resolve, `satisfies[*].steps[*]` points to real step IDs,
-and there are no raw Mermaid `diagram` fields in step/final-design surfaces.
+This is now a strong book case. It teaches the right routing arc: start with
+Dijkstra/A*, expose why continental routing cannot do that per request, model
+roads as a weighted directed graph, add contraction-hierarchy preprocessing,
+separate map tiles onto CDN-backed static assets, layer live traffic through
+probe aggregation, then scale with geographic partitioning and immutable
+artifact rollout.
 
-The main weakness is that the production details are thinner than the topic
-deserves. Capacity is qualitative, the route API and route data model do not
-yet support the full stated behavior, live traffic is treated as a simple
-multiplier store, and region partitioning/index updates need a more precise
-operating model. This is a good book case, but not yet a flagship one.
+The remaining gaps are narrower and more production-facing. The final
+architecture still hides several stateful subsystems that the prose depends on:
+traffic-speed storage, urgent closure/restriction overlays, the offline build
+pipeline, geocode/place index state, and the inter-region overlay graph. The
+traffic step names several ways to combine live weights with precomputed
+shortest-path indexes, but the final design should commit to one default and
+state the correctness/latency trade-off. Region partitioning is much clearer in
+prose now, but not yet represented as a concrete model or diagram component.
 
 | Dimension | Rating | Notes |
 | --- | ---: | --- |
-| System design soundness | 3.9 / 5 | Correct core architecture; capacity, route schema, and dynamic-weight details need more precision. |
-| Production realism | 3.5 / 5 | Strong directionally, but light on privacy, map matching, closures, versioning, rollout, and observability. |
-| Pedagogical flow | 4.2 / 5 | The step progression is interview-friendly and easy to follow. |
-| Final design coherence | 4.0 / 5 | Final design integrates the chosen components, but several promised behaviors remain prose-only. |
-| Dataset/rendering fit | 4.7 / 5 | JSON and references validate; no renderer-facing blockers found. |
+| System design soundness | 4.4 / 5 | Correct core design with much better API, capacity, graph, traffic, and rollout detail. |
+| Production realism | 4.2 / 5 | Stronger on privacy, freshness, canary, rollback, and overlays; still missing a few stateful operational components. |
+| Pedagogical flow | 4.5 / 5 | Clean sequence from baseline to graph, preprocessing, tiles, traffic, sharding, and ops. |
+| Final design coherence | 4.3 / 5 | Most decisions converge well; final architecture should show the stores/pipelines behind the prose. |
+| Dataset/rendering fit | 4.7 / 5 | JSON and references validate; one semantic naming issue in the ops flow should be cleaned up. |
 
-Recommendation: keep the current step order and compact narrative. The next edit
-should add quantitative capacity assumptions, make the API/data model support
-turn-by-turn and traffic-aware routing explicitly, deepen the live-traffic and
-graph-update model, and make regional partitioning/operations concrete enough
-for a senior/staff interview answer.
+Recommendation: keep the current structure and most of the new content. The
+next revision should make hidden state explicit, choose a concrete live-traffic
+routing strategy, and represent region overlays/build artifacts as first-class
+architecture elements rather than prose-only details.
 
 ## What Works Well
 
-- The opening baseline is strong. Step 1 correctly starts with Dijkstra/A* and
-  uses the continental-scale latency failure to motivate preprocessing.
-- The graph-model step introduces the right core abstraction: directed weighted
-  edges, one-way streets, turn restrictions/penalties, and geometry expansion.
-- The preprocessing section teaches the most important maps-routing insight:
-  pay offline build/storage cost so online route queries touch a small fraction
-  of the road graph.
-- Step 3a gives a useful comparison between contraction hierarchies, hub
-  labeling, and ALT/A*-with-landmarks.
-- Tile serving is separated from routing, which prevents the common mistake of
-  putting all "maps" behavior on the route hot path.
-- The traffic step explains the desired default: aggregate probes into live
-  edge speeds and apply them at query time instead of rebuilding the whole
-  index every few minutes.
-- The final design ties the major components together: API gateway, routing
-  service, graph store, CH index, geocoder, tile service/store/CDN, probe
-  stream, traffic aggregator, and traffic service.
-- The wrap-up traceability is complete at a high level: every listed functional
-  and non-functional requirement maps to at least one step.
-- Renderer-facing structure is clean: structured views, valid references,
-  valid sequence messages, and no generated-doc changes required for the review.
+- Capacity is now actionable: route QPS, tile reads, probe ingestion, edge-speed
+  update rate, latency budget, graph/index sizing, and freshness cadences are
+  all present.
+- The route API now supports the promised product behavior: departure time,
+  traffic model, alternatives, waypoints, avoid flags, locale, route ID,
+  polyline, legs, steps, maneuvers, traffic-aware duration, warnings, and
+  graph/traffic versions.
+- The tile API now models immutable style/version paths and cache headers, which
+  fits CDN reality much better than a bare z/x/y endpoint.
+- The data model now exposes stable `edge_id`, directed edges, geometry
+  references, turn restrictions, access flags, region ownership, CH shortcut
+  unpacking, graph/index versions, traffic confidence, sample count, historical
+  fallback, incident override, and freshness.
+- Step 1 now quantifies the baseline failure: full-graph Dijkstra can settle
+  tens of millions of nodes, while CH queries touch only thousands.
+- Step 3 correctly explains that CH returns shortcuts and that a route must be
+  unpacked into base edges before geometry and maneuvers can be returned.
+- Step 5 is much stronger: it now covers map matching, noisy probe filtering,
+  anonymization, sparse-road fallback, incidents/closures, and why live traffic
+  should not trigger full re-preprocessing.
+- Step 6 now teaches the real partitioning issue: border vertices, overlay
+  graph, hot metro splits, no fanout to every region, and regional degradation.
+- Step 7 now includes immutable graph/index/tile artifacts, route regression,
+  canary rollout, rollback, urgent overlays, cache keys, and failure drills.
+- The final design now integrates version pinning, shortcut unpacking,
+  historical fallback, privacy boundaries, fast closure overlays, tile
+  versioning, and inter-region overlay routing.
 
 ## Highest-Impact Issues
 
-### 1. Capacity is too qualitative for a routing system
+### 1. Several production-critical stateful components are still prose-only
 
-The capacity section uses labels like "high", "massive", and "minutes". Those
-are directionally correct, but they do not force design decisions. A maps
-routing interview needs at least rough numbers for route QPS, tile QPS, graph
-size, probe ingestion, edge-speed updates, p99 latency, and storage/index size.
+The architecture diagram has `TrafficSvc` as a stateless service and
+`TrafficAgg` writing directly to it, but the dataset now claims roughly 1-5M
+edge-speed updates per minute. That needs an explicit stateful traffic store or
+regional cache. Similarly, urgent closures/restrictions, graph/index build
+artifacts, route-regression/canary state, geocode/place indexes, and the
+inter-region overlay graph are important to the design but not visible as
+components.
 
-Why it matters: the dataset says the goal is millisecond routing on hundreds of
-millions of nodes. Without numbers, the candidate cannot reason about memory
-fit, region shard count, index replication, cache hit rates, traffic aggregation
-fanout, or whether a route request can afford geocoding, CH query, traffic
-overlay, and geometry expansion in one synchronous path.
-
-Concrete fixes:
-
-- Replace "Route QPS: high" with an example such as `50k route requests/sec`
-  globally, `5k/sec` in a hot region, and a `p99 < 100 ms` budget split across
-  gateway, geocoding/snap, index query, traffic lookup, and geometry expansion.
-- Quantify tile load separately, for example `1M+ tile reads/sec`, `95-99% CDN
-  hit rate`, and origin QPS after cache misses.
-- Quantify probe ingestion: devices/sec, events/sec, aggregation window, number
-  of edge-speed updates/minute, and how sparse roads fall back to historical
-  speeds.
-- Give a rough graph/index size: nodes, directed edges, bytes per edge, CH
-  shortcut growth, per-region shard size, and replica count.
-- State a freshness SLO for graph data separately from traffic: traffic in
-  `2-5 min`, incidents/closures in `seconds-minutes`, base-road rebuilds in
-  `hours-days`.
-
-### 2. The API and data model do not fully support the stated route behavior
-
-The requirements promise route geometry, distance, ETA, and turn-by-turn. The
-current `GET /v1/route` response shows distance, ETA, and geometry only. The
-data model also lacks several fields that the prose depends on: stable
-`edge_id` in `road_graph.edges`, route-leg/step/maneuver output, turn
-restrictions, shortcut-unpacking metadata, graph/index version, region ID, and
-time-dependent speed fields.
-
-Why it matters: routing correctness lives in these details. A system can find a
-node path but still fail product requirements if it cannot unpack shortcuts into
-road geometry, produce maneuvers, honor turn restrictions, avoid tolls/highways,
-or compute ETAs against the same graph/index/traffic versions used for the
-selected path.
+Why it matters: the prose is production-realistic, but the diagram currently
+makes the system look more stateless than it is. A candidate copying the diagram
+could omit the very stores that make freshness, rollback, probe aggregation,
+and cross-region routing operational.
 
 Concrete fixes:
 
-- Extend `/v1/route` request parameters with `departure_time`,
-  `traffic_model`, `alternatives`, `waypoints`, `avoid`, `locale`, and a
-  bounded response-shape option.
-- Extend the response with `route_id`, `polyline`, `legs[]`, `steps[]`,
-  `maneuver`, `duration`, `duration_in_traffic`, `warnings`, and
-  `graph_version` / `traffic_version`.
-- Add `edge_id`, `from_node`, `to_node`, `geometry_ref`, `region_id`,
-  `turn_restrictions`, `access_flags`, and `road_class` to the road-graph model.
-- Add shortcut unpacking to `ch_index`, such as skipped edge references or an
-  unpack tree, so the final route can become geometry and turn-by-turn steps.
-- Make `edge_speed` versioned/time-bucketed rather than a single `live_speed`
-  row if the design wants departure-time-aware ETAs.
+- Add a `TrafficStore` or regional edge-speed cache between `TrafficAgg`,
+  `TrafficSvc`, and `RouteSvc`; include read/write/freshness expectations.
+- Add a `RestrictionOverlay` or `IncidentStore` for closures, turn bans, and
+  temporary penalties that bypass the slow base-graph rebuild cadence.
+- Add a `BuildPipeline` node for graph validation, CH build, route regression,
+  artifact publish, canary, and rollback.
+- Add a `GeocodeIndex` or `PlaceIndex` if geocoding remains a functional
+  requirement rather than an external dependency.
+- Add an `OverlayGraph`/`RegionIndex` concept for border vertices and
+  inter-region high-rank shortcuts.
 
-### 3. Live traffic is underspecified for production
+### 2. Live traffic names multiple algorithms but does not pick a final default
 
-Step 5 correctly says that live traffic should not trigger a full CH rebuild.
-However, the dataset compresses the hard production work into "dynamic edge
-weights at query time". It does not explain map matching, noisy probe filtering,
-privacy controls, sparse-road fallback, traffic smoothing, incident/closure
-overrides, or the exact way dynamic weights interact with a precomputed
-shortest-path index.
+Step 5 now honestly states that plain CH assumes fixed weights and lists
+customizable CH, time-dependent CH, and CH-plus-local-A* corridor repair as
+practical options. That is the right nuance. The final design, however, still
+says the router "overlays" live weights as dynamic weights without choosing the
+default strategy or stating whether routes are exact, bounded-suboptimal, or
+best-effort under very fresh traffic.
 
-Why it matters: static CH assumes fixed weights. Real traffic can change edge
-ordering and route optimality. A credible answer needs to say whether the
-system uses customizable CH, time-dependent CH, live-weight overlays on
-candidate corridors, local A* repair, or bounded suboptimality for very fresh
-traffic.
+Why it matters: live traffic is the hardest algorithmic part of this case.
+Without a chosen strategy, the answer can sound correct while hiding the central
+trade-off between fresh weights, query latency, preprocessing cost, and optimal
+route guarantees.
 
 Concrete fixes:
 
-- Add a traffic data model with `edge_id`, speed buckets, confidence,
-  sample_count, source, updated_at, historical fallback, and incident/closure
-  override fields.
-- Add a short map-matching note: probes are snapped to candidate road segments,
-  filtered for GPS quality, deduped by anonymized device/session, then
-  aggregated with privacy-preserving retention.
-- Clarify the routing algorithm under live weights: customizable CH update
-  phase, time-dependent CH, corridor reranking, or a hybrid CH-plus-local-A*
-  approach.
-- State what happens when traffic is stale or missing: fall back to historical
-  speed by time-of-day and road class, not only free-flow speed.
-- Add privacy as a first-class non-functional requirement: opt-in/consent,
-  short retention, coarse analytics, access controls, and no raw trace exposure
-  to operators.
+- Pick one default, for example customizable CH for live speed updates plus
+  closure overlays as hard bans.
+- If using corridor repair, say CH on base/historical weights finds a candidate
+  corridor, then local A* reranks/repairs within that corridor under live
+  weights; call out possible bounded suboptimality.
+- If using time-dependent CH, say how departure-time buckets align with
+  `edge_speed.time_bucket` and what happens for "leave now" versus future
+  departure.
+- Update the traffic option's default and final design to use the same wording.
+- Add one sentence to `satisfies` explaining the freshness/correctness contract
+  for live traffic in routing.
 
-### 4. Graph updates need a stronger versioning and rollout story
+### 3. Region partitioning is clearer, but still under-modeled
 
-Step 7 says the graph/index is rebuilt offline and swapped atomically. That is
-the right default for slow road-data changes, but maps systems also need faster
-updates for closures, restrictions, incidents, construction, and bad map edits.
-The dataset does not yet define graph/index versions, compatibility between
-graph and CH artifacts, canary rollout, rollback, or how a route request stays
-consistent while artifacts are changing.
+The text now describes duplicated/coordinated border vertices, a thin
+inter-region overlay graph, hot metro splits, and regional degradation. The data
+model and architecture view still only show `region_id` on edges and the generic
+`GraphStore`/`CH` components.
 
-Why it matters: a stale or mismatched graph/index can produce invalid routes.
-Atomic swap is necessary, but the candidate should also show how derived
-artifacts are built, validated, rolled out, observed, and rolled back.
+Why it matters: geographic partitioning is one of the core staff-level signals
+for a routing system. It should be represented by at least one concrete artifact
+so the candidate can explain ownership, cross-region planning, and failure
+behavior without relying on prose.
 
 Concrete fixes:
 
-- Add `graph_version`, `index_version`, and `tile_version` fields to relevant
-  data-model entities and response metadata.
-- Describe the build pipeline: ingest map changes, validate topology, build CH,
-  run route-regression tests, publish immutable artifacts, canary by region, and
-  roll back on bad route metrics.
-- Separate urgent overlays from base rebuilds: closures and restrictions should
-  be pushed in minutes through an overlay/restriction store, while base graph
-  and CH rebuilds can remain slower.
-- State that a route request pins one graph/index version through query,
-  shortcut unpacking, and geometry expansion.
-- Add a failure drill for a bad graph release or partially published index.
+- Add model entries for `region_shard`, `border_vertex`, and `overlay_edge` or
+  fold those fields into a dedicated `region_overlay` entity.
+- Show the overlay graph as a derived index or part of the CH/index layer in
+  Step 6 and the final design.
+- State whether border vertices are duplicated with reconciliation, owned by a
+  parent partition, or materialized in an overlay service.
+- Add a cross-region cache key example that includes source/destination cells,
+  graph/index version, avoid flags, mode, and traffic freshness bucket.
+- Add one regional failure drill: traffic unavailable in a region, graph shard
+  stale, or overlay graph publish failure.
 
-### 5. Region partitioning is plausible but too hand-wavy
+### 4. Geocoding is in scope but still light compared with routing
 
-Step 6 says most routes are local and long routes use high-rank CH shortcuts
-spanning regions. That is a good interview-level intuition, but the dataset does
-not define boundary handling, overlay graphs, duplicated border nodes,
-cross-region route stitching, region failover, or hot metro partitioning.
+The requirements and API include geocoding, and the route API sequence snaps
+endpoints to graph nodes. The dataset does not yet show the place/address index,
+normalization, ambiguity handling, or nearest-edge snapping quality that makes
+geocoding reliable enough for routing.
 
-Why it matters: geographic sharding is one of the hardest parts of a continental
-routing service. If the design simply says "partition by region", it hides the
-problem that routes regularly cross boundaries and dense metros can dominate
-load.
+Why it matters: a route request often starts from user-entered addresses or
+place names. Bad geocoding or snapping can produce a perfectly computed route
+from the wrong point.
 
 Concrete fixes:
 
-- Add an overlay/border graph concept: each region owns local graph data,
-  boundary vertices are duplicated or coordinated, and long routes use a
-  higher-level inter-region graph before local unpacking.
-- Explain how a cross-region query is planned without synchronous fanout to
-  every region.
-- Discuss hot-region splitting for dense cities and why administrative borders
-  are often worse than traffic/topology-aware partitions.
-- Add cache keys that include origin/destination cells, mode, avoid flags, graph
-  version, and traffic freshness bucket.
-- Add a regional degradation story: what routes can still be served if one
-  region's graph shard, traffic feed, or tile origin is unavailable.
+- Either explicitly scope geocoding as an external subsystem, or add a
+  lightweight `geocode_index` data model and `GeocodeIndex` node.
+- Include response ambiguity fields such as confidence, candidate places, and
+  snapped edge/node metadata.
+- Mention reverse geocoding and nearest-road snapping separately if the route
+  API accepts raw lat/lng.
+- Add a trap or follow-up: "The shortest path is correct, but the origin was
+  snapped to the wrong frontage road."
 
 ## System Design Soundness
 
 ### Requirements and Capacity
 
-The requirements cover the right product surface: route computation, geometry
-and ETA, tiles, live traffic, and geocoding. The non-functional requirements
-name the right broad constraints: low latency, continental scale, CDN tiles,
-fresh traffic, and read-heavy workloads.
+The requirements are now well scoped for a maps-routing interview: fastest route
+between locations, geometry/distance/ETA/turn-by-turn, tile serving, live
+traffic, and geocoding. The privacy non-functional requirement is a strong
+addition because probe-based traffic is impossible to discuss responsibly
+without it.
 
-The weak point is capacity. The current numbers are not wrong, but they are not
-actionable. This case should convert "high route QPS" and "massive tile reads"
-into route-hot-path budgets, edge-speed update rates, artifact sizes, and shard
-counts. That would make the later choices around CH, CDN, region partitioning,
-and traffic freshness more defensible.
+Capacity is now one of the stronger parts of the dataset. It separates route
+QPS from tile reads, gives a p99 route budget, quantifies graph size, estimates
+CH expansion and region shard sizing, and separates traffic freshness from base
+graph rebuild cadence. The next useful capacity addition is a traffic-store
+budget: edge-speed rows, update QPS, route-time read QPS, cache memory, and
+multi-region replication.
 
 ### API
 
-The API is intentionally compact, which helps readability. It is not yet strong
-enough for the stated behavior. `/v1/route` should expose departure time,
-traffic behavior, alternatives, waypoints, avoid flags, and bounded response
-size. The response should include turn-by-turn structures, route legs, encoded
-polyline/geometry references, traffic-aware duration, warnings, and version
-metadata.
+`GET /v1/route` now matches the stated product behavior well. It includes
+traffic-aware request parameters and returns route legs, steps, maneuvers,
+polyline, traffic-aware duration, warnings, and version metadata. That is a big
+improvement over the previous shape.
 
-`/v1/tiles/{z}/{x}/{y}` is acceptable as the minimal tile shape, but a production
-case should mention style/version, raster vs vector content type, cache headers,
-and CDN URL versioning. `/v1/geocode` is present, but the dataset should either
-scope geocoding as a dependency or add the index/model used to resolve
-addresses and snap points to graph nodes.
+Two API refinements would make it more production-like:
+
+- For many waypoints or route-shape options, mention when the route endpoint
+  becomes `POST` instead of a very long `GET` query string.
+- Add an optional response-shape control such as overview-only versus full
+  turn-by-turn, because mobile clients often need to bound payload size.
+
+The tile API is now solid: style/version/z/x/y/format plus immutable caching is
+the right mental model. The geocode API is acceptable for the case, but it needs
+either a backing index model or an explicit "provided by a separate geocoding
+system" boundary.
 
 ### Data Model
 
-The three current entities are the right starting point: road graph, CH index,
-and edge speed. They are too thin for the behavior promised by the rest of the
-case.
+The data model now supports the main routing behavior. `road_graph (edge)` has
+the fields needed for directed routing, avoid flags, geometry, restrictions,
+region ownership, and versioning. `ch_index` now carries shortcut unpacking and
+compatible graph/index versions. `edge_speed` now supports live speed,
+time-bucketed historical fallback, confidence, sample count, incident overrides,
+and freshness.
 
-The road graph should expose stable edge IDs, directed from/to nodes, geometry
-references, turn restrictions, access/avoid flags, region ownership, and version.
-The CH index should store shortcut-unpacking metadata and version/build
-metadata. The traffic model should carry confidence, sample count, historical
-fallback, time buckets, incident overrides, and freshness. If geocoding stays in
-scope, add a small geocode/place index or explicitly say it is provided by an
-external subsystem.
+The remaining model gaps are the stateful artifacts around the model:
+`TrafficStore`, `RestrictionOverlay`, `BuildArtifact`/`GraphRelease`,
+`RegionOverlay`, and possibly `GeocodeIndex`. These do not need exhaustive
+schemas, but naming them would make the final architecture more honest.
 
 ### Architecture
 
-The high-level architecture is coherent. The routing service reads the graph,
-CH index, geocoder, and traffic service; tiles are backed by object storage and
-CDN; probes flow through a stream and aggregator into traffic state.
+The high-level architecture is coherent: client, gateway, routing service,
+geocoder, graph store, CH index, tile service/store/CDN, probe stream, traffic
+aggregator, and traffic service. The separation between routing, tiles, and
+traffic is correct and easy to teach.
 
-The missing architecture surfaces are operational: build pipeline, artifact
-versioning, traffic quality controls, privacy boundary, observability, and
-regional failover. These do not need to dominate the diagram, but they should be
-visible enough that the final design feels production-operated rather than only
-algorithmically correct.
+The architecture still underrepresents derived state and offline work. The
+`TrafficSvc` is marked stateless, but it is the read API for continuously
+updated traffic state. The build pipeline is represented in the ops sequence by
+relabeling the `TrafficAgg` participant as "Build Pipeline", which is
+semantically confusing because the traffic aggregator and graph/index builder
+are different systems. Add a real `BuildPipeline` node and, ideally, a
+`TrafficStore`/`RestrictionOverlay` node.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: Dijkstra/A* Over the Whole Graph Per Request
 
-This is the right opener. It gives the candidate a familiar baseline and then
-explains why it breaks at continental scale. The step would be stronger with one
-rough number: nodes settled or latency for a long route under naive Dijkstra/A*
-versus a CH query.
+This is now an excellent opener. It starts with the familiar correct baseline,
+then gives concrete scale language: plain Dijkstra can settle tens of millions
+of nodes while CH touches thousands. That makes the need for preprocessing
+obvious.
+
+Keep this step compact. It should not teach all routing algorithms yet; it
+should motivate why the next steps exist.
 
 ### Step 2: Model Roads as a Weighted Graph
 
-The graph abstraction is introduced well. It mentions directed edges, one-way
-streets, turn restrictions, and geometry. The next edit should make those
-details visible in the data model so turn-by-turn output and traffic edge-speed
-rows have concrete fields to attach to.
+The graph abstraction is introduced cleanly: intersections as nodes, road
+segments as directed weighted edges, one-way streets, restrictions, penalties,
+and geometry. The data model now reinforces those details, so this step no
+longer feels disconnected from the schema.
+
+One possible improvement is to mention edge-based routing for turn costs: some
+systems model state as "arrived via edge" so turn restrictions and penalties are
+handled accurately. That can be a note, not a main branch.
 
 ### Step 3: Make Shortest-Path Fast with Preprocessing
 
-This is the key teaching step and it is effective. It explains the offline
-build/online query trade-off clearly. Add a note that CH shortcuts must be
-unpacked back into base edges for route geometry and maneuvers, otherwise the
-candidate can accidentally stop at "shortest distance" instead of "usable
-route".
+This is the core teaching step and it now lands well. The shortcut-unpacking
+paragraph is especially important because it connects the algorithmic answer to
+the product output: geometry and maneuvers.
+
+Keep CH as the default. It is the right interview choice when paired with the
+live-traffic caveats introduced later.
 
 ### Step 3a: Preprocessing Choices: CH vs Hub Labeling vs A*
 
-The option comparison is useful and not a strawman. The CH default is
-reasonable. This step should be the place where dynamic traffic compatibility is
-made precise: plain CH, customizable CH, time-dependent CH, hub-label storage
-cost, and ALT's behavior under frequent weight changes.
+The option comparison is strong. CH, hub labeling, and ALT are described in
+terms of build time, storage, query speed, and graph update frequency rather
+than as strawmen.
+
+The only remaining gap is linking this choice more explicitly to Step 5. The CH
+option already says live traffic needs customizable CH or A* support; the final
+design should pick which one the system actually uses.
 
 ### Step 4: Serving Map Tiles
 
-This is a good separation of concerns. The options cover CDN pre-rendering,
-client-rendered vector tiles, and origin rendering. Add cache/version details:
-style version in the URL, immutable tile assets, cache-control, invalidation by
-publishing a new tile version, and origin protection when a popular area misses.
+This step is now production-realistic. It explains tiles as static, read-heavy,
+CDN-friendly content and includes immutable version paths, cache headers, and
+origin stampede protection. The alternatives are useful: pre-rendered CDN
+tiles, client-rendered vector tiles, and origin rendering.
+
+No major change is needed. A minor optional improvement is to state which format
+is the default for the interview answer: vector tiles for flexible clients or
+raster tiles for simpler serving.
 
 ### Step 5: Live Traffic from GPS Probes
 
-The step has the right default choice. It needs the most production depth:
-probe consent/anonymization, map matching, noisy data filtering, speed
-confidence, sparse coverage, incidents/closures, historical fallback, and the
-specific dynamic-weight routing algorithm. This would also be a good place for
-a sequence flow that shows probe ingestion separately from route-time traffic
-lookups.
+This step improved the most. It now covers map matching, GPS noise,
+anonymization, dedupe, confidence, sparse coverage, historical fallback,
+incidents/closures, privacy, and the challenge of using dynamic weights with
+preprocessed routing.
+
+The remaining issue is decision precision. The step lists the right approaches,
+but the chosen design should not leave the candidate saying only "dynamic edge
+weights." Pick a default live-weight strategy and state its consequences.
 
 ### Step 6: Scaling: Region Partitioning
 
-The locality argument is good. The step currently hides boundary and overlay
-complexity. Add region border nodes, an inter-region/overlay graph, cross-region
-planning, hot-city splits, and failure behavior when a regional shard is stale
-or unavailable.
+The locality, border, overlay, hot-metro, and degradation story is now much more
+credible. This is close to a strong staff-level partitioning discussion.
+
+The improvement should be visual/model-based: show the region overlay as an
+artifact. If the final diagram only shows a generic graph store and CH index,
+the most important part of Step 6 can be missed.
 
 ### Step 7: Graph Updates, Caching, and Reliability
 
-This is the correct final architecture step, but it is too compressed. It should
-name artifact versions, build validation, canary rollout, rollback, urgent
-closure overlays, cache keys, route regression tests, freshness metrics, and
-traffic fallback. A small failure drill for "bad graph release" would make this
-step much more interview-realistic.
+This step now has the right operational arc: immutable artifacts, topology
+validation, CH build, route regression, canary, rollback, request version
+pinning, fast urgent overlays, route cache keys, and traffic fallback.
+
+The main cleanup is semantic: do not reuse `TrafficAgg` as the "Build Pipeline"
+participant in the ops sequence. Add a build-pipeline node or keep the flow
+purely conceptual. Also consider adding closure-overlay storage to the diagram
+because Step 7 correctly depends on it.
 
 ## Final Design Review
 
-The final design accurately integrates the selected components from the steps.
-It states the important defaults: weighted directed road graph, offline-built CH
-index, stateless routing service, geometry expansion from the graph store, live
-probe-derived edge speeds, CDN-backed tiles, geo partitioning, atomic graph/index
-swap, and fallback to free-flow weights when traffic lags.
+The final design is now much closer to a polished interview answer. It includes
+the important choices: weighted directed graph, offline CH index, stateless
+routing service, version pinning, shortcut unpacking, traffic overlays,
+historical fallback, privacy-controlled probes, fast closure overlays,
+versioned CDN tiles, geo partitioning, and inter-region overlay/border graph
+routing.
 
-The final design should become more explicit about version consistency and
-operational boundaries. A polished final answer would say:
+The final answer should make three things more explicit:
 
-- Route requests pin a graph/index version and use traffic speeds from a bounded
-  freshness window.
-- Shortcuts are unpacked into base edges before returning geometry and
-  turn-by-turn maneuvers.
-- Closures/restrictions use a fast overlay path, while base graph/CH artifacts
-  are rebuilt and canaried offline.
-- Regional routing uses local shards plus an overlay/border graph for long
-  routes.
-- Tiles are versioned immutable assets served by CDN, with origin protection and
-  style/content-type choices.
-- Raw GPS probes are short-lived, privacy-controlled data; the routing service
-  reads only aggregated edge-speed state.
+- Where dynamic traffic and urgent restrictions are stored and served from.
+- Which live-weight routing algorithm is the default.
+- Which components own graph/index/tile artifact build, validation, canary, and
+  rollback.
+
+Those changes would make the final design match the quality of the improved
+step prose.
 
 ## Concept Introduction and Learning Flow
 
-The concepts are introduced in a good order: road graph, preprocessing,
-preprocessing trade-off triangle, tile pyramid/CDN, probe-based traffic, geo
-region sharding, and dynamic edge weights. That flow is easy for a candidate to
-replay in an interview.
+The concept order is strong: road graph, contraction hierarchies, preprocessing
+trade-off triangle, tile pyramid/CDN, probe-based traffic, dynamic edge weights,
+geo sharding/overlay graph, and immutable versioned artifacts. The concepts are
+introduced just in time and tied to steps.
 
-The missing concept is artifact/version management. In this domain, graph
-versions, index versions, tile versions, and traffic freshness are not
-operations-only details; they are part of correctness. Add a concept card or
-Step 7 concept for immutable map artifacts and versioned rollout.
+Two concept additions would sharpen the staff-level learning path:
+
+- "Traffic state store / freshness bucket": live speeds are a high-write,
+  high-read regional state problem, not just a service.
+- "Restriction overlay": closures and temporary turn bans are correctness
+  overlays with faster freshness than base graph rebuilds.
 
 ## Step-to-Final-Design Coherence
 
-The final design includes every major component introduced in the steps. The
-coherence is good:
+The step-to-final-design coherence is now good:
 
-- Step 1 motivates why naive online search is unacceptable.
-- Step 2 introduces `GraphStore` and `Geocode`.
-- Step 3 and 3a introduce `CH` as the default online index.
-- Step 4 introduces `TileSvc`, `TileStore`, and `CDN`.
-- Step 5 introduces `ProbeStream`, `TrafficAgg`, and `TrafficSvc`.
-- Step 6 explains why graph, index, tiles, and traffic need regional locality.
-- Step 7 explains offline rebuilds, caching, replication, and degradation.
+- Step 1 motivates why naive per-request graph search fails.
+- Step 2 introduces the road graph and geocoding dependency.
+- Step 3 and 3a introduce CH and preprocessing alternatives.
+- Step 4 introduces tile service, tile store, CDN, and immutable tile versions.
+- Step 5 introduces probe stream, traffic aggregation, dynamic weights, privacy,
+  incidents, and historical fallback.
+- Step 6 introduces region partitioning and the overlay/border graph idea.
+- Step 7 introduces immutable artifacts, version pinning, rebuild validation,
+  canary, rollback, cache keys, and degradation.
 
-The largest coherence gap is between the promised product outputs and the data
-shown in final design. Geometry, turn-by-turn, traffic-aware duration,
-alternatives, closures, and route versioning should be visible either in the API
-or data model so the final design can claim them without relying only on prose.
+The main coherence gap is that some late-step entities are not visible in the
+architecture inventory. Add explicit nodes or data-model entries for traffic
+state, restrictions, build pipeline, and region overlay so the final design
+does not rely on prose alone.
 
 ## Realism Compared With Production Systems
 
-The design is directionally similar to real routing systems: static map graph,
-preprocessed route index, CDN tiles, live traffic aggregation, regional
-partitioning, and offline artifact rebuilds. The realism gaps are mostly in the
-operating details:
+The case now resembles real routing systems much more closely than the previous
+reviewed version. It accounts for the distinction between static graph data and
+live traffic, separates tile delivery from route computation, uses immutable
+artifact versions, recognizes probe privacy, and describes canary/rollback for
+graph releases.
 
-- Real route APIs expose route options, departure-time semantics, alternatives,
-  avoid flags, waypoints, route legs, warnings, and encoded polylines.
-- Real road graphs include turn restrictions, access rules, closures, geometry,
-  versions, and map-matching concerns.
-- Real traffic systems spend substantial effort on privacy, probe quality,
-  confidence scoring, sparse-road fallback, incidents, and freshness alerts.
-- Real map releases are versioned artifacts with validation, canary rollout,
-  rollback, and route-regression test suites.
-- Real region partitioning uses border/overlay graphs and hot-area splits rather
-  than simple administrative partitions.
-- Real map tile serving depends on immutable versioned URLs, cache headers,
-  content negotiation, and origin protection.
+Remaining realism gaps:
+
+- Traffic state is not modeled as a store despite high update volume.
+- Closure/restriction overlays are mentioned but not represented as a data path.
+- Geocoding lacks a place/address index and ambiguity handling.
+- Dynamic traffic with CH needs a committed algorithm and correctness statement.
+- Region overlay routing should have a concrete artifact, not only a paragraph.
+- Route observability could be more explicit: p50/p95/p99 latency, no-route
+  rate, ETA error, probe freshness, traffic coverage, graph-release regression,
+  and tile origin miss/stampede metrics.
 
 ## Dataset and Renderer-Facing Observations
 
 - `interview.json` parses successfully.
-- Top-level structure is valid for this project: requirements, capacity, API,
-  data model, high-level architecture, steps, final design, satisfies, script,
-  level variants, follow-ups, and probe links are present.
-- No raw Mermaid `diagram` fields were found in step, option, flow, or final
-  design surfaces.
-- Step `view.nodes` and string `view.links` references resolve against
-  `highLevelArchitecture`.
-- Option-local nodes and inline links are used for alternate designs such as
-  `HubLabels`, `Landmarks`, `VectorStore`, and `Preproc`; this is supported by
-  the renderer.
-- Flow sequence messages reference declared participants.
+- Top-level sections are present: requirements, capacity, API, data model,
+  high-level architecture, patterns, steps, final design, satisfies, interview
+  script, level variants, follow-ups, and probe links.
+- No raw Mermaid `diagram` fields were found in step, option, flow, or
+  final-design surfaces.
+- Step, option, and final-design string `view.nodes` references resolve against
+  `highLevelArchitecture.nodes`.
+- Step, option, and final-design string `view.links` references resolve against
+  `highLevelArchitecture.links`.
+- Flow and API sequence messages reference declared participants.
 - `satisfies.functional[*].steps[*]` and
   `satisfies.nonFunctional[*].steps[*]` resolve to real step IDs.
-- Step-level `probeLinks` reference known links in `toProbeFurther`.
-- No generated `docs/` rebuild is needed for this review-only change.
+- `patterns[*].steps[*]` and step-level `probeLinks` resolve.
+- All step and option views have captions.
+- Review-only changes do not require rebuilding `docs/`.
 
-Optional renderer/content polish:
+Renderer/content polish:
 
-- Add `aiVisual` assets if this case should match the most visual flagship
-  datasets.
-- Add one or two more sequence flows: route query with geocode/CH/traffic/graph
-  expansion, and offline graph/index build plus atomic publish.
-- If the decision-tree overview feels dense, the sub-step `3a` is correctly
-  modeled as a child of `preprocess`; keep that hierarchy.
+- The Step 7 flow uses participant ID `TrafficAgg` with label "Build Pipeline".
+  Rendering is valid, but the semantic mapping is wrong. Prefer a distinct
+  `BuildPipeline` node or participant.
+- There are no `aiVisual` assets for this dataset. That is fine for correctness,
+  but optional if this case should visually match the most illustrated book
+  interviews.
 
 ## Recommended Edits, Prioritized
 
-### P1: Make capacity quantitative and tied to work units
+### P1: Add stateful traffic, restriction, build, and geocode/overlay artifacts
 
-Add route QPS, tile QPS, probe ingestion, graph/index size, edge-speed update
-rate, latency budget, region shard sizing, and cache hit-rate assumptions.
+Add `TrafficStore`, `RestrictionOverlay`, `BuildPipeline`, and either
+`GeocodeIndex` or an explicit external geocoding boundary. Consider adding an
+`OverlayGraph`/`RegionIndex` as a derived routing artifact.
 
-### P1: Align API and data model with route outputs
+### P1: Commit to one live-traffic routing strategy
 
-Add route options, turn-by-turn response fields, version metadata, road-edge
-IDs, geometry references, turn restrictions, shortcut unpacking, and traffic
-speed buckets.
+Choose customizable CH, time-dependent CH, or CH-plus-local-A* corridor repair
+as the default. State freshness, latency, and optimality trade-offs clearly.
 
-### P1: Deepen live-traffic correctness and privacy
+### P1: Represent region overlay routing in the model/diagram
 
-Add map matching, quality/confidence, historical fallback, incidents/closures,
-privacy/retention, and the exact algorithmic approach for using dynamic weights
-with preprocessed routing.
+Add border vertices, overlay edges, region ownership, and cross-region planning
+as concrete artifacts so Step 6 is visible in the final architecture.
 
-### P2: Add graph/index/tile versioning and rollout mechanics
+### P2: Add a traffic-state capacity line
 
-Represent immutable artifacts, build validation, canary rollout, rollback,
-urgent overlays, and route-regression tests in Step 7 and the final design.
+Quantify edge-speed rows, update rate into the store, route-time reads, memory
+footprint, and replication/freshness behavior.
 
-### P2: Make region partitioning operationally concrete
+### P2: Add geocoding ambiguity and snapping behavior
 
-Add border nodes, overlay/inter-region graph, cross-region route stitching,
-hot-metro splitting, and regional degradation behavior.
+Model confidence, candidates, snapped edge/node, and failure behavior when the
+address or coordinate maps ambiguously to the road graph.
 
-### P2: Add route and build sequence flows
+### P2: Add observability signals
 
-The API route sequence exists, but the step walkthrough would benefit from a
-main route-query flow and an offline build/publish flow.
+Add route latency, no-route rate, ETA error, traffic freshness, traffic coverage,
+probe drop/filter rate, graph-release regression metrics, and tile-origin miss
+rate.
 
-### P3: Improve tile-serving details
+### P3: Add optional visuals or one extra sequence flow
 
-Add tile version/style, vector vs raster content-type, cache headers, immutable
-URLs, and CDN origin protection.
-
-### P3: Decide how much geocoding is in scope
-
-Either add a small geocode/place-index model and snapping behavior, or state
-that geocoding is an external dependency and the routing service receives graph
-node IDs after resolution.
+Optional: add `aiVisual` assets or a step-level route-query flow showing version
+pinning, traffic lookup, CH query, shortcut unpacking, and response assembly.
 
 ## What Not To Change
 
-- Keep the baseline-to-preprocessing teaching arc. It is the strongest part of
-  the case.
-- Keep the separation between routing, tiles, and traffic. Combining them would
-  make the design harder to teach.
-- Keep CH as the default preprocessing choice; it is a defensible interview
-  default when paired with the right live-traffic caveats.
-- Keep the `preprocessing-choice` sub-step under preprocessing. It is a good
-  way to teach alternatives without disrupting the main spine.
-- Keep the final design compact. Add missing contracts through targeted fields,
-  flows, and captions rather than turning the case into a routing textbook.
+- Keep the baseline-to-CH teaching arc. It is clear and effective.
+- Keep the separate treatment of routing, tiles, and traffic.
+- Keep CH as the default preprocessing family, with live-traffic caveats.
+- Keep `preprocessing-choice` as a sub-step under preprocessing.
+- Keep the quantitative capacity section; refine it rather than replacing it.
+- Keep privacy as a first-class non-functional requirement.
+- Keep the final design compact; add missing components surgically.
 
 ## Bottom Line
 
-The dataset is a good, readable maps-routing walkthrough with clean renderer
-structure and a coherent final design. To make it production-grade, the next
-revision should quantify capacity, make route outputs and graph/index versions
-explicit, and deepen live traffic, graph updates, region partitioning, and
-privacy. Those changes would turn a solid overview into a strong senior/staff
-system-design case.
+The maps-routing interview is now a strong, coherent walkthrough. The recent
+changes fixed the largest issues in capacity, API, data model, traffic, privacy,
+partitioning, and rollout. To make it flagship-level, the next pass should make
+the hidden operational state visible and choose a precise live-traffic routing
+strategy. Those are targeted improvements, not structural rewrites.

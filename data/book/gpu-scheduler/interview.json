@@ -246,10 +246,16 @@
         "label": "evict victim"
       },
       {
+        "id": "jobdb-quota",
+        "from": "JobDB",
+        "to": "Quota",
+        "label": "billable usage (allocation intervals)"
+      },
+      {
         "id": "metrics-quota",
         "from": "Metrics",
         "to": "Quota",
-        "label": "usage for fair-share"
+        "label": "utilization signal, not authority"
       },
       {
         "id": "agent-checkpoints",
@@ -322,7 +328,8 @@
       "Fairness: no team starves; bursty teams can use spare capacity but yield it back.",
       "High-priority/production jobs can preempt lower-priority/best-effort jobs.",
       "Scheduling latency low for the queue, but throughput and packing quality matter more than per-job ms.",
-      "Resilient: a node or the scheduler crashing must not lose jobs or strand GPUs."
+      "Resilient: a node or the scheduler crashing must not lose jobs or strand GPUs.",
+      "Multi-tenant isolation: untrusted team images share GPU nodes without leaking another team's data or escaping their quota."
     ]
   },
   "capacity": [
@@ -376,8 +383,8 @@
     {
       "method": "POST",
       "path": "/v1/jobs",
-      "description": "Submit a job with its resource request. Idempotency-Key header dedups client retries. Returns once queued.",
-      "request": "{ \"idempotencyKey\": \"sub-9af3\", \"gpus\": 8, \"gpuType\": \"a100\", \"memGB\": 80, \"walltime\": \"24h\", \"priority\": \"prod\", \"team\": \"vision\", \"image\": \"reg/trainer:1.4\", \"command\": [\"python\",\"train.py\"], \"gang\": { \"minReplicas\": 8 }, \"constraints\": { \"topology\": \"same-nvlink\", \"migProfile\": null, \"nodeSelector\": {} }, \"retryPolicy\": { \"maxRetries\": 3 }, \"preemptible\": true, \"maxPreemptions\": 5, \"checkpoint\": { \"enabled\": true, \"uri\": \"s3://ck/vision/j771\", \"intervalMin\": 30 }, \"logSink\": \"s3://logs/vision/j771\" }",
+      "description": "Submit a job with its resource request. Idempotency-Key header dedups client retries (scoped per tenant, expiring after a retention window — not globally permanent). Admission validates the resource vector against quota, the image against allowed registries + signature policy, and that the requested service account / checkpoint+log URIs belong to the caller's tenant. Returns once queued.",
+      "request": "{ \"idempotencyKey\": \"sub-9af3\", \"resources\": { \"gpus\": 8, \"gpuType\": \"a100\", \"migProfile\": null, \"gpuMemGB\": 80, \"cpu\": 32, \"ramGB\": 256, \"localSsdGB\": 500, \"netTier\": \"nvlink\" }, \"walltime\": \"24h\", \"priority\": \"prod\", \"team\": \"vision\", \"tenant\": { \"namespace\": \"vision\", \"serviceAccount\": \"vision-trainer\", \"networkPolicy\": \"team-only\" }, \"image\": \"reg.internal/vision/trainer:1.4@sha256:...\", \"command\": [\"python\",\"train.py\"], \"securityContext\": { \"runtimeClass\": \"gvisor\", \"privileged\": false }, \"gang\": { \"minReplicas\": 8 }, \"constraints\": { \"topology\": \"same-nvlink\", \"nodeSelector\": {} }, \"retryPolicy\": { \"maxRetries\": 3 }, \"preemptible\": true, \"maxPreemptions\": 5, \"checkpoint\": { \"enabled\": true, \"uri\": \"s3://ck/vision/j771\", \"intervalMin\": 30, \"resumeCmd\": [\"python\",\"train.py\",\"--resume\"] }, \"logSink\": \"s3://logs/vision/j771\" }",
       "response": "{ \"jobId\": \"j_771\", \"state\": \"pending\" }",
       "sequence": {
         "participants": [
@@ -475,16 +482,16 @@
           "type": "enum(prod, batch, best_effort)"
         },
         {
-          "name": "gpus",
-          "type": "int"
+          "name": "resources",
+          "type": "json resource vector (gpus, gpu_type, mig_profile, gpu_mem_gb, cpu, ram_gb, local_ssd_gb, net_tier)"
         },
         {
           "name": "gpu_type",
-          "type": "string"
+          "type": "string (denormalized for the placement index)"
         },
         {
           "name": "walltime",
-          "type": "duration"
+          "type": "duration (declared max runtime; bounds backfill + drives kill/requeue on overrun)"
         },
         {
           "name": "state",
@@ -492,7 +499,7 @@
         },
         {
           "name": "placement",
-          "type": "list<node_id,gpu_idx>"
+          "type": "list<node_id,gpu_idx> (cached projection of the live allocation — allocations is authoritative)"
         },
         {
           "name": "idempotency_key",
@@ -511,12 +518,16 @@
           "type": "int (live)"
         },
         {
-          "name": "checkpoint_uri",
-          "type": "string | null (last successful checkpoint)"
+          "name": "checkpoint_policy",
+          "type": "json (enabled, interval_min, grace_target_s, resume_cmd, last_status, last_uri)"
         },
         {
           "name": "constraints",
           "type": "json (mig_profile, topology, node_selector, taints)"
+        },
+        {
+          "name": "tenant",
+          "type": "json (namespace/project, service_account, image_pull_identity, network_policy, log_acl)"
         }
       ]
     },
@@ -556,27 +567,31 @@
     },
     {
       "name": "quotas",
-      "note": "Per-team guaranteed + burst limits and rolling usage used for fair-share.",
+      "note": "Per-team, per-resource-class guarantees + burst ceilings + rolling usage. One row per (team, resource_class) so fair-share can compute a dominant share across heterogeneous bottlenecks, not just GPU count.",
       "fields": [
         {
           "name": "team",
-          "type": "string PK"
+          "type": "string (PK part)"
         },
         {
-          "name": "guaranteed_gpus",
-          "type": "int"
+          "name": "resource_class",
+          "type": "enum(gpu_a100, gpu_h100, gpu_t4, gpu_mem, mig_slice, cpu, ram) (PK part)"
         },
         {
-          "name": "max_gpus",
-          "type": "int (burst ceiling)"
+          "name": "guaranteed",
+          "type": "scarcity-normalized units (1 H100 weighs more than 1 T4; a MIG slice is fractional)"
         },
         {
-          "name": "used_gpus",
-          "type": "int (live)"
+          "name": "max_burst",
+          "type": "units (ceiling regardless of idle capacity — anti-gaming cap)"
+        },
+        {
+          "name": "used",
+          "type": "units (live, summed from open allocations)"
         },
         {
           "name": "usage_window",
-          "type": "rolling GPU-seconds (e.g. 24h decay)"
+          "type": "rolling unit-seconds (e.g. 24h decay) — derived from allocation intervals, not metrics"
         },
         {
           "name": "weight",
@@ -597,8 +612,24 @@
           "type": "uuid (index)"
         },
         {
+          "name": "attempt_id",
+          "type": "uuid (FK job_attempts — ties this allocation to one launch attempt)"
+        },
+        {
           "name": "gpu_ids",
           "type": "list<(node_id, idx)>"
+        },
+        {
+          "name": "resource_vector",
+          "type": "json (normalized units billed for fair-share/usage accounting)"
+        },
+        {
+          "name": "started_at",
+          "type": "timestamp (allocation interval start — the billable usage clock)"
+        },
+        {
+          "name": "ended_at",
+          "type": "timestamp | null (interval end; usage_window is summed over these intervals)"
         },
         {
           "name": "scheduler_epoch",
@@ -620,7 +651,7 @@
     },
     {
       "name": "reservations",
-      "note": "Future-start reservation for a head-of-line gang — holds a planned start, never partial GPUs. Backfill jobs must finish before this start.",
+      "note": "Future-start reservation for a head-of-line gang — holds a planned start, never partial GPUs. A backfill job is admitted only if its latest-finish (now + remaining walltime) provably precedes planned_start, or it is preemptible.",
       "fields": [
         {
           "name": "res_id",
@@ -631,12 +662,20 @@
           "type": "uuid (the waiting gang)"
         },
         {
-          "name": "gpus_needed",
-          "type": "int"
+          "name": "resource_shape",
+          "type": "json (gpus_needed, gpu_type, topology domain the gang needs)"
         },
         {
           "name": "planned_start",
-          "type": "timestamp (est. when enough free)"
+          "type": "timestamp (projected from running jobs' remaining walltime)"
+        },
+        {
+          "name": "reason",
+          "type": "string (why this start: e.g. 'frees when alloc a17 hits walltime')"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamp (deadline — stale projections are recomputed, not honored forever)"
         },
         {
           "name": "priority",
@@ -662,7 +701,15 @@
         },
         {
           "name": "outcome",
-          "type": "enum(succeeded, failed, preempted, node_lost)"
+          "type": "enum(succeeded, failed, preempted, node_lost, walltime_exceeded)"
+        },
+        {
+          "name": "started_at",
+          "type": "timestamp"
+        },
+        {
+          "name": "ended_at",
+          "type": "timestamp | null"
         },
         {
           "name": "checkpoint_uri",
@@ -781,6 +828,16 @@
         "reliability"
       ],
       "group": "Reliability: Reconciliation and Failure Recovery"
+    },
+    {
+      "name": "Tenant admission & isolation",
+      "what": "Validate images, identities, and resource/log ACLs at submit so untrusted team workloads can share GPU nodes safely.",
+      "whenToUse": "Any multi-tenant platform running arbitrary user code on shared infrastructure.",
+      "steps": [
+        "queueing",
+        "placement"
+      ],
+      "group": "Accept and Queue Jobs by Priority"
     }
   ],
   "technologyChoices": [
@@ -917,6 +974,45 @@
       ]
     },
     {
+      "concern": "Image trust & tenant isolation",
+      "steps": [
+        "queueing",
+        "placement"
+      ],
+      "selfHosted": [
+        "Sigstore / cosign image signing",
+        "OPA / Gatekeeper admission",
+        "Kyverno",
+        "Harbor registry + Trivy scanning",
+        "gVisor / Kata runtime class",
+        "NetworkPolicy (Cilium/Calico)"
+      ],
+      "cloud": {
+        "aws": [
+          "ECR + image scanning",
+          "IAM roles for service accounts (IRSA)",
+          "EKS Pod Identity"
+        ],
+        "gcp": [
+          "Artifact Registry + Binary Authorization",
+          "Workload Identity"
+        ],
+        "azure": [
+          "ACR + Defender",
+          "AKS Workload Identity",
+          "Azure Policy"
+        ]
+      },
+      "tradeoff": [
+        "Policy-as-code admission (OPA/Kyverno) is flexible and auditable but is one more control-plane component to operate and keep correct.",
+        "Sandboxed runtimes (gVisor/Kata) harden multi-tenant nodes but add per-container overhead — often reserved for untrusted/best-effort tenants.",
+        "Per-team object-store ACLs + workload identity remove inline secrets but require the registry, IdP, and storage to agree on tenant identity."
+      ],
+      "makesIrrelevant": [
+        "Strict single-tenant-per-node placement (exclusive nodes) sidesteps most runtime-isolation concerns at the cost of utilization."
+      ]
+    },
+    {
       "concern": "Leader election / coordination",
       "steps": [
         "reliability"
@@ -950,7 +1046,7 @@
       "title": "1. Naive: FIFO Queue onto the Next Free GPU (the baseline)",
       "description": [
         "Start with the simplest thing that works. Jobs go into one first-in-first-out queue; the scheduler takes the head job and assigns it to the next free GPU, one job per GPU.",
-        "This is genuinely fine for a tiny single-team lab cluster with single-GPU jobs — which is worth saying, because it frames the rest of the complexity as justified only at shared-cluster scale. But it exposes the problems the rest of the design exists to solve. There is no notion of priority or fairness, so one team's flood of jobs starves everyone behind it and a production job waits behind hours of best-effort work. A distributed job needing 64 GPUs at once can't be expressed — FIFO would hand it GPUs one at a time and two such jobs deadlock holding half the cluster each. And matching a job only to 'a free GPU' ignores GPU type and memory, so jobs land on hardware that can't run them and capacity fragments.",
+        "This is genuinely fine for a tiny single-team lab cluster running single-GPU jobs — worth saying, because it frames the rest of the complexity as justified only at shared-cluster scale. But at that scale it exposes the problems the rest of the design exists to solve. There is no notion of priority or fairness, so one team's flood of jobs starves everyone behind it and a production job waits behind hours of best-effort work. A distributed job needing 64 GPUs at once can't be expressed — FIFO would hand it GPUs one at a time, and two such jobs deadlock holding half the cluster each. And matching a job only to 'a free GPU' ignores GPU type and memory, so jobs land on hardware that can't run them and capacity fragments.",
         "So the baseline motivates everything that follows: priority/fair-share queueing, constrained bin-packing, gang scheduling, and preemption."
       ],
       "view": {
@@ -1005,6 +1101,8 @@
         "The submission API validates the resource request against the team's quota, persists the job as pending in the job store, and enqueues it into a priority queue.",
         "Submission is idempotent: the client supplies an Idempotency-Key, stored as a unique idempotency_key on jobs, so a retried POST returns the existing job rather than creating a duplicate.",
         "Separate queues (or one priority-ordered queue) per priority class — prod, batch, best-effort — so the scheduler always pulls the most important runnable job.",
+        "Admission is also where multi-tenant security is enforced, because the cluster runs arbitrary team images on shared GPU nodes. The API validates that the image comes from an allowed registry and is signed (with a digest, not a mutable tag), rejects privileged/host-mount requests, and pins a runtime class (e.g. a sandboxed runtime). It binds the job to the caller's namespace/project and service account, and checks that the requested checkpoint and log-sink URIs are owned by that tenant — a team can't write to or read another team's checkpoints/logs. Secrets are mounted via the tenant's identity, never passed inline.",
+        "The Idempotency-Key is scoped per tenant/client and expires after a retention window, so keys don't collide across teams and the dedup table doesn't grow forever.",
         "Persisting before enqueueing means a crash never loses an accepted job; the queue is rebuildable from pending jobs in the store. Cancellation flips the durable state to cancelled, so the scheduler skips it even if a stale queue reference lingers."
       ],
       "view": {
@@ -1105,7 +1203,8 @@
       ],
       "decisionPrompt": "Should the queue be the source of truth for pending jobs, or the database?",
       "patterns": [
-        "Priority queue"
+        "Priority queue",
+        "Tenant admission & isolation"
       ],
       "probeLinks": [
         "volcano-docs",
@@ -1221,6 +1320,11 @@
           "trap": "Treating the in-memory queue as the only record of pending jobs.",
           "why": "A scheduler restart would lose every queued job.",
           "instead": "Persist jobs first; rebuild the queue from the store on startup."
+        },
+        {
+          "trap": "Accepting any image, command, and checkpoint/log URI a tenant supplies.",
+          "why": "On shared GPU nodes a team could run a privileged container, pull an unsigned image, or point its log/checkpoint URI at another team's bucket and exfiltrate their data.",
+          "instead": "Enforce admission: signed images from allowed registries (by digest), no privileged/host mounts, a sandboxed runtime class, and tenant-scoped service accounts + checkpoint/log ACLs."
         }
       ]
     },
@@ -1228,8 +1332,9 @@
       "id": "placement",
       "title": "3. Place Jobs: Bin-Packing onto GPUs",
       "description": [
-        "The scheduler loop pulls the top candidate and asks the resource manager for a set of free GPUs matching the request (count, GPU type, memory). The resource manager keeps indexed free-lists — by GPU type, memory, node, topology domain, and health — so this is a lookup over ~10–100 candidates, not a full scan of every node on each decision.",
+        "The scheduler loop pulls the top candidate and asks the resource manager for a set of free GPUs matching the full request vector (count, GPU type/profile, GPU memory, and any CPU/RAM/local-storage the sidecars need). The resource manager keeps indexed free-lists — by GPU type/MIG profile, memory, node, topology domain, health, drain state, and runtime/driver compatibility — so this is a lookup over ~10–100 candidates, not a full scan of every node on each decision.",
         "This is multi-dimensional bin-packing: pack jobs to minimize fragmentation so large jobs can still find contiguous capacity later. Prefer filling partially-used nodes (best-fit) over scattering.",
+        "Isolation also constrains placement: whether a node may co-locate jobs from different tenants is a policy choice. Sensitive workloads get exclusive GPUs or whole-node placement; MIG slices give hardware-isolated partitions for small jobs; taints/drains keep jobs off nodes under maintenance or with incompatible drivers.",
         "On placement, mark the GPUs allocated, update the job to scheduled, and hand it to the node agent to launch the container."
       ],
       "view": {
@@ -1404,13 +1509,16 @@
         "nvidia-mig"
       ],
       "patterns": [
-        "Bin-packing placement"
+        "Bin-packing placement",
+        "Tenant admission & isolation"
       ],
       "whyNow": [
         "Placement is the core scheduling decision; framing it as constrained bin-packing shows you understand fragmentation, the central efficiency problem."
       ],
       "flows": [
         {
+          "name": "Best-fit placement and launch",
+          "note": "The scheduler asks the resource manager for a best-fit set of free GPUs, reserves the allocation, marks the job scheduled, and hands it to the node agent to launch.",
           "sequence": {
             "participants": [
               {
@@ -1481,7 +1589,8 @@
       "description": [
         "A distributed training job needs all N GPUs simultaneously. If the scheduler grants GPUs incrementally, two big jobs can each hold half the cluster and deadlock waiting for the rest.",
         "Gang scheduling allocates all-or-nothing: only place the job when every GPU it needs is available at once; otherwise leave it pending and hold no GPUs. A partial gang never starts and never sits on idle GPUs.",
-        "To stop a large gang from starving behind a stream of small jobs, give it a future-start reservation: a planned start time and priority position, not held GPUs. Backfill then runs only small jobs whose walltime guarantees they finish before that planned start — they fill time, never the gang's reserved capacity."
+        "To stop a large gang from starving behind a stream of small jobs, give it a future-start reservation: a planned start time and priority position, not held GPUs. The planned_start is projected from the remaining walltime of the running jobs whose GPUs the gang will inherit, the reservation records why (which allocations free it) and an expiry so a stale projection is recomputed rather than honored forever.",
+        "Backfill is admitted by an explicit predicate, not by hope: a candidate runs in the gap only if its latest-finish — now plus its remaining declared walltime — provably precedes the reservation's planned_start, or if it is preemptible (so the scheduler can reclaim it at planned_start). If a backfilled job overruns its declared walltime, the scheduler enforces it: checkpoint-and-requeue (or kill) at the walltime so it can't push the gang's start. Without this enforcement, the 'reservation' is only advisory and large gangs can still starve."
       ],
       "view": {
         "nodes": [
@@ -1518,7 +1627,7 @@
           "cons": [
             "A huge job can wait a long time for enough simultaneous free GPUs (head-of-line blocking).",
             "Reserving and releasing the whole set atomically needs careful coordination in the scheduler.",
-            "Idle GPUs may sit reserved-but-unused briefly while the full set is assembled."
+            "A brief utilization dip can occur at planned_start if no backfill job fit the remaining gap — but no GPUs are ever held idle by the pending gang itself."
           ],
           "view": {
             "nodes": [
@@ -1599,9 +1708,9 @@
         },
         {
           "term": "Backfill",
-          "definition": "Running short jobs around a large job's future-start reservation, only if they provably finish before its planned start.",
-          "whyItMatters": "Keeps utilization high without delaying the reserved gang — and crucially never runs on GPUs held by a partial gang (there are none).",
-          "example": "The 64-GPU gang is reserved to start at T+10min; a 5-min 1-GPU job backfills the gap, finishing before T+10min.",
+          "definition": "Running short jobs around a large job's future-start reservation, admitted only if their latest-finish (now + remaining walltime) provably precedes the reservation's planned start, or they are preemptible.",
+          "whyItMatters": "Keeps utilization high without delaying the reserved gang — and crucially never runs on GPUs held by a partial gang (there are none). The walltime predicate is what makes the reservation enforceable rather than advisory.",
+          "example": "The 64-GPU gang is reserved to start at T+10min; a 5-min 1-GPU job backfills the gap because 5min < 10min; a 30-min job is rejected unless it's preemptible.",
           "group": "Gang Scheduling for Distributed Jobs"
         }
       ],
@@ -1609,7 +1718,8 @@
         "k8s-device-plugin",
         "nvidia-mig",
         "volcano-docs",
-        "kueue-docs"
+        "kueue-docs",
+        "slurm-sched"
       ],
       "patterns": [
         "Gang scheduling"
@@ -1709,21 +1819,24 @@
       "title": "5. Fairness and Quotas Across Teams",
       "description": [
         "Each team has a guaranteed share and a burst ceiling. A team may use idle capacity beyond its guarantee, but must yield it when others need their guaranteed share.",
-        "Compute scheduling priority from fair-share. A concrete sketch: score = priorityClass + teamWeight × (guaranteed − rollingUsage) / guaranteed + ageBoost. A team far under its share (or with a starving, aged job) floats up; a team over its guarantee on burst capacity sinks. rollingUsage is GPU-seconds over a decaying window (the quotas.usage_window field), so a team that just finished a big run is briefly deprioritized.",
-        "Dominant-resource fairness generalizes this when jobs differ in their bottleneck resource: fairness is computed on each team's dominant share — the max of its GPU-count share, GPU-memory share, and scarce-type (e.g. A100) share — not on a single resource.",
-        "Guard against gaming: bill against requested walltime/size (not just used), reclaim overruns, and cap how much any team can borrow regardless of idle capacity."
+        "Compute scheduling priority from fair-share. A concrete sketch: score = priorityClass + teamWeight × (guaranteed − rollingUsage) / guaranteed + ageBoost. A team far under its share (or with a starving, aged job) floats up; a team over its guarantee on burst capacity sinks. rollingUsage is normalized unit-seconds over a decaying window (quotas.usage_window), so a team that just finished a big run is briefly deprioritized.",
+        "Dominant-resource fairness generalizes this when jobs differ in their bottleneck resource: fairness is computed on each team's dominant share — the max over resource classes (scarcity-normalized GPU-count by type, GPU-memory, MIG slices, CPU/RAM) — not on a single GPU count. The quotas table holds one row per (team, resource_class), and a job's resources vector says which classes it consumes; one scarce H100 weighs more than one T4.",
+        "Usage is accounted from durable state, not raw metrics. Billable usage is summed from allocation intervals (allocations.started_at/ended_at × resource_vector) and attempt records — these can't lag, drop samples, or be spoofed by a broken agent. Metrics enriches utilization and health decisions (a job pinning low GPU util is a candidate to investigate), but never frees a GPU or sets fair-share usage. The quotas.usage_window is therefore derived from the allocation ledger, with metrics as an advisory overlay.",
+        "Guard against gaming: bill against requested walltime/size (not just used), reclaim overruns, and cap how much any team can borrow (max_burst) regardless of idle capacity."
       ],
       "view": {
         "nodes": [
           "Scheduler",
           "Quota",
           "Queues",
+          "JobDB",
           "Metrics"
         ],
-        "caption": "The scheduler asks the quota/fairness service for fair-share priority before dequeuing, and the service derives shares from usage reported by metrics.",
+        "caption": "The scheduler asks the quota/fairness service for fair-share priority before dequeuing; the service derives billable usage from durable allocation intervals in the job store, with metrics only an advisory utilization signal.",
         "links": [
           "sched-quota",
           "sched-queues",
+          "jobdb-quota",
           "metrics-quota"
         ],
         "highlight": [
@@ -1740,11 +1853,11 @@
           "pros": [
             "Team B can burst onto Team A's idle GPUs, maximizing cluster utilization.",
             "When Team A submits, fair-share reclaims its guaranteed share (via preemption of borrowed capacity).",
-            "Dominant-resource fairness handles mixed GPU/CPU/memory demands across teams."
+            "Dominant-resource fairness across per-resource-class quotas handles mixed GPU-type/memory/CPU demands, not just GPU count."
           ],
           "cons": [
             "Reclaim requires preempting Team B's borrowed jobs, which only pays off if those jobs checkpoint.",
-            "Computing fair shares from rolling usage adds a feedback loop and metrics dependency.",
+            "Computing fair shares from the allocation ledger adds a feedback loop (cheaper and harder to spoof than a metrics loop, but still state to maintain).",
             "'Fair' is contested — teams argue over weights and guarantees."
           ],
           "view": {
@@ -1752,12 +1865,14 @@
               "Scheduler",
               "Quota",
               "Queues",
+              "JobDB",
               "Metrics"
             ],
-            "caption": "Hierarchical fair-share lets the quota service raise a team's priority by borrowing idle capacity, computed from the usage metrics feed.",
+            "caption": "Hierarchical fair-share lets the quota service raise a team's priority by borrowing idle capacity, computed from durable allocation intervals with metrics as an advisory signal.",
             "links": [
               "sched-quota",
               "sched-queues",
+              "jobdb-quota",
               "metrics-quota"
             ],
             "highlight": [
@@ -1809,13 +1924,21 @@
           "whyItMatters": "Prevents one busy team from monopolizing a shared cluster.",
           "example": "A team under its guarantee is scheduled ahead of one over it.",
           "group": "Fairness and Quotas Across Teams"
+        },
+        {
+          "term": "Worked example: gang + backfill + fair-share together",
+          "definition": "One scenario tying the mechanisms together on a 128-GPU cluster, 120 busy.",
+          "whyItMatters": "Shows how reservation, backfill admission, and a fair-share shift interact in a single timeline.",
+          "example": "Team Vision submits a 64-GPU gang; only 8 are free, so it gets a future-start reservation at T+12min (when a running 56-GPU job hits its walltime). The scheduler backfills the 8 free GPUs with two 1-GPU jobs whose walltimes (4min, 9min) both clear T+12min; a 20-min job is rejected. Then Team NLP, far under its guarantee, returns and submits prod work: fair-share floats it above Vision's borrowed best-effort jobs, the preemption controller checkpoints-and-requeues two of them, and NLP runs — but the 64-GPU reservation is untouched because no GPU was ever held by the pending gang.",
+          "group": "Fairness and Quotas Across Teams"
         }
       ],
       "probeLinks": [
         "volcano-docs",
         "kueue-docs",
         "k8s-device-plugin",
-        "nvidia-mig"
+        "nvidia-mig",
+        "slurm-sched"
       ],
       "patterns": [
         "Dominant-resource fairness"
@@ -1836,7 +1959,8 @@
         "When a high-priority job has no room, the preemption controller selects victims among lower-priority/best-effort jobs and evicts them to free GPUs. Only jobs that advertised preemptible:true are eligible.",
         "Evict gracefully: send SIGTERM, the agent checkpoints to the checkpoint store (writing checkpoint_uri back), and a bounded grace window elapses before SIGKILL. Because checkpoint I/O is storage-bandwidth bound (a 200GB checkpoint can take tens of seconds), the grace window and concurrent-preemption count must be bounded so eviction doesn't stall the incoming job.",
         "Choose victims to minimize wasted work: lowest priority first, then least progress / cheapest to redo, then best fit for the incoming job's shape (so one eviction frees exactly the GPUs needed).",
-        "Throttle thrashing: each job has a max_preemptions cap (after which it becomes non-preemptible for a cooldown), and a recently-preempted job gets a brief anti-thrash grace before it can be evicted again."
+        "Throttle thrashing: each job has a max_preemptions cap (after which it becomes non-preemptible for a cooldown), and a recently-preempted job gets a brief anti-thrash grace before it can be evicted again.",
+        "Persist the checkpoint policy, not just the last URI: jobs.checkpoint_policy stores whether checkpointing is enabled, the interval, the grace target, the resume command, and the last checkpoint status, so any scheduler instance can decide eligibility and resume correctly after a restart — not only the one that placed the job."
       ],
       "view": {
         "nodes": [
@@ -1966,6 +2090,8 @@
       ],
       "flows": [
         {
+          "name": "Graceful preemption: checkpoint and requeue",
+          "note": "To free room for a prod job, the controller SIGTERMs a victim, the agent checkpoints within the grace window (SIGKILL on timeout), and the freed GPUs go back while the victim is requeued to resume from its checkpoint.",
           "sequence": {
             "participants": [
               {
@@ -2044,7 +2170,9 @@
         "Capacity is freed by authoritative agent status events to the resource manager (job exited / node lost) plus durable attempt records — not by a metrics signal. Metrics observes utilization and health; it must never be the source of truth for freeing a GPU, or a slow/partitioned node looks idle and its job gets double-run.",
         "The scheduler is a reconciliation loop: desired state (jobs that should run) is in the durable store, actual state is reported by agents. On restart it rebuilds from the store and re-reconciles — no scheduling state lives only in memory.",
         "Allocations are leased and fenced. Each allocation carries the scheduler_epoch that made it and a lease the agent must renew; a launch_token makes the launch idempotent so a retried placement can't double-run. A single active scheduler is chosen by leader election, and its epoch fences a stale or partitioned former leader — its writes are rejected as old.",
-        "Distinguish a dead node from a slow one (heartbeat timeout + failure detector) before rescheduling, and resume from the last checkpoint where available."
+        "Distinguish a dead node from a slow one (heartbeat timeout + failure detector) before rescheduling, and resume from the last checkpoint where available.",
+        "The lifecycle is a small state machine the agent and scheduler drive idempotently: pending → scheduled → running → {succeeded | failed | preempted | cancelled}, where failed/preempted go back to pending (retry/resume) until the retry policy or max_preemptions is exhausted. Each transition is one job_event and (for running) one allocation interval. An allocation belongs to exactly one job_attempt (attempt_id), so a duplicate launch token or a stale-epoch write is rejected rather than creating a second live attempt. jobs.placement and gpus.allocated_to are cached projections of the authoritative allocations rows; on reconcile the scheduler rebuilds them from allocations and never trusts a divergent cache.",
+        "Operational SLOs make reconciliation testable: scheduling p95 (queue-to-placed) under a target, max reconcile lag (how stale actual-vs-desired may be) bounded, lease renewal cadence shorter than lease TTL, node-failure detection within a few missed heartbeats, and a checkpoint-drain bound so preemption can't stall indefinitely. The control plane exports counters for these: stale-lease reclaims, duplicate launch-token rejections, queue wait by team/priority, fragmentation, checkpoint duration, and preemption success/failure."
       ],
       "view": {
         "nodes": [
@@ -2087,6 +2215,13 @@
           "definition": "An allocation carries a monotonic scheduler_epoch and a time-bounded lease the owner must renew; a higher epoch fences out a stale writer.",
           "whyItMatters": "Stops a partitioned old scheduler or a duplicate launch from double-acting on the same GPUs.",
           "example": "Resource manager rejects a free/launch stamped with epoch 7 once epoch 8 has been elected.",
+          "group": "Reliability: Reconciliation and Failure Recovery"
+        },
+        {
+          "term": "Job lifecycle state machine",
+          "definition": "Valid transitions pending → scheduled → running → {succeeded | failed | preempted | cancelled}, with failed/preempted returning to pending until retry/preemption caps are hit.",
+          "whyItMatters": "Retries, cancellation, preemption, lease expiry, node loss, and scheduler restart all mutate overlapping state; only valid transitions plus idempotent attempt records keep it reconcilable.",
+          "example": "A preempted attempt closes its allocation interval and emits a 'preempted' event; the job returns to pending and resumes from checkpoint_uri on the next attempt.",
           "group": "Reliability: Reconciliation and Failure Recovery"
         }
       ],
@@ -2178,6 +2313,16 @@
           "scenario": "Scheduler restarts.",
           "expectedBehavior": "It rebuilds queues and allocations from the store and resumes; running jobs are untouched.",
           "mitigation": "Durable job/allocation state + reconciliation; leader election for a single active scheduler."
+        },
+        {
+          "scenario": "Split-brain: a partitioned former leader keeps issuing placements while a new leader is elected.",
+          "expectedBehavior": "The resource manager rejects the old leader's writes because they carry a stale scheduler_epoch; only the new leader's epoch is authoritative, so no GPU is double-allocated.",
+          "mitigation": "Leader election + monotonic epoch fencing on every allocation write."
+        },
+        {
+          "scenario": "Metrics stop flowing while an allocation lease is still valid.",
+          "expectedBehavior": "The GPU is NOT freed — capacity ownership comes from the live allocation lease and agent status, not metrics; the job keeps running and only utilization dashboards degrade.",
+          "mitigation": "Metrics is observe-only; freeing requires an authoritative agent exit event or lease expiry, never a missing metric."
         }
       ],
       "bottlenecks": [
@@ -2194,7 +2339,7 @@
   ],
   "finalDesign": {
     "title": "Final Design — Multi-Tenant GPU Scheduler",
-    "description": "Jobs are validated against quota, persisted (idempotently), and enqueued by priority. A reconciliation-loop scheduler does constrained bin-packing onto GPUs via the resource manager, gang-schedules distributed jobs all-or-nothing with future-start reservations and bounded backfill, blends priority with fair-share across teams, and preempts lower-priority work (checkpoint + requeue to the checkpoint store) when needed. Node agents launch containers from the registry, write checkpoints and lifecycle/log events, and send authoritative status to the resource manager. Durable job/allocation/attempt state plus leased, epoch-fenced allocations make the control plane crash-tolerant — capacity is freed from agent status, never from metrics.",
+    "description": "Jobs are validated against quota, persisted (idempotently), and enqueued by priority. A reconciliation-loop scheduler does constrained bin-packing onto GPUs via the resource manager, gang-schedules distributed jobs all-or-nothing with future-start reservations and bounded backfill, blends priority with fair-share across teams, and preempts lower-priority work (checkpoint + requeue to the checkpoint store) when needed. Node agents launch containers from the registry, write checkpoints and lifecycle/log events, and send authoritative status to the resource manager. Durable job/allocation/attempt state plus leased, epoch-fenced allocations make the control plane crash-tolerant — capacity is freed from agent status and fair-share usage is billed from allocation intervals, never from metrics. Tenant isolation (signed images, per-team service accounts, network policy, checkpoint/log ACLs) is enforced at admission.",
     "view": {
       "nodes": [
         "User",
@@ -2232,6 +2377,7 @@
         "agent-events",
         "agent-metrics",
         "agent-res",
+        "jobdb-quota",
         "metrics-quota"
       ],
       "groups": [
@@ -2311,6 +2457,14 @@
         ]
       },
       {
+        "requirement": "Multi-tenant isolation",
+        "how": "Admission enforces signed images from allowed registries, non-privileged sandboxed runtime, tenant-scoped service accounts/network policy, and per-team checkpoint/log ACLs; placement can give exclusive GPUs or MIG slices.",
+        "steps": [
+          "queueing",
+          "placement"
+        ]
+      },
+      {
         "requirement": "Low scheduling latency",
         "how": "Indexed free-lists make placement a lookup not a scan, priority queues surface the next runnable job, and a single loop keeps decisions/sec well ahead of submit rate; throughput/packing are prioritized over per-job ms.",
         "steps": [
@@ -2356,7 +2510,8 @@
       "say": [
         "Map requirements to mechanisms.",
         "Tradeoffs: reservation idling vs starvation, preemption thrashing, single-scheduler scaling.",
-        "Extensions: topology-aware placement (NVLink), spot/preemptible capacity, autoscaling."
+        "Call out the precision points: fair-share billed from allocation intervals (not metrics), dominant-resource fairness, tenant isolation/admission, and operational SLOs.",
+        "Extensions: topology-aware placement (NVLink), image pre-warming, spot/preemptible capacity, autoscaling."
       ]
     }
   ],
@@ -2381,16 +2536,20 @@
       "level": "Staff",
       "expectations": [
         "Reasons about packing quality vs fragmentation quantitatively.",
-        "Designs crash-tolerant reconciliation + leader election.",
-        "Discusses topology-aware placement, backfill, and spot capacity tradeoffs."
+        "Designs crash-tolerant reconciliation + leader election with epoch fencing.",
+        "Bills fair-share from durable allocation intervals, not metrics, and models dominant-resource fairness across resource classes.",
+        "Enforces multi-tenant isolation (signed images, service accounts, network policy, per-team checkpoint/log ACLs).",
+        "Discusses topology-aware placement, walltime-bounded backfill, operational SLOs/observability, and spot capacity tradeoffs."
       ]
     }
   ],
   "followUps": [
     "How would you make placement topology-aware (co-locate a job's GPUs on the same NVLink island)?",
+    "Image pull can dominate startup latency for multi-GB training images — how would you cache/pre-warm images on nodes and factor pull time into scheduling?",
     "How do you incorporate cheaper spot/preemptible nodes that can vanish?",
     "How would you autoscale the GPU pool up/down based on queue depth and utilization?",
     "How do you prevent preemption thrashing under heavy contention?",
+    "How would you enforce tenant isolation so one team can't exfiltrate another's checkpoints/logs or run privileged containers on shared nodes?",
     "How would you shard or replicate the scheduler to remove it as a bottleneck/SPOF?"
   ],
   "toProbeFurther": {
@@ -2445,6 +2604,16 @@
         "source": "Kueue",
         "type": "Docs",
         "why": "Kubernetes-native queueing and quota-management reference for batch workloads."
+      },
+      {
+        "id": "slurm-sched",
+        "group": "AI and ML Systems",
+        "groupDescription": "Feature stores, model serving, RAG, recommendation, and ML operations references.",
+        "title": "Slurm Scheduling: Backfill, Fair-Share, and Gang",
+        "url": "https://slurm.schedmd.com/sched_config.html",
+        "source": "SchedMD",
+        "type": "Docs",
+        "why": "One of the strongest real-world backfill/fair-share/gang schedulers — the HPC counterpart to the Kubernetes-native approaches here, and the model for walltime-bounded backfill."
       },
       {
         "id": "triton-docs",

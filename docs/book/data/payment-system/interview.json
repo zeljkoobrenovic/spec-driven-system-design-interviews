@@ -36,7 +36,15 @@
         "type": "worker",
         "category": "compute",
         "traits": [],
-        "description": "Capture Worker: Asynchronous or background compute component that processes jobs, events, batches, or scheduled work."
+        "description": "Capture Worker: drives our own outbound capture of authorized payments against the PSP, then posts ledger entries once the capture result is known."
+      },
+      {
+        "id": "EventWorker",
+        "label": "PSP Event Worker",
+        "type": "worker",
+        "category": "compute",
+        "traits": [],
+        "description": "PSP Event Worker: consumes signature-verified inbound PSP events (settlement, dispute, chargeback, refund result, late failure) from the queue and applies external truth to the payment state machine and ledger — distinct from the outbound Capture Worker."
       },
       {
         "id": "Client",
@@ -350,9 +358,28 @@
         "label": "enqueue"
       },
       {
-        "id": "capture-db",
-        "from": "Capture",
-        "to": "DB"
+        "id": "queue-eventworker",
+        "from": "Queue",
+        "to": "EventWorker",
+        "label": "PSP events"
+      },
+      {
+        "id": "eventworker-db",
+        "from": "EventWorker",
+        "to": "DB",
+        "label": "apply transition"
+      },
+      {
+        "id": "eventworker-ledger",
+        "from": "EventWorker",
+        "to": "Ledger",
+        "label": "post (dedupe on event_id)"
+      },
+      {
+        "id": "eventworker-router",
+        "from": "EventWorker",
+        "to": "Router",
+        "label": "apply via"
       },
       {
         "id": "psp-statement-daily-settlement-file",
@@ -554,13 +581,15 @@
   ],
   "capacityDiagram": [
     "graph LR",
-    "  Reads[Balance / status reads<br/>~50k rps]",
     "  Writes[Charges & refunds<br/>~2k tps]",
     "  LedgerW[Ledger entries<br/>2x writes = ~4k tps]",
     "  Recon[Daily reconciliation<br/>~150M entries/day]",
+    "  ReadModel[Balance read model]",
+    "  Reads[Balance / status reads<br/>~50k rps]",
     "  Writes --> LedgerW",
     "  LedgerW --> Recon",
-    "  Reads -.->|served from read model| LedgerW"
+    "  LedgerW -.->|project| ReadModel",
+    "  ReadModel --> Reads"
   ],
   "requirements": {
     "functional": [
@@ -621,9 +650,9 @@
     {
       "method": "POST",
       "path": "/v1/payments",
-      "description": "Create (authorize+capture or authorize-only) a payment. Requires an Idempotency-Key header (scoped per merchant) so retries are safe. Synchronous capture returns the final captured state; when capture is asynchronous the response is 202 Accepted with status=capturing, and the final state arrives via webhook or status lookup.",
+      "description": "Create (authorize+capture or authorize-only) a payment. Requires an Idempotency-Key header (scoped per merchant) so retries are safe. Because capture runs asynchronously through the outbox + capture worker (Step 4), the create call does NOT promise a synchronously-final captured state: it returns 202 Accepted with a non-final status (authorized, capturing, or — if the PSP outcome is ambiguous — capture_unknown) plus the psp_reference used for in-doubt recovery. The terminal state (captured, failed) arrives later via GET /payments/{id} or a webhook. A simple synchronous gateway variant may instead return 201 captured, but this design intentionally exposes the async state machine.",
       "request": "Idempotency-Key: 7c1f...\n{\n  \"order_id\": \"ord_123\",\n  \"amount\": 4200,\n  \"currency\": \"USD\",\n  \"capture\": true,\n  \"source\": \"tok_visa\"\n}",
-      "response": "201 Created\n{\n  \"payment_id\": \"pay_456\",\n  \"status\": \"captured\",\n  \"amount\": 4200,\n  \"currency\": \"USD\",\n  \"psp_reference\": \"ch_3Pq...\"\n}",
+      "response": "202 Accepted\n{\n  \"payment_id\": \"pay_456\",\n  \"status\": \"capturing\",\n  \"amount\": 4200,\n  \"currency\": \"USD\",\n  \"psp_reference\": \"ch_3Pq...\",\n  \"poll\": \"GET /v1/payments/pay_456\"\n}\n\n// status is one of: authorized | capturing | capture_unknown.\n// Final state (captured | failed) is observed via GET /payments/{id} or webhook.",
       "sequence": {
         "participants": [
           {
@@ -676,7 +705,7 @@
                 "from": "PaySvc",
                 "to": "C",
                 "arrow": "-->>",
-                "label": "replay original 201"
+                "label": "replay original response"
               }
             ],
             "else": {
@@ -686,31 +715,37 @@
                   "from": "PaySvc",
                   "to": "X",
                   "arrow": "->>",
-                  "label": "authorize + capture"
+                  "label": "authorize (sync)"
                 },
                 {
                   "from": "X",
                   "to": "PaySvc",
                   "arrow": "-->>",
-                  "label": "captured"
-                },
-                {
-                  "from": "PaySvc",
-                  "to": "L",
-                  "arrow": "->>",
-                  "label": "post balanced entries"
+                  "label": "authorized + psp_reference"
                 },
                 {
                   "from": "PaySvc",
                   "to": "Idem",
                   "arrow": "->>",
-                  "label": "store response"
+                  "label": "store 202 response"
                 },
                 {
                   "from": "PaySvc",
                   "to": "C",
                   "arrow": "-->>",
-                  "label": "201 captured"
+                  "label": "202 capturing (poll for final state)"
+                },
+                {
+                  "from": "PaySvc",
+                  "to": "X",
+                  "arrow": "->>",
+                  "label": "capture worker: capture later (Step 4)"
+                },
+                {
+                  "from": "PaySvc",
+                  "to": "L",
+                  "arrow": "->>",
+                  "label": "post balanced entries once capture confirmed"
                 }
               ]
             }
@@ -944,6 +979,14 @@
           "type": "uuid"
         },
         {
+          "name": "order_id",
+          "type": "varchar null (correlates to the adjacent orders system; carried from the create request)"
+        },
+        {
+          "name": "source_token",
+          "type": "varchar null (tokenized payment method from the tokenization/vault system — never raw PAN)"
+        },
+        {
           "name": "amount",
           "type": "bigint"
         },
@@ -1132,6 +1175,22 @@
           "type": "uuid null (finalize or reversal)"
         },
         {
+          "name": "bank_callback_event_id",
+          "type": "varchar null (bank/ACH return or settlement event that finalized or failed this payout)"
+        },
+        {
+          "name": "failure_reason",
+          "type": "varchar null (e.g. account_closed, insufficient_funds, returned — drives reverse vs retry)"
+        },
+        {
+          "name": "attempts",
+          "type": "int (bank-call retry count)"
+        },
+        {
+          "name": "last_error",
+          "type": "text null"
+        },
+        {
           "name": "updated_at",
           "type": "timestamptz"
         }
@@ -1163,11 +1222,65 @@
         },
         {
           "name": "status",
-          "type": "enum(received, processed, deferred)"
+          "type": "enum(received, processed, deferred, dead_letter)"
+        },
+        {
+          "name": "attempts",
+          "type": "int (processing retry count)"
+        },
+        {
+          "name": "last_error",
+          "type": "text null"
+        },
+        {
+          "name": "deferred_until",
+          "type": "timestamptz null (re-attempt time for out-of-order/held events)"
+        },
+        {
+          "name": "escalated",
+          "type": "boolean (flagged for finance-ops once retries are exhausted / dead-lettered)"
         },
         {
           "name": "received_at",
           "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "statement_files",
+      "note": "One row per ingested PSP settlement/statement import. Tracks provider, sequence, and completeness so a late or partial file defers its window instead of flagging mass breaks, and gives every reconciliation_break a file to point back to.",
+      "fields": [
+        {
+          "name": "statement_file_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "provider",
+          "type": "varchar (which PSP / rail produced the file)"
+        },
+        {
+          "name": "period",
+          "type": "date (settlement date the file covers)"
+        },
+        {
+          "name": "sequence_no",
+          "type": "bigint (per-provider monotonic; a gap means a missing file)"
+        },
+        {
+          "name": "file_hash",
+          "type": "varchar (content hash — dedupes re-delivered files, proves integrity)"
+        },
+        {
+          "name": "row_count",
+          "type": "bigint null (expected vs ingested line count for completeness)"
+        },
+        {
+          "name": "status",
+          "type": "enum(received, ingesting, complete, partial, failed)"
+        },
+        {
+          "name": "ingested_at",
+          "type": "timestamptz null"
         }
       ]
     },
@@ -1181,7 +1294,7 @@
         },
         {
           "name": "statement_file_id",
-          "type": "uuid (which settlement import surfaced it)"
+          "type": "uuid FK -> statement_files (which settlement import surfaced it)"
         },
         {
           "name": "psp_reference",
@@ -1193,7 +1306,11 @@
         },
         {
           "name": "amount_delta",
-          "type": "bigint"
+          "type": "bigint (signed, in minor units)"
+        },
+        {
+          "name": "currency",
+          "type": "char(3)"
         },
         {
           "name": "state",
@@ -2272,8 +2389,8 @@
                 "alias": "W"
               },
               {
-                "id": "Capture",
-                "label": "Event Worker",
+                "id": "EventWorker",
+                "label": "PSP Event Worker",
                 "alias": "E"
               },
               {
@@ -2295,24 +2412,24 @@
               },
               {
                 "from": "WebhookSvc",
-                "to": "Capture",
+                "to": "EventWorker",
                 "arrow": "->>",
                 "label": "verified + persisted, enqueue"
               },
               {
-                "from": "Capture",
+                "from": "EventWorker",
                 "to": "DB",
                 "arrow": "->>",
                 "label": "transition captured -> disputed (payment_events row)"
               },
               {
-                "from": "Capture",
+                "from": "EventWorker",
                 "to": "L",
                 "arrow": "->>",
                 "label": "post reversing transaction (dedupe on E)"
               },
               {
-                "from": "Capture",
+                "from": "EventWorker",
                 "to": "X",
                 "arrow": "-->>",
                 "label": "200 ack"
@@ -2320,7 +2437,7 @@
             ]
           },
           "highlight": [
-            "Capture",
+            "EventWorker",
             "DB",
             "L"
           ]
@@ -2350,7 +2467,7 @@
             "Every signature-verified event is written to a psp_events inbox (raw payload kept for audit and replay) before any processing, deduped by the PSP event id.",
             "Out-of-order events (a settlement before we recorded the authorization) are held as 'deferred' and retried, not dropped.",
             "A dispatcher routes by event type — charge.settled, charge.dispute.created, refund.updated, charge.failed — to the handler that owns that state transition.",
-            "Capture execution (driving our own capture) is distinct from PSP event application (reacting to the PSP's truth); keeping them separate avoids double-posting."
+            "Capture execution lives in the outbound Capture Worker (driving our own requested capture); PSP event application lives in a separate inbound PSP Event Worker (reacting to the PSP's truth — settlement, dispute, chargeback, refund result, late failure). Two distinct workers off the same queue keep the roles — and their ledger posts — from being conflated."
           ]
         }
       ],
@@ -2385,21 +2502,22 @@
           "WebhookSvc",
           "Idem",
           "Queue",
-          "Capture",
+          "EventWorker",
           "DB",
           "Ledger"
         ],
-        "caption": "Inbound PSP webhooks hit the receiver, which dedupes by event_id in the idempotency store and enqueues; the capture worker then updates the DB and ledger.",
+        "caption": "Inbound PSP webhooks hit the receiver, which dedupes by event_id in the idempotency store and enqueues; a dedicated PSP event worker (distinct from the outbound capture worker) then applies the transition to the DB and ledger.",
         "links": [
           "psp-webhooksvc-webhook",
           "webhooksvc-idem-dedupe-by-event-id",
           "webhooksvc-queue-enqueue",
-          "queue-capture",
-          "capture-db",
-          "capture-ledger-entries"
+          "queue-eventworker",
+          "eventworker-db",
+          "eventworker-ledger"
         ],
         "highlight": [
-          "WebhookSvc"
+          "WebhookSvc",
+          "EventWorker"
         ]
       },
       "options": [
@@ -2422,18 +2540,18 @@
               "WebhookSvc",
               "Idem",
               "Queue",
-              "Capture",
+              "EventWorker",
               "DB",
               "Ledger"
             ],
-            "caption": "The webhook receiver dedupes each inbound event by event_id before enqueuing, so a redelivered webhook is processed once by the capture worker.",
+            "caption": "The webhook receiver dedupes each inbound event by event_id before enqueuing, so a redelivered webhook is processed once by the PSP event worker.",
             "links": [
               "psp-webhooksvc-webhook",
               "webhooksvc-idem-dedupe-by-event-id",
               "webhooksvc-queue-enqueue",
-              "queue-capture",
-              "capture-db",
-              "capture-ledger-entries"
+              "queue-eventworker",
+              "eventworker-db",
+              "eventworker-ledger"
             ],
             "highlight": [
               "WebhookSvc"
@@ -2458,16 +2576,16 @@
               "PSP",
               "WebhookSvc",
               "Queue",
-              "Capture",
+              "EventWorker",
               "Ledger"
             ],
-            "caption": "No inbound dedupe: webhooks are enqueued straight through and the capture worker relies on a unique event_id constraint when inserting ledger entries.",
+            "caption": "No inbound dedupe: webhooks are enqueued straight through and the PSP event worker relies on a unique event_id constraint when inserting ledger entries.",
             "links": [
               "psp-webhooksvc-webhook",
               "webhooksvc-queue",
-              "queue-capture",
+              "queue-eventworker",
               {
-                "from": "Capture",
+                "from": "EventWorker",
                 "to": "Ledger",
                 "label": "insert keyed by event_id"
               }
@@ -2519,7 +2637,7 @@
         {
           "title": "Break lifecycle (reconciliation is an operating model, not a job)",
           "points": [
-            "Each settlement file import is recorded with completeness/sequence metadata so a late or partial file defers its window instead of flagging mass breaks.",
+            "Each settlement file import is recorded as a statement_files row (provider, sequence_no, file_hash, row_count, status) so a late or partial file defers its window instead of flagging mass breaks, and a sequence gap is itself an alert.",
             "Every unmatched/mismatched line becomes a reconciliation_breaks work item with a state machine: detected -> timing -> investigating -> auto_corrected / manual_approved -> resolved -> written_off.",
             "Breaks have an owner and an escalation path; auto-correctable timing breaks resolve without a human, while high-value or ambiguous breaks require finance-ops approval.",
             "Resolution always links to the correcting ledger_transaction (reason-coded), so the fix is auditable evidence — never an in-place edit.",
@@ -2981,11 +3099,13 @@
       ],
       "deepDives": [
         {
-          "title": "Cross-shard transactions",
+          "title": "Cross-shard transactions: the pending-visibility rule",
           "points": [
-            "Keep entries balanced per transaction_id even when split across shards.",
-            "Use a saga: write the debit on shard A and the credit on shard B, both tagged with the same transaction_id.",
-            "Reconciliation verifies that every transaction_id nets to zero across shards — a missing side is a detectable break."
+            "Keep entries balanced per transaction_id even when split across shards: each side writes a shard-local entry carrying the same global transaction_id.",
+            "Both sides post with ledger_transactions.status = pending. The write protocol is a saga (debit on shard A, credit on shard B); a coordinator/outbox record owns retrying whichever side is missing.",
+            "Visibility rule: a transaction is only flipped to balanced once BOTH sides are observed. Balance projections ignore pending/incomplete transactions, so a cross-shard half-write can never become available money before its matching side lands.",
+            "Reconciliation verifies that every transaction_id nets to zero across shards — a missing side is a detectable break — and pages immediately on aged half-transactions that have not completed within their SLA.",
+            "Net effect: half-written cross-shard transfers are invisible to spendable balance, are actively retried, and are alerted if they stall — never silently lost or prematurely available."
           ]
         },
         {
@@ -3221,7 +3341,7 @@
   ],
   "finalDesign": {
     "title": "Final Design",
-    "description": "End-to-end: idempotent APIs, a sharded append-only double-entry ledger (with balanced-transaction headers) as the source of truth, asynchronous capture via outbox + queue with an explicit in-doubt (capture_unknown) state, signature-verified deduplicated webhooks persisted in a psp_events inbox, daily line-item reconciliation with a break-lifecycle workflow, a rebuildable balance read model, and payouts run as a state machine that reserves funds in the ledger before the bank call. Lifecycle state (payment_events, refunds, payouts, reconciliation_breaks) lives in the data model and step deep dives so the diagram stays a clean overview.",
+    "description": "End-to-end, the pieces fit together as follows. Idempotent APIs sit in front of a sharded, append-only double-entry ledger (with balanced-transaction headers) as the source of truth. Capture runs asynchronously via outbox + queue, with an explicit in-doubt (capture_unknown) state driven by an outbound capture worker. Inbound PSP webhooks are signature-verified, deduplicated, and persisted in a psp_events inbox, then applied by a separate inbound PSP event worker. Daily line-item reconciliation runs a break-lifecycle workflow against the PSP. A rebuildable balance read model serves fast reads, and payouts run as a state machine that reserves funds in the ledger before the bank call. Lifecycle state (payment_events, refunds, payouts, reconciliation_breaks, statement_files) lives in the data model and step deep dives, so the diagram stays a clean overview.",
     "view": {
       "nodes": [
         "Client",
@@ -3232,6 +3352,7 @@
         "Outbox",
         "Queue",
         "Capture",
+        "EventWorker",
         "PSP",
         "WebhookSvc",
         "Router",
@@ -3243,7 +3364,7 @@
         "Payout",
         "Bank"
       ],
-      "caption": "End to end: the gateway and payment service take charges idempotently, an outbox/queue drives async capture and webhooks, sharded ledgers feed reconciliation, the balance read model, and bank payouts.",
+      "caption": "End to end: the gateway and payment service take charges idempotently; an outbox/queue drives async capture (outbound Capture Worker) while inbound PSP webhooks are deduped and applied by a separate PSP Event Worker; payouts reserve funds in the ledger before the bank transfer; sharded ledgers feed reconciliation and the balance read model.",
       "links": [
         "client-gw",
         "gw-paysvc",
@@ -3259,6 +3380,8 @@
         "router-ledgerb",
         "psp-webhooksvc-webhook",
         "webhooksvc-queue",
+        "queue-eventworker",
+        "eventworker-router",
         "psp-statement-settlement",
         "statement-recon",
         "recon-ledgera",
@@ -3593,14 +3716,20 @@
       "say": [
         "Start with the naive synchronous charge and immediately name the double-charge-on-retry hazard.",
         "Add idempotency, then the double-entry ledger, then async capture via outbox, then webhooks.",
-        "Go deep on whichever the interviewer pushes: exactly-once, the ledger invariant, or reconciliation."
+        "Make capture honest about being asynchronous: name the capture_unknown in-doubt state and how you recover it (PSP reference lookup, webhook, settlement reconciliation, deduped ledger post).",
+        "Distinguish the outbound capture worker (drives our own capture) from the inbound PSP event worker (applies settlement/dispute/chargeback/late-failure) — one node for both reintroduces double-posting.",
+        "Describe the webhook inbox: verify signature, persist raw psp_events, dedupe by event id, defer out-of-order, dispatch by event type.",
+        "Go deep on whichever the interviewer pushes: exactly-once, the ledger invariant, in-doubt recovery, or reconciliation."
       ]
     },
     {
       "phase": "Reconcile & wrap",
       "time": "final 5 min",
       "say": [
-        "Cover reconciliation against the PSP and how breaks are resolved with compensating entries.",
+        "Cover reconciliation as an operating model: statement-file imports, the break lifecycle (detected -> investigating -> auto/manual resolution), and compensating entries — not just a compare job.",
+        "Name the payout consistency guard: reserve funds strongly in the ledger before the bank rails, then finalize or reverse on the bank callback.",
+        "If sharding came up, state the cross-shard pending-visibility rule: half-written transfers stay pending, are excluded from available balance, retried, and alerted.",
+        "Call out money-movement observability signals (in-doubt count, break aging, stuck payouts, dead-lettered events).",
         "Summarize how each requirement is met and name the consistency budget explicitly."
       ]
     }
@@ -3618,6 +3747,8 @@
       "expectations": [
         "Drives the double-entry invariant and exactly-once-effect reasoning.",
         "Uses a transactional outbox to avoid dual writes; makes async consumers idempotent.",
+        "Explains PSP in-doubt recovery: the capture_unknown state and how it resolves via PSP reference, webhook, and settlement, posting the ledger exactly once.",
+        "Distinguishes the outbound capture worker from the inbound PSP event worker and explains why conflating them double-posts.",
         "Designs reconciliation at line-item grain with compensating corrections."
       ]
     },
@@ -3625,18 +3756,21 @@
       "level": "Staff+",
       "expectations": [
         "Allocates the consistency budget deliberately (strong on writes/payout, eventual on reads).",
-        "Shards the ledger by account and handles cross-shard transfers as reconciled sagas.",
-        "Quantifies failure modes and frames money loss as the metric that dominates all others."
+        "Defines the payout consistency guard: reserve in the ledger before the bank call, finalize or reverse on callback.",
+        "Specifies the reconciliation break operating model (statement-file imports, break lifecycle, owners, alert thresholds), not just a compare job.",
+        "Shards the ledger by account and states the cross-shard pending-visibility rule (half-transactions stay pending, are excluded from available balance, retried, and alerted).",
+        "Names the money-movement observability signals (in-doubt count, break aging, stuck payouts, dead-lettered events) and frames money loss as the metric that dominates all others."
       ]
     }
   ],
   "followUps": [
-    "How would you handle multi-currency charges and FX, and where does the rate get fixed?",
-    "How do disputes and chargebacks flow through the ledger weeks after the original charge?",
-    "How would you support partial captures and multiple captures against one authorization?",
-    "What's your strategy for a PSP outage — queue and retry, fail closed, or fail over to a second PSP?",
-    "How do you prevent and detect internal fraud given the system can move money?",
-    "How would you rebuild the balance read model from scratch, and how long would it take at this scale?"
+    "Covered in the main design — push for depth: How does an in-doubt capture (capture_unknown) get recovered, and how do you guarantee the ledger posts exactly once across PSP-reference lookup, webhook, and settlement?",
+    "Covered in the main design — push for depth: How do disputes and chargebacks flow through the inbound PSP event worker and the ledger weeks after the original charge, without touching the outbound capture path?",
+    "Covered in the main design — push for depth: How do you rebuild the balance read model from scratch, and how long would it take at this scale?",
+    "Extension topic: How would you handle multi-currency charges and FX, and where does the rate get fixed?",
+    "Extension topic: How would you route across multiple PSPs and handle a PSP outage — queue and retry, fail closed, or fail over to a second PSP?",
+    "Extension topic: How do you prevent and detect internal fraud and meet KYC/AML given the system can move money?",
+    "Extension topic: How would you support partial captures and multiple captures against one authorization as a product feature?"
   ],
   "toProbeFurther": {
     "links": [

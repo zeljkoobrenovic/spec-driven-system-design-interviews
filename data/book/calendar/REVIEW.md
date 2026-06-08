@@ -5,492 +5,427 @@ Review date: 2026-06-08
 
 ## Executive Summary
 
-This is a strong interview spine for a calendar system. It correctly centers the
-hard parts of the domain: recurrence rules, "this instance vs the series" edits,
-timezone/DST correctness, free/busy indexing, invites/RSVPs, reminders, and
-delta sync. The step order is natural and teaches the candidate to move from a
-naive event table toward derived indexes and collaboration workflows.
+The recent calendar revision materially improves the dataset. The earlier gaps
+around capacity math, update/delete/RSVP/sync APIs, recurrence identity,
+idempotency, reminder jobs, calendar ACLs, change-log driven derived state,
+reminder/sync flows, cache invalidation, and probe-link grouping are now
+addressed in the JSON. The interview is no longer just a strong conceptual
+calendar walkthrough; it now has a credible production spine.
 
-The main weakness is that several production boundaries are still compressed
-into prose. Capacity is qualitative rather than calculated, the API/data model
-do not expose enough mutation, RSVP, sync, reminder, idempotency, and privacy
-contracts, and derived-state propagation is described without a durable change
-pipeline. The design is plausible, but the next pass should make the production
-mechanics concrete enough that a candidate can reason about correctness under
-retry, race, timezone rule changes, external-provider ambiguity, and stale
-indexes.
+The remaining issues are narrower and mostly about making the new mechanics
+precise. The design introduces a durable change log and projectors, but some
+API/diagram flows still show direct side effects from `EventSvc` to invites and
+reminders. The organizer-authoritative invite model also needs an explicit
+attendee-calendar projection model so attendee reads, busy indexes, and delta
+sync cursors work without scanning organizer-owned events. Capacity is much
+more useful than before, but one event-count assumption is internally
+inconsistent and the storage estimate is too broad to teach trade-offs.
 
 | Dimension | Rating | Notes |
 | --- | ---: | --- |
-| System design soundness | 3.8 / 5 | Good core architecture for recurrence, free/busy, invites, and reminders; under-specified contracts around mutation, recurrence identity, and derived state. |
-| Production realism | 3.2 / 5 | Names the right issues, but needs idempotency, outbox/change-log mechanics, ACL/privacy, sync cursors, reminder dedup, and external-calendar failure handling. |
-| Pedagogical flow | 4.1 / 5 | The progression is clean and interview-friendly; later steps need options, flows, and traps at the same depth as recurrence/timezone. |
-| Final design coherence | 3.7 / 5 | Final design includes the introduced components, but mentions caches and sync/reminder behavior that the schema/API do not yet support explicitly. |
-| Dataset/rendering fit | 4.5 / 5 | JSON parses; step view nodes, links, highlights, and `satisfies` step references resolve. Mostly polish issues in diagrams and probe-link grouping. |
+| System design soundness | 4.4 / 5 | Strong recurrence, timezone, free/busy, reminders, sync, and derived-state design; needs sharper attendee-calendar projection semantics. |
+| Production realism | 4.1 / 5 | Much better idempotency, outbox, scheduler, ACL, and sync modeling; still needs clearer write-side effect boundaries and external-calendar caveats. |
+| Pedagogical flow | 4.4 / 5 | The step progression is clean and now has richer reminder/sync material; Step 7 could use explicit trade-off options or a flow. |
+| Final design coherence | 4.3 / 5 | Final design includes the improved components, but a few links/flows blur whether projectors or direct service calls own side effects. |
+| Dataset/rendering fit | 4.8 / 5 | JSON parses; checked step/final links, `satisfies` references, and sequence participants resolve. Only small polish remains. |
 
-Recommendation: keep the current conceptual spine. Add concrete capacity math,
-expand the API/data model for mutation and sync workflows, and add a durable
-event/change pipeline that feeds busy indexes, reminders, invite fanout, and
-device sync.
+Recommendation: keep the revised structure. The next pass should clarify the
+change-log as the source of all derived work, add attendee-calendar projection
+state, and tighten the capacity assumptions.
 
 ## What Works Well
 
-- The opening naive step is effective: pre-created occurrence rows plus
-  local-string times exposes both infinite recurrence and DST bugs quickly.
-- The recurrence section is strong. It teaches RRULE storage, windowed
-  expansion, EXDATEs, overrides, and the "this / following / all" edit split.
-- The timezone step correctly frames recurrence as local wall-clock expansion
-  followed by UTC conversion, instead of a fixed UTC offset.
-- Free/busy is framed around a derived, per-calendar busy-interval index, which
-  is the right privacy and performance boundary for availability queries.
-- The invite step chooses an organizer-authoritative event as the default and
-  contrasts it with per-attendee copies.
-- The final design integrates the main components: Event Service, Event Store,
-  Expander, Free/Busy Service, Busy Index, Invite Service, Reminder Scheduler,
-  Notification Service, and Sync Service.
-- The renderer-facing structure is healthy: no raw Mermaid step diagrams,
-  structured sequence data where present, and no unresolved step view links or
-  `satisfies` references in the checks run during review.
+- Capacity is now quantitative: users/events, read/write QPS, free/busy fanout,
+  reminder bursts, storage, and latency targets are present.
+- The API now covers the important mutation surfaces: create, update, delete,
+  RSVP, free/busy, list, and cursor sync.
+- The data model now includes `version`, `recurrence_id`, `calendar_acl`,
+  `reminder_jobs`, `calendar_changes`, and `idempotency_keys`.
+- The durable `ChangeLog` plus `Projector` components are the right conceptual
+  center for busy-index maintenance, reminder materialization, invite fanout,
+  sync cursors, and cache invalidation.
+- Step 6 is much stronger than before: reminders have a due-index option,
+  leasing, dedup, retry/backoff, cancellation/supersession, and delta sync with
+  tombstones.
+- Recurrence and timezone are still the teaching core. RRULE storage, windowed
+  expansion, EXDATEs, stable recurrence ids, "this and following" as a series
+  split, and explicit DST gap/overlap policy are all present.
+- Probe links are now calendar-specific and grouped well: standards, time and
+  recurrence, sync protocols, and notifications/streams.
 
 ## Highest-Impact Issues
 
-### 1. Capacity is qualitative, so the scaling step has no numbers to build on
+### 1. The change-log pipeline is present, but side-effect ownership is still mixed
 
-The capacity section says "billions", "common", "frequent", and
-"exactly-once-ish", but it does not translate the product surface into read QPS,
-write QPS, event volume, recurrence expansion work, free/busy fanout, reminder
-burst size, sync traffic, or storage. Step 7 then says to shard by calendar/user
-and absorb reminder bursts, but the reader cannot evaluate whether those
-choices are sufficient.
+The final design says every event write commits an outbox row, and projectors
+feed the busy index, reminder jobs, invite fanout, sync cursors, and cache. That
+is the right design. But several flows and links still show direct side effects:
+`POST /v1/events` persists an event and then calls `InviteSvc`; the final
+diagram includes both `projector-reminder` and the older `event-reminder` link;
+and the high-level architecture still contains direct `EventSvc -> InviteSvc`
+and `EventSvc -> ReminderQ` paths.
 
-Why it matters: calendar systems are dominated by skewed workloads. Most reads
-are narrow window reads, free/busy fanout multiplies by attendee count, and
-reminders spike at round local times. Without estimates, the dataset cannot
-teach when to maintain a busy index, how far to precompute, how many reminder
-workers are needed, or what a shard must own.
+Why it matters: the point of the outbox is to avoid "event write committed, but
+invite/reminder/index/cache update was lost." If the walkthrough shows direct
+post-commit side effects, candidates may miss the reliability boundary or treat
+the projector path as optional.
 
-Concrete fix: replace the qualitative capacity bullets with a small calculation
-set, for example:
+Concrete fix: make the write transaction authoritative:
 
-- Active users, calendars per user, events per calendar, and recurring-event
-  percentage.
-- Calendar view read QPS, event mutation QPS, RSVP QPS, free/busy QPS, and
-  typical attendee count.
-- Expansion window assumptions such as 30 or 90 days.
-- Reminder fanout at local 9am and before-meeting offsets.
-- Storage estimate for event rows, attendees, overrides, change-log entries,
-  busy intervals, and reminder jobs.
-- Target latency for event list, free/busy, create/update, RSVP, and sync.
+- `EventSvc` writes `events`/`attendees` plus `calendar_changes` in one
+  transaction.
+- Projectors consume `calendar_changes` to update `BusyIndex`, materialize
+  `reminder_jobs`, emit invite/update notifications, and invalidate `Cache`.
+- If a direct call remains in a sequence, label it as a synchronous validation
+  or request path, not the durable side-effect path.
+- Remove or relabel `event-reminder` in the final view so reminders are clearly
+  sourced from the projector.
 
-### 2. The API is too small for the promised behavior
+### 2. Organizer-authoritative invites need an attendee-calendar projection model
 
-The API section has create, free/busy, and list-events endpoints. It does not
-show the contracts for update/delete, edit scope (`this`, `thisAndFollowing`,
-`series`), RSVP, reminder preferences, delta sync, idempotency, or external
-calendar sync. The create request has `start`, `tz`, `rrule`, and attendees, but
-does not expose `calendarId`, `organizerId`, `duration`/`end`, `visibility`,
-`conference/resource` metadata, reminders, idempotency key, or write version.
+The default invite model uses one organizer-owned event row and attendee rows
+for responses. That is a good default, but the dataset also promises attendee
+calendar reads, attendee free/busy, and per-calendar delta sync. The current
+model does not yet show the projection that makes those possible. `attendees`
+has `event_id` and `user_id`, but no attendee calendar id, local event
+reference, per-attendee reminder/visibility override, or per-attendee change
+record.
 
-Why it matters: the most interesting correctness problems in this case happen
-on mutations, not on simple reads. Recurrence edits need a scope and a stable
-occurrence identity. RSVP and organizer edits race. Device sync needs a cursor
-and tombstones. Retried create/update/RSVP requests need idempotency keys.
+Why it matters: a user's calendar view and sync cursor should not need to scan
+every organizer-owned event in the system where that user appears as an
+attendee. Free/busy for an attendee also needs to know whether the attendee's
+copy blocks time, especially for declined, tentative, hidden, or private
+events.
 
-Concrete fix: add representative endpoints:
+Concrete fix: add a small projection entity, for example
+`calendar_event_refs` or `attendee_event_refs`:
 
-- `PATCH /v1/events/{eventId}` with `scope`, `recurrenceId`, `expectedVersion`,
-  and idempotency.
-- `DELETE /v1/events/{eventId}` with the same recurrence scope.
-- `POST /v1/events/{eventId}/rsvp` with attendee id, response, version, and
-  idempotency key.
-- `GET /v1/sync?calendarId=...&cursor=...` returning changed events,
-  tombstones, and the next cursor.
-- Optional `PUT /v1/events/{eventId}/reminders` or reminder fields on create
-  and update.
+- `calendar_id`, `event_id`, `organizer_calendar_id`, `attendee_user_id`,
+  `response`, `blocks_time`, `local_reminder_overrides`, `visibility_override`,
+  and `last_seen_event_version`.
+- Organizer edits project changes into each affected attendee calendar's
+  change log so `GET /v1/sync?calendarId=...` returns the update for attendees,
+  not only for the organizer calendar.
+- Busy-index projectors update each attendee calendar's busy intervals according
+  to RSVP and visibility policy.
 
-### 3. The data model does not yet support sync, reminders, privacy, and safe recurrence edits
+### 3. The capacity numbers are useful but internally inconsistent
 
-The current model has `events`, `event_overrides`, and `attendees`. That is a
-good start, but it is not enough for the behavior in the requirements and final
-design. There is no calendar membership/share table, no ACL/visibility model,
-no change-log or sync-cursor table, no reminder job table, no idempotency table,
-and no versioning field. The `event_overrides.instance_date` field is also
-ambiguous for recurring events across timezone and rule changes.
+The capacity section says `~500M users`, `~3 calendars/user`, and `~50 active
+events/calendar`, which implies roughly 75B active event references before
+attendees are counted. The headline says `~10B events`. That can be reconciled,
+but the dataset should say whether `10B` means canonical event series, retained
+event rows, active visible calendar entries, or organizer-owned events only.
 
-Why it matters: production calendars need to answer "who may see this?", "what
-changed since my cursor?", "did this retry already apply?", "which occurrence
-did this override target?", and "has this reminder already fired?" These cannot
-be inferred from a minimal event row.
+Why it matters: calendar storage and fanout are sensitive to the difference
+between canonical organizer events, attendee projections, recurring rules,
+expanded instances, change-log records, busy intervals, and reminder jobs. The
+new architecture makes those distinctions important.
 
-Concrete fix: extend the model with a few focused entities rather than a large
-schema dump:
+Concrete fix:
 
-- `calendars` and `calendar_memberships` or `calendar_acl`.
-- `event_versions` or `events.version` for optimistic concurrency.
-- `event_overrides.recurrence_id`, using the original local occurrence
-  timestamp plus TZID, not a vague date.
-- A series-splitting representation for "this and following".
-- `reminder_jobs` with `fire_at_utc`, `event_id`, `recurrence_id`,
-  `dedup_key`, and state.
-- `calendar_changes` with monotonically increasing sequence/cursor,
-  tombstones, and changed entity ids.
-- `idempotency_keys` scoped by actor, operation, and request fingerprint.
+- Separate `canonical_events`, `calendar_event_refs`, and `expanded_instances`
+  in the capacity math.
+- Give one attendee fanout assumption, such as average attendees per meeting
+  and percentage of solo events.
+- Replace `~tens of TB` with a rough row-size calculation for event rows,
+  attendee refs, change-log retention, busy intervals, and reminder jobs.
+- State retention windows for `calendar_changes`, tombstones, and reminder-job
+  history.
 
-### 4. Derived-state propagation is implied instead of designed
+### 4. Privacy is modeled, but the API and flows should enforce it
 
-The prose says the busy index is updated when events change, reminders are
-scheduled by fire time, and device sync pulls changes since a cursor. The final
-design also says busy indexes, expanded instances, and device caches are
-derived/rebuildable. But there is no durable mutation stream, outbox, projector,
-or reconciliation loop in the architecture or data model.
+The data model now has `calendar_acl`, and the requirements call out free/busy
+privacy. The free/busy API, however, still reads as
+`?attendees=u1,u2,u3&from=...&to=...` without showing caller identity,
+calendar/principal authorization, or how `private`, `busy`, `public`, and
+`freebusy_only` affect the response.
 
-Why it matters: busy indexes, reminder queues, invite fanout, and sync cursors
-all depend on not losing change events. If an event update commits but the busy
-index update is lost, free/busy lies. If a reminder enqueue fails after the
-event write, the user misses the reminder. If sync changes are not durable,
-offline devices never converge.
+Why it matters: free/busy is one of the main privacy surfaces in a calendar
+system. The same event may be fully visible to the owner, busy-only to a
+colleague, and invisible to an external user. The design should teach that the
+busy index is privacy-preserving only when ACL checks happen before returning
+intervals.
 
-Concrete fix: add a local transaction boundary around event writes and an
-outbox/change-log record. Then show projectors/workers consuming that durable
-stream:
+Concrete fix: add a short API/flow note:
 
-- Busy-index projector updates per-calendar intervals idempotently.
-- Reminder scheduler materializes due jobs for the next horizon.
-- Invite fanout worker sends update notifications at least once.
-- Sync service reads the same calendar change log for cursor-based pulls.
-- Reconciliation jobs rebuild the busy index and reminder jobs from EventDB.
-
-### 5. Reminder and notification semantics need a sharper failure model
-
-The requirements ask for reliable reminders that fire on time and once. The
-dataset says "exactly-once-ish" and "deduped", which is honest, but it does not
-define the operational contract. There is no state model for scheduled, leased,
-sent, failed, cancelled, or superseded reminders, and no explanation of what
-happens when notification delivery is retried.
-
-Why it matters: notification systems are usually at-least-once. The calendar
-service can dedup job execution, but it cannot guarantee that every external
-push/email channel delivers exactly once. The candidate should learn to state
-the boundary precisely.
-
-Concrete fix: define reminders as at-least-once processing with idempotent send
-attempts and user-visible dedup keys. Add a short sequence flow for due
-reminder execution:
-
-- Worker leases due reminder job.
-- Checks event/version still valid and reminder not cancelled.
-- Sends via notification provider with a stable dedup key.
-- Marks sent or retries with backoff.
-- Metrics track due-lag, duplicate-suppression count, provider errors, and
-  abandoned leases.
+- `FreeBusy` authorizes the caller against `calendar_acl` before returning
+  intervals.
+- Response shape distinguishes "busy interval", "unknown/no permission", and
+  optional event details when the caller has reader rights.
+- Private events contribute busy blocks but do not expose title/location.
 
 ## System Design Soundness
 
 ### Requirements and Capacity
 
-The requirement list is well scoped for a calendar interview: event CRUD,
-recurrence, free/busy, invites, reminders, and sync. The non-functional
-requirements correctly highlight timezone/DST correctness and reliable derived
-work.
+The requirements are now well scoped: event CRUD, recurrence, availability,
+invites/RSVPs, reminders, device sync, DST correctness, retry safety, privacy,
+and reliable derived work. The non-functional section is stronger because it
+explicitly names at-least-once delivery, versioned edits, idempotent mutations,
+and ACL-bound free/busy.
 
-The missing piece is quantitative scale. "Billions of events" is not enough by
-itself. A calendar case needs at least rough traffic and fanout numbers because
-the architecture choices are workload-sensitive. For example, free/busy for 20
-attendees over a 30-day window has a very different cost from listing one
-calendar's day view; a reminder wave for millions of users at local 9am has a
-different shape from steady event CRUD.
-
-Privacy and access control also deserve explicit non-functional treatment.
-Free/busy sharing intentionally hides details, but the dataset does not define
-calendar visibility, delegation, shared calendars, resource calendars, or
-cross-organization free/busy permissions.
+Capacity is the biggest remaining soundness gap. The numbers are directionally
+helpful, especially the reminder burst ratio and free/busy attendee fanout, but
+the event totals should be made internally consistent. Once attendee projections
+are added, capacity should distinguish canonical event rows from per-calendar
+event references; otherwise the sharding and storage story is hard to evaluate.
 
 ### API
 
-The create and free/busy APIs are good starting points. The create sequence also
-usefully shows conflict checking, event persistence, and invite dispatch. One
-caveat: calendars generally allow overlapping events unless the organizer or a
-resource calendar has a policy that rejects conflicts. The API should word
-conflict checking as a policy decision, not as a universal requirement.
+The API surface now supports the main workflows. `PATCH`/`DELETE` include
+recurrence scope and `expectedVersion`; RSVP is idempotent and version-stamped;
+sync uses a cursor and tombstones; create includes calendar id, organizer,
+duration, visibility, attendees, reminders, and idempotency.
 
-The API gaps are mostly mutation and sync contracts. Add update/delete with
-recurrence edit scope, RSVP, sync, and reminder preference endpoints. Add
-idempotency and versioning to write APIs. Those fields connect directly to the
-architecture's consistency, retry, and device-sync claims.
+Two API improvements would make the case more production-ready:
+
+- Clarify that write APIs commit only authoritative state plus an outbox/change
+  record; invite/reminder/cache/index side effects are projector work.
+- Add caller/auth context to free/busy and sync examples so privacy and ACLs are
+  not only data-model concepts.
 
 ### Data Model
 
-The event model is directionally right: authoritative event rows, RRULEs,
-EXDATEs, overrides, and attendees. It should split "UTC plus original timezone"
-into precise fields: original local start, original timezone/TZID, duration,
-computed UTC for each expanded instance, and possibly timezone database version
-or a policy for tzdb updates.
+The model is much better than the prior version. `events` captures local start,
+TZID, duration, RRULE, EXDATEs, visibility, and version. `event_overrides`
+uses a stable recurrence id. `reminder_jobs`, `calendar_changes`, and
+`idempotency_keys` support the async reliability story.
 
-`event_overrides.instance_date` should become a stable recurrence identity. A
-date alone is risky for events that recur multiple times per day, cross
-timezones, or move after a series split. Use an RFC-style recurrence id: the
-original local occurrence timestamp in the event timezone.
+The main missing state is attendee-calendar projection. `attendees` tracks
+responses, but it does not give an attendee calendar a local reference for
+listing, busy indexing, reminder overrides, sync changes, or visibility
+behavior. Add that as a small focused entity rather than expanding the main
+`events` table.
 
-The model also needs change tracking and reminder records to support the final
-design. Without them, the Sync Service and Reminder Scheduler are components
-without a clear source of truth.
+For recurrence, the "this and following" series-split model is mentioned in
+prose and traps. If this is meant to be teachable from the schema, add one
+field-level note that the old series gets an `UNTIL`/bounded rule and the new
+series is a new `events` row linked by `split_from_event_id` or equivalent.
 
 ### Architecture
 
-The main components are sensible. EventDB is authoritative, Expander is
-stateless, BusyIndex is derived, FreeBusy handles availability queries,
-InviteSvc handles collaboration, ReminderQ handles time-ordered work, and
-SyncSvc handles device/external sync.
+The architecture now has the right components: Event Service, Event Store,
+Recurrence Expander, Free/Busy, Busy Index, Invite/RSVP, Notification,
+Reminder Scheduler, Sync Service, Read Cache, Change Log, and Projectors.
 
-The architecture should add one explicit durable-change component: an outbox,
-calendar change log, or event stream. That single addition would connect event
-mutations to busy-index updates, reminders, invite notifications, and sync
-cursors. It would also make "derived/rebuildable" operationally credible.
-
-The final design mentions hot calendar views and free/busy caches in Step 7,
-but no cache component appears in the final diagram. Either add a cache node or
-remove/cache-soften that claim so the final diagram and prose match.
+The strongest design move is treating busy intervals, reminder jobs, sync
+cursors, and caches as derived/rebuildable state. To make that fully coherent,
+the diagrams and flows should consistently route durable side effects through
+`ChangeLog -> Projector`. Direct calls can still exist for synchronous reads or
+validation, but not for side effects that must survive failures.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: One Row per Occurrence, Local-String Times
 
-This is a strong opening. It presents a tempting model and shows precisely why
-it fails: infinite recurrence, bulk series edits, timezone comparisons, and DST
-corruption. The trap is concrete and useful.
-
-Improvement: none required. Keep this as the problem-revealing baseline.
+Still a strong baseline. It exposes infinite recurrence, bulk rewrite pain, and
+timezone/DST corruption quickly. No major change needed.
 
 ### Step 2: Recurring Events: Store the Rule, Expand on Read
 
-This is one of the strongest sections. The default option is realistic, the
-materialize-every-row alternative is a useful foil, and the bounded cache option
-adds production nuance without making it the default. The concept and trap are
-well aligned.
+This remains one of the best sections. The default, materialize-all, and bounded
+cache options teach the real trade-off space. The updated trap about stable
+recurrence ids and series splitting is valuable.
 
-Improvement: add a small "this and following" model note. The prose names
-series splitting, but the data model only has overrides and EXDATEs. A candidate
-should see that a split creates a new series from a recurrence boundary and
-terminates or modifies the original rule.
+Improvement: add a tiny schema note for how a "this and following" split is
+represented as two bounded/linked series.
 
 ### Step 3: Timezones and DST Correctness
 
-This is also strong. It correctly teaches that recurring events are anchored to
-local wall-clock time and only then converted to UTC. The option comparison is
-clear and avoids the common "store UTC only" mistake for recurring events.
+The section correctly anchors recurring events in local wall-clock time plus
+IANA TZID. The new nonexistent/ambiguous local-time policy is a good interview
+detail.
 
-Improvement: state explicit policy choices for nonexistent and ambiguous local
-times. For example, decide whether a spring-forward `02:30` occurrence is
-skipped, shifted to `03:00`, or rejected at creation time, and how the repeated
-fall-back hour is disambiguated.
+Improvement: mention the operational policy for tzdb updates: whether future
+instances are recomputed lazily at read time, reindexed by a background job, or
+both.
 
 ### Step 4: Free/Busy Availability
 
-The busy-interval index is the right design move and the option comparison is
-good. This step also introduces privacy naturally by exposing intervals rather
-than event details.
+This step is now strong because it includes both the query path and the
+busy-index update path through the change log/projector. The staleness note is
+appropriately honest.
 
-Improvement: add the update path, not just the query path. Show how an event
-create/update/cancel produces a busy-index update, what version it carries, and
-how the system handles temporarily stale index entries.
+Improvement: connect the busy index to attendee projection and ACLs. The index
+needs to know which attendee calendar blocks time and what the caller is
+allowed to see.
 
 ### Step 5: Invites and RSVPs
 
-The organizer-authoritative option is a good default for an internal calendar
-system, and the per-attendee-copy alternative is a useful contrast for
-federated/iCalendar behavior.
+The organizer-authoritative default and per-attendee-copy alternative are the
+right contrast. The idempotent, version-stamped RSVP flow and race-condition
+trap address an important previous gap.
 
-Improvement: add an RSVP flow and a race condition trap. Organizer edits and
-attendee RSVPs can cross in flight; the system needs event versions, attendee
-response timestamps, idempotent RSVP writes, and update notifications that do
-not erase responses.
+Improvement: show how organizer event updates become attendee calendar changes
+for reads, sync, and busy indexing. Without that projection, the default model
+is conceptually right but operationally incomplete.
 
 ### Step 6: Reminders and Device Sync
 
-This step names the right concepts, but it is thinner than the earlier sections.
-There are no options, flows, traps, or data-model fields for either reminders or
-sync. That makes it feel like a summary rather than a design step.
+This step improved the most. It now has real options, due-reminder execution,
+lease/validate/send/mark semantics, dedup keys, retry/backoff, delta sync,
+tombstones, and cursor-retention behavior.
 
-Improvement: add at least one sequence flow for due reminders and one sequence
-flow for delta sync. Good option comparisons would be delayed queue vs
-time-bucketed scheduler vs database polling for reminders, and push-only vs
-pull-with-cursor vs hybrid sync for devices.
+Improvement: add two or three fields to `reminder_jobs`, such as `lease_until`,
+`attempt_count`, `channel`, and `recipient_id`, or mention them in the note.
+That would make the state machine more concrete without bloating the schema.
 
 ### Step 7: Scaling and Consistency
 
-The scaling advice is directionally correct: shard by calendar/user, keep
-derived state rebuildable, and tolerate brief propagation lag. It should be
-more concrete.
+The scaling step now ties back to the capacity numbers, reminder bursts,
+sharding, projector lag, cache invalidation, and DR drills. It is much stronger
+than before.
 
-Improvement: connect the scale story back to capacity numbers and operational
-mechanics. Name shard-key implications for events with many attendees, hot
-resource calendars, cross-shard free/busy fanout, outbox/projector lag,
-backfills, and disaster recovery for derived indexes.
+Improvement: give Step 7 one explicit trade-off comparison or flow. Good
+choices would be calendar-sharded vs user-sharded vs hybrid, or transactional
+outbox/projectors vs direct async publish. This would make the closing step
+feel like a decision rather than a summary.
 
 ## Final Design Review
 
-The final design description integrates the major decisions: RRULE storage,
-windowed local-time expansion, override/exceptions, busy-interval index,
-organizer-authoritative invites, reminders, and cursor-based sync. The final
-diagram includes all major components introduced in the steps.
+The final design now integrates the steps well. It includes rule storage,
+windowed local-time expansion, overrides/exceptions, recurrence ids, series
+splits, busy-index free/busy, organizer-authoritative invites, reliable
+reminders, cursor sync with tombstones, read cache, sharding, and bounded
+projector lag.
 
-The biggest final-design gap is that it has derived components but no durable
-derivation mechanism. Add an outbox/change-log/event-stream component and make
-it feed the BusyIndex, ReminderQ, InviteSvc/Notify, and SyncSvc. That would make
-the final architecture much more production-realistic without changing the
-teaching spine.
-
-Also align Step 7's cache language with the diagram. If hot calendar/free-busy
-caches are important, add a cache node and describe invalidation through the
-same change stream. If not, keep caches as a follow-up optimization.
+The final-design risk is no longer missing components; it is semantic
+precision. Decide whether `ChangeLog -> Projector` is the only durable owner of
+derived work. If yes, remove or relabel direct side-effect links from
+`EventSvc` to `InviteSvc` and `ReminderQ`. Also add the attendee-calendar
+projection path so the final design explains how organizer-owned events appear
+in attendee calendar views, free/busy indexes, and sync streams.
 
 ## Concept Introduction and Learning Flow
 
-The core concepts are introduced in a good order:
+The concept staging is strong:
 
-- Rule + expansion follows naturally from the naive infinite-row failure.
-- Timezone/DST correctness builds on recurrence rather than being a side note.
-- Busy index appears after recurrence and timezone, which is right because it
-  depends on correct interval materialization.
-- Invites/RSVPs follow event correctness and availability.
-- Reminders and sync come after event mutation and collaboration.
+- The naive model fails first, so RRULE storage feels motivated.
+- Timezone/DST correctness follows recurrence at the right time.
+- Free/busy appears after correct interval expansion.
+- Invites/RSVPs introduce collaboration and races after event correctness.
+- Reminders and sync now introduce durable async work rather than appearing as
+  a summary.
+- Scaling closes with sharding, burst handling, projectors, cache invalidation,
+  and DR.
 
-Missing concepts to add:
-
-- Idempotency keys for create/update/RSVP/reminder send operations.
-- Optimistic concurrency or event versions.
-- Durable outbox/change log for derived state.
-- Calendar ACLs, visibility, and free/busy privacy boundaries.
-- Reminder job leasing, retry, dedup, and cancellation.
-- Sync cursors, tombstones, and conflict resolution.
-- External calendar/iTIP delivery uncertainty and reconciliation.
+The missing concept is "calendar event projection" or "attendee calendar
+reference." It should be introduced in Step 5 and reused in Step 6/7. That one
+concept connects invites, attendee calendar reads, busy indexes, reminders, and
+sync.
 
 ## Step-to-Final-Design Coherence
 
-The step-to-final-design mapping is mostly coherent:
+The step-to-final-design mapping is now mostly coherent:
 
-- Step 1 motivates replacing occurrence rows and local strings.
-- Step 2 introduces EventDB plus Expander.
-- Step 3 defines how Expander must handle local time and DST.
-- Step 4 introduces FreeBusy and BusyIndex.
-- Step 5 introduces InviteSvc and Notify.
-- Step 6 introduces ReminderQ and SyncSvc.
-- Step 7 frames sharding and rebuildable derived state.
+- Step 1 motivates leaving one-row-per-occurrence behind.
+- Step 2 introduces rule storage, overrides, and the expander.
+- Step 3 defines the expander's timezone behavior.
+- Step 4 introduces FreeBusy, BusyIndex, and projector-driven index updates.
+- Step 5 introduces organizer-authoritative invites and RSVP race handling.
+- Step 6 introduces ReminderQ and SyncSvc with real flows.
+- Step 7 introduces ChangeLog, Projector, Cache, sharding, and DR.
 
-The weak transitions are Step 6 and Step 7. ReminderQ and SyncSvc appear in the
-final diagram, but the API and data model do not yet give them durable state.
-Step 7 mentions caches and consistency boundaries that are not represented in
-the final diagram or schema. Add the missing state and change-log mechanics to
-make the final design feel earned rather than asserted.
+The remaining weak transition is Step 5 into Step 6/7: attendee calendars need
+derived projection state before sync and free/busy can be fully explained. The
+other weak point is the mixed direct/projector side-effect path in the final
+diagram.
 
 ## Realism Compared With Production Systems
 
-A production-grade calendar design should make these tradeoffs explicit:
+The design now handles many real-world calendar issues:
 
-- Calendar systems often allow event overlap; conflict checks are policy-bound,
-  especially for rooms/resources.
-- Recurrence exceptions need stable recurrence ids, not just dates.
-- Timezone rules change after future events are created; the design needs a
-  recomputation policy.
-- Free/busy is a privacy surface. Users may reveal full details, busy-only, or
-  nothing depending on ACLs and organization boundaries.
-- External calendar invites are eventually consistent and lossy. Email/iTIP and
-  CalDAV clients can delay, duplicate, or reject updates.
-- Reminder delivery is not exactly once through external push/email providers;
-  the internal scheduler can be idempotent, but sends are at-least-once with
-  deduplication.
-- Device sync needs tombstones and cursor retention policies, or offline
-  clients will miss deletions and old changes.
-- Derived indexes must be rebuildable from an authoritative event log or event
-  store.
+- RRULE plus overrides instead of pre-created infinite occurrence rows.
+- Local-time recurrence with IANA TZIDs and explicit DST edge policy.
+- Stable recurrence ids for instance edits.
+- Policy-bound conflict checks rather than assuming all overlaps are rejected.
+- Idempotent writes and optimistic concurrency.
+- At-least-once reminder delivery with fire-once scheduler execution.
+- Tombstones and cursor retention for device sync.
+- Durable outbox/change log and idempotent projectors.
+- Rebuildable derived indexes and caches.
 
-The current dataset mentions several of these, but usually in one sentence. The
-next pass should turn the most important ones into explicit fields, flows, and
-traps.
+Residual realism gaps:
+
+- Cross-calendar attendee projections are not explicit enough for reads, sync,
+  reminders, and busy indexing.
+- External calendar sync is named, but iTIP/CalDAV inbound/outbound failure,
+  duplicate, and reconciliation behavior is still mostly out of scope.
+- Privacy/ACL semantics are present in the model but not strongly visible in
+  free/busy API examples.
+- Reminder jobs would benefit from lease, attempt, recipient, and channel
+  fields to match the described state machine.
 
 ## Dataset and Renderer-Facing Observations
 
 - `interview.json` parses successfully.
-- `steps[].view.nodes` references resolve against high-level architecture nodes
-  or option-local inline nodes in the inspected views.
-- `steps[].view.links` string references resolve against
-  `highLevelArchitecture.links`.
+- `steps[].view.nodes` string references resolve against high-level
+  architecture nodes.
+- `steps[].view.links`, option view link references, and final-design link
+  references resolve against `highLevelArchitecture.links`.
 - `satisfies.functional[].steps` and `satisfies.nonFunctional[].steps` resolve
   to real step ids.
-- The structured sequence messages inspected during review reference declared
-  participants.
-- The requirements and capacity Mermaid diagrams are valid-looking but very
-  sparse. They omit several important surfaced requirements, especially
-  timezone/DST, reminders, sync, and invites.
-- The two step flows have no titles, so the UI may render generic flow labels.
-  Add short titles such as "Free/busy query" and "Organizer update fanout".
-- Option-local nodes such as `OccCache` and `AttendeeDB` do not specify a
-  canonical node type. They will render, but adding types would make captions
-  and styling clearer.
-- `toProbeFurther.links` contains useful links, but several are grouped under
-  inherited "Booking and Contention" labels. Calendar-specific grouping such as
-  "Calendar Standards", "Time and Recurrence", "Sync Protocols", and
-  "Notifications and Streams" would fit this dataset better.
-- `postgres-isolation` and `kafka-design` may be useful general references, but
-  their `why` text does not connect tightly to this calendar case. Either tie
-  them to idempotent updates/outbox/projectors or replace them with more
-  calendar-specific material.
+- Step and API sequence messages reference declared participants.
+- Flow and option names are present.
+- Option-local nodes `OccCache` and `AttendeeDB` are rendered inline and are
+  acceptable, but adding explicit canonical `type` values would make styling
+  clearer if they become more prominent.
+- Because this review only changes `REVIEW.md`, no `docs/` rebuild is needed.
 
 ## Recommended Edits, Prioritized
 
-### P1: Add concrete capacity math
+### P1: Make the change-log/projector path authoritative
 
-Turn the capacity section into numbers that drive the architecture. Include
-users, events, recurrence rate, event reads, writes, RSVP traffic, free/busy
-fanout, reminder bursts, storage estimates, and latency targets.
+Align API sequences, architecture links, and final-design prose so durable side
+effects are owned by the outbox/change-log pipeline. Remove or relabel direct
+`EventSvc -> InviteSvc` and `EventSvc -> ReminderQ` side-effect paths.
 
-### P1: Expand API and data model for mutation correctness
+### P1: Add attendee-calendar projection state
 
-Add update/delete with recurrence scope, RSVP, sync, reminders, idempotency,
-versions, recurrence ids, change log, reminder jobs, and ACL/visibility.
+Introduce `calendar_event_refs` or an equivalent entity and explain how
+organizer event changes fan out into attendee calendar change logs, busy-index
+updates, sync cursors, and local reminder state.
 
-### P1: Add a durable change pipeline
+### P2: Fix capacity consistency and storage math
 
-Add an outbox/change-log/event-stream component and show it feeding BusyIndex,
-ReminderQ, InviteSvc/Notify, and SyncSvc. Include idempotent projectors and
-rebuild/reconciliation notes.
+Reconcile `500M users * 3 calendars/user * 50 active events/calendar` with the
+`10B events` headline. Separate canonical events from attendee refs, expanded
+instances, change-log rows, busy intervals, and reminder jobs.
 
-### P2: Deepen Step 6 and Step 7
+### P2: Surface privacy enforcement in the API/flow
 
-Give reminders, sync, and scale the same teaching richness as recurrence and
-timezone: options, sequence flows, traps, and concrete operational tradeoffs.
+Add caller/authorization context to free/busy and sync examples. Show
+busy-only/private/no-permission response behavior.
 
-### P2: Make recurrence edge policies explicit
+### P2: Deepen Step 7 with a trade-off or sequence
 
-Specify recurrence ids, series splitting for "this and following", and policies
-for spring-forward nonexistent times and fall-back ambiguous times.
+Add one closing decision: sharding strategy, outbox/projector vs direct async
+publish, or cache invalidation strategy. This would give Step 7 the same
+decision quality as earlier steps.
 
-### P2: Tighten invite/RSVP realism
+### P3: Add small state-machine details
 
-Add an RSVP endpoint/flow, organizer-edit vs attendee-response race handling,
-cross-provider ambiguity, attendee overrides, and notification retry behavior.
-
-### P3: Improve diagrams and probe-link metadata
-
-Expand the requirements/capacity diagrams, title the flows, type option-local
-nodes, and regroup external links under calendar-specific categories.
+Add `lease_until`, `attempt_count`, `recipient_id`, and `channel` to
+`reminder_jobs` or mention them in Step 6. Add an explicit tzdb-update
+recompute policy in Step 3.
 
 ## What Not To Change
 
-- Keep recurrence and timezone as separate steps. That separation is a teaching
-  strength.
+- Keep recurrence and timezone as separate steps.
 - Keep "store rule, expand on read" as the default recurrence decision.
 - Keep the busy-interval index as the default free/busy mechanism.
-- Keep organizer-authoritative events as the default internal invite model, with
-  per-attendee copies as the federated/cross-provider alternative.
-- Keep derived busy indexes and reminder state rebuildable rather than
-  authoritative.
+- Keep organizer-authoritative events as the default internal invite model.
+- Keep reminders and sync in the same step now that the async state machine is
+  concrete.
+- Keep the durable change log and idempotent projectors as the final
+  architecture's central reliability mechanism.
 
 ## Bottom Line
 
-The dataset already teaches the right calendar-system instincts. To make it
-book-quality, the next revision should turn the implied production mechanics
-into explicit API fields, data-model entities, sequence flows, and capacity
-calculations. The highest-leverage addition is a durable calendar change log:
-it would connect event mutations to free/busy, reminders, invites, sync, cache
-invalidation, and rebuildability in one coherent design move.
+The recent changes turned the calendar interview into a strong book-quality
+case. The next refinement should not broaden the scope; it should make the new
+production spine precise. Clarify that the change log owns derived side effects,
+add attendee-calendar projections, and tighten the capacity math. That would
+close the main remaining gaps without disturbing the excellent recurrence,
+timezone, free/busy, reminders, and sync flow.

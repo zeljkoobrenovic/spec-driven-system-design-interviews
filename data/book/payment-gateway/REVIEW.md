@@ -390,3 +390,36 @@ This dataset has moved from a good outline to a strong, interview-ready payment
 gateway case. The next review pass should focus on precision rather than breadth:
 consistent capacity math, a cleaner PSP-failover decision step, explicit ledger
 invariants, and concrete merchant/security operations.
+
+## Changes Applied (2026-06-08)
+
+All prioritized recommendations above were addressed in `interview.json`:
+
+- **P1 capacity math** — derived every count from a single ~173M charges/day
+  baseline; split "ledger entries/day" from "total persisted rows/day", added
+  peak write math (~70k–130k writes/sec), and clarified the retry multiplier
+  applies to outbound delivery attempts (HTTP), not the event count.
+- **P1 Step 7 split** — split into Step 7 "Scale the Payment Store" (storage
+  topology options) and a new Step 8 "PSP Resilience & Multi-Acquirer Routing"
+  with first-class routing options (active/passive default, single acquirer,
+  rule-based) that name the safe-failover contract. The existing failover flow
+  moved to Step 8 so the title, default option, and decision now line up.
+- **P1 ledger invariants** — added explicit invariants to Step 6 (balanced per
+  currency, append-only, idempotent posting via unique `ref_type/ref_id`,
+  materialized balance is derived, settled-available-minus-reserve payouts);
+  added `currency`/`posting_state`/`created_at`/`effective_at` to
+  `ledger_entries`, `materialized_balance`/`balance_version` to
+  `ledger_accounts`, and a `reconciliation_items` settlement-line table.
+- **P2 merchant/security ops** — added `merchant_api_keys` (overlap rotation,
+  publishable vs secret), `merchants.status` (disable compromised),
+  `vault_access_log`, `key_version` on tokens; added API endpoints for
+  webhook-endpoint update/delete/secret-rotation and API-key rotation; named
+  the operational plane and runbooks in the final design.
+- **P2 Step 6 traps** — added traps for mutable balances, unbalanced postings,
+  paying pending funds, and stale materialized-balance reads.
+- **P3 scoped-out features** — added a requirements-level "Scoped out" note and
+  expanded follow-ups with where 3DS/SCA, disputes, multi-currency/FX, and
+  KYC/payout-verification would extend the design.
+- **P3 API/sequence polish** — added `Authorization` to all request examples,
+  clarified tokenization uses the publishable client key, documented replay
+  idempotency, and routed the charge sequence response through the API.

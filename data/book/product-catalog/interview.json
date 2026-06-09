@@ -1,6 +1,6 @@
 {
   "title": "Amazon Product Catalog — System Design",
-  "description": "Design the catalog behind a large e-commerce store: browse and search hundreds of millions of products, filter by facets, and render fast product pages — while inventory and prices change constantly. The themes are the read/write (CQRS) split, search + faceting, a denormalized read model, and keeping inventory/price consistent across that split.",
+  "description": "Design the catalog behind a large e-commerce store: browse and search hundreds of millions of products, filter by facets, and render fast product pages — while inventory and prices change constantly. The recurring themes are the read/write (CQRS) split, search and faceting, a denormalized read model, and keeping inventory and price consistent across that split.",
   "highLevelArchitecture": {
     "nodes": [
       {
@@ -255,10 +255,16 @@
         "label": "read/write price"
       },
       {
-        "id": "edge-cache",
-        "from": "LB",
+        "id": "client-edge",
+        "from": "Client",
         "to": "EdgeCache",
-        "label": "cache hot reads"
+        "label": "hot reads (CDN)"
+      },
+      {
+        "id": "edge-lb",
+        "from": "EdgeCache",
+        "to": "LB",
+        "label": "miss → origin"
       }
     ],
     "types": [
@@ -560,7 +566,7 @@
     },
     {
       "name": "product_view (read model)",
-      "note": "Denormalized, render-ready detail view. Carries source ownership: catalog content is projected; price/stock here are display-only badges, verified live at purchase time.",
+      "note": "Denormalized, render-ready detail view. Carries source ownership: catalog content is projected; price/stock here are display-only snapshots of the winning offer, verified live at purchase time. Search filters/sorts on indexed_price_bucket (a coarse, slowly-changing bucket), never on a precise live price.",
       "fields": [
         {
           "name": "product_id",
@@ -571,8 +577,16 @@
           "type": "json (title, images[], attrs, category path, rating_summary)"
         },
         {
-          "name": "display_price",
-          "type": "money (last-projected; not authoritative for checkout)"
+          "name": "winning_offer_snapshot",
+          "type": "json (offer_id, seller_id, display_price, stock_badge — projected; not authoritative for checkout)"
+        },
+        {
+          "name": "indexed_price_bucket",
+          "type": "enum/range (coarse band for price filter/sort facets; debounced so repricing doesn't churn the index)"
+        },
+        {
+          "name": "price_last_projected_at",
+          "type": "timestamp (when display_price/bucket were last refreshed; bounds acceptable staleness)"
         },
         {
           "name": "stock_badge",
@@ -640,19 +654,39 @@
     },
     {
       "name": "price / offers",
-      "note": "Authoritative price/promotion, owned by the pricing service; read live for display and verified at checkout. Multi-seller offers/buy-box live here.",
+      "note": "Authoritative price/promotion, owned by the pricing service; read live for display and verified at checkout via a TTL'd quote. Multi-seller offers and buy-box selection live here; the winning offer is projected into the read model/index for display and bucketed search.",
       "fields": [
+        {
+          "name": "offer_id",
+          "type": "uuid PK (per seller offer)"
+        },
         {
           "name": "product_id",
           "type": "uuid"
         },
         {
           "name": "seller_id",
-          "type": "uuid (per-offer)"
+          "type": "uuid (offer owner)"
+        },
+        {
+          "name": "condition",
+          "type": "enum (new|used|refurb)"
+        },
+        {
+          "name": "fulfillment_channel",
+          "type": "enum (e.g. seller|platform-fulfilled)"
         },
         {
           "name": "price",
           "type": "money"
+        },
+        {
+          "name": "availability",
+          "type": "int / badge (per offer)"
+        },
+        {
+          "name": "is_buy_box_winner",
+          "type": "bool (the offer projected/displayed by default)"
         },
         {
           "name": "promo",
@@ -749,7 +783,7 @@
       "title": "1. Naive: Query the Normalized Products Table Directly (the baseline)",
       "description": [
         "Start with one normalized products table in a relational database. Product pages are a row lookup (plus a few joins for category/brand), and search is a LIKE/keyword query with WHERE filters over the same table.",
-        "This is fine for a small store and exposes exactly why a catalog needs more. At ~300M products and ~150k search QPS, a SQL LIKE scan with per-filter facet aggregations can't meet a < 200 ms p99, and assembling a rich product page from many joined tables on every one of ~300k detail QPS is too slow under massive read volume. The write-shaped normalized model is simply the wrong shape for read-heavy browse.",
+        "This is fine for a small store, and it exposes exactly why a catalog needs more. At ~300M products and ~150k search QPS, a SQL LIKE scan with per-filter facet aggregations can't meet a < 200 ms p99. And assembling a rich product page from many joined tables, on every one of ~300k detail QPS, is too slow under that read volume. The write-shaped normalized model is simply the wrong shape for read-heavy browse.",
         "So the baseline motivates the rest: split reads from writes (CQRS), build a search/facet index for discovery, and precompute a denormalized read model for fast pages."
       ],
       "view": {
@@ -945,7 +979,9 @@
       "description": [
         "Browse and search are the primary entry points. Build an inverted index over product text and attributes; serve keyword queries and rank results (relevance, popularity, rating).",
         "Faceting is the e-commerce twist: alongside results, return counts per filter value (brand, price range, rating) so shoppers can narrow down. The index computes these aggregations as part of the query.",
-        "Shard the index by product; replicate for query volume. Hydrate result cards from the read model (title, image, price) rather than the index itself."
+        "Price in search is a projected snapshot, not the live price. At 50–100k price/stock events per second, indexing every change as a precise sort key would churn the index constantly and still serve stale numbers. So filter and sort on a coarse, debounced indexed_price_bucket (e.g. $25–$50) and display the projected winning-offer price; when the shopper opens the detail page or adds to cart, the live price is refreshed from the Pricing Service.",
+        "Be ready to say what the shopper sees when a sorted or filtered result is re-priced live: the displayed price may differ slightly from the search snapshot, and the authoritative value always comes from the owner at the purchase decision.",
+        "Shard the index by product; replicate for query volume. Hydrate result cards from the read model (title, image, display price) rather than the index itself."
       ],
       "view": {
         "nodes": [
@@ -1100,6 +1136,13 @@
           "whyItMatters": "Lets shoppers narrow large result sets — core to product discovery.",
           "example": "'headphones' -> 842 results; facets: Brand{Acme:120,...}, Price{<50:300,...}.",
           "group": "Search and Faceting"
+        },
+        {
+          "term": "Price snapshot vs price authority",
+          "definition": "Search filters/sorts on a coarse, debounced projected price bucket; the authoritative price is read live from the Pricing Service at the purchase decision.",
+          "whyItMatters": "Indexing a fast-changing price as a precise key churns the index and still serves stale numbers; bucketing keeps search fast while live reads keep purchase correct.",
+          "example": "Sort-by-price uses indexed_price_bucket; detail/add-to-cart refreshes the winning offer's live price.",
+          "group": "Search and Faceting"
         }
       ],
       "probeLinks": [
@@ -1187,7 +1230,8 @@
       "description": [
         "A product page combines data from many places: catalog attributes, images, rating summary, category info. Assembling that per request (fan-out joins) is slow at this scale.",
         "Precompute a denormalized, render-ready product view keyed by product id — a single lookup serves the detail page. The read model carries the source version it reflects, so it's verifiable and rebuildable.",
-        "Search hydrates result cards from the same read model. It's derived state: a cache loss is a rebuild from the write model, not data loss."
+        "Search hydrates result cards from the same read model. It's derived state: a cache loss is a rebuild from the write model, not data loss.",
+        "Note ownership: the rating summary and media/images are projected content summaries owned by the reviews and media systems, not data the catalog service owns — the read model just denormalizes their latest projected values alongside catalog attributes."
       ],
       "view": {
         "nodes": [
@@ -1629,6 +1673,7 @@
           "title": "Projection mechanics: exactly-once-effect, ordering, and recovery",
           "points": [
             "Source via transactional outbox / CDC: the event is committed in the same transaction as the write, so there is no dual-write gap. Every event carries an event_id (dedupe key) and the per-product write version.",
+            "The 'change stream' in the diagram is a shared eventing abstraction, not one physical queue: catalog, price, and inventory each emit to their own owner-specific topic (partitioned by product_id), and the projector consumes the relevant topics. Drawing it as one node keeps the concept clear without implying a single shared log.",
             "Idempotent upserts keyed by product_id and guarded by version — apply only if event.version > stored source_version — so duplicate or out-of-order deliveries are harmless. Partition the stream by product_id so a product's events stay ordered.",
             "Each projector commits a checkpoint (stream offset / CDC position) per partition; lag is exported per partition against the p99 < 5 s SLO and alarms when breached.",
             "A poison event that repeatedly fails goes to a dead-letter queue with bounded retry/backoff rather than blocking its partition.",
@@ -1643,7 +1688,9 @@
       "title": "6. Inventory and Price: Freshness Where It Matters",
       "description": [
         "Catalog content tolerating seconds of staleness is fine. Price and availability do not: showing an out-of-stock item as buyable, or a stale price at checkout, is a real defect.",
-        "Treat inventory and pricing as separate services owning their authoritative data (their own stores). For volatile values, read them live from their owner at decision time (add-to-cart, checkout) rather than trusting a projected snapshot. The read model can show an approximate badge ('in stock') and a display price, but the purchase path verifies both live: the catalog detail endpoint calls the pricing and inventory services, and checkout re-verifies an authoritative price quote.",
+        "Treat inventory and pricing as separate services owning their authoritative data in their own stores. For volatile values, read them live from their owner at decision time (add-to-cart, checkout) rather than trusting a projected snapshot. The read model can show an approximate badge ('in stock') and a display price, but the purchase path verifies both live: the catalog detail endpoint calls the pricing and inventory services, and checkout re-verifies an authoritative price quote.",
+        "Scope the offer model. A product can have many seller offers, so the default design projects and displays just one winning offer (the buy-box winner) per product — its display_price and stock_badge are what search and the read model show. Buy-box selection itself is owned by the pricing service, not the catalog. Search price filter and sort therefore operate on the winning offer's bucketed snapshot, while the detail page and checkout resolve the specific selected offer live.",
+        "Define the purchase boundary precisely (checkout stays out of scope). The catalog detail page may refresh live display values, but the cart/checkout service — not the catalog — owns the final purchase decision: it requests an authoritative price quote (a quote_id with a short TTL) and an inventory reservation/hold for the selected offer, and revalidates the quote before order placement. If the quote expires or fails to refresh, the shopper re-prices rather than buying at a stale number. This keeps 'catalog detail page is fresh' distinct from 'checkout correctness'.",
         "This splits consistency by data type: eventually-consistent catalog content via projection, authoritative live reads for money/stock."
       ],
       "view": {
@@ -1827,6 +1874,24 @@
           "trap": "Over-projecting price into the search index/read model because it makes browse fast.",
           "why": "It speeds search/detail but breaks purchase trust — a stale projected price shown at checkout is a real defect. Using a fast-changing price as a hard search facet also churns the index.",
           "instead": "Keep at most a display price/badge in the projection; verify price live at the purchase decision and treat price facets as bucketed with explicit acceptable staleness."
+        },
+        {
+          "trap": "Letting the catalog service own the final purchase decision (quote + reservation).",
+          "why": "Conflates 'catalog detail page shows fresh values' with 'checkout is correct'. The catalog can refresh display values, but it does not hold inventory or commit a price.",
+          "instead": "Hand off to cart/checkout: it requests an authoritative price quote (quote_id + short TTL) and an inventory reservation/hold for the selected offer, and revalidates before order placement."
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Purchase boundary: quote, reservation, and the offer/buy-box handoff",
+          "points": [
+            "Display vs authoritative: the catalog detail page reads live display values (winning-offer price, stock badge) for accuracy, but those are still display values — they do not commit anything.",
+            "Price quote: when the shopper adds to cart / proceeds to checkout, the cart/checkout service asks the Pricing Service for an authoritative quote scoped to the selected offer — a quote_id with a short TTL (e.g. tens of seconds to minutes). Order placement passes the quote_id and is rejected if it has expired or been superseded, so no order is committed at a stale price.",
+            "Inventory reservation: in parallel the checkout flow requests a reservation/hold on the selected offer's stock from the Inventory Service (a short-lived hold decremented on order, released on timeout/abandonment) so two shoppers can't both buy the last unit.",
+            "Failed refresh: if the quote can't be refreshed or the hold can't be granted, the shopper is re-priced / shown limited availability rather than allowed to complete — the failure surfaces before money moves.",
+            "Offer/buy-box ownership: a product has many seller offers; the Pricing Service owns buy-box selection and projects the winning offer into the read model/index for display and bucketed search. The quote and reservation are always scoped to a specific offer_id, so switching sellers re-quotes.",
+            "Scope boundary: catalog/search/read-model is in scope here; the cart/checkout/order service is the adjacent owner of the final decision and is intentionally out of scope for this catalog case."
+          ]
         }
       ]
     },
@@ -1849,10 +1914,10 @@
           "Indexer",
           "ChangeStream"
         ],
-        "caption": "Hot product views and popular search results are served from an edge/CDN cache; misses fall through to the search index and read model, both kept fresh by the indexer consuming the change stream. Volatile stock/price bypass the cache.",
+        "caption": "Hot product views and popular search results are served by a fronting edge/CDN cache; on a miss it falls through to the origin gateway, the search index, and the read model, all kept fresh by the indexer consuming the change stream. Volatile stock/price bypass the cache.",
         "links": [
-          "client-lb",
-          "edge-cache",
+          "client-edge",
+          "edge-lb",
           "search-idx",
           "search-readmodel",
           "indexer-readmodel",
@@ -1913,13 +1978,18 @@
           "scenario": "A poison change event repeatedly fails projection.",
           "expectedBehavior": "The event is routed to a DLQ after bounded retries so its partition keeps flowing; an operator inspects and replays it after a fix.",
           "mitigation": "Per-partition DLQ with backoff; idempotent reapply on replay."
+        },
+        {
+          "scenario": "A product is suppressed by moderation but the edge/CDN cache still serves the old page.",
+          "expectedBehavior": "Suppression is a high-priority signal: the projector evicts/marks the read-model entry and the CDN entry is invalidated (targeted purge by product key) rather than waiting for TTL, so the stale page stops serving quickly; the origin returns a suppressed/unavailable response on the next miss.",
+          "mitigation": "Active cache invalidation (purge by key) for suppression/takedown, short TTLs on cached content as a backstop, and never cache the suppressed-state response long."
         }
       ]
     }
   ],
   "finalDesign": {
     "title": "Final Design — CQRS Product Catalog",
-    "description": "The catalog service owns the normalized write model; a change stream (transactional outbox/CDC) projects edits into a denormalized product read model and a sharded search/facet index (eventually consistent, rebuildable, p99 < 5 s lag). Shoppers search/filter via the index and hydrate result cards and detail pages from the read model in a single lookup. Inventory and pricing are separate services owning authoritative data in their own stores; volatile stock/price are read live from them at purchase-decision time while content stays projected. Hot reads are sharded, replicated, and edge/CDN-cached (volatile values bypass the cache); projection bursts buffer in the stream; all derived stores rebuild from the authoritative write model.",
+    "description": "The catalog service owns the normalized write model; a change stream (transactional outbox/CDC) projects edits into a denormalized product read model and a sharded search/facet index (eventually consistent, rebuildable, p99 < 5 s lag). Shoppers search/filter via the index and hydrate result cards and detail pages from the read model in a single lookup. Search uses a projected, bucketed price snapshot of the winning offer, while the detail page and checkout refresh/verify the live price from the Pricing Service. Inventory and pricing are separate services owning authoritative data in their own stores; volatile stock/price are read live from them at purchase-decision time while content stays projected, and the cart/checkout service (out of scope) holds the final TTL'd price quote and inventory reservation. Hot reads are sharded, replicated, and edge/CDN-cached (the CDN fronts the gateway; volatile values bypass the cache); projection bursts buffer in the stream; all derived stores rebuild from the authoritative write model.",
     "view": {
       "nodes": [
         "Client",
@@ -1940,7 +2010,8 @@
       "caption": "The shopper client reaches the gateway for catalog detail and search, served from an edge cache, the read model, and search index — which the change stream and indexer keep fresh from the catalog store — with volatile stock/price read live from the inventory and pricing services.",
       "links": [
         "client-lb",
-        "edge-cache",
+        "client-edge",
+        "edge-lb",
         "lb-search",
         "lb-detail",
         "lb-catalog",
@@ -1993,7 +2064,7 @@
       },
       {
         "requirement": "Accurate price/availability",
-        "how": "Live reads from the inventory and pricing services (each owns its store) at the purchase decision; checkout re-verifies an authoritative price quote.",
+        "how": "Live reads from the inventory and pricing services (each owns its store) at the purchase decision; the winning offer is displayed, and cart/checkout re-verifies an authoritative TTL'd price quote plus an inventory reservation for the selected offer.",
         "steps": [
           "consistency"
         ]
@@ -2007,6 +2078,16 @@
       }
     ],
     "nonFunctional": [
+      {
+        "requirement": "Extremely read-heavy browse/search",
+        "how": "CQRS read/write split serves browse/search from independently-scaled derived stores (search index + read model) instead of the write model.",
+        "steps": [
+          "cqrs",
+          "readmodel",
+          "search",
+          "scale"
+        ]
+      },
       {
         "requirement": "Low read latency",
         "how": "Read model + index + edge caches.",

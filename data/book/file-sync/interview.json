@@ -29,7 +29,7 @@
         "traits": [
           "stateless"
         ],
-        "description": "Owns the file/namespace tree, versions, and chunk lists."
+        "description": "Owns the file/namespace tree, versions, and chunk lists. Authorizes every mutation against namespace membership and enforces per-user/namespace quota at commit time."
       },
       {
         "id": "MetaDB",
@@ -49,7 +49,7 @@
         "traits": [
           "stateless"
         ],
-        "description": "Stores and retrieves content-addressed chunks; enforces dedup."
+        "description": "Stores and retrieves content-addressed chunks; enforces dedup, checks quota on upload, and hands out signed/scoped chunk URLs so private bytes aren't world-readable."
       },
       {
         "id": "BlockStore",
@@ -99,7 +99,7 @@
           "stateful",
           "derived"
         ],
-        "description": "Caches popular/public chunks near users for fast download."
+        "description": "Caches popular/public chunks near users for fast download; private chunks are fetched with short-lived signed URLs so cached bytes can't leak across users."
       },
       {
         "id": "GC",
@@ -277,7 +277,7 @@
       "Upload, download, and delete files of arbitrary size.",
       "Sync a folder so the same files appear on all of a user's devices.",
       "Versioning: keep history; restore a previous version.",
-      "Share files/folders with other users (read or write).",
+      "Share folders with other users at read or write roles (folder-level membership; per-file public links as a narrower extension, not full per-file ACL inheritance).",
       "Resumable uploads that survive flaky connections."
     ],
     "nonFunctional": [
@@ -307,7 +307,7 @@
     {
       "label": "Upload edits",
       "value": "~200k edits/sec",
-      "note": "~2 edits/user/day active. Avg ~3 changed chunks/edit (content-defined chunking re-chunks only the edited region)."
+      "note": "~17B edits/day — the active-editing cohort (a few percent of users syncing actively at any time) drives this, not 2 edits across all 100M users. Avg ~3 changed chunks/edit (content-defined chunking re-chunks only the edited region)."
     },
     {
       "label": "Chunk-check QPS",
@@ -401,16 +401,16 @@
     {
       "method": "PUT",
       "path": "/v1/chunks/{hash}",
-      "description": "Upload one content-addressed chunk. Idempotent: same hash, same content. The server re-hashes the bytes and rejects (400) if they don't match the path hash before marking the chunk available.",
-      "request": "(raw chunk bytes, ~4MB)",
-      "response": "{ \"stored\": true } | 400 hash_mismatch"
+      "description": "Upload one content-addressed chunk under an upload session (so a multi-chunk upload can resume after a dropped connection without re-sending stored chunks). Idempotent: same hash, same content. The server checks the caller's quota and authorization, re-hashes the bytes, and rejects (400) if they don't match the path hash before marking the chunk available. The bytes are durably written and verified (pending -> available) before any metadata version is allowed to reference them.",
+      "request": "(raw chunk bytes, ~4MB; header: X-Upload-Session)",
+      "response": "{ \"stored\": true } | 400 hash_mismatch | 413 over_quota"
     },
     {
       "method": "POST",
       "path": "/v1/files/commit",
-      "description": "Commit a new file version referencing its ordered chunk hashes. Authorized against namespace membership and the optimistic baseVersion. Triggers sync notifications. On a stale baseVersion returns 409 and the client creates a conflicted copy; on insufficient role returns 403.",
-      "request": "{ \"path\": \"/docs/a.pdf\", \"chunks\": [\"h1\",\"h2\",\"h3\"], \"baseVersion\": 7 }",
-      "response": "{ \"version\": 8 } | 409 conflict | 403 forbidden",
+      "description": "Commit a new file version referencing its ordered chunk hashes. Carries a client-generated commitId so retries after a timeout are idempotent (the same commitId returns the already-written version instead of creating a duplicate row or a spurious conflicted copy). Authorized against current namespace membership at commit time — a member revoked mid-edit is rejected here. Quota is checked before the version is written. Triggers sync notifications only after the manifest is durable. On a stale baseVersion returns 409 and the client creates a conflicted copy; on insufficient role or revoked membership returns 403; over quota returns 413.",
+      "request": "{ \"path\": \"/docs/a.pdf\", \"chunks\": [\"h1\",\"h2\",\"h3\"], \"baseVersion\": 7, \"commitId\": \"<uuid>\" }",
+      "response": "{ \"version\": 8 } | 409 conflict | 403 forbidden | 413 over_quota",
       "sequence": {
         "participants": [
           {
@@ -612,6 +612,58 @@
       ]
     },
     {
+      "name": "namespace_changes (change log)",
+      "note": "Append-only per-namespace change log that is the source of truth for sync. Devices pull deltas from here by cursor; notifications are only a hint to pull. Retained for a bounded window (e.g. ~30 days); a cursor older than the window forces a snapshot resync. Older entries are compacted (collapse multiple edits of the same path to the latest) and pruned.",
+      "fields": [
+        {
+          "name": "namespace_id",
+          "type": "bigint (shard key)"
+        },
+        {
+          "name": "seq",
+          "type": "bigint (monotonic cursor within the namespace)"
+        },
+        {
+          "name": "file_id",
+          "type": "bigint"
+        },
+        {
+          "name": "version_id",
+          "type": "bigint (-> file_versions)"
+        },
+        {
+          "name": "op",
+          "type": "enum(create, update, delete, rename, restore)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "device_cursors",
+      "note": "Per-device sync position. If cursor_seq predates the namespace_changes retention window, the server returns reset=true and the device falls back to snapshot + delta.",
+      "fields": [
+        {
+          "name": "device_id",
+          "type": "bigint"
+        },
+        {
+          "name": "namespace_id",
+          "type": "bigint"
+        },
+        {
+          "name": "cursor_seq",
+          "type": "bigint (last seq this device has applied)"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
       "name": "namespace_members",
       "note": "ACL: who can see/edit a namespace, with the role used to authorize every path operation.",
       "fields": [
@@ -736,7 +788,7 @@
       "description": [
         "Start with the simplest thing that works. On every change, the client uploads the entire file to the server, which stores it as one blob; to sync, another device downloads the whole file back.",
         "This is correct and trivial — and it exposes the problems the rest of the design exists to solve. A one-byte edit to a 500 MB file re-uploads all 500 MB; the same file shared by ten users is stored ten times; and an upload that drops at 90% must restart from zero because there are no independent pieces to resume from.",
-        "The cost compounds at scale: at ~200k edits/sec, re-uploading whole files instead of changed chunks would move petabytes per second before any CDN or compression — orders of magnitude more than the few changed chunks actually warrant.",
+        "The cost compounds at scale: at ~200k edits/sec against a ~100 MB average file, re-uploading whole files instead of changed chunks would move on the order of ~20 TB/sec — and ~100 TB/sec if the edited files run to 500 MB — before any CDN or compression. That is orders of magnitude more than the handful of changed chunks actually warrant.",
         "So the baseline motivates everything that follows: split files into content-addressed chunks so you transfer and store only what is new, and resume from the last good chunk."
       ],
       "view": {
@@ -783,6 +835,7 @@
       "description": [
         "The client splits each file into chunks (~4 MB) and hashes each chunk's content. The hash is the chunk's identity (content-addressed storage).",
         "Chunking is the unit of everything: transfer, dedup, resumability, and versioning. A small edit re-chunks only the affected region, not the whole file.",
+        "Bound the chunk size (e.g. min ~1 MB, target ~4 MB, max ~8 MB) so content-defined boundaries can't degenerate into pathologically tiny or huge chunks; the bounds keep per-chunk overhead and the chunk-index cardinality predictable.",
         "The client uploads chunks to the block service and records the ordered list of chunk hashes that reconstructs the file."
       ],
       "view": {
@@ -915,7 +968,8 @@
       "description": [
         "Before uploading, the client asks the block service which chunk hashes already exist (the chunk index). It uploads only the missing ones.",
         "This dedups across versions (an edit re-sends only changed chunks), across files, and across users (the same shared PDF is stored once).",
-        "The chunk index maps hash -> exists + refcount; the actual bytes live once in the object store keyed by hash."
+        "The chunk index maps hash -> exists + refcount; the actual bytes live once in the object store keyed by hash.",
+        "Scope dedup deliberately. Global cross-user dedup maximizes savings, but a raw `check` response also tells the caller whether a hash already exists — leaking that someone else holds that exact content. For sensitive data, scope dedup per user or per namespace, or salt the hash, so the existence answer isn't a cross-user side channel; the price is giving up the bandwidth saving on private content. This is the same tension the technology-choices step revisits for client-side encryption."
       ],
       "view": {
         "nodes": [
@@ -1023,7 +1077,8 @@
       "description": [
         "Keep two planes. The metadata service owns the namespace tree, file versions, and each file's ordered chunk-hash manifest in a transactional database. The block plane stores opaque bytes cheaply and durably in object storage.",
         "A 'file' is just metadata: a path + version + list of chunk hashes. Reconstructing it means fetching those chunks. This keeps the rich, queryable, transactional part small and the huge part cheap.",
-        "Commit metadata last: upload chunks first, then atomically commit the new version referencing them. A crash mid-upload leaves orphan chunks (GC handles them), never a dangling metadata pointer."
+        "Commit metadata last: upload chunks first, then atomically commit the new version referencing them. A crash mid-upload leaves orphan chunks (GC handles them), never a dangling metadata pointer.",
+        "Make commit idempotent: the client sends a commitId with each commit, so a retry after a timeout returns the version already written rather than creating a duplicate version row or a spurious conflicted copy. Refcount updates happen in the same metadata transaction as the version write (or are appended to a commit log the GC reconciles), so 'metadata says this chunk is referenced' and 'the index counts that reference' can diverge only transiently — the mark-and-sweep repairs the drift."
       ],
       "view": {
         "nodes": [
@@ -1052,6 +1107,13 @@
         ]
       },
       "decisionPrompt": "Why not store file bytes directly in the metadata database?",
+      "failureDrills": [
+        {
+          "scenario": "A user's chunks upload successfully but they are over quota when the version commit lands.",
+          "expectedBehavior": "The commit is rejected (413 over_quota) so no version references the bytes; the now-orphan chunks are reclaimed by GC. The user is never charged for an uncommitted upload.",
+          "mitigation": "Check quota at commit time (and best-effort at upload time); leave uncommitted chunks to the refcount/mark-and-sweep GC."
+        }
+      ],
       "concepts": [
         {
           "term": "Metadata/data split",
@@ -1080,6 +1142,11 @@
           "trap": "Committing metadata before chunks are durably stored.",
           "why": "A reader could resolve a version whose chunks don't exist yet.",
           "instead": "Upload chunks first; commit the version referencing them last."
+        },
+        {
+          "trap": "Non-idempotent commit that retries blindly after a client timeout.",
+          "why": "A timed-out-then-retried commit can write a duplicate version row, or read a now-advanced version and manufacture a bogus conflicted copy.",
+          "instead": "Carry a client-generated commitId; a repeat of the same commitId returns the already-written version instead of re-committing."
         }
       ]
     },
@@ -1089,7 +1156,8 @@
       "description": [
         "Each device tracks a cursor — a per-namespace monotonic change-log sequence — of the last version it has seen. To sync, it asks for the changes since its cursor and gets a delta of changed file metadata. If a device has been offline longer than the change-log retention window, the server signals a reset and the device falls back to a metadata snapshot plus delta rather than replaying a truncated log.",
         "For each changed file, the device compares the new chunk-hash list against what it already has locally and downloads only the missing chunks — delta sync in both directions.",
-        "Downloads come from the block service or a CDN; reconstruct the file from its ordered chunks. Resumable because chunks are independent units."
+        "Downloads come from the block service or a CDN; reconstruct the file from its ordered chunks. Resumable because chunks are independent units.",
+        "Persist the cursor properly so this is robust: the change log is an append-only `namespace_changes` table keyed by (namespace_id, seq), retained for a bounded window (e.g. ~30 days) and compacted so that many edits of the same path collapse to the latest before old entries are pruned. Each device stores its `cursor_seq` per namespace; the server advances it as deltas are acknowledged. A device whose cursor predates the retention window can't replay a truncated log, so the server returns reset=true and the device resyncs from a metadata snapshot plus the tail delta — bounding recovery cost rather than letting the log grow forever."
       ],
       "view": {
         "nodes": [
@@ -1117,6 +1185,13 @@
         ]
       },
       "decisionPrompt": "A 500 MB file changed by 4 MB. How much does each other device download?",
+      "failureDrills": [
+        {
+          "scenario": "A device comes back online after weeks offline; its cursor predates the change-log retention window.",
+          "expectedBehavior": "The server can't replay a truncated log, so it returns reset=true and the device resyncs from a metadata snapshot plus the tail delta — correct state, bounded cost.",
+          "mitigation": "Detect cursor < retained min seq; serve a snapshot + delta instead of replaying; retain ~30 days and compact older entries."
+        }
+      ],
       "patterns": [
         "Delta sync"
       ],
@@ -1212,6 +1287,8 @@
       "description": [
         "Sharing is not just a path in one user's tree. Model a shared folder as its own namespace with a membership table (owner / editor / viewer), mounted into each member's namespace at their chosen path. Inviting a user adds a `namespace_members` row; accepting activates it; revoking flips it to revoked.",
         "Authorization moves into the metadata service: before committing any path operation — write, rename, delete, version restore — `MetaSvc` checks the caller's role in that namespace's membership. A viewer's commit is rejected; an editor's is allowed. This makes ACL state part of the commit contract, not an afterthought.",
+        "Scope this deliberately: the sharing unit here is the shared folder modeled as a namespace with member roles, not arbitrary per-file ACL inheritance with overrides. That covers the 'share a folder with read/write' requirement cleanly and is teachable; per-file public links are a separate, narrower extension via the `shared_links` token table (view/edit to one path without a user account). True file-and-folder ACL trees with inherited+overridden permissions are a much larger product surface and are explicitly out of scope for this design.",
+        "Authorize at commit time against current membership, not against whatever role the client cached. A member downgraded to viewer or revoked mid-edit is rejected when the commit lands, because `MetaSvc` re-reads membership inside the commit — a stale client holding an old role or cached manifest cannot bypass authorization. The same rule guards chunk downloads: revoking a member must invalidate their signed chunk URLs, so old notifications or cached manifests can't be replayed to keep reading after access is pulled.",
         "Sharing reuses the rest of the machinery: a shared namespace has its own change cursor, so every member's devices sync it via the same delta-pull, and a commit fans notifications out to all members, not just the author's devices. Public links are a separate token table granting view/edit to a path without a user account.",
         "Sharing also touches dedup privacy: global cross-user dedup is storage-efficient but, done naively, lets one user probe whether a chunk hash already exists and infer that someone else holds that content. Scope or salt dedup (or fall back to per-namespace dedup for sensitive content) so existence isn't a side channel."
       ],
@@ -1241,6 +1318,13 @@
         ]
       },
       "decisionPrompt": "Two users in a shared folder edit the same file, and one is later downgraded to viewer mid-edit. How does the design keep authorization correct and avoid losing writes?",
+      "failureDrills": [
+        {
+          "scenario": "A member is revoked (or downgraded to viewer) while they have an upload in flight and a commit pending.",
+          "expectedBehavior": "Uploaded chunks may already be stored (harmless, GC-reclaimable), but the commit is rejected with 403 because MetaSvc authorizes against current membership at commit time — no version is written and no notification fans out.",
+          "mitigation": "Re-read membership inside the commit transaction; invalidate the member's signed chunk URLs on revoke so cached manifests can't keep reading."
+        }
+      ],
       "concepts": [
         {
           "term": "Shared namespace",
@@ -1348,8 +1432,9 @@
       "id": "notify",
       "title": "7. Change Notification and Conflict Handling",
       "description": [
-        "On commit, the metadata service publishes a 'namespace changed' event; a notification service (long-poll or push) tells the user's other devices to pull the delta — near-real-time without polling.",
-        "Concurrent edits are detected with optimistic versioning: a commit carries the baseVersion it edited; if the server has advanced past it, the commit conflicts.",
+        "Separate the two jobs this step does. The first is notification, which is best-effort delivery: on commit, the metadata service writes the durable change to `namespace_changes` and then publishes a lightweight 'namespace N changed' hint; a notification worker fans it out and a push/long-poll connection gateway wakes the user's (and shared-folder members') online devices to pull the delta. The hint carries no file data and is never the source of truth — a device that misses a push still converges on its next cursor pull, so the change log, not the push, is authoritative. The `NotifyQ -> Client` arrow in the diagram is shorthand for that durable-queue-plus-connection-gateway path.",
+        "Make fanout survive bursts: a single commit to a large shared folder (hundreds or thousands of members) must not emit a per-file push to every member. Coalesce hints by namespace (one 'namespace changed' wake per device per short window regardless of how many files changed) and let clients pull the batched delta. This turns a high-fanout commit into one cheap wake-up per device and absorbs reconnect storms after an outage or client rollout, because the cursor pull is idempotent and rate-limitable.",
+        "Conflict handling is the other job, and it is a metadata commit rule, not a notification concern. Concurrent edits are detected with optimistic versioning: a commit carries the baseVersion it edited; if the server has advanced past it, the commit conflicts.",
         "Resolve conflicts safely by keeping both: create a 'conflicted copy' rather than silently overwriting, and let the user reconcile. Never lose a write."
       ],
       "view": {
@@ -1488,6 +1573,18 @@
         }
       ],
       "decisionPrompt": "Two devices edit the same file offline, then both reconnect. What should happen?",
+      "failureDrills": [
+        {
+          "scenario": "One commit to a shared folder with thousands of members produces a notification fanout backlog.",
+          "expectedBehavior": "Devices still converge: hints are coalesced to one 'namespace changed' wake per device per window, and each device pulls the batched delta — a slow or backlogged push only delays the wake, never correctness.",
+          "mitigation": "Coalesce by namespace, cap per-device wake rate, and rely on the durable change log so a dropped push is recovered by the next cursor pull."
+        },
+        {
+          "scenario": "A client times out waiting for a commit response and retries the same commit.",
+          "expectedBehavior": "The retry is idempotent on commitId: it returns the version already written rather than creating a duplicate version or a spurious conflicted copy.",
+          "mitigation": "Dedupe commits by client-generated commitId; only fall into the conflict path on a genuinely stale baseVersion."
+        }
+      ],
       "concepts": [
         {
           "term": "Optimistic version check",
@@ -1585,7 +1682,8 @@
         "Dedup means a chunk may be referenced by many files/versions. Deleting a file or pruning old versions doesn't free a chunk until nothing references it — track a refcount per chunk.",
         "A background garbage collector finds chunks whose refcount hit zero and deletes them from the block store. Do this lazily and safely (grace period / mark-and-sweep) to avoid deleting a chunk a concurrent upload just referenced.",
         "Durability comes from the object store's replication/erasure coding across zones; metadata is replicated and backed up. Orphan chunks from interrupted uploads are reclaimed the same way.",
-        "The invariant that ties it together: bytes are uploaded and verified (chunk marked available) before any metadata version references them, and refcounts are derived from committed manifests — never trusted as the sole source of truth. Because counters drift (a crash between the version commit and the refcount update leaves them inconsistent), a periodic mark-and-sweep recomputes reachability from live manifests and repairs the index. A chunk is only deleted when it is both refcount-zero and unmarked by the last sweep, past the grace period."
+        "The invariant that ties it together: bytes are uploaded and verified (chunk marked available) before any metadata version references them, and refcounts are derived from committed manifests — never trusted as the sole source of truth. Because counters drift (a crash between the version commit and the refcount update leaves them inconsistent), a periodic mark-and-sweep recomputes reachability from live manifests and repairs the index. A chunk is only deleted when it is both refcount-zero and unmarked by the last sweep, past the grace period.",
+        "Make the lifecycle a mechanical state machine so no transition is ambiguous: pending_chunk (bytes uploaded, not yet hash-verified) -> available_chunk (hash matches the key, safe to reference) -> committed_manifest (a file version references it; commit is idempotent on commitId) -> reachable_chunk (refcount > 0 or reachable from a live manifest) -> gc_candidate (refcount hit zero, grace period running) -> deleted (swept after the grace period and confirmed unreachable by the last mark phase). Every transition is crash-safe in one direction: a failure between two states leaves a reclaimable orphan or a stale-low counter — never a dangling pointer to missing bytes. Notifications are emitted only after committed_manifest is durable, never on merely receiving chunk bytes, so a device is never told to pull a version whose chunks aren't yet available."
       ],
       "view": {
         "nodes": [
@@ -1837,7 +1935,7 @@
   ],
   "finalDesign": {
     "title": "Final Design — Chunked, Deduplicated File Sync",
-    "description": "Clients chunk files into content-addressed blocks, check the chunk index, and upload only verified missing chunks to the block store; then they commit a new file version (ordered chunk hashes) to the transactional metadata service. The metadata/block split keeps structure consistent and bytes cheap. Every metadata mutation is scoped to a namespace and authorized through membership/ACL state, so shared folders are first-class and a commit fans out to all members. The notification service pushes change events so other devices pull deltas and download only changed chunks (via CDN). Concurrent edits become conflicted copies; reference-counted GC reclaims unused chunks and a mark-and-sweep repairs refcount drift; the object store provides cross-zone durability. Operations track sync lag, refcount drift, chunk-verification failures, and restore readiness against explicit SLOs.",
+    "description": "Clients chunk files into content-addressed blocks, check the chunk index, and upload only verified missing chunks to the block store; then they commit a new file version (ordered chunk hashes) to the transactional metadata service. The metadata/block split keeps structure consistent and bytes cheap. Every metadata mutation is scoped to a namespace and authorized through membership/ACL state at commit time, and quota is enforced there too, so authorization and quota are central, not optional — shared folders are first-class and a commit fans out to all members. The durable change log is the source of truth for sync; the notification queue (a durable queue plus a push/long-poll connection gateway) only wakes devices as a hint, and they still pull deltas by cursor and download only changed chunks (via CDN, with signed URLs for private chunks). Concurrent edits become conflicted copies; reference-counted GC reclaims unused chunks and a mark-and-sweep repairs refcount drift; the object store provides cross-zone durability. Operations track sync lag, refcount drift, chunk-verification failures, and restore readiness against explicit SLOs.",
     "view": {
       "nodes": [
         "Client",

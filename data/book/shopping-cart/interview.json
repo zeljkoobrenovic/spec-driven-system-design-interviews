@@ -442,6 +442,12 @@
         "label": "cart"
       },
       {
+        "id": "cart-router",
+        "from": "Cart",
+        "to": "Router",
+        "label": "cart ops"
+      },
+      {
         "id": "cart-sharda",
         "from": "Cart",
         "to": "ShardA"
@@ -507,7 +513,7 @@
       "Track order lifecycle (placed, paid, fulfilled, cancelled) and allow cancellation."
     ],
     "nonFunctional": [
-      "Never oversell limited inventory; never charge without an order.",
+      "Never oversell limited inventory; never leave a charge without a recoverable order or compensation record.",
       "Idempotent checkout so retries don't double-order or double-charge.",
       "Cart operations are fast and highly available (browsing must feel instant).",
       "Order processing is durable and recoverable across service failures.",
@@ -519,27 +525,32 @@
     {
       "label": "Cart operations",
       "value": "~50k/s",
-      "note": "Add/update/view is frequent and latency-sensitive; availability over strict consistency."
+      "note": "Add/update/view; latency-sensitive, availability over strict consistency. ~2KB/cart x 300M active carts ≈ 600GB working set, sized for RAM-class KV across shards."
     },
     {
       "label": "Checkouts",
       "value": "~2k/s peak",
-      "note": "Far rarer than cart ops but correctness-critical (money + inventory)."
+      "note": "~25x rarer than cart ops but correctness-critical. Each writes 1 order + N reservations + 1 outbox event ≈ 5-10 CP writes, so ~10-20k order-side writes/s at peak."
     },
     {
       "label": "Active carts",
       "value": "100s of millions",
-      "note": "Most never convert; carts must be cheap to store and expire."
+      "note": "Most never convert; a ~7-day TTL bounds storage and expires abandoned carts cheaply."
     },
     {
       "label": "Inventory contention",
-      "value": "high on hot items",
-      "note": "Limited-stock or flash-sale items concentrate checkout contention."
+      "value": "hot SKU 100s-1000s/s",
+      "note": "Flash-sale items concentrate writes on one row; CAS holds keep it lock-free, but a hot SKU may need admission control / sharded counters."
+    },
+    {
+      "label": "Idempotency + outbox",
+      "value": "retain keys 24-72h",
+      "note": "~2k keys/s x 72h ≈ 0.5B rows to retain then prune; outbox throughput tracks checkout + state-transition rate (~5-10k events/s)."
     },
     {
       "label": "Order durability",
-      "value": "no loss after placement",
-      "note": "An accepted order survives service/region failure."
+      "value": "no loss; RPO≈0",
+      "note": "Synchronously-replicated CP order DB; single-writer region for orders/checkout with active-active AP carts, outbox replayed after failover."
     },
     {
       "label": "Read:write",
@@ -551,7 +562,7 @@
     {
       "method": "PUT",
       "path": "/v1/carts/{id}/items",
-      "description": "Add or update a cart line item. Highly available; eventual consistency is fine.",
+      "description": "Add or update a cart line item. Cart is scoped to the authenticated user/session (ownership enforced server-side — no IDOR). Highly available; eventual consistency is fine. Concurrent multi-device edits reconcile by last-write-wins per line (or a cart version), so confirmed mutations are not silently lost.",
       "request": "{ \"sku\": \"sku_9\", \"qty\": 2 }",
       "response": "200 OK { \"cart\": { \"items\": [ { \"sku\": \"sku_9\", \"qty\": 2 } ], \"subtotal\": 4000 } }"
     },
@@ -565,9 +576,9 @@
     {
       "method": "POST",
       "path": "/v1/checkout",
-      "description": "Convert a cart to an order: reserve inventory, charge payment, create the order. Idempotency-Key required.",
+      "description": "Convert a cart to an order: reserve inventory, create a PENDING_PAYMENT order, authorize/capture payment, mark PAID. Idempotency-Key required; a repeat with the same key returns the original result, a repeat with a different payload is rejected 422, and a still-running attempt returns 409 in_progress.",
       "request": "Idempotency-Key: co_7f\n{ \"cart_id\": \"c_3\", \"payment_source\": \"tok_visa\", \"address_id\": \"a_1\" }",
-      "response": "201 Created { \"order_id\": \"o_5\", \"status\": \"placed\" } — or 409 if an item is out of stock",
+      "response": "201 Created { \"order_id\": \"o_5\", \"status\": \"paid\" } — or 409 if a checkout for this key is still in_progress, or 409 if an item is out of stock",
       "sequence": {
         "participants": [
           {
@@ -612,13 +623,19 @@
                 "from": "I",
                 "to": "K",
                 "arrow": "-->>",
-                "label": "reserved"
+                "label": "reserved (TTL hold)"
+              },
+              {
+                "from": "K",
+                "to": "O",
+                "arrow": "->>",
+                "label": "create order PENDING_PAYMENT (frozen price, reservation ids)"
               },
               {
                 "from": "K",
                 "to": "P",
                 "arrow": "->>",
-                "label": "charge (idempotent)"
+                "label": "authorize+capture (key = order id)"
               },
               {
                 "from": "P",
@@ -630,13 +647,13 @@
                 "from": "K",
                 "to": "O",
                 "arrow": "->>",
-                "label": "create order (placed->paid)"
+                "label": "mark PAID + confirm holds (emit order.paid via outbox)"
               },
               {
                 "from": "K",
                 "to": "C",
                 "arrow": "-->>",
-                "label": "201 order"
+                "label": "201 order (paid)"
               }
             ],
             "else": {
@@ -663,9 +680,9 @@
     {
       "method": "POST",
       "path": "/v1/orders/{id}/cancel",
-      "description": "Cancel an order; compensates (refund, release inventory) per its current state.",
+      "description": "Cancel an order; compensates per its current state — pending_payment releases holds and voids any auth, paid (not fulfilled) voids/refunds and releases, fulfilled routes to a return/refund flow. Rejected (409) if the order is in a non-cancellable state.",
       "request": "{ \"reason\": \"customer_request\" }",
-      "response": "200 OK { \"status\": \"cancelled\" }"
+      "response": "200 OK { \"status\": \"cancelled\" } — or 409 if the order can no longer be cancelled"
     }
   ],
   "dataModel": [
@@ -683,7 +700,11 @@
         },
         {
           "name": "items",
-          "type": "jsonb (sku, qty)"
+          "type": "jsonb (sku, qty, updated_at per line for LWW merge)"
+        },
+        {
+          "name": "version",
+          "type": "int (multi-device merge)"
         },
         {
           "name": "updated_at",
@@ -697,7 +718,7 @@
     },
     {
       "name": "orders",
-      "note": "The durable record of a placed order and its lifecycle state.",
+      "note": "The durable record of an order and its lifecycle state. Created PENDING_PAYMENT before capture so a charge always has a recoverable record. Line items snapshot the frozen price.",
       "fields": [
         {
           "name": "order_id",
@@ -709,19 +730,95 @@
         },
         {
           "name": "items",
-          "type": "jsonb (sku, qty, price)"
+          "type": "jsonb (sku, qty, unit_price, currency, discount, tax, promo_ids, coupon_code)"
         },
         {
           "name": "total",
-          "type": "bigint"
+          "type": "bigint (frozen at checkout)"
+        },
+        {
+          "name": "currency",
+          "type": "char(3)"
+        },
+        {
+          "name": "price_quote_id",
+          "type": "uuid (quote frozen into the order)"
         },
         {
           "name": "status",
-          "type": "enum(placed, paid, fulfilled, cancelled, failed)"
+          "type": "enum(pending_payment, paid, fulfillment_requested, fulfilled, cancel_requested, cancelled, failed)"
         },
         {
           "name": "payment_ref",
+          "type": "varchar (gateway charge/intent id)"
+        },
+        {
+          "name": "payment_status",
+          "type": "enum(none, authorized, captured, voided, refunded)"
+        }
+      ]
+    },
+    {
+      "name": "order_events",
+      "note": "Append-only history of order state transitions for audit and recovery; one row per legal transition.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "order_id",
+          "type": "uuid (aggregate id)"
+        },
+        {
+          "name": "type",
+          "type": "varchar (order.created, order.paid, order.fulfilled, order.cancelled, ...)"
+        },
+        {
+          "name": "from_status",
           "type": "varchar"
+        },
+        {
+          "name": "to_status",
+          "type": "varchar"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "outbox_events",
+      "note": "Events written in the same transaction as the order state change; a relay publishes them to the queue exactly once relative to the commit. Consumers dedupe on event_id.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid PK (consumer dedupe key)"
+        },
+        {
+          "name": "aggregate_id",
+          "type": "uuid (order_id)"
+        },
+        {
+          "name": "type",
+          "type": "varchar (order.paid, order.cancelled, ...)"
+        },
+        {
+          "name": "payload",
+          "type": "jsonb"
+        },
+        {
+          "name": "status",
+          "type": "enum(pending, published)"
+        },
+        {
+          "name": "attempts",
+          "type": "int"
+        },
+        {
+          "name": "published_at",
+          "type": "timestamptz null"
         }
       ]
     },
@@ -749,15 +846,19 @@
     },
     {
       "name": "reservations",
-      "note": "Short-lived holds on inventory created at checkout; expire if checkout doesn't complete.",
+      "note": "Short-lived holds on inventory created at checkout; confirmed on payment, released on failure/expiry. Unique on (checkout_id, sku) so a retried checkout reuses its hold instead of double-reserving.",
       "fields": [
         {
           "name": "reservation_id",
           "type": "uuid PK"
         },
         {
+          "name": "checkout_id",
+          "type": "uuid (unique with sku)"
+        },
+        {
           "name": "order_id",
-          "type": "uuid"
+          "type": "uuid null (set once order created)"
         },
         {
           "name": "sku",
@@ -768,6 +869,14 @@
           "type": "int"
         },
         {
+          "name": "status",
+          "type": "enum(held, confirmed, released, expired)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz"
+        },
+        {
           "name": "expires_at",
           "type": "timestamptz"
         }
@@ -775,11 +884,15 @@
     },
     {
       "name": "idempotency_keys",
-      "note": "Dedupes retried checkouts; stores the first result.",
+      "note": "Dedupes retried checkouts; stores the first result. Retained for a bounded window (e.g. 24–72h). A repeat with the same key + matching request_hash replays the stored response; a mismatching hash is rejected (422).",
       "fields": [
         {
           "name": "key",
           "type": "varchar PK"
+        },
+        {
+          "name": "request_hash",
+          "type": "varchar (detects payload mismatch on reuse)"
         },
         {
           "name": "order_id",
@@ -792,6 +905,10 @@
         {
           "name": "response",
           "type": "jsonb"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamptz (retention window)"
         }
       ]
     }
@@ -966,7 +1083,8 @@
         "Session vs persistent cart"
       ],
       "probeLinks": [
-        "debezium-outbox"
+        "redis-cache",
+        "dynamodb-transactions"
       ],
       "decisionPrompt": "A guest fills a cart, then logs in. What happens to their items, and where does the cart live?",
       "concepts": [
@@ -980,6 +1098,12 @@
           "term": "Guest-to-user merge",
           "definition": "Combining a session cart with the account cart on login.",
           "whyItMatters": "Preserves intent across the auth boundary.",
+          "group": "Persistent Cart Store"
+        },
+        {
+          "term": "Multi-device merge / versioning",
+          "definition": "Reconciling concurrent edits from multiple devices via last-write-wins per line or a cart version.",
+          "whyItMatters": "Confirmed cart mutations shouldn't be silently lost when two devices edit at once.",
           "group": "Persistent Cart Store"
         }
       ],
@@ -1048,8 +1172,8 @@
       "failureDrills": [
         {
           "scenario": "A cart-store replica is briefly unavailable.",
-          "expectedBehavior": "Adding to cart still mostly works.",
-          "mitigation": "AP store with failover; occasional lost write is acceptable and recoverable at checkout."
+          "expectedBehavior": "Adding to cart still works; the shopper isn't blocked.",
+          "mitigation": "AP store with failover: writes are retried and reconciled, and stale replicas are acceptable for reads (checkout revalidates price/stock) — but a confirmed cart mutation should not simply vanish, so writes use last-write-wins-per-line or a cart version."
         }
       ],
       "interviewerSignals": {
@@ -1097,7 +1221,6 @@
         "Pricing at the right moment"
       ],
       "probeLinks": [
-        "debezium-outbox",
         "postgres-isolation"
       ],
       "decisionPrompt": "A coupon expires between adding to cart and checkout. What price does the shopper pay?",
@@ -1292,7 +1415,7 @@
     {
       "id": "inventory",
       "title": "4. Inventory Reservation & Oversell Prevention",
-      "description": "Make 'never oversell' a hard invariant. At checkout, reserve each item with an atomic decrement-if-available (optimistic CAS) creating a short-lived reservation; the reservation expires if checkout doesn't complete. Inventory is the authoritative source of truth.",
+      "description": "Make 'never oversell' a hard invariant. At checkout, a single conditional write creates a short-lived hold only if enough stock remains (atomic CAS), decrementing available and incrementing reserved together; the hold has a TTL and auto-releases if checkout doesn't complete. Payment success confirms the hold as sold; failure or expiry releases it. The invariant is available + reserved + sold = stock_on_hand, and inventory is the authoritative source of truth.",
       "patterns": [
         "Inventory reservation + TTL",
         "Optimistic concurrency (CAS)"
@@ -1396,8 +1519,8 @@
       },
       "recap": {
         "before": "Concurrent checkouts could oversell.",
-        "after": "Atomic reservations with TTL make oversell impossible while checkout is in flight.",
-        "newRisk": "Reservations must be released on failure/expiry — handled by the saga."
+        "after": "One CAS-protected conditional write creates a TTL hold (available -> reserved), making oversell impossible while checkout is in flight; the invariant available + reserved + sold = stock_on_hand is maintained.",
+        "newRisk": "Holds must be confirmed (reserved -> sold) on payment and released on failure/expiry — handled by the saga plus a sweeper/reconciler for stale holds."
       },
       "whyNow": [
         "Inventory correctness must be solid before orchestrating the full checkout."
@@ -1421,47 +1544,17 @@
       },
       "options": [
         {
-          "name": "CAS decrement of available (default)",
-          "description": "Checkout reserves stock with an atomic compare-and-set decrement of the available count, so exactly one of two racers wins the last unit without locking.",
+          "name": "CAS-protected hold with TTL (default)",
+          "description": "Checkout issues one conditional write that creates a short-lived hold only if available >= qty, atomically decrementing available and incrementing reserved together. The hold has a TTL and auto-releases on expiry; payment success confirms it (reserved -> sold), failure or expiry releases it (reserved -> available). Combines optimistic CAS for oversell safety with a TTL hold for abandoned-checkout recovery.",
           "pros": [
-            "A compare-and-set on the available count atomically lets exactly one of two racers win the last unit.",
-            "O(1) and lock-free, so it survives the hot-item burst without row-lock contention.",
-            "Simple to reason about: the count is the source of truth."
+            "The conditional write is atomic, so exactly one of two racers wins the last unit without locking.",
+            "Distinguishes available / reserved / sold and auto-releases on TTL, so abandoned checkouts free stock instead of stranding it.",
+            "Lock-free and O(1), so it survives the hot-item burst without row-lock contention; the invariant available + reserved + sold = stock_on_hand stays explicit."
           ],
           "cons": [
-            "Decrement-on-checkout means an abandoned checkout strands the unit until released.",
-            "A single hot SKU is still a write hotspot to scale.",
-            "Needs reconciliation if the fast counter and durable store can diverge."
-          ],
-          "view": {
-            "nodes": [
-              "Checkout",
-              "Inventory",
-              "InvStore"
-            ],
-            "caption": "The Checkout Orchestrator reserves via the Inventory Service, which atomically CAS-decrements the available count in the Inventory DB so only one racer wins the last unit.",
-            "links": [
-              "checkout-inventory-reserve",
-              "inventory-invstore-cas-decrement-available"
-            ],
-            "highlight": [
-              "Inventory",
-              "InvStore"
-            ]
-          }
-        },
-        {
-          "name": "Reservation hold with TTL",
-          "description": "Checkout creates a short-lived reservation row that holds the unit for the checkout window and auto-releases on TTL; available reads subtract active holds.",
-          "pros": [
-            "Reserves the unit for the checkout window and auto-releases on TTL, so abandoned checkouts free stock.",
-            "Distinguishes 'reserved' from 'sold', giving accurate availability during long checkouts.",
-            "Two shoppers can't both hold the last unit — the second sees zero available."
-          ],
-          "cons": [
-            "Adds a holds table plus an expiry sweeper to operate.",
-            "Available reads must subtract active holds, complicating the query.",
-            "TTL tuning trades shopper grace time against over-protecting stock."
+            "Adds a holds table plus an expiry sweeper/reconciler to operate.",
+            "Available reads must account for active holds.",
+            "A single hot SKU is still a write hotspot to scale; TTL tuning trades shopper grace time against over-protecting stock."
           ],
           "view": {
             "nodes": [
@@ -1472,12 +1565,44 @@
                 "label": "Inventory + Holds (TTL)"
               }
             ],
-            "caption": "The Checkout Orchestrator reserves via the Inventory Service, which writes a short-lived TTL hold into the Inventory + Holds store that auto-releases.",
+            "caption": "The Checkout Orchestrator reserves via the Inventory Service, which runs one CAS conditional write — decrement available, create a TTL hold — in the Inventory + Holds store, so only one racer wins the last unit and abandoned holds auto-release.",
             "links": [
               "checkout-inventory-reserve",
+              "inventory-invstore-cas-decrement-available",
               "inventory-invstore-hold-w-ttl"
             ],
             "highlight": [
+              "Inventory",
+              "InvStore"
+            ]
+          }
+        },
+        {
+          "name": "Plain CAS decrement of available (no hold)",
+          "description": "Checkout reserves stock with an atomic compare-and-set decrement of the available count only, with no separate hold record — the unit is taken the moment checkout starts.",
+          "pros": [
+            "Simplest oversell guard: a compare-and-set on the available count, O(1) and lock-free.",
+            "The single count is the source of truth — easy to reason about.",
+            "No holds table or sweeper to operate."
+          ],
+          "cons": [
+            "Decrement-on-checkout strands the unit until something releases it — an abandoned checkout shrinks available with no TTL to recover it.",
+            "Can't distinguish 'reserved' from 'sold', so availability is wrong during long checkouts.",
+            "Needs reconciliation if the fast counter and durable store diverge."
+          ],
+          "view": {
+            "nodes": [
+              "Checkout",
+              "Inventory",
+              "InvStore"
+            ],
+            "caption": "The Checkout Orchestrator reserves via the Inventory Service, which atomically CAS-decrements the available count in the Inventory DB with no separate hold record.",
+            "links": [
+              "checkout-inventory-reserve",
+              "inventory-invstore-cas-decrement-available"
+            ],
+            "highlight": [
+              "Inventory",
               "InvStore"
             ]
           }
@@ -1523,16 +1648,16 @@
     {
       "id": "checkout-saga",
       "title": "5. Checkout as a Saga (idempotent)",
-      "description": "Orchestrate checkout as a saga: reserve inventory -> charge payment -> create order, with compensations on failure (release reservation, refund). An idempotency key makes the whole flow safe to retry, so a shopper is never double-charged or double-ordered.",
+      "description": "Orchestrate checkout as a saga: reserve inventory -> create a durable PENDING_PAYMENT order (frozen price + reservation ids) -> authorize/capture payment using the order id as the gateway idempotency key -> mark the order PAID and confirm the holds, with compensations on failure (void/refund, release reservation, mark the order FAILED). Creating the order before money moves means there is always a durable local record to reconcile against, and an idempotency key makes the whole flow safe to retry so a shopper is never double-charged or double-ordered.",
       "patterns": [
         "Saga / orchestration",
         "Idempotency key"
       ],
       "probeLinks": [
         "stripe-idempotency",
-        "dynamodb-transactions",
         "stripe-payment-intents",
-        "debezium-outbox"
+        "temporal-saga",
+        "dynamodb-transactions"
       ],
       "decisionPrompt": "Payment succeeds but order creation fails. What happens to the money and the reserved stock?",
       "concepts": [
@@ -1544,15 +1669,32 @@
         },
         {
           "term": "Compensation",
-          "definition": "Undo actions (refund, release reservation) for completed steps when the saga aborts.",
+          "definition": "Undo actions (void/refund, release reservation, mark order FAILED) for completed steps when the saga aborts.",
           "whyItMatters": "Restores consistency after partial failure.",
           "group": "Checkout as a Saga (idempotent)"
+        },
+        {
+          "term": "Authorize vs capture",
+          "definition": "Authorization reserves funds on the card; capture actually moves them. Void cancels an uncaptured auth; refund reverses a capture.",
+          "whyItMatters": "Separating them lets the saga hold money tentatively and release it cheaply (void) when a later step fails, instead of always refunding.",
+          "group": "Checkout as a Saga (idempotent)"
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Payment lifecycle and reconciliation",
+          "points": [
+            "Order before money: create a durable PENDING_PAYMENT order with the frozen price and reservation ids, then authorize/capture — so a capture always has a local record to reconcile against.",
+            "Use the order id as the gateway idempotency key so a retried charge can never double-bill; distinguish authorize, capture, void, and refund explicitly.",
+            "Payments can confirm asynchronously: an order may sit PENDING until a webhook arrives. A reconciliation job sweeps stale PENDING orders, reading gateway state to either complete (mark PAID) or compensate (release + FAILED).",
+            "Idempotency keys are retained for a bounded window (e.g. 24–72h); a repeat with the same key replays the stored result, and a repeat with a different payload is rejected rather than silently re-run."
+          ]
         }
       ],
       "flows": [
         {
-          "name": "Payment ok but order-create fails -> compensate",
-          "note": "Refund and release so no money or stock is stranded.",
+          "name": "Order is PENDING but payment fails -> compensate",
+          "note": "The durable PENDING_PAYMENT order exists before capture, so on payment failure the saga voids/refunds, releases the hold, and marks the order FAILED — no money or stock is stranded, and there is always a local record to reconcile.",
           "sequence": {
             "participants": [
               {
@@ -1564,12 +1706,12 @@
                 "label": "Inventory"
               },
               {
-                "id": "P",
-                "label": "Payment"
-              },
-              {
                 "id": "O",
                 "label": "Order"
+              },
+              {
+                "id": "P",
+                "label": "Payment"
               }
             ],
             "messages": [
@@ -1577,43 +1719,43 @@
                 "from": "K",
                 "to": "I",
                 "arrow": "->>",
-                "label": "reserve"
-              },
-              {
-                "from": "K",
-                "to": "P",
-                "arrow": "->>",
-                "label": "charge"
-              },
-              {
-                "from": "P",
-                "to": "K",
-                "arrow": "-->>",
-                "label": "captured"
+                "label": "reserve (TTL hold)"
               },
               {
                 "from": "K",
                 "to": "O",
                 "arrow": "->>",
-                "label": "create order"
-              },
-              {
-                "from": "O",
-                "to": "K",
-                "arrow": "-->>",
-                "label": "failure"
+                "label": "create order PENDING_PAYMENT"
               },
               {
                 "from": "K",
                 "to": "P",
                 "arrow": "->>",
-                "label": "refund (compensate)"
+                "label": "authorize+capture (key = order id)"
+              },
+              {
+                "from": "P",
+                "to": "K",
+                "arrow": "-->>",
+                "label": "declined / timeout"
+              },
+              {
+                "from": "K",
+                "to": "P",
+                "arrow": "->>",
+                "label": "void/refund if captured (compensate)"
               },
               {
                 "from": "K",
                 "to": "I",
                 "arrow": "->>",
                 "label": "release reservation"
+              },
+              {
+                "from": "K",
+                "to": "O",
+                "arrow": "->>",
+                "label": "mark order FAILED"
               }
             ]
           }
@@ -1621,14 +1763,19 @@
       ],
       "traps": [
         {
+          "trap": "Capturing payment before any durable order exists",
+          "why": "If the order write then fails, you have moved money with no local record — reconciliation and support are blind, and 'refund compensates' is not the same as never entering the bad state.",
+          "instead": "Create a durable PENDING_PAYMENT order (frozen price + reservation ids) before capture, so a charge always has a recoverable order to reconcile against."
+        },
+        {
           "trap": "No compensation when a later step fails",
-          "why": "Payment without an order strands the shopper's money and the reserved stock.",
-          "instead": "On failure, run compensations: refund the charge and release the reservation."
+          "why": "A failed step strands the shopper's money and the reserved stock.",
+          "instead": "On failure, run compensations: void/refund the charge, release the reservation, and mark the order FAILED."
         },
         {
           "trap": "Non-idempotent checkout",
           "why": "A retried request re-reserves, re-charges, or re-orders.",
-          "instead": "Idempotency key: a repeat returns the original result without re-running steps."
+          "instead": "Idempotency key: a repeat returns the original result without re-running steps; reuse the order id as the gateway key so the charge itself is idempotent."
         }
       ],
       "failureDrills": [
@@ -1636,6 +1783,11 @@
           "scenario": "The shopper double-clicks 'place order'.",
           "expectedBehavior": "Exactly one order and one charge.",
           "mitigation": "Idempotency key dedupes the second request to the same in-progress/completed result."
+        },
+        {
+          "scenario": "The gateway captures payment but the response is lost before the order is marked PAID.",
+          "expectedBehavior": "The order eventually reaches PAID exactly once; no second charge.",
+          "mitigation": "The order id keys the gateway charge, so a retry is deduped; an async webhook and a reconciliation sweep of stale PENDING orders complete the transition."
         }
       ],
       "interviewerSignals": {
@@ -1650,8 +1802,8 @@
       },
       "recap": {
         "before": "Multi-service checkout couldn't be atomic or safely retried.",
-        "after": "A compensating, idempotent saga gives all-or-nothing checkout.",
-        "newRisk": "Saga + compensation logic is complex; every step must be idempotent."
+        "after": "A compensating, idempotent saga gives all-or-nothing checkout, with a durable PENDING_PAYMENT order created before capture so money is never stranded without a recoverable record.",
+        "newRisk": "Saga + compensation logic is complex; every step must be idempotent, and a webhook/reconciler must close the gap between gateway state and order state."
       },
       "whyNow": [
         "The saga ties inventory, payment, and orders into a correct checkout."
@@ -1681,15 +1833,15 @@
       "options": [
         {
           "name": "Idempotent orchestrated saga (default)",
-          "description": "A central orchestrator drives reserve-inventory then charge-payment then create-order, deduping retries with a client idempotency key and running compensations on failure.",
+          "description": "A central orchestrator drives reserve-inventory then create a durable PENDING_PAYMENT order then authorize/capture payment then mark PAID, deduping retries with a client idempotency key (using the order id as the gateway key) and running compensations (void/refund, release, mark FAILED) on failure. An asynchronous payment webhook reconciles any capture whose response was lost.",
           "pros": [
-            "A client-supplied idempotency key dedupes retries, so a dropped response never double-charges or double-reserves.",
-            "The checkout orchestrator drives reserve -> charge -> create-order and compensates on failure (release stock, refund).",
-            "Centralized state makes 'payment succeeded but order failed' recoverable and auditable."
+            "A client-supplied idempotency key dedupes retries, so a dropped response never double-charges or double-reserves; the order id keys the gateway charge so the payment side is idempotent too.",
+            "The order exists (PENDING_PAYMENT) before money moves, so there is always a durable local record — capture is never stranded without a recoverable order.",
+            "Centralized state makes every partial-failure branch recoverable and auditable; a reconciliation job and payment webhook close any gap between gateway state and order state."
           ],
           "cons": [
-            "Compensation is eventually consistent: a brief window where money is captured but no order exists.",
-            "Requires an idempotency store and careful per-step idempotency.",
+            "Compensation is eventually consistent: a brief window where a capture has happened but the order is still PENDING — closed by the webhook/reconciler.",
+            "Requires an idempotency store (with a retention window) and careful per-step idempotency, plus payload-mismatch handling on key reuse.",
             "The orchestrator concentrates logic and must itself be reliable."
           ],
           "view": {
@@ -1815,7 +1967,7 @@
     {
       "id": "order-state",
       "title": "6. Order State Machine & Fulfillment",
-      "description": "Model the order as a state machine (placed -> paid -> fulfilled / cancelled) with guarded transitions. State changes emit events via a transactional outbox to fulfillment, notifications, and analytics — reliably and without dual writes.",
+      "description": "Model the order as a state machine — pending_payment -> paid -> fulfillment_requested -> fulfilled, with cancel_requested/cancelled and failed branches — and only allow legal transitions. Each transition is recorded in order_events and emits an outbox event in the same transaction; a relay publishes to a queue so idempotent consumers (keyed by event id) act exactly once. Cancellation compensates by current state: pending_payment releases holds, paid (not fulfilled) voids/refunds and releases, fulfilled becomes a return/refund flow rather than a simple cancel.",
       "patterns": [
         "Order state machine",
         "Transactional outbox"
@@ -1837,6 +1989,17 @@
           "definition": "Events written in the same transaction as the state change, relayed to a queue.",
           "whyItMatters": "Guarantees a 'paid' event is published iff the state committed — no lost or phantom ships.",
           "group": "Order State Machine & Fulfillment"
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Legal transitions and cancellation matrix",
+          "points": [
+            "States: pending_payment -> paid -> fulfillment_requested -> fulfilled; pending_payment/paid can branch to cancel_requested -> cancelled; pending_payment can go to failed. Anything else is rejected.",
+            "Each transition writes an order_events row and an outbox_events row in the same transaction; the transition owner is the service that holds that state (checkout for pending->paid, fulfillment for ->fulfilled).",
+            "Cancel by current state: pending_payment releases holds and voids any auth; paid-but-not-fulfilled voids/refunds and releases; fulfilled is out of scope for cancel — it routes to a return/refund flow.",
+            "Consumers dedupe on event_id so a redelivered order.paid ships once; guarded transitions stop a cancelled order from later being fulfilled or a fulfilled order from being silently cancelled."
+          ]
         }
       ],
       "options": [
@@ -2149,7 +2312,7 @@
   ],
   "finalDesign": {
     "title": "Final Design",
-    "description": "End-to-end: carts live in a sharded, available, expiring KV store (intent only); a pricing service computes promotions, re-validated and frozen at checkout; checkout runs as an idempotent saga that reserves inventory via atomic CAS holds with TTL, charges payment, and creates an order, compensating on any failure; the order is a guarded state machine emitting events via a transactional outbox to fulfillment; carts (AP) and orders/inventory (CP) scale as separate systems.",
+    "description": "End-to-end: carts live in a sharded, available, expiring KV store (intent only) behind the Cart Service; a pricing service computes promotions, re-validated and frozen at checkout; checkout runs as an idempotent saga that reserves inventory via CAS-protected TTL holds, creates a durable PENDING_PAYMENT order, charges payment (order id as the gateway key), then marks it PAID — compensating on any failure and reconciling via webhook; the order is a guarded state machine recording transitions and emitting events via a transactional outbox to fulfillment; carts (AP) and orders/inventory (CP) scale as separate systems.",
     "view": {
       "nodes": [
         "Client",
@@ -2171,13 +2334,13 @@
         "Queue",
         "Fulfillment"
       ],
-      "caption": "The shopper app hits the Commerce API, which shards carts via the Shard Router (Cart Shards A/B) and prices them via Pricing & Promotions; the Checkout Orchestrator dedupes against the Idempotency Store, reserves inventory, charges payment, and creates orders, whose state changes flow through the Outbox and Order Event Queue to the Fulfillment Service.",
+      "caption": "The shopper app hits the Commerce API, which routes cart ops to the Cart Service; the Cart Service shards carts via the Shard Router (Cart Shards A/B), and Pricing & Promotions prices them; the Checkout Orchestrator dedupes against the Idempotency Store, reserves inventory, creates the order, charges payment, and marks it paid, whose state changes flow through the Outbox and Order Event Queue to the Fulfillment Service.",
       "links": [
         "client-api",
-        "api-router-cart",
+        "api-cart",
+        "cart-router",
         "router-sharda",
         "router-shardb",
-        "cart-sharda",
         "api-pricing",
         "pricing-promo",
         "api-checkout-checkout",
@@ -2234,8 +2397,8 @@
     ],
     "nonFunctional": [
       {
-        "requirement": "Never oversell / never charge without order",
-        "how": "Atomic CAS reservations + compensating saga.",
+        "requirement": "Never oversell / no charge without a recoverable order",
+        "how": "CAS-protected TTL reservations; a durable PENDING_PAYMENT order created before capture; compensating saga with webhook/reconciler.",
         "steps": [
           "inventory",
           "checkout-saga"

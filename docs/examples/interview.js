@@ -3581,9 +3581,37 @@
     }
 
     // Pattern Catalog (catalog dataset). Each item: { name, category?, what,
-    // whenToUse?, tradeoffs?, usedBy? }. A standalone reference of the reusable
-    // patterns the book teaches; cases reference these by name. Groups cards by
-    // `category`/`group` when present.
+    // whenToUse?, tradeoffs?, aliases?, pairsWith?, commonlyConfusedWith?,
+    // usedBy? }. A standalone reference of the reusable patterns the book
+    // teaches; cases reference these by name. Groups cards by `category`/`group`
+    // when present.
+    //
+    // `aliases`/`pairsWith`/`commonlyConfusedWith` are arrays of strings (other
+    // pattern names or case-study tag synonyms) rendered as labelled chip rows.
+    // `usedBy` entries are either a bare string (display name) or an object
+    // `{ datasetId, label }` — when a `datasetId` is given the chip becomes a
+    // link to that case (hash `#<datasetId>`), so the catalog can point at the
+    // real walkthrough.
+
+    // Render a labelled row of plain (non-link) chips, e.g. "Pairs with: …".
+    // Returns null when the list is empty so callers can skip appending.
+    function makePatternChipRow(label, names, chipClass) {
+        if (!Array.isArray(names) || names.length === 0) return null;
+        const row = document.createElement("div");
+        row.className = "pattern-rel";
+        const lbl = document.createElement("span");
+        lbl.className = "pattern-rel-label muted";
+        lbl.textContent = `${label}:`;
+        row.appendChild(lbl);
+        for (const n of names) {
+            const chip = document.createElement("span");
+            chip.className = chipClass;
+            chip.textContent = String(n);
+            row.appendChild(chip);
+        }
+        return row;
+    }
+
     function renderIntroPatternCatalog(items) {
         const outer = document.createElement("div");
 
@@ -3640,13 +3668,30 @@
                     tr.textContent = `Trade-off: ${p.tradeoffs}`;
                     card.appendChild(tr);
                 }
+                const aliasRow = makePatternChipRow("Also called", p.aliases, "pattern-alias");
+                if (aliasRow) card.appendChild(aliasRow);
+                const pairsRow = makePatternChipRow("Pairs with", p.pairsWith, "pattern-rel-chip");
+                if (pairsRow) card.appendChild(pairsRow);
+                const confusedRow = makePatternChipRow("Confused with", p.commonlyConfusedWith, "pattern-rel-chip");
+                if (confusedRow) card.appendChild(confusedRow);
                 if (Array.isArray(p.usedBy) && p.usedBy.length > 0) {
                     const used = document.createElement("div");
                     used.className = "pattern-tags";
                     for (const u of p.usedBy) {
-                        const chip = document.createElement("span");
+                        // `u` is either a string (display name) or an object
+                        // `{ datasetId, label }`; a datasetId makes the chip a
+                        // link into that case study.
+                        const obj = (u && typeof u === "object") ? u : null;
+                        const label = obj ? (obj.label || obj.datasetId || "") : String(u);
+                        let chip;
+                        if (obj && obj.datasetId) {
+                            chip = document.createElement("a");
+                            chip.href = `#${obj.datasetId}`;
+                        } else {
+                            chip = document.createElement("span");
+                        }
                         chip.className = "pattern-tag";
-                        chip.textContent = String(u);
+                        chip.textContent = label;
                         used.appendChild(chip);
                     }
                     card.appendChild(used);
@@ -4305,6 +4350,22 @@
             if (pattern && typeof pattern === "object") {
                 validateAssetPath(pattern.icon, `Dataset ${path}: patternCatalog[${i}].icon`);
                 validateOptionalString(pattern.group, `Dataset ${path}: patternCatalog[${i}].group`);
+                for (const key of ["aliases", "pairsWith", "commonlyConfusedWith"]) {
+                    if (pattern[key] !== undefined && !Array.isArray(pattern[key])) {
+                        throw new Error(`Dataset ${path}: patternCatalog[${i}].${key} must be an array if present`);
+                    }
+                }
+                // usedBy entries may be strings or { datasetId, label } objects.
+                if (pattern.usedBy !== undefined) {
+                    if (!Array.isArray(pattern.usedBy)) {
+                        throw new Error(`Dataset ${path}: patternCatalog[${i}].usedBy must be an array if present`);
+                    }
+                    pattern.usedBy.forEach((u, j) => {
+                        if (u && typeof u === "object" && !u.datasetId && !u.label) {
+                            throw new Error(`Dataset ${path}: patternCatalog[${i}].usedBy[${j}] object needs a datasetId or label`);
+                        }
+                    });
+                }
             }
         });
         const architecture = d.highLevelArchitecture;

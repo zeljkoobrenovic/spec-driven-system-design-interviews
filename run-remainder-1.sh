@@ -7,9 +7,9 @@
 * product-catalog
 * logging-platform
 
-metrics-monitoring
-lock-service
+* metrics-monitoring
+* lock-service
 
 
-interview-method
+* interview-method
 patterns

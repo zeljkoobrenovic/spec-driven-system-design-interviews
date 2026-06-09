@@ -6,12 +6,12 @@
 #
 #echo "CODEX: Updating review of $1 based on recent changes and improving the content based on the review."
 #codex exec "Update review of $1 based on recent changes using the review-system-design-interview skill. Commit changes."
-
-echo "CLAUDE: Improving $1 based on the updated review."
-claude -p "Improve $1 based on the updated REVIEW.md" --allowedTools "Read,Edit,Bash"
-
-echo "CLAUDE: Polishing $1 for better understandability, readability, flows, and overall quality."
-claude -p "Make one more pass in $1 of lightweight edits and polishing to improve understandability, readability, flows, and overall quality. Commit changes." --allowedTools "Read,Edit,Bash"
+#
+#echo "CLAUDE: Improving $1 based on the updated review."
+#claude -p "Improve $1 based on the updated REVIEW.md" --allowedTools "Read,Edit,Bash"
+#
+#echo "CLAUDE: Polishing $1 for better understandability, readability, flows, and overall quality."
+#claude -p "Make one more pass in $1 of lightweight edits and polishing to improve understandability, readability, flows, and overall quality. Commit changes." --allowedTools "Read,Edit,Bash"
 
 echo "CODEX: Adding technologies choices and external links to $1, and writing a LinkedIn post for $1."
 codex exec "Add technologies choices to $1 using the add-technology-choices skill. Commit changes."

@@ -301,7 +301,7 @@
     {
       "label": "Scatter fan-out",
       "value": "~30K x 10K = 300M shard-requests/s",
-      "note": "Cache-miss QPS x shard count. Each replica set sees ~30K req/s; with 3 replicas that is ~10K req/s per index server, which sets the per-server CPU/IO budget."
+      "note": "Cache-miss QPS x shard count — absorbed by a broker fan-out tree, not one box. Each replica set sees ~30K req/s; with 3 replicas that is ~10K req/s per index server, which sets the per-server CPU/IO budget (see step 4b)."
     },
     {
       "label": "Per-query work",
@@ -323,9 +323,9 @@
     {
       "method": "GET",
       "path": "/search",
-      "description": "Run a query and return ranked results. q supports multi-term, quoted phrases (\"exact match\"), and basic boolean operators (+required, -excluded, OR). hl/gl set language and country for ranking/locale; num+cursor page results (deep pagination is capped); freshness biases toward recent content.",
+      "description": "Run a query and return ranked results. q supports multi-term, quoted phrases (\"exact match\"), and basic boolean operators (+required, -excluded, OR). hl/gl set language and country for ranking/locale; num+cursor page results — cursors are opaque, short-lived (minutes), and deep pagination is capped because the index changes under you. freshness is a ranking bias/filter toward recent content, not a guarantee that all new pages are visible. approxTotal is an estimate (capped at web scale, not an exact count). Under deadline pressure the response can be partial: partialResults flags it, timedOutShards counts dropped shards, servedFromCache tells whether the result cache answered.",
       "request": "?q=%22distributed+systems%22+-tutorial&hl=en&gl=us&num=10&cursor=&freshness=any",
-      "response": "{ \"results\": [ { \"url\": \"...\", \"title\": \"...\", \"snippet\": \"...\", \"crawledAt\": \"...\" } ], \"total\": 12000, \"nextCursor\": \"...\" }",
+      "response": "{ \"results\": [ { \"url\": \"...\", \"title\": \"...\", \"snippet\": \"...\", \"crawledAt\": \"...\" } ], \"approxTotal\": 12000, \"partialResults\": false, \"timedOutShards\": 0, \"servedFromCache\": true, \"nextCursor\": \"...\" }",
       "sequence": {
         "participants": [
           {
@@ -524,7 +524,7 @@
         },
         {
           "name": "host",
-          "type": "string (politeness bucket)"
+          "type": "string FK -> host_crawl_state (politeness + robots scheduled per host)"
         },
         {
           "name": "priority",
@@ -539,16 +539,64 @@
           "type": "int (drives backoff / give-up)"
         },
         {
-          "name": "robots_policy",
-          "type": "ref (cached per-host robots rules + key)"
-        },
-        {
           "name": "change_freq",
           "type": "float (observed; sets recrawl interval)"
         },
         {
           "name": "next_fetch_at",
           "type": "timestamp (politeness delay or retry/backoff time)"
+        }
+      ]
+    },
+    {
+      "name": "host_crawl_state",
+      "note": "Per-host politeness and robots state — the frontier schedules eligible hosts, then URLs within them.",
+      "fields": [
+        {
+          "name": "host",
+          "type": "string PK"
+        },
+        {
+          "name": "crawl_delay",
+          "type": "float (per-host rate limit / min gap between fetches)"
+        },
+        {
+          "name": "robots_rules",
+          "type": "blob (parsed robots.txt allow/disallow)"
+        },
+        {
+          "name": "robots_fetched_at",
+          "type": "timestamp (+ TTL; drives robots re-fetch)"
+        },
+        {
+          "name": "next_host_fetch_at",
+          "type": "timestamp (when this host may be fetched again)"
+        },
+        {
+          "name": "backoff_state",
+          "type": "enum(ok, slowed, blocked) + recent 429/5xx error budget"
+        }
+      ]
+    },
+    {
+      "name": "serving_metrics (control plane)",
+      "note": "Time-series the system is operated by — emitted across crawl, index, serving, and ranking; alerts fire on these.",
+      "fields": [
+        {
+          "name": "crawl",
+          "type": "frontier backlog by host/priority, fetch success rate, robots/blocked rate, 429/5xx rate, duplicate rate, crawl lag"
+        },
+        {
+          "name": "indexing",
+          "type": "segment build lag, validation failures, publish generation, merge backlog, tombstone ratio, rollback count"
+        },
+        {
+          "name": "serving",
+          "type": "result-cache hit rate, doc-cache hit rate, cache-miss QPS, shard p95/p99, hedge rate, partial-result rate, timeout rate, candidate count, merge/rank latency"
+        },
+        {
+          "name": "quality",
+          "type": "spam demotion rate, suppression count, ranker model version"
         }
       ]
     }
@@ -612,7 +660,7 @@
   "steps": [
     {
       "id": "naive",
-      "title": "1. Naive: Scan Every Document for the Query Terms (the baseline)",
+      "title": "1. Naive Baseline: Scan Every Document for the Query Terms",
       "description": [
         "Start with the simplest thing that works. Assume pages have already been fetched somehow (the next step builds the crawler) and stored in a document store; on each search read through every document checking whether it contains the query terms, collecting the matches.",
         "This is correct and trivial — and it is hopeless at web scale. A single query would have to scan 100B+ documents (petabytes), so even one search takes far longer than the sub-second budget, and serving ~100K queries/sec this way is physically impossible. The cost is linear in the corpus size for every single query.",
@@ -665,10 +713,10 @@
       "id": "crawl",
       "title": "2. Crawl the Web with a URL Frontier",
       "description": [
-        "A crawler fleet fetches pages, but you can't just BFS naively: you must be polite (obey robots.txt, rate-limit per host), avoid re-fetching unchanged pages, and prioritize important/fresh URLs.",
+        "A crawler fleet fetches pages, but a naive breadth-first crawl won't do: you must be polite (obey robots.txt, rate-limit per host), avoid re-fetching unchanged pages, and prioritize important/fresh URLs.",
         "A URL frontier is a prioritized, politeness-aware queue: it hands out URLs respecting per-host delays and priority. Crawlers fetch, store the raw page, dedup by URL and content hash, and enqueue newly discovered links.",
         "Production crawling needs more than fetch-and-store. Canonicalize URLs (strip tracking params, resolve redirects) so the same page isn't crawled under many URLs; cache robots.txt per host so you don't refetch it every request; isolate DNS/fetch with timeouts; retry transient failures with exponential backoff and host-level backoff on 429/5xx; cluster near-duplicate content by hash; detect crawler traps (infinite calendars, faceted-URL explosions) and cap depth/URLs per host; and seed from sitemaps. A recrawl policy driven by each page's observed change frequency decides who gets re-fetched soon vs. rarely.",
-        "A seen-URL/content store prevents re-crawling the same page and detects duplicate content across URLs."
+        "Underpinning all of this is a seen-URL/content store: it keys on both the canonical URL and a content hash, so it prevents re-crawling the same page and catches the same content served under different URLs."
       ],
       "view": {
         "nodes": [
@@ -823,7 +871,7 @@
       "description": [
         "To answer 'which docs contain these words' fast, build an inverted index: for each term, a posting list of the documents (and positions) containing it — the opposite of scanning every document.",
         "The indexing pipeline parses each stored doc, assigns a compact internal docID, tokenizes/normalizes terms (lowercase, stemming), and writes postings. Concretely: a term dictionary maps each term to its posting list; postings are delta-encoded and compressed (docIDs are sorted and gap-encoded) so a multi-PB corpus stays affordable; and per-block skip lists / block-max metadata let query execution skip whole chunks of a posting list, which is why a posting-list lookup is fast even for common terms. Indexing is a batch/stream pipeline that produces immutable index segments, periodically merged.",
-        "Also extract links to build the link graph used for query-independent scoring."
+        "The same pass also extracts each page's outbound links to build the link graph, which feeds the query-independent page scores (PageRank) used later at ranking time."
       ],
       "view": {
         "nodes": [
@@ -880,8 +928,7 @@
       "description": [
         "The index spans petabytes, so partition it by document: each shard holds the full inverted index for its slice of the corpus. (Document partitioning beats term partitioning here — each shard answers independently and load is even.)",
         "A query is scattered to all shards in parallel; each returns its top-k candidates for the query, and an aggregator merges them. Replicate each shard for QPS and availability — concretely ~10K primary shards (~10M docs each) x ~3 replicas. 'Scatter to all shards' means hitting one chosen replica per primary partition, not broadcasting to every replica.",
-        "At ~100K QPS, the broker is a first-class component, not a single box. The path is really: parse/rewrite the query -> a broker that fans out to one replica per partition -> per-shard top-k retrieval -> merge -> re-rank -> hydrate snippets. Each broker picks the fastest/least-loaded replica, propagates a deadline so shards self-abort, and hedges (sends a duplicate request to a second replica if the first is slow). Per-shard top-k is capped so the gathered candidate set stays small.",
-        "This scatter-gather is the latency challenge: total latency is the slowest shard, so you bound per-shard work with deadlines, hedge slow replicas, and accept partial results (drop shards that miss the deadline) rather than blow the sub-second budget."
+        "The basic path is: parse/rewrite the query -> scatter to one replica per partition -> per-shard top-k retrieval -> merge -> re-rank -> hydrate snippets. That is the clean partitioning lesson. Making that scatter-gather survive 100K QPS — broker fan-out topology, deadlines, hedging, top-k limits, partial results, and overload behavior — is involved enough that it gets its own sub-step (4b)."
       ],
       "view": {
         "nodes": [
@@ -961,7 +1008,8 @@
               "QuerySvc",
               {
                 "id": "TermShards",
-                "label": "Term-Partitioned Shards"
+                "label": "Term-Partitioned Shards",
+                "type": "index"
               },
               "ResultCache"
             ],
@@ -1016,31 +1064,9 @@
       ],
       "recap": {
         "before": "Monolithic index.",
-        "after": "Document-sharded, replicated index served via scatter-gather.",
-        "newRisk": "Merged candidates still need good ranking, and fanning out everything is expensive."
+        "after": "Document-sharded, replicated index served via basic scatter-gather.",
+        "newRisk": "Fanning out every cache-miss query to 10K shards is an enormous load — the serving path has to be hardened to survive 100K QPS (next sub-step)."
       },
-      "bottlenecks": [
-        {
-          "issue": "Tail latency: the slowest shard sets query latency.",
-          "mitigation": "Replicas + hedged requests; per-shard deadline + cap on top-k work; skip slow shards with partial results."
-        },
-        {
-          "issue": "Fan-out amplification: cache-miss QPS x shard count is huge (~30K x 10K ~= 300M shard-requests/s).",
-          "mitigation": "High result-cache hit rate to cut miss QPS; balanced document partitioning so per-replica load is even; add replicas to hot shards."
-        }
-      ],
-      "failureDrills": [
-        {
-          "scenario": "One replica goes slow (GC pause, hot shard) and threatens the deadline.",
-          "expectedBehavior": "The broker's hedge request to a second replica returns first; the slow shard's late reply is ignored. If no replica answers in time, that shard is dropped and the query returns partial results.",
-          "mitigation": "Request hedging + deadline propagation + partial-result merge; per-shard top-k cap to bound shard work."
-        },
-        {
-          "scenario": "Result-cache node fails and a burst of popular queries all miss at once (cache stampede).",
-          "expectedBehavior": "A single-flight / request-coalescing guard lets one query do the scatter-gather while duplicates wait for its result; serving degrades in load, not correctness.",
-          "mitigation": "Single-flight per query key, cache warming for top queries, and TTL jitter so entries don't expire in lockstep."
-        }
-      ],
       "flows": [
         {
           "name": "Scatter-gather query across shards",
@@ -1155,7 +1181,7 @@
           "term": "Document vs term partitioning",
           "definition": "Doc-partition = each shard has full postings for its docs (scatter-gather, even load); term-partition = shards own terms (single-term cheap, multi-term cross-shard expensive).",
           "whyItMatters": "It determines query fan-out, load balance, and hotspot behavior at web scale.",
-          "example": "Google/Elasticsearch use document partitioning + scatter-gather.",
+          "example": "Document partitioning + scatter-gather is the dominant web-search retrieval pattern (e.g. Elasticsearch shards, large web indexes) — though real systems layer tiering and hot-term handling on top.",
           "group": "Document vs Term Partitioning"
         }
       ],
@@ -1177,6 +1203,170 @@
         "after": "Document partitioning chosen for even load and parallel scatter-gather.",
         "newRisk": "Every query touches all shards — tail latency is the slowest shard (addressed with replicas/hedging)."
       }
+    },
+    {
+      "id": "serve-scale",
+      "parent": "serve",
+      "title": "4b. Make Scatter-Gather Survive 100K QPS",
+      "description": [
+        "Document partitioning is settled; now make the fan-out economical. The headline number is brutal: ~30K cache-miss QPS x ~10K shards = ~300M shard-requests/s, and each cache-miss query gathers ~10MB of top-k across the fleet. A single QuerySvc box opening 10K connections per query cannot do this — the serving topology has to absorb it.",
+        "Broker topology. Many stateless query frontends terminate user requests; each hands a parsed query to a broker that fans out. At 10K shards you don't fan out flat from one process — use a two-level (or n-ary) fan-out tree of broker workers, so each broker talks to a few hundred shards and an intermediate tier merges sub-results. This bounds per-process connections and lets merge happen hierarchically (early pruning at each level) instead of one box sorting a 10M-candidate set.",
+        "Per-replica load. ~30K cache-miss QPS x 10K shards spread over 3 replicas/shard is ~10K shard-requests/s per index server — that sets the per-server CPU/IO budget. If a shard's replicas can't hold ~10K req/s of top-k retrieval, you add replicas (hot shards get more) or treat each 'shard' as a logical partition spread across several serving nodes. Network: ~10MB gathered per miss x 30K miss QPS is hundreds of GB/s of internal egress, which is why top-k is hierarchically merged and pruned, not shipped whole to one aggregator.",
+        "Top-k discipline. Default to a small per-shard top-k (~100). 10K shards x top-100 is ~1M candidates before merge; phase-2 re-ranks only the top ~1000. Larger top-k (up to ~1000/shard) is reserved for rare queries that need deep recall — it is a deliberate, not default, cost because it multiplies both merge work and network.",
+        "Deadlines, hedging, partial results. The broker propagates a deadline so shards self-abort; it hedges a duplicate request to a second replica when the first is slow; and it drops shards that miss the deadline, returning partial results rather than blowing the sub-second budget.",
+        "Overload behavior. A 60-70% result-cache hit rate is what makes 100K QPS affordable, but it is not a complete overload story. Under a cache-miss burst the system also needs admission control / load shedding (shed or queue excess scatter-gathers), aggressive partial results (lower the deadline), hot-query precomputation and cache warming, and query classification (cheap path for common queries). A real 100K-QPS web search also tiers the index (a small hot tier served first) so most queries never touch the full fan-out."
+      ],
+      "view": {
+        "nodes": [
+          "User",
+          "QuerySvc",
+          "IndexShards",
+          "ResultCache"
+        ],
+        "caption": "Stateless query frontends check the result cache; on a miss a broker fan-out tree scatters to one replica per partition with deadlines and hedging, and merges hierarchically.",
+        "links": [
+          "user-query",
+          "query-resultcache",
+          "query-shards"
+        ],
+        "highlight": [
+          "QuerySvc",
+          "IndexShards"
+        ],
+        "groups": [
+          "serve"
+        ]
+      },
+      "decisionPrompt": "300M shard-requests/s on cache misses — what broker topology, per-replica load, top-k, and overload controls keep that sub-second?",
+      "concepts": [
+        {
+          "term": "Broker fan-out tree",
+          "definition": "A two-level (or n-ary) tree of broker workers that each fan out to a few hundred shards and merge sub-results hierarchically.",
+          "whyItMatters": "Bounds per-process connections and merge cost so no single box opens 10K connections or sorts a 10M-candidate set.",
+          "example": "Root broker -> ~32 intermediate brokers -> ~300 shards each; merge + prune at every level.",
+          "group": "Make Scatter-Gather Survive 100K QPS"
+        },
+        {
+          "term": "Deadline propagation + hedging",
+          "definition": "Send a per-request deadline shards self-abort on, and duplicate slow shard requests to a second replica.",
+          "whyItMatters": "Total latency is the slowest shard; deadlines + hedging bound the tail and yield partial results instead of timeouts.",
+          "example": "Hedge after p95; drop shards past the deadline and serve partial results.",
+          "group": "Make Scatter-Gather Survive 100K QPS"
+        }
+      ],
+      "probeLinks": [
+        "lucene-docs",
+        "elasticsearch-docs",
+        "bigtable-paper"
+      ],
+      "whyNow": [
+        "Once the capacity model reveals 300M shard-requests/s, the design has to prove the serving fleet can absorb it — this is the senior/staff core of the case."
+      ],
+      "recap": {
+        "before": "Basic document-sharded scatter-gather.",
+        "after": "A broker fan-out tree with per-replica budgets, top-k discipline, deadlines/hedging, partial results, and overload controls.",
+        "newRisk": "Merged candidates still need good ranking; and at this QPS even cheap fan-out is heavy, so caching is mandatory."
+      },
+      "bottlenecks": [
+        {
+          "issue": "Tail latency: the slowest shard sets query latency across a 10K-way fan-out.",
+          "mitigation": "Replicas + hedged requests; per-shard deadline + cap on top-k work; skip slow shards with partial results; hierarchical merge so no single node sorts everything."
+        },
+        {
+          "issue": "Fan-out amplification: cache-miss QPS x shard count is huge (~30K x 10K ~= 300M shard-requests/s, ~10MB gathered per miss).",
+          "mitigation": "High result-cache hit rate to cut miss QPS; broker fan-out tree to bound connections; small default per-shard top-k with early pruning; index tiering and admission control / load shedding under bursts."
+        },
+        {
+          "issue": "Per-replica saturation: ~10K shard-requests/s per index server at 3x replication.",
+          "mitigation": "Add replicas to hot shards, or spread a logical shard over multiple serving nodes; balanced document partitioning so per-replica load is even."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "One replica goes slow (GC pause, hot shard) and threatens the deadline.",
+          "expectedBehavior": "The broker's hedge request to a second replica returns first; the slow shard's late reply is ignored. If no replica answers in time, that shard is dropped and the query returns partial results (partialResults=true, timedOutShards>0).",
+          "mitigation": "Request hedging + deadline propagation + partial-result merge; per-shard top-k cap to bound shard work."
+        },
+        {
+          "scenario": "Result-cache node fails and a burst of popular queries all miss at once (cache stampede).",
+          "expectedBehavior": "A single-flight / request-coalescing guard lets one query do the scatter-gather while duplicates wait for its result; admission control sheds excess miss traffic; serving degrades in load, not correctness.",
+          "mitigation": "Single-flight per query key, cache warming for top queries, TTL jitter so entries don't expire in lockstep, and load shedding on the cache-miss path."
+        },
+        {
+          "scenario": "A cache-miss burst pushes scatter QPS past fleet capacity.",
+          "expectedBehavior": "Admission control sheds or queues excess scatter-gathers and the broker tightens the deadline (more partial results) so latency for admitted queries stays bounded, rather than every query degrading together.",
+          "mitigation": "Load shedding / admission control, tighter deadlines under pressure, hot-query precomputation, index tiering so most queries hit the hot tier, and per-query-class budgets."
+        }
+      ],
+      "flows": [
+        {
+          "name": "Hierarchical broker fan-out under deadline",
+          "note": "A query frontend checks the result cache; on a miss a broker tree fans out to one replica per partition with a deadline, hedges slow replicas, and merges hierarchically, dropping shards that miss the deadline.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "QuerySvc",
+                "label": "Frontend / Broker"
+              },
+              {
+                "id": "ResultCache",
+                "label": "Result Cache"
+              },
+              {
+                "id": "IndexShards",
+                "label": "Shard Replicas"
+              }
+            ],
+            "messages": [
+              {
+                "from": "QuerySvc",
+                "to": "ResultCache",
+                "arrow": "->>",
+                "label": "cached query?"
+              },
+              {
+                "type": "alt",
+                "label": "cache miss",
+                "messages": [
+                  {
+                    "from": "QuerySvc",
+                    "to": "IndexShards",
+                    "arrow": "->>",
+                    "label": "fan-out tree: scatter w/ deadline (one replica/partition)"
+                  },
+                  {
+                    "from": "IndexShards",
+                    "to": "QuerySvc",
+                    "arrow": "-->>",
+                    "label": "top-k per shard (hierarchically merged + pruned)"
+                  },
+                  {
+                    "from": "QuerySvc",
+                    "to": "IndexShards",
+                    "arrow": "->>",
+                    "label": "hedge slow replica; drop shards past deadline"
+                  }
+                ],
+                "else": {
+                  "label": "cache hit",
+                  "messages": [
+                    {
+                      "from": "ResultCache",
+                      "to": "QuerySvc",
+                      "arrow": "-->>",
+                      "label": "cached results (servedFromCache)"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "QuerySvc",
+            "IndexShards"
+          ]
+        }
+      ]
     },
     {
       "id": "rank",
@@ -1289,11 +1479,12 @@
           "pros": [
             "Query-independent page score is precomputed offline — a cheap lookup at query time.",
             "Very fast: no per-query relevance model to run.",
-            "Strong against spam/low-quality pages via link-graph authority."
+            "Link authority gives a baseline quality signal — genuinely well-linked pages rank above obscure ones."
           ],
           "cons": [
             "Ignores query-specific text relevance, so results match authority more than intent.",
             "Same authoritative pages float up regardless of the actual query terms.",
+            "Vulnerable to link manipulation: link farms and SEO abuse game the graph, which is exactly why explicit spam/quality signals are needed on top of PageRank.",
             "Authority scores lag the live graph until the next recompute."
           ],
           "view": {
@@ -1429,7 +1620,8 @@
       "description": [
         "Query popularity is heavily skewed: a small set of queries recurs constantly. Cache full results for popular queries so repeats skip scatter-gather entirely. Assume a ~60-70% hit rate on the result cache — that is what turns ~100K QPS into only ~30-40K QPS actually scattering to shards, which is what makes the fleet size affordable.",
         "Cache hot document metadata/snippets so result hydration doesn't refetch per query. Both caches cut both latency and load.",
-        "Bound cache staleness with TTLs (short for fresh/news-like queries, longer for stable ones) so fresh content still surfaces; invalidate or expire result-cache entries when a new index segment publishes documents matching those terms. Protect against stampede: when a hot entry expires, a single-flight guard lets one request recompute while duplicates wait, and TTL jitter avoids synchronized expiry. Warm the cache for the top queries after a big crawl/segment publish."
+        "Bound cache staleness with TTLs (short for fresh/news-like queries, longer for stable ones) so fresh content still surfaces; invalidate or expire result-cache entries when a new index segment publishes documents matching those terms. Protect against stampede: when a hot entry expires, a single-flight guard lets one request recompute while duplicates wait, and TTL jitter avoids synchronized expiry. Warm the cache for the top queries after a big crawl/segment publish.",
+        "Operate the caches by metric: alert on result-cache and doc-cache hit rate (a sudden drop signals a stampede or eviction storm), single-flight wait/coalesce rate, stale-hit rate, and invalidation lag after a segment publish. A hit-rate collapse is the early warning that the scatter-gather fleet is about to be overloaded."
       ],
       "view": {
         "nodes": [
@@ -1489,7 +1681,8 @@
         "The crawl never stops, so the index must update continuously. Indexing produces immutable segments that are added and periodically merged; serving reads the current segment set, so new content appears without rebuilding the whole index.",
         "Changes and deletes need real semantics, not just appends. Because segments are immutable, an updated page is written as a new version in a new segment and the old version is marked in a tombstone list so serving skips it; deletions, redirects, and takedowns/spam suppression are the same tombstone mechanism. The serving visibility contract is generation-based: an indexer builds a segment, validates it, then flips a publish marker that bumps the generation; readers atomically refresh to the latest published generation, so a query sees a consistent segment set. A bad segment is handled by not publishing it (or rolling the generation back), and background merge compacts small segments and drops tombstoned docs.",
         "Prioritize freshness in the crawl frontier (re-crawl fast-changing or important pages sooner, driven by observed change frequency) and propagate new segments to shards quickly so breaking content is searchable within a bounded time. Tie result-cache invalidation to segment publishes that touch matching terms/docs, not a vague 'material' rule.",
-        "Recompute query-independent scores (link graph / PageRank) periodically as the graph evolves; serve with the latest available scores."
+        "Recompute query-independent scores (link graph / PageRank) periodically as the graph evolves; serve with the latest available scores.",
+        "Operate the pipeline by metric: alert on segment build lag, validation failure rate, the live publish generation per shard, merge backlog, tombstone ratio, and rollback count. A stuck publish generation or a growing merge backlog means freshness is silently degrading even while serving looks healthy."
       ],
       "view": {
         "nodes": [
@@ -1620,6 +1813,11 @@
           "scenario": "A bad segment is built (corrupt postings / quality regression) during a high-news crawl.",
           "expectedBehavior": "Validation fails the segment so the publish marker never advances to it, or the generation is rolled back; readers keep serving the last good generation. Stale result-cache entries are flushed on the eventual good publish.",
           "mitigation": "Build -> validate -> atomic publish-marker flip with rollback; generation-based reader refresh; cache invalidation tied to publishes."
+        },
+        {
+          "scenario": "A new ranker model or quality-score recompute regresses result quality after rollout.",
+          "expectedBehavior": "The ranker version is a tracked control-plane value; quality metrics (spam demotion rate, click/feedback indicators if in scope) flag the regression and the serving fleet is rolled back to the previous model version, decoupled from segment generation so ranking can revert without re-publishing the index.",
+          "mitigation": "Versioned ranker models with canary/shadow evaluation before full rollout, quality-metric alerts, and one-flip rollback to the last good model version; flush/repopulate result cache on the revert."
         }
       ]
     }
@@ -1708,17 +1906,19 @@
     "nonFunctional": [
       {
         "requirement": "Sub-second p99",
-        "how": "Parallel scatter-gather + caching + bounded per-shard work.",
+        "how": "Parallel scatter-gather + broker deadlines/hedging/partial results + caching + bounded per-shard work.",
         "steps": [
           "serve",
+          "serve-scale",
           "cache"
         ]
       },
       {
         "requirement": "~100K QPS",
-        "how": "Shard replication + result/doc caches.",
+        "how": "Shard replication + broker fan-out tree + per-replica budgets + overload controls + result/doc caches.",
         "steps": [
           "serve",
+          "serve-scale",
           "cache"
         ]
       },

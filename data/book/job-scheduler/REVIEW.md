@@ -5,196 +5,221 @@ Review date: 2026-06-09
 
 ## Executive Summary
 
-This is a strong, focused scheduler walkthrough. It teaches the right core distinction: exactly-once triggering is a scheduler responsibility, while execution is at-least-once and must be made idempotent. The step progression is coherent, the diagrams are renderer-friendly, and the wrap-up maps requirements back to mechanisms clearly.
+This is now a strong, production-aware scheduler walkthrough. The recent changes resolved the earlier core gaps: the API and model now include time zone, schedule versioning, misfire/overlap policy, retry policy, timeout, tenant ownership, and idempotent writes; Step 5 makes the transactional outbox the default; the final design includes `Outbox + Relay`; Step 1 now matches the single-box cron baseline; capacity is concrete; and `technologyChoices` is present.
+
+The remaining issues are narrower and more advanced. The design is credible, but it should be more explicit about due-index consistency when the index is not the same transactional store as `JobDB`, how misfire/overlap policies are enforced in the dispatcher, and whether run state lives in `RunStore`, `JobDB`, or both.
 
 | Axis | Score | Notes |
 | --- | ---: | --- |
-| System design soundness | 4/5 | Solid backbone: durable schedule store, due index, per-shard leader, dedup key, queue, workers, retries. Needs sharper atomicity and recurrence semantics. |
-| Production realism | 3/5 | Missing time-zone/DST/misfire/overlap policy, API idempotency, explicit outbox/transaction boundary, and richer operations signals. |
-| Pedagogical flow | 4/5 | Each step exposes the next problem cleanly. A few diagrams and claims move faster than the supporting model. |
-| Dataset/rendering fit | 5/5 | JSON parses; step/final views and step references resolve; no obvious renderer-facing schema problems. |
-| Overall | 4/5 | Usable and interview-ready after a few high-impact clarifications. |
+| System design soundness | 4/5 | Strong durable schedule, due index, fenced dispatcher, outbox, worker idempotency, retry/DLQ design. Needs sharper due-index atomicity and overlap/misfire algorithms. |
+| Production realism | 4/5 | Much improved: concrete schedule semantics, outbox, target idempotency, claim leases, capacity numbers, technology choices. Remaining gaps are operational edge cases and store boundaries. |
+| Pedagogical flow | 4/5 | The seven-step progression is coherent and now introduces the hard concepts earlier. A few later policies need to be tied back to the dispatch algorithm. |
+| Dataset/rendering fit | 4/5 | JSON parses and references resolve. Minor clarity issues around `JobDB` vs `RunStore`; several tech chips use generic fallback icons. |
+| Overall | 4/5 | Interview-ready and close to reference quality after tightening consistency and policy enforcement details. |
 
 ## What Works Well
 
-- The dataset separates "exactly-once trigger" from "at-least-once execution" in requirements, steps, concepts, final design, and follow-ups. That is the right senior-level framing for this problem.
-- The seven-step story has a clean escalation: naive loop, durable state, due lookup, leader election, trigger dedup, execution idempotency, retries/DLQ.
-- The option sets for due lookup, election, and dispatch compare real alternatives instead of strawmen.
-- The final design includes the main components introduced in the steps and does not add unrelated services late.
-- The structured diagrams are well-formed. Global node/link references resolve, `satisfies` step links resolve, and pattern step links resolve.
+- The central guarantee is framed correctly: exactly-once triggering per scheduled fire, at-least-once execution with idempotency for the actual work.
+- Step 2 now teaches the scheduler semantics that make cron systems hard: time zone/DST, schedule versioning, misfire/catch-up, overlap policy, retry policy, timeout, and client write idempotency.
+- Step 5 now uses the right default production answer for a separate queue: commit fire marker, `next_fire_at`, and outbox row in one transaction, then publish at least once.
+- Step 6 now distinguishes infrastructure idempotency from target idempotency, including the crash-after-side-effect-before-success-record case.
+- Capacity is no longer hand-wavy. The dataset names stored schedules, write QPS, average due fires/sec, top-of-hour burst, worker concurrency, retention, and semantics.
+- `technologyChoices` is useful and aligned with the design concerns: schedule store, due index, lease store, run queue, worker runtime, and observability.
 
 ## Highest-Impact Issues
 
-### 1. The API and data model do not capture hard scheduler semantics
+### 1. Due-index consistency has the same cross-store problem as the queue
 
-The API request only includes `name`, `schedule`, and `target`, while the requirements promise recurring cron, update/cancel, retries, and seconds-level accuracy. Production cron semantics depend on fields that are not modeled: `timezone`, schedule type, `start_at`/`end_at`, misfire/catch-up policy, max overlap/concurrency policy, retry policy, timeout, tenant/owner, API idempotency key, and target idempotency key propagation.
+The design correctly fixes the `JobDB` -> `RunQ` atomicity gap with an outbox, but the API and Step 3 still imply that `JobDB` and `TimeWheel` can be updated together when creating, updating, canceling, and firing schedules. That is only true if the due index is implemented inside the same transactional store as `jobs`.
 
-This matters because time-zone and DST behavior, missed fires after downtime, and overlapping long-running executions are not edge polish for cron systems. They determine what "run at 02:00" and "exactly one run per scheduled fire" mean.
+If `TimeWheel` is Redis, an in-memory wheel, or another separate system, a crash after writing `JobDB` but before indexing `next_fire_at` can make a job invisible until rebuild. A crash after changing a schedule but before removing the old due entry can leave stale entries behind. The current text says the index is derived and rebuildable, which is good, but it should define the steady-state repair pattern.
 
-Concrete fix: expand `POST /v1/jobs` and the `jobs` table with explicit scheduling policy fields. Add `PATCH /v1/jobs/{id}` or `POST /v1/jobs/{id}:pause/resume` examples that recompute `next_fire_at` and update the due index atomically. Add `client_request_id` or `idempotency_key` for create/update operations.
+Concrete fix: add one of these explicit answers:
 
-### 2. The default "atomic mark + enqueue" path is too magical for a separate queue
+- Same-store due index: an indexed `jobs.next_fire_at` column or DB-backed due table, so create/update/cancel/fire changes are transactional.
+- Separate derived index: write schedule changes to `JobDB`, update `TimeWheel` via CDC/outbox/relay, and make dispatcher validation lazy by checking `(job_id, scheduled_fire, schedule_version, next_fire_at, state)` in `JobDB` before firing. Stale index entries become harmless no-ops; missing entries are repaired by periodic reconciliation/rebuild.
 
-Step 5 says the dispatcher atomically marks a fire and enqueues a run. The default option admits that a separate queue needs an outbox, but the selected/default path and final design still draw `Dispatcher -> JobDB` and `Dispatcher -> RunQ` directly. That leaves the critical crash window unresolved: if the mark succeeds and enqueue fails, the run is lost; if enqueue succeeds and mark fails, it can double-fire.
+### 2. Misfire and overlap policies are modeled but not yet wired into dispatch
 
-Concrete fix: make "Transactional outbox" the default production answer unless `RunQ` is explicitly the same transactional store as `JobDB`. Add an `Outbox/Relay` node to the final design or add a `run_outbox` table to the data model. The flow should commit `(job_id, scheduled_fire)` plus an outbox row in one transaction, then publish to `RunQ` at least once.
+The dataset now adds `misfire_policy` and `overlap_policy`, which is the right move. The dispatch step, however, still mostly describes the happy path: mark fire, advance `next_fire_at`, write outbox. It does not say how the dispatcher behaves when there are missed fires after downtime or when the previous run is still active.
 
-### 3. Recurring `next_fire_at` ownership is inconsistent
+For `misfire_policy=run_all_missed`, the dispatcher may need to enumerate many fire keys, not just the next one. For `run_one_catchup`, it should choose a representative missed fire and advance past the rest. For `overlap_policy=skip` or `queue_one`, the dispatcher needs to consult run state before writing the outbox, and it may need to record a skipped run rather than enqueue work.
 
-Step 5 correctly says recurring jobs advance `next_fire_at` in the same atomic trigger step. Step 6 and the final architecture link `Workers -> JobDB` says workers compute the next fire for recurring jobs. Those are different semantics.
+Concrete fix: add a short "dispatch policy algorithm" to Step 5:
 
-For cron-style scheduling, the dispatcher should usually advance to the next scheduled occurrence when it claims the current fire, independent of whether the current execution later succeeds. If workers advance the schedule only after execution, long-running or failed jobs can block future scheduled occurrences, which is fixed-delay workflow behavior rather than cron behavior.
+- Load current job row and validate the due index entry against `schedule_version`.
+- Compute due fire keys according to `misfire_policy`.
+- Check active run state according to `overlap_policy`.
+- In one transaction, insert fire/run records as `queued` or `skipped`, advance `next_fire_at`, update/remove the due entry, and write outbox rows for queued runs.
 
-Concrete fix: move recurring `next_fire_at` advancement to the dispatcher transaction and update the due index/outbox in that same logical step. Keep workers focused on run status, attempts, result, and target execution. If the desired product is "do not overlap runs", model that as an explicit overlap policy instead of implicit worker-owned recurrence.
+### 3. The burst numbers need a timing-accuracy budget
 
-### 4. Worker idempotency is worded as stronger than it really is
+The capacity section is much stronger, but the numbers create an interview-worthy tension that the design does not resolve. A top-of-hour burst of `~200k in a few sec` can mean tens of thousands of fires/sec. `~10k` worker slots at `~2s` per job process about `5k jobs/sec` before retry amplification. That can absorb the burst through backlog, but not necessarily preserve "seconds" timing accuracy.
 
-Step 6 says the worker records/checks `(job_id, scheduled_fire)` before executing so a redelivered run is recognized and not run twice. That can prevent duplicate worker claims, but it does not by itself prevent duplicate external side effects if the worker crashes after performing the target action but before recording success.
+Concrete fix: make the smoothing target explicit. For example, if `200k` top-of-hour jobs may be jittered over `60s`, the dispatch target is about `3.3k fires/sec`, which matches the worker pool. If they must all be triggered within `5s`, the system needs about `40k fires/sec` dispatch throughput and much more worker concurrency or a clear acceptance that execution lags while trigger records remain on time.
 
-Concrete fix: distinguish infrastructure idempotency from target idempotency. Add fields and text for `attempt_id`, claim lease/heartbeat, visibility timeout, target timeout, and propagation of `idempotency_key` to the target. The run state machine should explain what happens to `running` claims whose worker dies.
+### 4. `JobDB` and `RunStore` ownership is ambiguous
+
+The high-level architecture says `JobDB` stores "job definitions, schedules, and run state"; `RunStore` separately stores per-run records; the final design includes both `workers-runstore` and `workers-jobdb` with `workers-jobdb` labeled "report run status." The step text says workers only write run status, but it is unclear which store owns that state.
+
+Concrete fix: pick one boundary and make the labels/data model match:
+
+- Unified store: `JobDB` contains `jobs`, `runs`, `run_outbox`, and `leader_lease`; remove or rename `RunStore`.
+- Split store: `JobDB` owns job definitions and schedule state; `RunStore` owns runs, attempts, claims, and outcomes; relabel `workers-jobdb` or remove it from final design unless workers really update job summary fields.
 
 ## System Design Soundness
 
-The core architecture is sound: durable `jobs`, due lookup through `TimeWheel` or indexed `next_fire_at`, leader election with fencing, run queue, workers, run store, retry controller, and DLQ. The design correctly treats the due index as rebuildable rather than authoritative.
+The design has the right backbone for distributed cron: durable schedule store, time-ordered due lookup, per-shard leader election with fencing, fire-key dedup, transactional outbox, at-least-once queue, idempotent workers, claim leases, retries, and DLQ.
 
-The main correctness gaps are at transaction boundaries and time semantics. The design should explicitly define:
+The most important correctness story is now present: the dispatcher advances recurring `next_fire_at` when claiming the fire, not after worker success. That preserves cron semantics and avoids turning recurring jobs into fixed-delay workflows. The fire identity also improved from `(job_id, scheduled_fire)` to `(job_id, scheduled_fire, schedule_version)`, which protects update/cancel races.
 
-- Fire identity: likely `(job_id, scheduled_fire_at, schedule_version)`, not just `(job_id, scheduled_fire)`, so updates/cancels cannot collide with old schedule occurrences.
-- Claim/update transaction: dedup marker, `next_fire_at` advance, due-index update/removal, and outbox write.
-- Lease/fencing enforcement point: where the fencing token is checked when writing fire markers.
-- Misfire/catch-up behavior: skip missed occurrences, run one catch-up, or enqueue all missed occurrences.
-- Overlap behavior: allow concurrent runs, skip if previous still running, or queue one pending run.
+The remaining correctness questions are about coupling:
 
-Capacity is currently qualitative. "Millions" and "spiky" are useful starting labels, but the design choices need numbers: schedules stored, schedule create/update QPS, average and peak due fires/sec, top-of-hour burst size, worker concurrency, average job duration, retry amplification, and run-retention storage. Without those, it is hard to justify time wheel vs DB range scan, shard count, queue throughput, or worker autoscaling.
+- If `TimeWheel` is separate from `JobDB`, how are stale and missing due entries detected and repaired?
+- If overlap policy depends on run state, does the dispatcher transaction read/write the same store that workers use for active run claims?
+- If the target system ignores the idempotency key, is that scoped as caller responsibility or does the scheduler provide a compensating mechanism?
+- How long are fire keys, run records, and dedup records retained relative to retry delay, queue redelivery, and operator rerun windows?
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: One Cron Process on a Single Box
 
-The text does a good job motivating durability, duplicate triggers, and scan cost. The diagram is less aligned: it already shows `Client`, `API`, and `JobDB`, which looks more like the first production step than a single in-memory cron process. Consider showing a single `Cron Process` plus in-memory schedules, then introduce `API`/`JobDB` in Step 2.
+This step is now aligned with the text. The diagram shows `Client -> Cron Process (in-memory schedules)`, which cleanly motivates durability, availability, and scan-cost problems without prematurely showing the production API/store.
 
 ### Step 2: Durable Schedules
 
-This step introduces the right source-of-truth idea. It should also introduce schedule versioning and create/update idempotency because later dedup depends on fire identity. If updates can move a future fire from 02:00 to 03:00, the model needs to explain which pending fire keys remain valid.
+This is much stronger than before. It introduces the exact scheduler semantics the rest of the design relies on: `timezone`, `schedule_version`, misfire/catch-up, overlap policy, retry, timeout, and idempotent create/update.
+
+The next improvement is to be explicit about cancellation semantics. Does cancel stop only future fires, also remove queued not-yet-started runs, or attempt to cancel an active worker lease? That can be a short note rather than a full step.
 
 ### Step 3: Finding Due Jobs Efficiently
 
-The options are good. The missing teaching point is index mutation. The API adds entries, but updates/cancels/fires also need to remove or replace entries. The walkthrough should explain whether `TimeWheel` is a durable sorted set, an in-memory shard-local cache rebuilt from `JobDB`, or an indexed table. Each choice changes failover and burst behavior.
+The options are good and the text now explains mutable index entries and physical choices. The main issue is consistency across stores. If the default "time wheel" is Redis or in-memory, the design should teach lazy validation and reconciliation; otherwise candidates may believe schedule-store and due-index writes are magically atomic.
 
 ### Step 4: Leader Election to Avoid Duplicate Triggers
 
-This is one of the strongest steps. The lease, TTL, fencing, and per-shard leader framing is exactly the right escalation. Tighten it by saying where the fencing token is enforced: the dispatcher should include it in the conditional fire-marker write, or the store should reject stale tokens.
+This is one of the strongest steps. It correctly teaches TTL leases, fencing tokens, stale leader rejection, and per-shard leaders. The text also now says the fencing token must be enforced at the fire-marker write, which is the right precision.
+
+Useful polish: add one metric or operational note here, such as lease churn, fencing-token rejects, or failover gap, so the candidate can explain how to detect leader flapping.
 
 ### Step 5: Exactly-Once Triggering
 
-This is the most important step and needs the clearest atomic boundary. The default option should not imply a normal DB and normal queue can be atomically updated without an outbox or shared transaction. The transactional outbox option is the better production default.
+This step has been substantially fixed. The transactional outbox is the default, the CAS shortcut is clearly scoped to a same-store queue, and the sequence now shows `poll due -> dedup tx -> relay enqueue`.
 
-The sequence also says "enqueue run + advance next_fire" as a queue operation. That should be a store transaction followed by a relay publish, or it should be split into "commit fire marker + next_fire + outbox row" and "relay publish".
+The remaining teaching gap is how policy affects the transaction. This is the right place to show how missed fires and overlap rules change which fire keys are inserted, skipped, or queued.
 
 ### Step 6: At-Least-Once Execution with Idempotency
 
-The concept is right, but the claim sequence is too compressed. Add a lease/heartbeat or visibility-timeout story around `running` attempts. Also explain that worker-side dedup cannot make arbitrary targets safe unless the target accepts and honors the idempotency key or the side effect is itself transactional with the run store.
+The two-layer idempotency explanation is strong. It correctly states that a run-store claim does not protect external side effects unless the target honors the propagated idempotency key.
+
+The step would be even better with a compact run state machine: `queued -> running(lease) -> succeeded | failed | dead | skipped`, plus `running -> queued` on lease expiry. That would connect claim leases, retries, DLQ, overlap policy, and status APIs.
 
 ### Step 7: Retries, Backoff, and Dead-Lettering
 
-This closes the lifecycle well. It would be stronger with a retry policy in the job definition, error classification, timeout handling, and alerting ownership for DLQ entries. Right now the DLQ exists, but the operator workflow after dead-lettering is only implied.
+This step closes the execution lifecycle well. It now includes per-job retry policy, transient vs non-retryable errors, DLQ owner alerting, operator rerun, and bounded retries.
+
+The useful addition is a little more cancellation/rerun detail: whether a rerun reuses the same fire key, creates a new manual run key, or records an operator action for audit.
 
 ## Final Design Review
 
-The final design integrates most step components cleanly. The biggest concern is that it repeats the direct dispatcher-to-queue path and worker-owned recurrence ambiguity. A production final design should either:
+The final design now matches the step progression much better. It includes `Outbox + Relay` and the caption accurately describes the one-transaction marker/advance/outbox commit followed by relay publish. The previous major final-design issue is resolved.
 
-- include `Outbox + Relay` between `JobDB` and `RunQ`, or
-- state that the queue is implemented inside the same transactional store as the fire marker.
+The final design should still clarify store ownership. Either `JobDB` is the broad durable database containing job and run tables, or `RunStore` is a separate run database. The current diagram has both, which is fine only if the labels make their roles distinct.
 
-It should also remove or relabel `Workers -> JobDB compute next-fire (recurring)` unless the product intentionally uses fixed-delay scheduling. For cron semantics, the dispatcher should compute/advance future fires during trigger claim.
+The final design could also show due-index reconciliation if `TimeWheel` is a separate derived system. A small `Rebuilder/Reconciler` node is optional, but a caption note may be enough.
 
 ## Concept Introduction and Learning Flow
 
-The concept staging is strong and just-in-time. The candidate learns why persistence is needed, why due lookup is needed, why one dispatcher is needed, why election is not enough, and why worker execution is a different guarantee.
+The concept staging is now excellent for an interview walkthrough:
 
-The main missing concepts are schedule semantics rather than distributed-systems mechanics: time zones, DST, misfires, catch-up, overlap policy, schedule versioning, and update/cancel race handling. Add these before or during Step 2 so the later dedup key has enough meaning.
+- Step 1 exposes why single-box cron is insufficient.
+- Step 2 introduces schedule semantics and identity.
+- Step 3 solves due lookup.
+- Step 4 solves duplicate leaders.
+- Step 5 solves crash-safe triggering.
+- Step 6 separates dispatch guarantees from execution guarantees.
+- Step 7 completes the failure lifecycle.
+
+The only learning-flow adjustment is to explicitly connect policies introduced in Step 2 back to the Step 5 dispatcher transaction. That will prevent the policies from feeling like API/model fields that never affect the architecture.
 
 ## Step-to-Final-Design Coherence
 
-Most steps flow into the final architecture:
+The step-to-final mapping is mostly clean:
 
-- `store` introduces `JobDB`.
+- `store` introduces `API` and `JobDB`.
 - `due` introduces `TimeWheel`.
 - `election` introduces `Dispatcher` and `Lease`.
-- `dispatch` introduces `RunQ` and fire dedup.
+- `dispatch` introduces `Outbox` and `RunQ`.
 - `execute` introduces `Workers` and `RunStore`.
 - `retry` introduces `Retry` and `DLQ`.
 
-The weak transitions are the outbox omission and recurrence ownership. Step 5's transactional outbox option does not make it into the final design, even though it is needed for the stated crash safety with a separate queue. Step 6's worker-to-job-store recurrence link contradicts Step 5's atomic next-fire advancement.
+The main coherence issue is the final `workers-jobdb` link. If workers write run status to `RunStore`, that link should not say "report run status" to `JobDB`. If `JobDB` owns run state, the separate `RunStore` node should be explained as a logical table or removed.
 
 ## Realism Compared With Production Systems
 
-The dataset covers the classic reliable distributed cron backbone, but production scheduler behavior also needs:
+The dataset is now realistic enough for senior/staff interview practice. It acknowledges the hard parts: DST, misfires, overlaps, update races, fire identity, outbox, target idempotency, worker leases, retry classes, DLQ remediation, and burst sizing.
 
-- multi-tenant isolation, quotas, and per-tenant rate limits;
-- authz/audit for creating, updating, pausing, and deleting schedules;
-- schedule parsing and validation errors;
-- misfire/catch-up and DST/time-zone semantics;
-- max runtime, timeout, cancellation of active runs, and overlap policy;
-- retry policy per job, non-retryable errors, and DLQ remediation workflow;
-- observability: schedule lag, fire-to-enqueue latency, queue backlog, run latency, duplicate-suppression count, lease churn, retry rate, DLQ rate, and missed-fire alerts;
-- retention and compaction for run history and dedup keys.
+Remaining production realism gaps:
 
-These do not all need full steps, but the API/model and final wrap-up should acknowledge the most interview-relevant ones.
+- due-index repair/rebuild cadence and stale-entry validation;
+- quota/rate-limit behavior per tenant and per target;
+- authz/audit for create, update, pause, cancel, rerun, and DLQ operations;
+- cancellation semantics for queued and running jobs;
+- run history compaction versus dedup retention;
+- alert thresholds for schedule lag, fire-to-enqueue latency, queue backlog, lease churn, retries, DLQ growth, and duplicate suppression.
+
+These do not all need full steps. Most can be added as short notes in Step 2, Step 3, Step 5, and the final wrap-up.
 
 ## Dataset and Renderer-Facing Observations
 
 The source file is healthy from a renderer perspective:
 
 - `interview.json` parses as JSON.
-- Top-level keys cover the expected sections: requirements, capacity, API, data model, patterns, steps, final design, satisfies, script, level variants, follow-ups, and probe links.
 - Global architecture links reference existing nodes.
 - Step and final-design string node/link references resolve.
-- `satisfies[*].steps[*]` and `patterns[*].steps[*]` references resolve.
+- `satisfies[*].steps[*]`, `patterns[*].steps[*]`, and `technologyChoices[*].steps[*]` references resolve.
+- Top-level sections include requirements, capacity, API, data model, patterns, steps, final design, satisfies, technology choices, script, level variants, follow-ups, and probe links.
+- No generated `docs/` changes are needed for this review because `REVIEW.md` is repo-only.
 
-No generated `docs/` changes are needed for this review because `REVIEW.md` is repo-only.
+Minor observations:
+
+- The `Target` participant appears in the Step 6 sequence without being a high-level architecture node. That is acceptable for a sequence-only external participant, but adding an `external` node could make the final design's target-idempotency story more visible.
+- Several technology chips use the generic `assets/tech-icons/tech.png` fallback. That is not a rendering bug, but mapping the missing terms in `_media/index.yaml` would improve the visual polish of the Technology Choices entry.
 
 ## Recommended Edits, Prioritized
 
-### P1: Make the dispatch atomicity explicit
+### P1: Define due-index consistency
 
-Promote transactional outbox to the default path or explicitly collapse `RunQ` into the transactional store. Add outbox schema/diagram/flow if the queue remains separate.
+State whether the due index is same-store transactional or a separate derived index. If separate, add lazy validation, CDC/outbox update, and periodic reconciliation/rebuild so stale and missing due entries are handled explicitly.
 
-### P1: Fix recurring schedule ownership
+### P1: Wire misfire and overlap policies into dispatch
 
-Move `next_fire_at` advancement and due-index update to the dispatcher claim transaction. Remove the worker-owned recurring schedule link or turn it into run-status-only writes.
+Add a compact algorithm in Step 5 showing how `misfire_policy` and `overlap_policy` affect fire-key generation, skipped run records, `next_fire_at` advancement, and outbox writes.
 
-### P1: Add schedule semantics to API and data model
+### P2: Reconcile burst capacity with timing accuracy
 
-Add timezone, schedule version, misfire/catch-up policy, overlap policy, retry policy, timeout, owner/tenant, create/update idempotency key, and target idempotency key.
+Explain the jitter/backlog budget for `~200k` top-of-hour jobs. Either size dispatch/workers for the desired seconds-level trigger window or state the accepted lag under bursts.
 
-### P2: Add concrete capacity math
+### P2: Clarify `JobDB` vs `RunStore`
 
-Replace qualitative capacity labels with example numbers for stored jobs, due fires/sec, top-of-hour burst, schedule-write QPS, worker concurrency, retry amplification, queue throughput, and run retention.
+Make the data model, high-level node descriptions, and final-design links agree on where run status, attempts, claims, and outcomes live.
 
-### P2: Clarify worker idempotency and attempt state
+### P2: Add cancellation and rerun semantics
 
-Add claim leases, attempt IDs, heartbeats or visibility timeout, and target idempotency-key propagation. Explain the crash-after-side-effect-before-success-record case.
+Define what cancel does to future, queued, and active runs. Define whether operator rerun uses the same fire key or a manual rerun key, and how that is audited.
 
-### P2: Add operational signals and remediation workflows
+### P3: Improve operational and visual polish
 
-Add metrics/alerts for schedule lag, backlog, lease churn, retries, DLQ, and duplicate suppression. Explain who handles a DLQ item and whether rerun/manual override is supported.
-
-### P3: Align the naive-step diagram with the text
-
-Show the true single-box/in-memory cron design in Step 1, then introduce `API` and `JobDB` in Step 2.
-
-### P3: Consider technology choices
-
-Because this is a `book` dataset, a `technologyChoices` wrap-up could be useful for schedule store, due index, lease store, queue, worker runtime, and observability options.
+Add a few scheduler-specific metric names to the relevant steps and replace generic `tech.png` fallback icons where better mappings exist.
 
 ## What Not To Change
 
-- Keep the narrow focus on distributed cron/scheduler semantics rather than broad DAG orchestration. DAGs are already a good follow-up.
-- Keep the exactly-once-trigger vs at-least-once-execution distinction prominent.
-- Keep leader election and fire-level dedup as separate steps; merging them would hide an important interview insight.
-- Keep the compact seven-step structure. The fixes above can mostly be added as sharper model/API details and one stronger dispatch flow.
+- Keep the compact seven-step structure. It is easy to follow and each step solves a real problem exposed by the previous one.
+- Keep transactional outbox as the default for a separate run queue.
+- Keep the exact-trigger versus at-least-once-execution distinction prominent.
+- Keep schedule versioning and dispatcher-owned `next_fire_at` advancement; those are important correctness upgrades.
+- Keep DAGs, priorities, and richer workflow orchestration as follow-ups rather than expanding this into an Airflow-style workflow engine.
 
 ## Bottom Line
 
-This is a strong scheduler case with a clean teaching arc. The next revision should make the production guarantees more honest by defining schedule semantics, making outbox/atomicity explicit, and resolving who advances recurring fires. Those edits would move it from a strong interview walkthrough to a production-grade reference case.
+The recent changes moved this from a good walkthrough with major correctness caveats to a strong scheduler case. The next pass should focus on the remaining production gaps: due-index consistency, policy-aware dispatch, burst timing math, and clear store ownership.

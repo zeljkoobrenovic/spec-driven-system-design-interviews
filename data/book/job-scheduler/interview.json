@@ -29,7 +29,7 @@
         "traits": [
           "stateful"
         ],
-        "description": "Authoritative job definitions, schedules, and run state."
+        "description": "Authoritative job definitions and schedule state (next_fire_at, version, policies). Also holds the fire-dedup markers, run_outbox, and leader_lease so the fire transaction is one atomic write. It does not own per-run execution state — that lives in RunStore."
       },
       {
         "id": "TimeWheel",
@@ -40,7 +40,7 @@
           "stateful",
           "derived"
         ],
-        "description": "Time-ordered index of next-fire times so 'what's due now' is cheap."
+        "description": "Time-ordered index of next-fire times so 'what's due now' is cheap. Derived from JobDB's next_fire_at; if it's a separate store (Redis/in-memory) the dispatcher validates each due entry against JobDB before firing and a reconciler rebuilds it."
       },
       {
         "id": "Dispatcher",
@@ -100,7 +100,7 @@
         "traits": [
           "stateful"
         ],
-        "description": "Per-run records: status, attempts, idempotency key, result."
+        "description": "Owns all per-run execution state: run records, status, attempts, claim leases, idempotency key, and result. Workers read/write only here; the dispatcher's overlap check reads active claims from here too."
       },
       {
         "id": "Retry",
@@ -121,6 +121,14 @@
           "stateful"
         ],
         "description": "Runs that exhausted retries, for inspection."
+      },
+      {
+        "id": "Target",
+        "label": "Target System",
+        "type": "external",
+        "category": "boundary",
+        "traits": [],
+        "description": "The external endpoint/handler the job acts on. The worker propagates an idempotency key it must honor so a redelivered run causes no double side effect."
       }
     ],
     "links": [
@@ -159,6 +167,12 @@
         "from": "Dispatcher",
         "to": "JobDB",
         "label": "mark fired + advance next-fire + outbox (1 tx)"
+      },
+      {
+        "id": "dispatcher-runstore",
+        "from": "Dispatcher",
+        "to": "RunStore",
+        "label": "check active run (overlap policy)"
       },
       {
         "id": "jobdb-outbox",
@@ -203,10 +217,10 @@
         "label": "give up -> dead-letter"
       },
       {
-        "id": "workers-jobdb",
+        "id": "workers-target",
         "from": "Workers",
-        "to": "JobDB",
-        "label": "report run status"
+        "to": "Target",
+        "label": "act with idempotency key"
       }
     ],
     "types": [
@@ -230,7 +244,8 @@
           "Workers",
           "RunStore",
           "Retry",
-          "DLQ"
+          "DLQ",
+          "Target"
         ]
       }
     ]
@@ -289,13 +304,13 @@
     },
     {
       "label": "Top-of-hour burst",
-      "value": "~200k in a few sec",
-      "note": "Cron skew to :00; jitter + queue + worker autoscale absorb it."
+      "value": "~200k at :00",
+      "note": "Cron skew to :00. Budget: jitter over 60s -> ~3.3k fires/sec (matches workers); demand all within 5s -> ~40k fires/sec dispatch + far more workers, or accept execution lag while trigger records stay on time."
     },
     {
       "label": "Worker concurrency",
       "value": "~10k slots",
-      "note": "Avg job ~2s; retry amplification ~1.2x -> size for ~2.4k effective/sec."
+      "note": "Avg job ~2s -> ~5k jobs/sec; retry amplification ~1.2x -> ~4k effective/sec. Sets the jitter window: a 200k burst drains in ~50s at full pool."
     },
     {
       "label": "Run retention",
@@ -374,7 +389,7 @@
     {
       "method": "PATCH",
       "path": "/v1/jobs/{id}",
-      "description": "Update a schedule or pause/resume it. Bumps the schedule version, recomputes next_fire_at from the new expression/timezone, and replaces the job's entry in the due index in one transaction — so a pending fire keyed on the old (job_id, scheduled_fire, version) can no longer collide with the new schedule.",
+      "description": "Update a schedule or pause/resume it. Bumps the schedule version and recomputes next_fire_at from the new expression/timezone in JobDB. If the due index is a column in JobDB the entry is replaced in the same transaction; if it's a separate store the new next_fire_at is propagated via outbox/CDC and a stale old entry is a harmless no-op because the dispatcher validates schedule_version against JobDB before firing. Either way a pending fire keyed on the old (job_id, scheduled_fire, version) can no longer collide with the new schedule.",
       "request": "{ \"schedule\": { \"type\": \"cron\", \"expr\": \"0 3 * * *\", \"timezone\": \"America/New_York\" }, \"state\": \"active\", \"client_request_id\": \"req_def\" }",
       "response": "{ \"jobId\": \"j_9\", \"version\": 2, \"nextFire\": \"2026-06-11T07:00:00Z\" }"
     },
@@ -388,9 +403,9 @@
     {
       "method": "DELETE",
       "path": "/v1/jobs/{id}",
-      "description": "Cancel/unschedule a job.",
-      "request": "(id in path)",
-      "response": "{ \"cancelled\": true }"
+      "description": "Cancel/unschedule a job. Cancellation always stops future fires (state=cancelled, due-index entry removed) and the schedule_version bump invalidates any in-flight fire key. A query/body flag controls already-queued and in-flight runs: by default queued-but-unclaimed runs are marked skipped, while a run already claimed by a worker is left to finish (or, if cancel=hard, the worker is signaled to stop via its lease and the run is marked cancelled on the next heartbeat).",
+      "request": "(id in path; optional ?runs=leave|drain|hard)",
+      "response": "{ \"cancelled\": true, \"queuedRunsSkipped\": 1, \"activeRuns\": 0 }"
     }
   ],
   "dataModel": [
@@ -458,7 +473,7 @@
     },
     {
       "name": "runs",
-      "note": "Per-execution record; fire identity = (job_id, scheduled_fire, schedule_version). A claim lease + heartbeat lets a dead worker's 'running' claim be reclaimed.",
+      "note": "Owned by RunStore. Per-execution record; fire identity = (job_id, scheduled_fire, schedule_version). A claim lease + heartbeat lets a dead worker's 'running' claim be reclaimed. The dispatcher reads active (running/queued) rows here to enforce overlap_policy and may insert a 'skipped' row instead of enqueuing.",
       "fields": [
         {
           "name": "run_id",
@@ -486,7 +501,11 @@
         },
         {
           "name": "status",
-          "type": "enum(queued, running, succeeded, failed, dead)"
+          "type": "enum(queued, running, succeeded, failed, dead, skipped)"
+        },
+        {
+          "name": "origin",
+          "type": "enum(scheduled, manual_rerun) — operator reruns are audited as new runs"
         },
         {
           "name": "attempts",
@@ -500,7 +519,7 @@
     },
     {
       "name": "run_outbox",
-      "note": "Written in the same transaction as the fire marker; a relay reads it and publishes to the run queue at least once, then marks the row sent. Makes 'mark fired' and 'enqueue run' atomic across separate stores.",
+      "note": "Lives in JobDB so it's written in the same transaction as the fire marker and next-fire advance; a relay reads it and publishes to the run queue at least once, then marks the row sent. Makes 'mark fired' and 'enqueue run' atomic across separate stores.",
       "fields": [
         {
           "name": "outbox_id",
@@ -526,7 +545,7 @@
     },
     {
       "name": "leader_lease",
-      "note": "Election state for the active dispatcher.",
+      "note": "Election state for the active dispatcher; kept in JobDB (or a coordination store) so the fencing-token check on the fire-marker write is a same-store conditional.",
       "fields": [
         {
           "name": "role",
@@ -661,6 +680,7 @@
       "description": [
         "First, never forget a job. Persist each job definition and its schedule in a durable store with a computed next_fire_at. The schedule isn't just a cron string: it carries a timezone (so '02:00' is DST-aware), a validity window (start_at/end_at), and policies for the messy real cases — misfire/catch-up (what to do about fires missed during downtime), overlap (whether a new fire may start while the previous run is still going), retry, and timeout. These define what 'run at 02:00' actually means and the later dedup key depends on them.",
         "Give each job a schedule_version, bumped on every update, and make create/update idempotent via a client_request_id. Versioning matters because a fire is identified by (job_id, scheduled_fire, schedule_version): if an update moves a future fire from 02:00 to 03:00, the old pending 02:00 fire key is from a stale version and is ignored, so the change can't double-fire or collide.",
+        "Cancel and pause are versioned the same way: bumping the version (and clearing next_fire_at / setting state) stops all future fires and invalidates any pending fire key. What happens to work already in flight is a policy choice the API exposes — stop only future fires, also drop queued-but-unstarted runs, or additionally signal an active worker to abort via its lease. The default is to skip queued runs and let an already-running attempt finish.",
         "The store is the source of truth: a full restart can reconstruct exactly what should run and when. Everything else (the due index, the dispatcher's in-memory view) is derived from and rebuildable from this store."
       ],
       "view": {
@@ -715,7 +735,7 @@
         "Durable schedule store"
       ],
       "whyNow": [
-        "Durability of schedules is the foundation; without it a crash silently drops jobs, which is the cardinal sin for a scheduler."
+        "Durability of schedules is the foundation; without it a crash silently drops jobs — the one failure a scheduler can never be allowed to have."
       ],
       "recap": {
         "before": "Nothing.",
@@ -729,7 +749,8 @@
       "description": [
         "You can't scan millions of jobs each second to find which are due. Maintain a time-ordered index keyed by next_fire_at so 'what's due in the next window' is a cheap range query (a time wheel / sorted index).",
         "The index is mutable, not append-only: a create adds an entry, a fire removes (or for recurring, re-inserts at the new next_fire_at), and an update/cancel must remove or replace the old entry. Getting these mutations right in the same transaction as the schedule change is what keeps the index from drifting from the store.",
-        "Pick what the index physically is, because it changes failover and burst behavior: a durable sorted set (e.g. Redis ZSET keyed on next_fire_at) is fast but needs its own HA; an indexed column (B-tree on next_fire_at) is just the store with no drift; an in-memory shard-local time wheel is fastest but must be rebuilt from the store on takeover. In all cases the store's next_fire_at is authoritative and the index is rebuildable. The scheduler ticks, pulls the small due set, and fans out round-time bursts."
+        "Pick what the index physically is, because it changes failover and burst behavior: a durable sorted set (e.g. Redis ZSET keyed on next_fire_at) is fast but needs its own HA; an indexed column (B-tree on next_fire_at) is just the store with no drift; an in-memory shard-local time wheel is fastest but must be rebuilt from the store on takeover.",
+        "Consistency depends on which of those you pick, and an interviewer will push here. If the index is a column in JobDB, create/update/cancel/fire mutate the index in the same transaction — it cannot drift. If it's a separate store, you cannot make the JobDB write and the index write atomic, so treat the index as a derived hint, not a source of truth: (1) propagate schedule changes to the index asynchronously via outbox/CDC; (2) make the dispatcher validate lazily — before firing a due entry it re-reads (job_id, scheduled_fire, schedule_version, next_fire_at, state) from JobDB, so a stale entry (job moved/cancelled) is a harmless no-op; (3) run a periodic reconciler that rebuilds/repairs the index from JobDB to recover missing entries (a crash after writing JobDB but before indexing). In all cases the store's next_fire_at is authoritative and the index is rebuildable. The scheduler ticks, pulls the small due set, and fans out round-time bursts."
       ],
       "view": {
         "nodes": [
@@ -890,7 +911,8 @@
       "description": [
         "For availability you run multiple scheduler instances — but if they all read the due index and dispatch, every job fires multiple times. Elect a single active dispatcher (per shard) via a lease in a coordination store.",
         "The lease has a TTL and a fencing token; only the lease holder dispatches. If the leader dies, its lease expires and another instance takes over — brief gap, no duplicate leaders. The fencing token guards against a paused-then-resumed old leader acting late: it must be enforced at the write, not just checked in memory — the dispatcher includes its token in the conditional fire-marker write and the store rejects any write carrying a token older than the current one. A stale leader's late fire is rejected even if it still thinks it holds the lease.",
-        "Shard the schedule space (by job id hash) across several leader leases so dispatch scales horizontally while each shard still has exactly one active dispatcher."
+        "Shard the schedule space (by job id hash) across several leader leases so dispatch scales horizontally while each shard still has exactly one active dispatcher.",
+        "Make leadership observable: track lease churn (handoffs/min), fencing-token rejections, and the failover gap (time from a leader's last heartbeat to a peer acquiring the lease). A spike in churn or rejects means leaders are flapping — usually a too-short TTL or a slow coordination store — and surfaces as missed-fire lag, so it's worth a dashboard and an alert."
       ],
       "view": {
         "nodes": [
@@ -1066,7 +1088,8 @@
       "description": [
         "Even with one leader, a dispatcher can crash after reading a due job but before recording it, then re-dispatch on restart. Make triggering idempotent: each fire has a natural key (job_id, scheduled_fire, schedule_version). In one transaction the dispatcher marks that key dispatched, advances next_fire_at to the next occurrence, removes/updates the due-index entry, and records the run to publish.",
         "A second attempt to fire the same key is a no-op because it already exists. This turns at-least-once dispatch into exactly-once triggering — one run per scheduled fire. Including schedule_version in the key means a fire computed before an update can't collide with the new schedule.",
-        "The dispatcher — not the worker — advances next_fire_at when it claims the fire, so the next occurrence is scheduled independently of whether this run later succeeds (cron semantics, not fixed-delay). Because the run queue is a separate store, the atomic answer is a transactional outbox: commit the fire marker, next_fire advance, and an outbox row together, then a relay publishes to the queue at least once. The 'atomic CAS' shortcut only works if the queue is the same transactional store as the marker."
+        "The dispatcher — not the worker — advances next_fire_at when it claims the fire, so the next occurrence is scheduled independently of whether this run later succeeds (cron semantics, not fixed-delay). Because the run queue is a separate store, the atomic answer is a transactional outbox: commit the fire marker, next_fire advance, and an outbox row together, then a relay publishes to the queue at least once. The 'atomic CAS' shortcut only works if the queue is the same transactional store as the marker.",
+        "This is also where the Step 2 policies stop being mere fields and start shaping the transaction. The per-fire dispatch algorithm: (1) load the job row and, if the due index is a separate store, validate the entry against schedule_version/state; (2) compute which fire keys are due by misfire_policy — `skip` advances next_fire_at past missed fires without enqueuing, `run_one_catchup` enqueues one representative missed fire and advances past the rest, `run_all_missed` enumerates every missed key (bounded, so a long outage doesn't explode); (3) for each candidate fire, apply overlap_policy by reading active run state from RunStore — `allow` always enqueues, `skip` records a 'skipped' run instead of enqueuing when a prior run is still active, `queue_one` enqueues at most one waiter; (4) in one transaction insert the run rows as queued or skipped, advance next_fire_at, update/remove the due entry, and write outbox rows only for the queued runs. So misfires and overlaps change which keys are inserted, skipped, or queued — not just metadata."
       ],
       "view": {
         "nodes": [
@@ -1194,8 +1217,8 @@
       },
       "flows": [
         {
-          "name": "Poll due -> dedup tx -> relay enqueue",
-          "note": "The leader pulls due jobs; for each, one transaction marks the fire, advances next_fire, and writes an outbox row. A relay then publishes the run to the queue at least once. A re-dispatch after a crash hits the existing fire key and no-ops.",
+          "name": "Poll due -> policy check -> dedup tx -> relay enqueue",
+          "note": "The leader pulls due jobs; for each it validates the entry and applies misfire/overlap policy (reading active runs from RunStore), then in one transaction marks the fire, advances next_fire, inserts the run as queued or skipped, and writes an outbox row only for queued runs. A relay publishes queued runs to the queue at least once. A re-dispatch after a crash hits the existing fire key and no-ops.",
           "sequence": {
             "participants": [
               {
@@ -1205,6 +1228,10 @@
               {
                 "id": "TimeWheel",
                 "label": "Due-Job Index"
+              },
+              {
+                "id": "RunStore",
+                "label": "Run Store"
               },
               {
                 "id": "JobDB",
@@ -1227,14 +1254,20 @@
                 "label": "poll due jobs (<= now)"
               },
               {
+                "from": "Dispatcher",
+                "to": "RunStore",
+                "arrow": "->>",
+                "label": "active run? (overlap_policy)"
+              },
+              {
                 "type": "alt",
-                "label": "first dispatch of this fire",
+                "label": "first dispatch, no overlap conflict",
                 "messages": [
                   {
                     "from": "Dispatcher",
                     "to": "JobDB",
                     "arrow": "->>",
-                    "label": "tx: mark fired + advance next_fire + outbox row"
+                    "label": "tx: mark fired + advance next_fire + queue run + outbox row"
                   },
                   {
                     "from": "Outbox",
@@ -1244,8 +1277,14 @@
                   }
                 ],
                 "else": {
-                  "label": "fire already marked (re-dispatch)",
+                  "label": "overlap=skip, or fire already marked (re-dispatch)",
                   "messages": [
+                    {
+                      "from": "Dispatcher",
+                      "to": "JobDB",
+                      "arrow": "->>",
+                      "label": "record skipped run + advance next_fire (no outbox)"
+                    },
                     {
                       "from": "JobDB",
                       "to": "Dispatcher",
@@ -1270,22 +1309,25 @@
       "description": [
         "Dispatched runs go onto an at-least-once queue consumed by stateless workers. A worker claims a run with a lease, executes the job, and records the outcome. At-least-once means a run can be delivered twice (worker crash before ack), so execution must be idempotent. The schedule was already advanced by the dispatcher in Step 5, so a slow or failed run never blocks the next occurrence — workers only write run status.",
         "There are two distinct layers of idempotency. Infrastructure idempotency: the worker claims the fire key in the run store before executing, so two workers can't both run the same delivery and a redelivery to a finished run is skipped. Target idempotency: that claim alone does not stop duplicate external side effects if the worker crashes after performing the action but before recording success — so the worker propagates an idempotency key (attempt_id / fire key) to the target, and the target must honor it (or the side effect must be transactional with the run store).",
-        "A claim is a lease with a heartbeat and a timeout: if the worker dies mid-run, the lease expires and the run is reclaimed and redelivered, where the target idempotency key prevents a double side effect. A run stuck 'running' past its timeout is reclaimed the same way."
+        "A claim is a lease with a heartbeat and a timeout: if the worker dies mid-run, the lease expires and the run is reclaimed and redelivered, where the target idempotency key prevents a double side effect. A run stuck 'running' past its timeout is reclaimed the same way.",
+        "It helps to name the run state machine, because it ties together claims, retries, DLQ, overlap policy, and the status API: `queued -> running` (worker claims a lease) -> `succeeded` | `failed` | `dead` (retries exhausted); `running -> queued` on lease expiry (reclaim and redeliver); and `queued -> skipped` when overlap_policy suppresses a fire that was never started. Every status API and metric reads off this machine."
       ],
       "view": {
         "nodes": [
           "RunQ",
           "Workers",
-          "RunStore"
+          "RunStore",
+          "Target"
         ],
-        "caption": "The run queue delivers runs to job workers, which claim a lease and record each attempt and result in the run store; a stale lease (dead worker) is reclaimed and redelivered.",
+        "caption": "The run queue delivers runs to job workers, which claim a lease in the run store and act on the target with a propagated idempotency key; a stale lease (dead worker) is reclaimed and redelivered, and the target's key absorbs the duplicate.",
         "links": [
           "runq-workers",
-          "workers-runstore"
+          "workers-runstore",
+          "workers-target"
         ],
         "highlight": [
           "Workers",
-          "RunStore"
+          "Target"
         ],
         "groups": [
           "execution"
@@ -1405,7 +1447,7 @@
       "description": [
         "Transient failures (a downstream blip, a timeout) should self-heal: on failure the retry controller re-enqueues the run with exponential backoff and jitter, incrementing the attempt count in the run store. The bounds come from the job's own retry_policy (max_attempts, backoff, base), not a global constant, so a flaky integration and a critical batch can retry differently.",
         "Classify errors: retry transient errors (5xx, timeout, connection reset) but fail fast on non-retryable ones (4xx validation, auth, malformed target) — retrying those just burns attempts. After max_attempts (or on a non-retryable error) stop and move the run to a dead-letter store, then alert the job's owner so a permanently-broken job doesn't retry forever or hide.",
-        "DLQ is not the end of the workflow: an operator inspects the dead-lettered run, fixes the cause, and either reruns that specific fire (re-enqueue by fire key, idempotency-safe) or marks it abandoned. Combined with the earlier guarantees — trigger once, execute at-least-once with idempotency, retry with policy-bounded backoff, dead-letter and remediate on give-up — this is a complete reliable-execution lifecycle."
+        "DLQ is not the end of the workflow: an operator inspects the dead-lettered run, fixes the cause, and either reruns it or marks it abandoned. The rerun has two flavors with different identity: an idempotent retry of the same scheduled fire re-enqueues the original fire key (so it stays deduped against any other delivery), whereas a deliberate fresh execution creates a new run with origin=manual_rerun and a new idempotency key (so the target treats it as a new side effect, not a replay). Either way the operator action — who, when, which run, leave/abandon/rerun — is recorded for audit. Combined with the earlier guarantees — trigger once, execute at-least-once with idempotency, retry with policy-bounded backoff, dead-letter and remediate on give-up — this is a complete reliable-execution lifecycle."
       ],
       "view": {
         "nodes": [
@@ -1476,7 +1518,7 @@
   ],
   "finalDesign": {
     "title": "Final Design — Distributed Scheduler",
-    "description": "Jobs and schedules persist durably with a computed next-fire time, a timezone, a schedule_version, and misfire/overlap/retry/timeout policies, and are indexed by time for cheap due-job lookup. Per shard, a single dispatcher is elected via a TTL lease with a fencing token enforced at the fire-marker write; it polls the due index and, for each fire, in one transaction dedups on (job_id, scheduled_fire, schedule_version), advances next_fire_at, and writes an outbox row — a relay then publishes the run to the queue at least once, giving exactly-once triggering even across crashes/failover. Idempotent workers claim runs with a lease, execute while propagating an idempotency key to the target, and record outcomes. A retry controller re-enqueues transient failures with policy-bounded backoff and dead-letters the rest for owner alerting and operator rerun. Round-time bursts are smoothed by jitter and absorbed by the queue + autoscaled workers.",
+    "description": "JobDB is the source of truth: it owns job definitions, schedule state, fire-dedup markers, the run_outbox, and the leader_lease; RunStore separately owns per-run execution state (status, attempts, claim leases, results). Schedules persist durably with a computed next-fire time, a timezone, a schedule_version, and misfire/overlap/retry/timeout policies, and are indexed by time (the due index) for cheap due-job lookup — if that index is a separate store, the dispatcher validates each entry against JobDB before firing and a reconciler rebuilds it. Per shard, a single dispatcher is elected via a TTL lease with a fencing token enforced at the fire-marker write; for each due fire it applies misfire/overlap policy (reading active runs from RunStore), then in one JobDB transaction dedups on (job_id, scheduled_fire, schedule_version), advances next_fire_at, inserts the run queued or skipped, and writes an outbox row — a relay then publishes queued runs to the queue at least once, giving exactly-once triggering even across crashes/failover. Idempotent workers claim runs with a lease, execute while propagating an idempotency key the target honors, and record outcomes in RunStore. A retry controller re-enqueues transient failures with policy-bounded backoff and dead-letters the rest for owner alerting and operator rerun. Round-time bursts are smoothed by jitter and absorbed by the queue + autoscaled workers.",
     "view": {
       "nodes": [
         "Client",
@@ -1490,9 +1532,10 @@
         "Workers",
         "RunStore",
         "Retry",
-        "DLQ"
+        "DLQ",
+        "Target"
       ],
-      "caption": "The client registers jobs via the API into the schedule store and due-job index; a leased leader dispatcher polls due jobs, marks each fire and writes an outbox row in one transaction, and a relay enqueues runs that workers execute and record, with failures retried through backoff or dead-lettered.",
+      "caption": "The client registers jobs via the API into the schedule store (JobDB) and due-job index; a leased leader dispatcher polls due jobs, checks active runs in RunStore for overlap policy, marks each fire and writes an outbox row in one JobDB transaction, and a relay enqueues runs that workers execute against the target (with an idempotency key) and record in RunStore, with failures retried through backoff or dead-lettered.",
       "links": [
         "client-api",
         "api-jobdb",
@@ -1500,14 +1543,15 @@
         "dispatcher-lease",
         "dispatcher-timewheel",
         "dispatcher-jobdb",
+        "dispatcher-runstore",
         "jobdb-outbox",
         "outbox-runq",
         "runq-workers",
         "workers-runstore",
+        "workers-target",
         "workers-retry",
         "retry-runq",
-        "retry-dlq",
-        "workers-jobdb"
+        "retry-dlq"
       ],
       "groups": [
         "control",
@@ -1548,7 +1592,7 @@
       },
       {
         "requirement": "Cancel/update",
-        "how": "Versioned update of the durable definition + atomic due-index replacement; old fire keys ignored.",
+        "how": "Versioned update of the durable definition + due-index entry replaced/invalidated; old fire keys ignored.",
         "steps": [
           "store"
         ]
@@ -1612,17 +1656,17 @@
         "aws": [
           {
             "name": "Amazon Aurora",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
           },
           {
             "name": "Amazon DynamoDB",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
           }
         ],
         "gcp": [
           {
             "name": "Cloud Spanner",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/Databases-512-color.png"
           },
           {
             "name": "Cloud SQL",
@@ -1669,7 +1713,7 @@
         "aws": [
           {
             "name": "Amazon ElastiCache (Redis)",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
           }
         ],
         "gcp": [
@@ -1719,7 +1763,7 @@
         "gcp": [
           {
             "name": "Cloud Spanner (lease row)",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/Databases-512-color.png"
           }
         ],
         "azure": [
@@ -1758,11 +1802,11 @@
         "aws": [
           {
             "name": "Amazon SQS",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
           },
           {
             "name": "Amazon MSK",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Streaming-for-Apache-Kafka_64.png"
           }
         ],
         "gcp": [
@@ -1778,11 +1822,11 @@
         "azure": [
           {
             "name": "Azure Service Bus",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
           },
           {
             "name": "Azure Queue Storage",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/10840-icon-service-Storage-Queue.svg"
           }
         ]
       },
@@ -1811,7 +1855,7 @@
         "aws": [
           {
             "name": "AWS Lambda",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/Arch_AWS-Lambda_64.png"
           },
           {
             "name": "ECS / Fargate",
@@ -1831,7 +1875,7 @@
         "azure": [
           {
             "name": "Azure Functions",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
           },
           {
             "name": "AKS",
@@ -1860,7 +1904,7 @@
         "aws": [
           {
             "name": "Amazon CloudWatch",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
           }
         ],
         "gcp": [

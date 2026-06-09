@@ -328,12 +328,13 @@ Map "Extremely read-heavy" to the CQRS, search/read model, and scaling steps.
 Consider drawing the edge cache as a fronting CDN and add one failure drill for
 stale cached content after moderation or a product suppression.
 
-### P3: Add technology choices when this case gets a tech pass
+### P3: Keep technology choices aligned with future architecture edits
 
-This dataset has no `technologyChoices` section. That is optional, but a future
-book polish pass could compare Elasticsearch/OpenSearch/Solr, Kafka/Pulsar,
-Bigtable/Cassandra/DynamoDB, Redis/CDN cache choices, and managed cloud
-equivalents.
+This dataset now has a `technologyChoices` section covering the catalog write
+store, search/facet index, read model, change stream, projectors, volatile
+pricing/inventory stores, caching, gateway, rebuild storage, and observability.
+If the architecture changes again, keep those choices aligned with the steps
+rather than growing them into a generic vendor catalog.
 
 ## What Not To Change
 
@@ -351,5 +352,6 @@ equivalents.
 The recent changes moved this dataset from "good but missing important
 production support" to a strong product-catalog interview. The remaining work is
 targeted: clarify how projected price participates in search, define the
-purchase quote/reservation boundary, scope multi-seller offers, and fix the
-small `satisfies.nonFunctional` mapping gap.
+purchase quote/reservation boundary, scope multi-seller offers, fix the small
+`satisfies.nonFunctional` mapping gap, and keep the new technology choices
+aligned as the design evolves.

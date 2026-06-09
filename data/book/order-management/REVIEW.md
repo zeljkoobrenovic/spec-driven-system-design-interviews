@@ -11,7 +11,7 @@ minimal data model, missing final flows, missing reconciliation, and absent
 technology choices are now largely addressed. The dataset now has numeric load
 assumptions, line-level order modeling, payment and WMS webhook APIs, richer
 idempotency/reconciliation language, a `Reconciler` node, three final sequence
-flows, and five technology-choice sections.
+flows, and ten technology-choice sections.
 
 The remaining issues are more about precision than missing foundations. The
 main one is the fulfillment handoff: the current flow says a WMS `shipped`
@@ -166,6 +166,12 @@ provider IDs, idempotency, and outbox delivery explicit. The missing data is
 mostly operational: webhook dedupe, reconciliation jobs, support actions, and
 manual repair audit.
 
+The technology-choice section is now broad enough for a book case. It covers
+API edge controls, order and inventory stores, workflow orchestration, payment
+tokenization/key custody, WMS ingestion, event transport, notifications,
+reconciliation workers, and observability. The remaining polish is mostly icon
+specificity for generic payment/PCI terms.
+
 The architecture is sound: an order-service orchestrator owns state transitions,
 inventory handles reservations, payment owns auth/capture/refund, fulfillment
 integrates WMS, outbox handles status events, returns handles refund/restock,
@@ -318,9 +324,9 @@ The remaining realism gaps are the kinds a senior interviewer may probe:
   resolve to real step IDs.
 - Canonical node types used in the dataset are valid: `client`, `edge`,
   `orchestrator`, `database`, `service`, `external`, `queue`, and `worker`.
-- `technologyChoices` is present and relevant. The payments concern is slightly
-  schema-awkward because PSPs such as Stripe/Adyen/Braintree are described in
-  tradeoff text but not represented as selectable chips.
+- `technologyChoices` has ten relevant OMS concerns, with icons assigned. The
+  direct PSP API and HSM terms intentionally use the generic fallback icon
+  because the icon map has no dedicated entries.
 - `finalDesign.flows` now has three useful sequence flows.
 - The dataset has no generated AI visuals or explainer comic. That is optional,
   not a correctness issue.
@@ -358,8 +364,8 @@ webhook signature validation, and async compensation status.
 
 ### P3: Add book polish
 
-Add more probe links, optional AI visuals/explainer comic, and a cleaner way to
-represent PSP choices in `technologyChoices`.
+Add more probe links, optional AI visuals/explainer comic, and dedicated
+payment-provider icons if desired.
 
 ## What Not To Change
 

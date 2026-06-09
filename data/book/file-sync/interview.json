@@ -109,7 +109,15 @@
         "traits": [
           "stateless"
         ],
-        "description": "Reclaims chunks whose refcount drops to zero."
+        "description": "Reclaims chunks whose refcount drops to zero; runs mark-and-sweep to repair refcount drift."
+      },
+      {
+        "id": "Obs",
+        "label": "Observability & Ops",
+        "type": "observability",
+        "category": "async",
+        "traits": [],
+        "description": "Tracks SLOs: commit latency, sync propagation lag, durability, failed chunk verifications, CDN hit ratio, refcount drift, and GC deletion rate."
       }
     ],
     "links": [
@@ -202,6 +210,20 @@
         "from": "GC",
         "to": "BlockStore",
         "label": "delete chunk"
+      },
+      {
+        "id": "meta-obs",
+        "from": "MetaSvc",
+        "to": "Obs",
+        "label": "metrics / SLOs",
+        "arrow": "-.-"
+      },
+      {
+        "id": "block-obs",
+        "from": "BlockSvc",
+        "to": "Obs",
+        "label": "metrics / SLOs",
+        "arrow": "-.-"
       }
     ],
     "types": [
@@ -240,11 +262,15 @@
   ],
   "capacityDiagram": [
     "graph LR",
-    "  Files[Billions of files]",
-    "  Bytes[Exabytes of data]",
-    "  Dedup[High dedup ratio]",
-    "  Files --> Bytes",
-    "  Bytes --> Dedup"
+    "  Users[~100M active users]",
+    "  Edits[~200k upload edits/sec]",
+    "  Checks[~2M chunk-checks/sec]",
+    "  Commits[~200k metadata commits/sec]",
+    "  Notify[~500k notify events/sec]",
+    "  Users --> Edits",
+    "  Edits --> Checks",
+    "  Checks --> Commits",
+    "  Commits --> Notify"
   ],
   "requirements": {
     "functional": [
@@ -264,29 +290,69 @@
   },
   "capacity": [
     {
-      "label": "Files",
-      "value": "billions",
-      "note": "Across hundreds of millions of users."
+      "label": "Active users / devices",
+      "value": "~100M users, ~250M devices",
+      "note": "~2.5 devices per user; each device long-polls for namespace changes."
     },
     {
-      "label": "Total bytes",
-      "value": "exabytes",
-      "note": "Dominated by media and backups."
+      "label": "Files & logical bytes",
+      "value": "~50B files, ~5 EB logical",
+      "note": "~500 files/user, ~100 MB average file (media + backups dominate)."
     },
     {
       "label": "Chunk size",
       "value": "~4 MB",
-      "note": "Unit of dedup, transfer, and resumability."
+      "note": "Unit of dedup, transfer, and resumability. ~25 chunks for the average file."
+    },
+    {
+      "label": "Upload edits",
+      "value": "~200k edits/sec",
+      "note": "~2 edits/user/day active. Avg ~3 changed chunks/edit (content-defined chunking re-chunks only the edited region)."
+    },
+    {
+      "label": "Chunk-check QPS",
+      "value": "~2M hashes/sec",
+      "note": "Each edit checks the full manifest (~10 hashes/edit batched) before uploading the ~3 missing ones."
+    },
+    {
+      "label": "Chunk-write QPS",
+      "value": "~600k chunks/sec pre-dedup",
+      "note": "~200k edits × ~3 changed chunks. After dedup only novel chunks hit the object store."
+    },
+    {
+      "label": "Metadata commits",
+      "value": "~200k commits/sec",
+      "note": "One version row per edit + a manifest. Sized separately from bytes — this is the transactional hot path."
+    },
+    {
+      "label": "Downloads",
+      "value": "~2M chunks/sec, downloads >> uploads",
+      "note": "Read-heavy: every committed change fans out to a user's other devices and to shared-folder members."
+    },
+    {
+      "label": "Notification fanout",
+      "value": "~500k events/sec",
+      "note": "~200k commits × ~2.5 other devices; spikes for large shared folders (one commit -> hundreds of members)."
     },
     {
       "label": "Dedup ratio",
-      "value": "high",
-      "note": "Shared files, re-uploads, and unchanged chunks dedup heavily."
+      "value": "~3-5x logical:physical",
+      "note": "Shared files, re-uploads, and unchanged chunks dedup heavily. ~5 EB logical -> ~1-1.5 EB physical."
     },
     {
-      "label": "Read:write",
-      "value": "downloads >> uploads",
-      "note": "Justifies a download CDN."
+      "label": "Chunk-index cardinality",
+      "value": "~250-400B unique chunks",
+      "note": "physical bytes / ~4 MB. Each row is hash + size + refcount + location -> ~30-50 TB of index, justifying its own store."
+    },
+    {
+      "label": "Metadata footprint",
+      "value": "~10-20 TB live + versions",
+      "note": "~50B files × a few hundred bytes/row + version history. Tiny vs object-store bytes — that asymmetry is why the planes split."
+    },
+    {
+      "label": "CDN egress",
+      "value": "~80-90% hit ratio target",
+      "note": "Hot/shared chunks served from edge; cold/private chunks origin-fetch from the object store."
     }
   ],
   "api": [
@@ -335,16 +401,16 @@
     {
       "method": "PUT",
       "path": "/v1/chunks/{hash}",
-      "description": "Upload one content-addressed chunk. Idempotent: same hash, same content.",
+      "description": "Upload one content-addressed chunk. Idempotent: same hash, same content. The server re-hashes the bytes and rejects (400) if they don't match the path hash before marking the chunk available.",
       "request": "(raw chunk bytes, ~4MB)",
-      "response": "{ \"stored\": true }"
+      "response": "{ \"stored\": true } | 400 hash_mismatch"
     },
     {
       "method": "POST",
       "path": "/v1/files/commit",
-      "description": "Commit a new file version referencing its ordered chunk hashes. Triggers sync notifications.",
+      "description": "Commit a new file version referencing its ordered chunk hashes. Authorized against namespace membership and the optimistic baseVersion. Triggers sync notifications. On a stale baseVersion returns 409 and the client creates a conflicted copy; on insufficient role returns 403.",
       "request": "{ \"path\": \"/docs/a.pdf\", \"chunks\": [\"h1\",\"h2\",\"h3\"], \"baseVersion\": 7 }",
-      "response": "{ \"version\": 8 }",
+      "response": "{ \"version\": 8 } | 409 conflict | 403 forbidden",
       "sequence": {
         "participants": [
           {
@@ -394,15 +460,36 @@
     {
       "method": "GET",
       "path": "/v1/files/changes",
-      "description": "Long-poll for changes to the user's namespace since a cursor (the sync delta).",
-      "request": "?cursor=<opaque>",
-      "response": "{ \"changes\": [ ... ], \"cursor\": \"...\" }"
+      "description": "Long-poll for changes to a namespace since a cursor (the sync delta). The cursor is a per-namespace monotonic sequence. If it predates the change-log retention window, the server returns reset=true and the client does a snapshot + delta resync.",
+      "request": "?namespace=<id>&cursor=<opaque>",
+      "response": "{ \"changes\": [ ... ], \"cursor\": \"...\" } | { \"reset\": true, \"snapshotUrl\": \"...\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/files/restore",
+      "description": "Restore a file to a previous version (or undelete a tombstoned file). Creates a new version whose manifest equals the target version's.",
+      "request": "{ \"fileId\": 42, \"toVersion\": 6 }",
+      "response": "{ \"version\": 9 }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/shares",
+      "description": "Create or update a share: add a member to a namespace with a role, or mint a public link. Requires owner/editor role on the namespace.",
+      "request": "{ \"namespace\": 7, \"member\": \"bob@x.com\", \"role\": \"editor\" }",
+      "response": "{ \"membershipId\": 1234, \"state\": \"invited\" }"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/shares/{membershipId}",
+      "description": "Revoke a member's access. Their devices stop receiving the namespace cursor; pending writes from a now-revoked member are rejected at commit.",
+      "request": "(path param)",
+      "response": "{ \"state\": \"revoked\" }"
     }
   ],
   "dataModel": [
     {
-      "name": "files (metadata)",
-      "note": "Current state of a path in a namespace.",
+      "name": "files (directory entry)",
+      "note": "Current state of a path in a namespace. (namespace_id, path) is unique; it points at a file_id and its current version.",
       "fields": [
         {
           "name": "namespace_id",
@@ -413,42 +500,66 @@
           "type": "varchar"
         },
         {
-          "name": "version",
+          "name": "file_id",
+          "type": "bigint (stable across renames/moves)"
+        },
+        {
+          "name": "current_version",
+          "type": "bigint (-> file_versions.version_id)"
+        },
+        {
+          "name": "is_dir",
+          "type": "bool"
+        },
+        {
+          "name": "deleted",
+          "type": "bool (tombstone)"
+        },
+        {
+          "name": "deleted_at",
+          "type": "timestamp null (drives restore window + GC)"
+        }
+      ]
+    },
+    {
+      "name": "file_versions",
+      "note": "Immutable version history per file_id for restore. The manifest is the ordered chunk list (inline for small files, manifest_ref for huge ones).",
+      "fields": [
+        {
+          "name": "version_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "file_id",
           "type": "bigint"
         },
         {
+          "name": "base_version",
+          "type": "bigint (parent; used for optimistic conflict check)"
+        },
+        {
+          "name": "manifest_ref",
+          "type": "object-store key (ordered chunk hashes for huge files)"
+        },
+        {
           "name": "chunk_hashes",
-          "type": "list<varchar> (ordered)"
+          "type": "list<varchar> (inline manifest for small/medium files)"
         },
         {
           "name": "size",
           "type": "bigint"
         },
         {
-          "name": "deleted",
-          "type": "bool"
-        }
-      ]
-    },
-    {
-      "name": "versions",
-      "note": "Immutable version history per file for restore.",
-      "fields": [
-        {
-          "name": "file_id",
+          "name": "created_by_device",
           "type": "bigint"
-        },
-        {
-          "name": "version",
-          "type": "bigint"
-        },
-        {
-          "name": "chunk_hashes",
-          "type": "list<varchar>"
         },
         {
           "name": "created_at",
           "type": "timestamp"
+        },
+        {
+          "name": "conflict_of",
+          "type": "bigint null (file_id this is a conflicted copy of)"
         }
       ]
     },
@@ -469,8 +580,86 @@
           "type": "bigint (for GC)"
         },
         {
+          "name": "state",
+          "type": "enum(pending, available)"
+        },
+        {
           "name": "location",
           "type": "object-store key"
+        }
+      ]
+    },
+    {
+      "name": "namespaces",
+      "note": "A user's root or a shared folder. Sharing makes a folder its own namespace mounted into each member's tree.",
+      "fields": [
+        {
+          "name": "namespace_id",
+          "type": "bigint PK (shard key)"
+        },
+        {
+          "name": "kind",
+          "type": "enum(root, shared_folder)"
+        },
+        {
+          "name": "owner_user_id",
+          "type": "bigint"
+        },
+        {
+          "name": "cursor_head",
+          "type": "bigint (monotonic change-log sequence)"
+        }
+      ]
+    },
+    {
+      "name": "namespace_members",
+      "note": "ACL: who can see/edit a namespace, with the role used to authorize every path operation.",
+      "fields": [
+        {
+          "name": "namespace_id",
+          "type": "bigint"
+        },
+        {
+          "name": "user_id",
+          "type": "bigint"
+        },
+        {
+          "name": "role",
+          "type": "enum(owner, editor, viewer)"
+        },
+        {
+          "name": "mount_path",
+          "type": "varchar (where it appears in the member's tree)"
+        },
+        {
+          "name": "state",
+          "type": "enum(invited, active, revoked)"
+        }
+      ]
+    },
+    {
+      "name": "shared_links",
+      "note": "Public/anonymous access tokens to a file or folder.",
+      "fields": [
+        {
+          "name": "token",
+          "type": "varchar PK"
+        },
+        {
+          "name": "namespace_id",
+          "type": "bigint"
+        },
+        {
+          "name": "path",
+          "type": "varchar"
+        },
+        {
+          "name": "access",
+          "type": "enum(view, edit)"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamp null"
         }
       ]
     }
@@ -513,6 +702,15 @@
       "group": "Delta Sync Across Devices"
     },
     {
+      "name": "Shared namespaces + ACLs",
+      "what": "Model a shared folder as its own namespace mounted into each member's tree, authorized by a membership/role table.",
+      "whenToUse": "Multi-user access to the same files with per-member read/write permissions and revocation.",
+      "steps": [
+        "sharing"
+      ],
+      "group": "Shared Namespaces and ACLs"
+    },
+    {
       "name": "Change notification (long-poll/push)",
       "what": "Tell other devices a namespace changed so they pull the delta.",
       "whenToUse": "Near-real-time multi-device sync without constant polling.",
@@ -538,6 +736,7 @@
       "description": [
         "Start with the simplest thing that works. On every change, the client uploads the entire file to the server, which stores it as one blob; to sync, another device downloads the whole file back.",
         "This is correct and trivial — and it exposes the problems the rest of the design exists to solve. A one-byte edit to a 500 MB file re-uploads all 500 MB; the same file shared by ten users is stored ten times; and an upload that drops at 90% must restart from zero because there are no independent pieces to resume from.",
+        "The cost compounds at scale: at ~200k edits/sec, re-uploading whole files instead of changed chunks would move petabytes per second before any CDN or compression — orders of magnitude more than the few changed chunks actually warrant.",
         "So the baseline motivates everything that follows: split files into content-addressed chunks so you transfer and store only what is new, and resume from the last good chunk."
       ],
       "view": {
@@ -593,7 +792,7 @@
           "BlockSvc",
           "BlockStore"
         ],
-        "caption": "The client sends files through the gateway to the block service, which now splits them into chunks before putting and getting them in the object store.",
+        "caption": "The client splits files into content-addressed chunks locally, then sends them through the gateway to the block service, which puts and gets them in the object store.",
         "links": [
           "client-lb",
           "lb-block",
@@ -610,7 +809,7 @@
       "options": [
         {
           "name": "Content-defined chunking (rolling hash) (default)",
-          "description": "A rolling hash sets chunk boundaries based on content, so an edit re-chunks only the affected region while unchanged chunks keep their hashes.",
+          "description": "The client runs a rolling hash to set chunk boundaries based on content, so an edit re-chunks only the affected region while unchanged chunks keep their hashes. Client-side chunking is what enables check-before-upload and per-chunk resume.",
           "pros": [
             "Chunk boundaries follow content, so inserting a byte at the front only re-chunks the first region — the rest keep their hashes.",
             "Edits re-upload a handful of chunks, which is what makes dedup and delta sync actually save bandwidth.",
@@ -628,7 +827,7 @@
               "BlockSvc",
               "BlockStore"
             ],
-            "caption": "The block service splits the file into variable-size chunks at content-defined boundaries before storing each chunk in the object store.",
+            "caption": "The client splits the file into variable-size chunks at content-defined boundaries, then uploads them through the block service into the object store.",
             "links": [
               "client-lb",
               "lb-block",
@@ -645,7 +844,7 @@
         },
         {
           "name": "Fixed-size chunking (e.g. 4 MB blocks)",
-          "description": "The file is split every fixed N bytes and each block is hashed, so boundaries fall at fixed offsets regardless of content.",
+          "description": "The client splits the file every fixed N bytes and hashes each block, so boundaries fall at fixed offsets regardless of content.",
           "pros": [
             "Trivial to implement: split every N bytes, hash each block.",
             "Uniform chunk sizes make storage accounting and indexing simple.",
@@ -663,7 +862,7 @@
               "BlockSvc",
               "BlockStore"
             ],
-            "caption": "The block service splits the file into fixed-size blocks before putting and getting them in the object store.",
+            "caption": "The client splits the file into fixed-size blocks before uploading them through the block service into the object store.",
             "links": [
               "client-lb",
               "lb-block",
@@ -797,7 +996,13 @@
                 "from": "BlockSvc",
                 "to": "BlockStore",
                 "arrow": "->>",
-                "label": "store h2"
+                "label": "verify hash(bytes)==h2, store"
+              },
+              {
+                "from": "BlockSvc",
+                "to": "ChunkIdx",
+                "arrow": "->>",
+                "label": "mark h2 available"
               }
             ]
           },
@@ -882,7 +1087,7 @@
       "id": "sync",
       "title": "5. Delta Sync Across Devices",
       "description": [
-        "Each device tracks a cursor of the last namespace version it has seen. To sync, it asks for the changes since its cursor and gets a delta of changed file metadata.",
+        "Each device tracks a cursor — a per-namespace monotonic change-log sequence — of the last version it has seen. To sync, it asks for the changes since its cursor and gets a delta of changed file metadata. If a device has been offline longer than the change-log retention window, the server signals a reset and the device falls back to a metadata snapshot plus delta rather than replaying a truncated log.",
         "For each changed file, the device compares the new chunk-hash list against what it already has locally and downloads only the missing chunks — delta sync in both directions.",
         "Downloads come from the block service or a CDN; reconstruct the file from its ordered chunks. Resumable because chunks are independent units."
       ],
@@ -921,7 +1126,7 @@
       "recap": {
         "before": "Whole-file transfer.",
         "after": "Devices transfer only changed chunks, resumably, via CDN.",
-        "newRisk": "How do devices learn there's a change without constant polling? And what if two devices edit at once?"
+        "newRisk": "Sync so far assumes one owner per namespace — but a stated requirement is sharing a folder with other users at different permission levels."
       },
       "flows": [
         {
@@ -1002,8 +1207,146 @@
       ]
     },
     {
+      "id": "sharing",
+      "title": "6. Shared Namespaces and ACLs",
+      "description": [
+        "Sharing is not just a path in one user's tree. Model a shared folder as its own namespace with a membership table (owner / editor / viewer), mounted into each member's namespace at their chosen path. Inviting a user adds a `namespace_members` row; accepting activates it; revoking flips it to revoked.",
+        "Authorization moves into the metadata service: before committing any path operation — write, rename, delete, version restore — `MetaSvc` checks the caller's role in that namespace's membership. A viewer's commit is rejected; an editor's is allowed. This makes ACL state part of the commit contract, not an afterthought.",
+        "Sharing reuses the rest of the machinery: a shared namespace has its own change cursor, so every member's devices sync it via the same delta-pull, and a commit fans notifications out to all members, not just the author's devices. Public links are a separate token table granting view/edit to a path without a user account.",
+        "Sharing also touches dedup privacy: global cross-user dedup is storage-efficient but, done naively, lets one user probe whether a chunk hash already exists and infer that someone else holds that content. Scope or salt dedup (or fall back to per-namespace dedup for sensitive content) so existence isn't a side channel."
+      ],
+      "view": {
+        "nodes": [
+          "Client",
+          "LB",
+          "MetaSvc",
+          "MetaDB"
+        ],
+        "caption": "Share and path operations route to the metadata service, which authorizes the caller against namespace membership in the metadata store before committing.",
+        "links": [
+          "client-lb",
+          "lb-meta",
+          {
+            "from": "MetaSvc",
+            "to": "MetaDB",
+            "label": "authorize against members"
+          }
+        ],
+        "highlight": [
+          "MetaSvc",
+          "MetaDB"
+        ],
+        "groups": [
+          "metadata-plane"
+        ]
+      },
+      "decisionPrompt": "Two users in a shared folder edit the same file, and one is later downgraded to viewer mid-edit. How does the design keep authorization correct and avoid losing writes?",
+      "concepts": [
+        {
+          "term": "Shared namespace",
+          "definition": "A folder modeled as its own namespace with a membership/ACL table, mounted into each member's tree.",
+          "whyItMatters": "Decouples who-can-access from any one user's path, so a single change cursor and one set of chunks serve all members.",
+          "example": "A 'Team Photos' namespace with 50 members; each member mounts it at their own path but shares one cursor and chunk set.",
+          "group": "Shared Namespaces and ACLs"
+        }
+      ],
+      "patterns": [
+        "Shared namespaces + ACLs"
+      ],
+      "probeLinks": [
+        "dropbox-magic-pocket"
+      ],
+      "whyNow": [
+        "Sharing is a stated requirement and it changes the metadata contract: every commit must be authorized against namespace membership, and notification fanout now spans members, not just one user's devices."
+      ],
+      "flows": [
+        {
+          "name": "Share a folder, then a member commits",
+          "note": "Inviting adds a membership row; an editor's commit is authorized against that membership before the version is written and fanned out to all members.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Client"
+              },
+              {
+                "id": "MetaSvc",
+                "label": "Metadata Service"
+              },
+              {
+                "id": "MetaDB",
+                "label": "Metadata Store"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Client",
+                "to": "MetaSvc",
+                "arrow": "->>",
+                "label": "share /Team, user=bob role=editor"
+              },
+              {
+                "from": "MetaSvc",
+                "to": "MetaDB",
+                "arrow": "->>",
+                "label": "add namespace_members row"
+              },
+              {
+                "from": "Client",
+                "to": "MetaSvc",
+                "arrow": "->>",
+                "label": "bob commits /Team/a.pdf"
+              },
+              {
+                "type": "alt",
+                "label": "role allows write",
+                "messages": [
+                  {
+                    "from": "MetaSvc",
+                    "to": "MetaDB",
+                    "arrow": "->>",
+                    "label": "authorize + write version"
+                  }
+                ],
+                "else": {
+                  "label": "viewer / revoked",
+                  "messages": [
+                    {
+                      "from": "MetaSvc",
+                      "to": "Client",
+                      "arrow": "-->>",
+                      "label": "403 not authorized"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "MetaSvc"
+          ]
+        }
+      ],
+      "recap": {
+        "before": "Files lived in a single user's namespace; no multi-user access.",
+        "after": "Shared folders are first-class namespaces with per-member roles; commits are authorized against membership.",
+        "newRisk": "Commits now fan out to many members' devices, and concurrent edits need conflict handling — plus a way to push changes without polling."
+      },
+      "traps": [
+        {
+          "trap": "Treating a shared folder as a copied path in each user's namespace.",
+          "why": "Duplicates metadata and chunks, breaks a single source of truth, and makes permission changes and a shared cursor incoherent.",
+          "instead": "Make the shared folder its own namespace with a membership table, mounted into each member's tree."
+        },
+        {
+          "trap": "Global cross-user dedup with no privacy scoping.",
+          "why": "A user can probe whether a chunk hash exists and infer that someone else holds that exact content.",
+          "instead": "Scope or salt dedup for sensitive content, or fall back to per-namespace dedup so existence isn't a side channel."
+        }
+      ]
+    },
+    {
       "id": "notify",
-      "title": "6. Change Notification and Conflict Handling",
+      "title": "7. Change Notification and Conflict Handling",
       "description": [
         "On commit, the metadata service publishes a 'namespace changed' event; a notification service (long-poll or push) tells the user's other devices to pull the delta — near-real-time without polling.",
         "Concurrent edits are detected with optimistic versioning: a commit carries the baseVersion it edited; if the server has advanced past it, the commit conflicts.",
@@ -1237,11 +1580,12 @@
     },
     {
       "id": "gc",
-      "title": "7. Garbage Collection and Durability",
+      "title": "8. Garbage Collection and Durability",
       "description": [
         "Dedup means a chunk may be referenced by many files/versions. Deleting a file or pruning old versions doesn't free a chunk until nothing references it — track a refcount per chunk.",
         "A background garbage collector finds chunks whose refcount hit zero and deletes them from the block store. Do this lazily and safely (grace period / mark-and-sweep) to avoid deleting a chunk a concurrent upload just referenced.",
-        "Durability comes from the object store's replication/erasure coding across zones; metadata is replicated and backed up. Orphan chunks from interrupted uploads are reclaimed the same way."
+        "Durability comes from the object store's replication/erasure coding across zones; metadata is replicated and backed up. Orphan chunks from interrupted uploads are reclaimed the same way.",
+        "The invariant that ties it together: bytes are uploaded and verified (chunk marked available) before any metadata version references them, and refcounts are derived from committed manifests — never trusted as the sole source of truth. Because counters drift (a crash between the version commit and the refcount update leaves them inconsistent), a periodic mark-and-sweep recomputes reachability from live manifests and repairs the index. A chunk is only deleted when it is both refcount-zero and unmarked by the last sweep, past the grace period."
       ],
       "view": {
         "nodes": [
@@ -1250,11 +1594,15 @@
           "BlockStore",
           "MetaDB"
         ],
-        "caption": "The garbage collector finds chunks with refcount zero in the chunk index and deletes them from the object store while the metadata store tracks references.",
+        "caption": "The garbage collector finds chunks with refcount zero in the chunk index and deletes them from the object store while reading reachability from the metadata store.",
         "links": [
           "gc-chunkidx",
           "gc-store",
-          "meta-metadb"
+          {
+            "from": "GC",
+            "to": "MetaDB",
+            "label": "read reachability"
+          }
         ],
         "highlight": [
           "GC"
@@ -1413,13 +1761,83 @@
           "scenario": "An availability zone holding chunks fails.",
           "expectedBehavior": "Reads/writes continue from replicas in other zones.",
           "mitigation": "Cross-zone replication / erasure coding in the object store."
+        },
+        {
+          "scenario": "A version commit succeeds but the follow-up refcount increment fails (crash between the two writes).",
+          "expectedBehavior": "The chunk is still referenced by a live manifest and must not be collected, even though its counter is stale-low.",
+          "mitigation": "Treat refcounts as a hint, not truth: the periodic mark-and-sweep recomputes reachability from live manifests and repairs drift; never delete a chunk reachable from a committed version."
+        },
+        {
+          "scenario": "A client claims a hash in check but uploads bytes that don't match it.",
+          "expectedBehavior": "The block service re-hashes received bytes; on mismatch it rejects the chunk and never marks it available.",
+          "mitigation": "Hash-verify every PUT /v1/chunks/{hash}; only flip state pending -> available after the content hash matches the key."
+        }
+      ],
+      "flows": [
+        {
+          "name": "Safe commit ordering: upload -> verify -> commit -> derive refcount",
+          "note": "Bytes become durable and verified before metadata references them; refcounts are derived from the committed manifest, so a crash leaves reclaimable orphans, never a dangling pointer.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Client"
+              },
+              {
+                "id": "BlockSvc",
+                "label": "Block Service"
+              },
+              {
+                "id": "ChunkIdx",
+                "label": "Chunk Index"
+              },
+              {
+                "id": "MetaSvc",
+                "label": "Metadata Service"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Client",
+                "to": "BlockSvc",
+                "arrow": "->>",
+                "label": "PUT missing chunks"
+              },
+              {
+                "from": "BlockSvc",
+                "to": "ChunkIdx",
+                "arrow": "->>",
+                "label": "verify hash, mark available"
+              },
+              {
+                "from": "Client",
+                "to": "MetaSvc",
+                "arrow": "->>",
+                "label": "commit version (chunk list)"
+              },
+              {
+                "from": "MetaSvc",
+                "to": "ChunkIdx",
+                "arrow": "->>",
+                "label": "increment refcounts (or derive on sweep)"
+              },
+              {
+                "from": "MetaSvc",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "200 committed"
+              }
+            ]
+          },
+          "highlight": [
+            "ChunkIdx"
+          ]
         }
       ]
     }
   ],
   "finalDesign": {
     "title": "Final Design — Chunked, Deduplicated File Sync",
-    "description": "Clients chunk files into content-addressed blocks, check the chunk index, and upload only missing chunks to the block store; then they commit a new file version (ordered chunk hashes) to the transactional metadata service. The metadata/block split keeps structure consistent and bytes cheap. The notification service pushes change events so other devices pull deltas and download only changed chunks (via CDN). Concurrent edits become conflicted copies; reference-counted GC reclaims unused chunks; the object store provides cross-zone durability.",
+    "description": "Clients chunk files into content-addressed blocks, check the chunk index, and upload only verified missing chunks to the block store; then they commit a new file version (ordered chunk hashes) to the transactional metadata service. The metadata/block split keeps structure consistent and bytes cheap. Every metadata mutation is scoped to a namespace and authorized through membership/ACL state, so shared folders are first-class and a commit fans out to all members. The notification service pushes change events so other devices pull deltas and download only changed chunks (via CDN). Concurrent edits become conflicted copies; reference-counted GC reclaims unused chunks and a mark-and-sweep repairs refcount drift; the object store provides cross-zone durability. Operations track sync lag, refcount drift, chunk-verification failures, and restore readiness against explicit SLOs.",
     "view": {
       "nodes": [
         "Client",
@@ -1432,9 +1850,10 @@
         "NotifySvc",
         "NotifyQ",
         "CDN",
-        "GC"
+        "GC",
+        "Obs"
       ],
-      "caption": "The sync client talks through the gateway to the metadata service (metadata store) and block service, which deduplicates via the chunk index into the object store; changes flow through the notification queue and downloads through the CDN, with a garbage collector reclaiming unreferenced chunks.",
+      "caption": "The sync client talks through the gateway to the metadata service (metadata store) and block service, which deduplicates via the chunk index into the object store; changes flow through the notification queue and downloads through the CDN, with a garbage collector reclaiming unreferenced chunks and an observability plane tracking SLOs.",
       "links": [
         "client-lb",
         "lb-meta",
@@ -1450,7 +1869,9 @@
         "client-cdn",
         "cdn-store",
         "gc-chunkidx",
-        "gc-store"
+        "gc-store",
+        "meta-obs",
+        "block-obs"
       ],
       "groups": [
         "metadata-plane",
@@ -1479,9 +1900,17 @@
       },
       {
         "requirement": "Versioning + restore",
-        "how": "Immutable version rows referencing chunk manifests.",
+        "how": "Immutable file_versions rows reference chunk manifests; restore creates a new version pointing at an old manifest, and tombstones allow undelete within a retention window.",
         "steps": [
-          "meta-split"
+          "meta-split",
+          "gc"
+        ]
+      },
+      {
+        "requirement": "Share files/folders with others (read or write)",
+        "how": "A shared folder is its own namespace with a membership/role table; MetaSvc authorizes every path operation against membership before committing, and changes fan out to all members.",
+        "steps": [
+          "sharing"
         ]
       },
       {
@@ -1499,6 +1928,15 @@
         "how": "Cross-zone replication/erasure coding in the object store; replicated metadata.",
         "steps": [
           "gc"
+        ]
+      },
+      {
+        "requirement": "Scale to billions of files / exabytes; read-heavy on downloads",
+        "how": "Metadata sharded by namespace and kept tiny vs object-store bytes; dedup shrinks physical bytes ~3-5x; a download CDN absorbs the read-heavy chunk traffic.",
+        "steps": [
+          "meta-split",
+          "dedup",
+          "sync"
         ]
       },
       {
@@ -1525,6 +1963,188 @@
       }
     ]
   },
+  "technologyChoices": [
+    {
+      "concern": "Metadata store (tree, versions, manifests, ACLs)",
+      "steps": [
+        "meta-split",
+        "sharing",
+        "gc"
+      ],
+      "selfHosted": [
+        "PostgreSQL (sharded / Citus)",
+        "MySQL (Vitess)",
+        "CockroachDB",
+        "FoundationDB"
+      ],
+      "cloud": {
+        "aws": [
+          "Aurora",
+          "DynamoDB"
+        ],
+        "gcp": [
+          "Cloud Spanner",
+          "Cloud SQL"
+        ],
+        "azure": [
+          "Cosmos DB",
+          "Azure SQL"
+        ]
+      },
+      "tradeoff": [
+        "Metadata is the transactional control plane: it needs atomic version commits, optimistic conflict checks, and ACL authorization, so a relational/strongly-consistent store fits better than the object store.",
+        "It is tiny relative to bytes (~10-20 TB vs exabytes), so shard by namespace and replicate/back it up aggressively rather than optimizing for raw capacity."
+      ],
+      "makesIrrelevant": "A horizontally-sharded managed SQL (Spanner/CockroachDB) removes most hand-rolled resharding and cross-shard transaction glue for the namespace tree."
+    },
+    {
+      "concern": "Block / object store for content-addressed chunks",
+      "steps": [
+        "chunking",
+        "dedup",
+        "gc"
+      ],
+      "selfHosted": [
+        "Ceph",
+        "MinIO",
+        "SeaweedFS"
+      ],
+      "cloud": {
+        "aws": [
+          "S3"
+        ],
+        "gcp": [
+          "Cloud Storage"
+        ],
+        "azure": [
+          "Blob Storage"
+        ]
+      },
+      "tradeoff": [
+        "Chunks are immutable, hash-keyed blobs — exactly the access pattern object stores are built for, with erasure coding and cross-zone durability handled for you.",
+        "At exabyte scale a purpose-built store (Dropbox's Magic Pocket) can beat cloud egress/cost, but only once volume justifies running your own."
+      ],
+      "makesIrrelevant": "Cloud object storage with erasure coding removes most custom replication, repair, and disk-management work."
+    },
+    {
+      "concern": "Chunk index (hash -> exists + refcount)",
+      "steps": [
+        "dedup",
+        "gc"
+      ],
+      "selfHosted": [
+        "RocksDB",
+        "ScyllaDB",
+        "Cassandra"
+      ],
+      "cloud": {
+        "aws": [
+          "DynamoDB"
+        ],
+        "gcp": [
+          "Bigtable"
+        ],
+        "azure": [
+          "Cosmos DB"
+        ]
+      },
+      "tradeoff": [
+        "Hundreds of billions of tiny key-value rows with high write/lookup QPS favor a wide-column / LSM store over a relational DB.",
+        "Refcounts here are a hint that the GC mark-and-sweep repairs, so the index can be eventually consistent without risking data loss."
+      ]
+    },
+    {
+      "concern": "Change notification & fanout",
+      "steps": [
+        "sharing",
+        "notify"
+      ],
+      "selfHosted": [
+        "Kafka",
+        "Redis pub/sub",
+        "NATS",
+        "WebSocket / long-poll gateway"
+      ],
+      "cloud": {
+        "aws": [
+          "SNS + SQS",
+          "API Gateway WebSockets"
+        ],
+        "gcp": [
+          "Pub/Sub"
+        ],
+        "azure": [
+          "Service Bus",
+          "Web PubSub"
+        ]
+      },
+      "tradeoff": [
+        "A durable log (Kafka) gives replayable change events and backpressure for large shared folders; a push gateway handles device presence and long-poll.",
+        "Devices must always be able to recover from the change cursor, so the notification path can be best-effort — it only triggers a pull, it isn't the source of truth."
+      ],
+      "makesIrrelevant": "A managed pub/sub + WebSocket service removes most connection-state and fanout plumbing for device notifications."
+    },
+    {
+      "concern": "Download CDN",
+      "steps": [
+        "sync"
+      ],
+      "selfHosted": [
+        "Varnish",
+        "Nginx cache",
+        "Apache Traffic Server"
+      ],
+      "cloud": {
+        "aws": [
+          "CloudFront"
+        ],
+        "gcp": [
+          "Cloud CDN"
+        ],
+        "azure": [
+          "Azure CDN",
+          "Front Door"
+        ]
+      },
+      "tradeoff": [
+        "Content-addressed chunks are immutable and cacheable forever by hash, so a CDN is a near-perfect fit for the read-heavy download path.",
+        "Private chunks need signed URLs and care about cross-user cache leakage; not everything should be edge-cached."
+      ],
+      "makesIrrelevant": "A managed CDN with signed URLs removes custom edge-cache and origin-shielding infrastructure."
+    },
+    {
+      "concern": "Auth, quotas, abuse/malware, and rate limits",
+      "steps": [
+        "sharing",
+        "meta-split"
+      ],
+      "selfHosted": [
+        "Keycloak",
+        "Envoy / Kong (rate limiting)",
+        "ClamAV (malware scan)"
+      ],
+      "cloud": {
+        "aws": [
+          "Cognito",
+          "WAF",
+          "API Gateway"
+        ],
+        "gcp": [
+          "Identity Platform",
+          "Cloud Armor"
+        ],
+        "azure": [
+          "Entra ID",
+          "API Management"
+        ]
+      },
+      "tradeoff": [
+        "Per-user/device quotas and rate limits protect the metadata hot path and the chunk store from abusive clients and reconnect storms.",
+        "Malware/abuse scanning runs async after commit so it doesn't block sync; encryption-at-rest and signed chunk URLs gate access to bytes.",
+        "Client-side (zero-knowledge) encryption conflicts with global cross-user dedup — you can keep per-user dedup, or convergent encryption with its own existence-leak caveats."
+      ]
+    }
+  ],
   "interviewScript": [
     {
       "phase": "Scope & requirements",
@@ -1548,9 +2168,10 @@
       "phase": "Deep dive",
       "time": "next 15 min",
       "say": [
-        "Delta sync with cursors + hash compare.",
+        "Delta sync with cursors + hash compare; cursor recovery past retention.",
+        "Shared namespaces + ACLs: authorize commits against membership, fanout to members.",
         "Change notification (long-poll/push) and conflict handling (conflicted copies).",
-        "Reference-counted GC and durability."
+        "Reference-counted GC, drift repair, and durability."
       ]
     },
     {
@@ -1558,8 +2179,9 @@
       "time": "final 5 min",
       "say": [
         "Map requirements to mechanisms.",
-        "Tradeoffs: chunking scheme, commit ordering, GC safety, conflict policy.",
-        "Extensions: sharing/ACLs, CDN tuning, client-side encryption."
+        "Tradeoffs: chunking scheme, commit ordering, GC safety, conflict policy, dedup privacy.",
+        "Operations: quotas, abuse scanning, metadata backup/restore, SLOs.",
+        "Extensions: CDN tuning, client-side (zero-knowledge) encryption vs dedup, huge files."
       ]
     }
   ],

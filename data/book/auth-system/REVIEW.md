@@ -5,288 +5,311 @@ Review date: 2026-06-09
 
 ## Executive Summary
 
-This is a strong security-first walkthrough. It teaches the right progression:
-password storage, session/token trade-offs, OIDC, refresh and revocation,
-authorization, MFA, abuse defense, and key rotation. The step options and traps
-are especially useful because they compare real alternatives instead of toy
-choices.
+The recent auth-system update materially improved the dataset. The previous
+highest-impact gaps around MFA gating, refresh-token lineage, authorization
+context, capacity math, duplicate architecture nodes, and audit schema are now
+mostly addressed in the source JSON. The interview is a credible security-first
+walkthrough that can be used as-is.
 
 | Axis | Score | Notes |
 | --- | ---: | --- |
-| System design soundness | 4 | Core architecture is credible, but some security-critical state is only described in prose. |
-| Production realism | 3 | Good threat framing; needs more explicit lifecycle, tenancy, recovery, and operational data. |
-| Pedagogical flow | 4 | The sequence builds cleanly and motivates each next step. |
-| Dataset/rendering fit | 4 | JSON and references are clean; duplicate legacy node IDs should be removed. |
-| Interview readiness | 4 | Usable as-is, with clear improvements before making it a flagship auth case. |
+| System design soundness | 4 | Strong auth fundamentals, concrete lifecycle state, and realistic token strategy; a few state machines still need explicit backing records. |
+| Production realism | 4 | Much better capacity, audit, revocation, and policy detail; recovery, tenant isolation, and incident operations remain follow-up-heavy. |
+| Pedagogical flow | 4 | The step order is coherent and the options teach real trade-offs. |
+| Dataset/rendering fit | 4 | JSON and graph references are clean; sequence aliases and sparse API/final flows are the main renderer-facing weaknesses. |
+| Interview readiness | 4 | Strong enough for the book group; one more pass would make it a flagship auth case. |
 
 ## What Works Well
 
-- The walkthrough starts with the highest-consequence baseline decision:
-  password storage. That is the right anchor for an auth interview.
-- The sessions vs stateless tokens step presents a real production trade-off:
-  revocation and centralized state versus hot-path verification scale.
-- The OIDC step correctly teaches authorization-code flow, PKCE, nonce/state,
-  issuer/audience validation, and local identity linking.
-- The refresh/revocation step names the right compromise: short access tokens,
-  rotating refresh tokens, and a small denylist for logout and sensitive
-  operations.
-- The traps are concrete and interview-relevant, especially around token
-  contents, generic login errors, gateway-only authz, SMS-only MFA, hard
-  lockouts, and central introspection.
-- Renderer-facing references are mostly healthy: JSON parses, step/final-design
-  view nodes and links resolve, `satisfies[*].steps[*]` resolve, and
-  `probeLinks` resolve.
+- The flow starts with secure password storage, then moves to sessions/tokens,
+  OIDC, refresh/revocation, authorization, MFA, abuse defense, and JWKS scaling.
+  That is the right learning progression for an auth interview.
+- Capacity now breaks the design into useful work units: verification QPS,
+  login QPS, password-hash CPU, refresh QPS, MFA QPS, authorization decisions,
+  audit writes, denylist memory, rate-limit counters, and revocation latency.
+- The API now models the key MFA split: `/v1/login` can return a
+  `mfa_required` response with `challenge_id` and `mfa_pending_token`, while
+  `/v1/mfa/verify` is the point that returns full tokens.
+- The data model now carries important production state: refresh-token
+  families, MFA factors, OAuth login attempts, tenant-scoped roles/permissions,
+  rate-limit counters, identity links, and an audit event schema.
+- The authorization API is no longer a toy query string. It accepts subject,
+  action, resource, tenant, owner, attributes, and decision context, and it
+  returns `policy_version` plus a cache TTL.
+- The high-level architecture uses canonical node IDs and no longer contains
+  duplicate legacy nodes such as `A`/`Auth` or `C`/`Client`.
+- Dataset references validate cleanly: step/final view nodes and links resolve,
+  option view nodes and links resolve, and `satisfies[*].steps[*]` references
+  resolve.
 
 ## Highest-Impact Issues
 
-### 1. Security-critical state is under-modeled
+### 1. MFA challenge state is introduced by the API but not modeled explicitly
 
-The data model has `users`, `sessions`, `roles_permissions`, `identity_links`,
-and `audit_log`. That supports the broad story, but not the details the case
-promises: rotating refresh-token chains, reuse detection, per-device session
-management, MFA enrollment, WebAuthn/passkey credentials, revocation by token
-ID/session family, OIDC state/nonce/PKCE login attempts, and abuse counters.
+The API now returns `challenge_id` and `mfa_pending_token`, and the MFA sequence
+correctly gates full token issuance. The data model has `mfa_factors`, but it
+does not yet model the short-lived challenge or pending-auth state behind those
+API fields.
 
-Why it matters: these are not implementation trivia for an auth system. They
-are the difference between "we say refresh rotation" and "we can detect a
-stolen refresh token and revoke the whole family."
-
-Concrete fix:
-
-- Add `refresh_token_families` or expand `sessions` with `family_id`,
-  `token_hash`, `rotated_from`, `last_used_at`, `revoked_at`,
-  `revocation_reason`, `device_id`, `ip_hash`, and `user_agent_hash`.
-- Add `mfa_factors` with factor type, encrypted TOTP seed reference or WebAuthn
-  credential ID/public key, enrollment status, last used time, and backup-code
-  handling.
-- Add `oauth_login_attempts` for `state`, `nonce`, `pkce_challenge`, provider,
-  redirect URI, expiry, and consumed time.
-- Add `rate_limit_counters` or `login_risk_events` to back the abuse-defense
-  step with concrete storage.
-- Add policy metadata such as tenant/resource attributes, policy version, and
-  decision cache TTL.
-
-### 2. MFA is taught as a gate, but the API returns full tokens immediately
-
-Step 6 correctly warns that full tokens must not be issued before MFA succeeds.
-However, the public API section still has `POST /v1/login` returning full
-`access_token` and `refresh_token`, with only prose saying it "triggers MFA if
-enabled." There is no MFA challenge endpoint, MFA-pending credential, or
-challenge state in the API.
-
-Why it matters: this is a direct coherence gap between the strongest MFA trap
-and the interface candidates will copy in an interview.
+Why it matters: MFA correctness depends on binding a challenge to the login
+attempt, factor, user, device, risk decision, expiry, and attempt counter. If
+that state is left implicit, candidates can miss replay protection and
+rate-limited verification semantics.
 
 Concrete fix:
 
-- Change `/v1/login` to return either full tokens for non-MFA users or a
-  `mfa_required` response with `challenge_id` and a limited `mfa_pending_token`.
-- Add `POST /v1/mfa/challenge` and `POST /v1/mfa/verify`.
-- Add `POST /v1/mfa/factors` and `DELETE /v1/mfa/factors/{factor_id}` if user
-  session/device management is in scope.
-- Show in the sequence diagram that full token issuance happens only after MFA
-  verification.
+- Add `mfa_challenges` or `pending_auth_attempts` with `challenge_id`,
+  `user_id`, `factor_id`, `device_id`, `tenant_id`, `risk_score`,
+  `expires_at`, `attempt_count`, `consumed_at`, and `status`.
+- State whether `mfa_pending_token` is an opaque lookup token or a short-lived
+  signed token with a `purpose=mfa_pending` claim.
+- Add a short note that MFA challenge verification is rate-limited separately
+  from password login.
 
-### 3. Capacity is too qualitative for the design choices it motivates
+### 2. API and final-design sequence coverage lags behind the richer model
 
-The capacity section names the right dimensions, especially `~100k req/s`
-verification, but it does not turn them into work units. For this interview,
-the crucial math is CPU and storage pressure: password hash cost, login peak,
-refresh QPS, signature verification cost, JWKS cache behavior, audit write
-volume, denylist lookup QPS, and rate-limit counter cardinality.
+Only `/v1/login` has a structured API sequence, and the final design has no
+flows. The step flows cover login, OIDC, refresh reuse, and MFA, but not the
+full set of APIs now present in the dataset.
 
-Why it matters: the case argues for local JWT verification and against central
-introspection, but the candidate needs numbers to defend that trade-off.
-
-Concrete fix:
-
-- Split traffic into verification QPS, login QPS, refresh QPS, MFA challenge
-  QPS, and authorization-decision QPS.
-- Estimate CPU for Argon2/bcrypt under login bursts and show why login must be
-  separately rate-limited and horizontally scaled.
-- Estimate audit writes/sec for successes, failures, revocations, policy
-  changes, and suspicious events.
-- Estimate denylist/cache memory from token TTL and revocation rate.
-- Add rate-limit counter cardinality for account, IP, subnet, tenant, and
-  device dimensions.
-
-### 4. Authorization lacks tenant/resource context and cache invalidation rules
-
-The authorization step correctly contrasts central policy decisions with
-permissions embedded in tokens. The API, however, uses
-`GET /v1/authorize?sub=usr_1&action=delete&resource=doc_9` and the model uses a
-flat `roles_permissions` table. That does not carry tenant, resource owner,
-relationship, environment, policy version, or freshness requirements.
-
-Why it matters: RBAC/ABAC is only realistic when the decision has enough context
-and a clear invalidation story. Otherwise the dataset teaches "central authz"
-without showing what makes it correct.
+Why it matters: this interview is about lifecycle correctness. The source now
+has enough API/model detail to teach those lifecycles, but the visual/sequence
+path still makes several critical operations feel secondary.
 
 Concrete fix:
 
-- Make authorization a POST body with `subject`, `action`, `resource`,
-  `tenant_id`, `resource_owner`, `attributes`, and `decision_context`.
-- Add policy versioning and decision cache TTLs.
-- State which decisions can be cached, which require a fresh policy lookup, and
-  what happens on role change.
-- Add one flow showing gateway and resource-service defense in depth.
+- Add API sequences for `/v1/mfa/challenge`, `/v1/mfa/verify`,
+  `/v1/token/refresh`, `/v1/logout`, and `/v1/authorize`.
+- Add at least one final-design flow for the hot request path:
+  gateway verifies JWT locally, checks revocation only for sensitive operations,
+  calls authorization with resource context, then writes audit events.
+- Add a second final-design flow for refresh-token reuse detection and family
+  revocation.
 
-### 5. The final design promises "everything security-relevant is audited" but
-the architecture has one generic audit log
+### 3. Authorization is much stronger, but still compressed into one table and
+one service call
 
-The final design includes `Audit Log`, and several steps mention auditability.
-That is a good signal, but the dataset does not specify event schema,
-immutability, retention, privacy treatment, alerting, or investigation
-workflows.
+The dataset now includes tenant ID, attributes, policy version, and cache TTLs.
+That fixes the previous toy authorization shape. The remaining weakness is that
+resource hierarchy, relationship checks, decision cache placement, and role
+change invalidation are still described compactly.
 
-Why it matters: auth audit logs often contain sensitive metadata and are used
-for account recovery, incident response, compliance, and abuse detection. A
-generic log box is not enough for the production story.
+Why it matters: real authz bugs usually happen at the boundary between policy,
+resource ownership, tenant scope, cached decisions, and service-level
+enforcement. A strong auth interview should make that boundary visible.
 
 Concrete fix:
 
-- Add event types: login success/failure, MFA challenge/verify, refresh rotate,
-  refresh reuse, logout, role/policy change, suspicious login, key rotation.
-- Include actor, subject, tenant, session/device, IP/user-agent fingerprint,
-  correlation ID, result, risk score, and policy version.
-- State retention and access controls for audit data.
-- Add alert examples for refresh reuse, impossible travel, credential stuffing,
-  and signing-key compromise.
+- Split or expand `roles_permissions` into policy bindings, resource
+  attributes, and relationship/ownership facts if the dataset wants to teach
+  ABAC beyond a small JSONB field.
+- Add a decision-cache component or explicitly state where the cache lives
+  (gateway, resource service, or authz service).
+- Include one sequence where the gateway authorizes broadly but the resource
+  service repeats an object-level check before mutation.
+- State how `policy_version` invalidates cached decisions after role or tenant
+  membership changes.
+
+### 4. Abuse defense has counter storage, but not the full risk workflow
+
+`rate_limit_counters` is a good addition, and the abuse step now discusses
+multi-dimensional limits. The design still does not show a counter/risk store
+node in the architecture, and the satisfies section mentions breached-password
+checks without showing the dependency or data path.
+
+Why it matters: credential-stuffing defense is not just counters. It includes
+signals, challenge escalation, false-positive handling, user recovery, and
+provider/dependency failure modes.
+
+Concrete fix:
+
+- Add a `Risk / Counter Store` node or make it clear that the Login Rate
+  Limiter owns a replicated fast store.
+- Add a breached-password-check dependency if that behavior is kept in
+  `satisfies`.
+- Document what happens when the counter store is degraded: fail open, fail
+  closed, local fallback, or challenge-only mode.
+- Add one note about support/user recovery for incorrectly challenged users.
+
+### 5. Recovery, device/session management, and tenant isolation are still
+mostly follow-ups
+
+The follow-up list correctly names passkeys, account recovery, SSO/logout,
+service-to-service auth, leaked signing keys, and multi-tenant isolation. Those
+are good follow-ups, but account recovery, session/device inventory, and tenant
+isolation are central enough to deserve a little more mainline treatment.
+
+Why it matters: auth systems are often compromised through recovery flows,
+stale devices, weak tenant boundaries, or support workflows rather than through
+the idealized login path.
+
+Concrete fix:
+
+- Add a compact "out of scope but important" note to requirements or final
+  design for recovery, support workflows, and tenant isolation.
+- Add a `devices` or `user_sessions` entity if "manage sessions/devices" stays
+  in the functional requirements.
+- Add tenant ID to token claims and state that verifier/authz checks reject
+  cross-tenant access even when the subject is valid.
 
 ## System Design Soundness
 
-The security fundamentals are strong. The dataset avoids common auth design
-mistakes: plaintext passwords, fast hashes, implicit OAuth flow, long-lived
-tokens without revocation, gateway-only authorization, hard account lockout,
-and central token introspection on every request.
+The security fundamentals are solid. The design avoids common traps: plaintext
+or fast-hashed passwords, password verification on every request, implicit OAuth
+flow, trusting ID tokens without issuer/audience/nonce validation, long-lived
+access tokens without revocation, SMS-only MFA, gateway-only authorization, hard
+account lockout, and central introspection on every request.
 
-The biggest soundness gap is that several critical behaviors remain prose-level:
-refresh-token lineage, MFA state, OIDC transient login state, and authz decision
-context. These should be represented in API and data-model fields so the final
-architecture is implementable, not just plausible.
+The strongest recent improvement is that the state model now backs most of the
+claims made by the steps. Refresh-token rotation has a family table, OAuth has
+transient login attempts, authorization has tenant and policy-version fields,
+rate limiting has keyed counters, and audit logging has concrete event fields.
 
-The key-rotation story is directionally right: local verification through JWKS,
-overlapping old/new keys, and short token TTLs. It would be stronger if it named
-`kid`, JWKS cache max-age, verifier refresh behavior on unknown `kid`, emergency
-key revocation, and blast radius for a leaked private key.
+The main remaining soundness gap is pending-state modeling. MFA challenges,
+remembered devices, account recovery, and session/device inventory still need
+either explicit records or a clear statement that they are outside scope.
 
-The abuse-defense step is good at explaining why per-IP limits and hard lockouts
-are insufficient. It should add operational detail: a shared counter store,
-multi-region counter consistency expectations, false-positive handling, CAPTCHA
-or step-up abuse, and a path for user recovery after suspicious activity.
+Key rotation is directionally right: JWKS, short access-token TTLs, overlapping
+keys, local verification, unknown-`kid` refresh behavior, and emergency
+revocation are described. It would be stronger if the final design had a
+sequence showing verifier cache refresh and what changes during emergency key
+compromise.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive Baseline: Password Login & Secure Storage
 
-This is a strong opening. It makes password hashing the first irreversible
-security decision and explains why login cannot be the per-request verification
-path. Add a small note about peppering/HSM-managed secret material only if you
-want a deeper senior/staff branch; it is not required for the base step.
+Strong opening. It anchors the interview in the highest-consequence storage
+decision and correctly separates slow password verification from the hot request
+path. The flow still uses short participant IDs (`C`, `U`) instead of canonical
+architecture IDs; this is minor, but canonical IDs would improve highlight
+inheritance and consistency.
 
 ### Step 2: Sessions vs Stateless Tokens
 
-The trade-off is well framed. The next improvement is to explicitly state which
-credential type the final design chooses for access tokens and refresh tokens:
-short JWT access tokens plus stateful/hashed refresh-token records. That wording
-prevents readers from thinking refresh tokens are also purely stateless.
+The trade-off is clear: centralized revocation and lookup state versus local
+verification speed. The chosen design should continue to emphasize that access
+tokens are short-lived signed tokens while refresh tokens are stateful,
+hashed, rotating records.
 
 ### Step 3: Federated Login (OAuth / OIDC)
 
-This is one of the strongest steps. It covers code flow, PKCE, IdP token
-validation, and identity mapping. Add callback/state storage to the data model
-and API so nonce/state/PKCE are not only mentioned in prose.
+This is one of the best steps. It teaches code flow, PKCE, nonce/state,
+server-side exchange, token validation, and identity linking. The added
+`oauth_login_attempts` entity makes the flow much more credible. Use canonical
+`Client` and `IdP` participant IDs in the sequence for consistency.
 
 ### Step 4: Token Refresh & Revocation
 
-The chosen approach is realistic. The missing piece is persistent token-family
-state: what exactly is stored, hashed, rotated, retired, and revoked. A flow for
-"refresh reuse detected" would make this step much stronger.
+The refresh-token family model is now the right production shape. The flow's
+reuse-detection branch is especially valuable because it shows why rotation is
+not just "issue a new token." Add an API sequence for `/v1/token/refresh` so
+this behavior appears in the public interface section too.
 
 ### Step 5: Authorization (RBAC / ABAC)
 
-The step teaches the right distinction between authentication and authorization
-and correctly warns against stale permissions embedded in tokens. It needs more
-resource context and cache invalidation details to be production-realistic.
+The step now has enough tenant/resource/policy context to be realistic. The
+next improvement is to show defense in depth: gateway-level authorization plus
+resource-service object-level checks. This would also make the "not only at the
+gateway" trap concrete.
 
 ### Step 6: Multi-Factor Authentication
 
-The options are strong, especially the WebAuthn/passkey alternative and the SMS
-caveats. The API needs to match the teaching: full tokens should be issued only
-after MFA succeeds, and the model should store enrolled factors, backup codes,
-factor recovery, and remembered-device state if those are in scope.
+The old coherence issue is fixed: the API and sequence no longer issue full
+tokens before MFA succeeds. The remaining improvement is to add challenge-state
+storage and clarify the lifetime/claims of the `mfa_pending_token`.
 
 ### Step 7: Rate Limiting & Abuse Defense
 
-This step is practical and avoids the common hard-lockout trap. It should add a
-concrete rate-limiter state model and state how counters are keyed, expired, and
-replicated. It should also distinguish login throttling from account recovery
-and MFA-prompt throttling, which have different abuse modes.
+The option set is practical and avoids teaching hard lockouts or single-IP
+limits as acceptable answers. The counter model is now present. Add degraded
+mode and recovery handling so this step teaches how to defend login without
+self-inflicted denial of service.
 
 ### Step 8: Scaling Verification & Key Rotation
 
-The step lands the main scaling lesson: do not put auth introspection on every
-request. Add verifier cache behavior, `kid` lookup, emergency rotation, and
-observability metrics so key rotation feels operationally complete.
+The core lesson lands: verify locally with JWKS and avoid central introspection
+on every request. The deep dive should stay. A visual or sequence for key
+rotation would make the operational story easier to explain under interview
+pressure.
 
 ## Final Design Review
 
-The final design integrates the major components introduced in the steps:
-limiter, auth service, IdP, MFA, token service, keys/JWKS, revocation list, API
-gateway, authorization service, policy store, resource service, and audit log.
-That coherence is a strength.
+The final design now integrates the major components cleanly: client app,
+login rate limiter, auth service, credential store, external IdP, MFA service,
+token service, signing keys/JWKS, revocation list, API gateway, authorization
+service, policy store, resource service, and audit log.
 
-The final design should be more explicit about trust boundaries and hot paths.
-For example:
+The final design's main weakness is that it is a static architecture view only.
+For an auth system, the dynamic paths matter as much as the boxes. Add final
+flows for:
 
-- Login path: limiter -> auth -> credential store/OIDC -> MFA -> token service.
-- Refresh path: token service -> hashed refresh-token record -> rotation/reuse
-  detection -> signing keys.
-- Request path: gateway/resource verifies JWT locally -> optional denylist
-  check for sensitive operations -> authz decision.
-- Operations path: audit events, risk signals, and key rotation events.
-
-This would make the final design read like the culmination of the steps rather
-than a compact summary of them.
+- Login with MFA: password verification -> pending MFA -> factor verify -> full
+  token issue.
+- Refresh reuse: refresh request -> token hash lookup -> retired-token replay
+  -> family revocation -> audit.
+- Hot request path: local JWT verify -> sensitive-op revocation check -> authz
+  decision/cache -> resource-service object check -> audit.
+- Key rotation: publish new JWKS key -> overlapping verification -> retire old
+  key -> emergency revoke if compromised.
 
 ## Concept Introduction and Learning Flow
 
-The concepts are staged well. Each step introduces two or three important terms
-right when the design needs them. The best examples are "slow KDF" in step 1,
-"stateless signed token" in step 2, "OIDC id token" in step 3, "refresh-token
-rotation" in step 4, and "JWKS" in step 8.
+Concepts are introduced at the right time. Slow KDFs appear before tokens,
+stateless verification appears before revocation, OIDC appears before identity
+linking, refresh rotation appears before denylist checks, and JWKS appears only
+after the hot-path scaling pressure is established.
 
-The learning flow would improve if "state machine" concepts were introduced
-explicitly for login, MFA, refresh rotation, and revocation. Auth systems are
-less about boxes and more about lifecycle correctness: pending, verified,
-active, refreshed, retired, revoked, compromised, recovered.
+The strongest remaining pedagogical improvement is to name the state machines
+more directly. Auth systems are lifecycle systems: pending login, MFA pending,
+active session, refreshed token, retired refresh token, revoked family,
+disabled factor, consumed OAuth state, and rotated signing key. The data model
+now contains many of those states; the prose should call them out as deliberate
+state transitions.
 
 ## Step-to-Final-Design Coherence
 
-Most step outputs appear in the final design. The main coherence issues are:
+Most step outputs now appear in the final design:
 
-- Step 6 says MFA must gate token issuance, but the API shows `/v1/login`
-  returning tokens directly.
-- Step 4 says refresh tokens rotate and reuse detection revokes the chain, but
-  the data model does not store enough chain state.
-- Step 7 says multi-dimensional limiting and breached-password checks are used,
-  but the final design lacks a counter/risk store or breach-check dependency.
-- Step 5 says policy decisions are cached and evaluated centrally, but the API
-  and data model do not carry tenant/resource attributes or cache-invalidation
-  mechanics.
+- Step 1 maps to `Auth` and `UserDB`.
+- Step 2 maps to `API`, `Token`, `Keys`, and `Session`.
+- Step 3 maps to `IdP`, `Auth`, and `UserDB`.
+- Step 4 maps to `Token`, `Revoke`, `Keys`, and refresh-token family state.
+- Step 5 maps to `AuthZ` and `Policy`.
+- Step 6 maps to `MFA`, `MFAProvider`, `Auth`, and `Token`.
+- Step 7 maps to `Limiter` and `Audit`, with `rate_limit_counters` in the data
+  model.
+- Step 8 maps to `API`, `Token`, `Keys`, and `Revoke`.
+
+The main coherence gaps are now narrower:
+
+- MFA challenge state is not represented as a data entity.
+- Rate-limit/risk storage is present in the data model but not visible as an
+  architecture node.
+- Authz caching and resource-service object-level enforcement are described but
+  not shown in a flow.
+- Final design has no dynamic flows to prove the state transitions.
 
 ## Realism Compared With Production Systems
 
-Compared with a production identity platform, the dataset is strongest on
-threat awareness and weakest on lifecycle data. Real systems spend a lot of
-energy on device/session inventory, account recovery, factor enrollment,
-support workflows, incident response, tenancy, and audit access controls.
+Compared with a production identity platform, this dataset is now realistic on
+the core login/token/authz path. It handles the main threat model: credential
+database theft, stolen refresh tokens, stale permission claims, credential
+stuffing, token replay, and signing-key rotation.
 
-The follow-up list already names WebAuthn, account recovery, SSO/single logout,
-service-to-service auth, leaked signing keys, and multi-tenant isolation. Those
-are good follow-ups. For a flagship case, pull one or two of them into the main
-body: account recovery and tenant isolation are too central to leave entirely
-as afterthoughts.
+The remaining realism gaps are around the messy operational edges:
+
+- account recovery and factor loss,
+- support/admin workflows,
+- device/session inventory,
+- tenant isolation,
+- risk-engine false positives,
+- degraded counter or MFA-provider dependencies,
+- audit access controls and incident investigation workflow,
+- passkey/passwordless migration.
+
+Those do not all need to become main steps. A concise "production extensions"
+note in final design or follow-ups would be enough for most of them.
 
 ## Dataset and Renderer-Facing Observations
 
@@ -296,66 +319,71 @@ as afterthoughts.
 - Option view node/link references resolve.
 - Final-design node/link references resolve.
 - `satisfies[*].steps[*]` references resolve.
-- `probeLinks` references resolve.
 - Requirements and capacity diagrams are raw Mermaid overview diagrams, which is
   allowed by the repo conventions.
-- There are duplicate/legacy architecture nodes with overlapping labels:
-  `A` and `Auth`, `C` and `Client`, `I` and `IdP`, `T` and `Token`, `U` and
-  `UserDB`. They do not break current rendering, but they increase maintenance
-  risk and make sequence aliases harder to reason about. Prefer canonical IDs
-  throughout and remove unused legacy nodes if no generated diagram needs them.
-- Only `/v1/login` has a structured API sequence. Add sequences for refresh,
-  logout/revocation, authorization, OIDC callback, and MFA verification if this
-  case is intended to match the richer book datasets.
+- The canonical architecture node set is clean: no duplicate legacy nodes were
+  found in `highLevelArchitecture.nodes`.
+- Some sequence participants still use short IDs (`C`, `U`, `I`) instead of
+  canonical IDs (`Client`, `UserDB`, `IdP`). They render, but canonical IDs
+  would make highlight inheritance and maintenance easier.
+- Only `/v1/login` has an API sequence. Add sequences for MFA, refresh,
+  logout/revocation, authorization, and OIDC callback for parity with the
+  richer data model.
+- `finalDesign.flows` is absent. This is not a schema error, but it is a missed
+  teaching opportunity for a lifecycle-heavy system.
+- The dataset does not yet include `technologyChoices`, `aiVisuals`, an
+  `explainerComic`, or per-requirement `aiVisual` fields. These are optional
+  book features, not correctness blockers.
 
 ## Recommended Edits, Prioritized
 
-### P1: Make API and data model match MFA and refresh-token lifecycle
+### P1: Add explicit MFA challenge / pending-auth state
 
-Add MFA challenge/verify endpoints and token-family/session fields. This fixes
-the most direct correctness gaps.
+Add a challenge or pending-auth entity and clarify whether the
+`mfa_pending_token` is opaque or signed. This is the most direct remaining
+correctness gap.
 
-### P1: Add concrete capacity math
+### P1: Add flows for lifecycle-critical operations
 
-Break down verification, login, refresh, MFA, audit, denylist, and rate-limit
-QPS. Use the math to justify local JWT verification and a small replicated
-revocation path.
+Add API or final-design sequences for MFA verification, refresh reuse,
+authorization, logout/revocation, and the hot request path.
 
-### P1: Expand authorization context
+### P2: Make authorization defense-in-depth visible
 
-Move `/v1/authorize` to a richer request shape with tenant/resource attributes,
-policy version, and cache/freshness semantics.
+Show gateway authorization plus resource-service object checks, and document
+where decision caching lives and how `policy_version` invalidates it.
 
-### P2: Clean up architecture node IDs
+### P2: Surface abuse/risk storage and degraded modes
 
-Remove duplicate legacy nodes or migrate sequences to canonical IDs without
-aliases. Keep `Client`, `Auth`, `UserDB`, `IdP`, and `Token` as the canonical
-forms.
+Represent the counter/risk store in the architecture or state clearly that the
+limiter owns it. Add behavior for counter-store and MFA-provider degradation.
 
-### P2: Add operational audit and key-rotation detail
+### P2: Add device/session and tenant-isolation detail
 
-Specify audit event schema, retention/access controls, key `kid` handling, JWKS
-cache refresh, and emergency key compromise response.
+Back the "manage sessions/devices" requirement with a small entity or final
+design note, and state how tenant IDs are carried in tokens and checked in
+authz/resource services.
 
 ### P3: Add optional book polish
 
-Consider adding `technologyChoices`, more API sequences, and generated visuals
-for parity with newer book datasets. These are presentation improvements, not
-core correctness blockers.
+Consider adding `technologyChoices`, generated AI visuals, per-requirement
+illustrations, and an explainer comic after the core review findings above are
+handled.
 
 ## What Not To Change
 
-- Keep the security-first ordering. It is the right teaching structure for auth.
-- Keep the explicit bad alternatives in the options; they teach real traps.
-- Keep WebAuthn/passkeys as an MFA option and follow-up unless the case is
-  intentionally expanded into passwordless auth.
-- Keep local JWT verification via JWKS as the scaling answer, with caveats for
-  sensitive-operation revocation checks.
+- Keep the security-first ordering.
+- Keep the explicit bad options; they teach real interview traps.
+- Keep short access tokens plus rotating, stateful refresh tokens as the
+  recommended compromise.
+- Keep local JWKS verification as the platform-scale request-path answer.
+- Keep WebAuthn/passkeys as a strong MFA option and follow-up unless the case is
+  expanded into a passwordless-auth interview.
 
 ## Bottom Line
 
-This is already a credible auth-system interview. The next level is to make the
-state machines explicit: MFA gating, refresh-token families, OIDC transient
-state, authorization context, revocation semantics, and audit operations. Those
-changes would turn a strong conceptual walkthrough into a production-realistic
-flagship dataset.
+The recent changes moved this from a good conceptual auth walkthrough to a
+production-plausible interview dataset. The remaining work is about making the
+state machines and operational paths visible: pending MFA, final-design flows,
+authz cache invalidation, abuse/risk degraded modes, device/session management,
+and tenant isolation.

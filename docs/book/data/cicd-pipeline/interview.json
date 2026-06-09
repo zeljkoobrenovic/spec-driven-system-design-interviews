@@ -410,14 +410,14 @@
     {
       "method": "POST",
       "path": "/deployments",
-      "description": "Promote an artifact version into an environment with a strategy. Verifies signature/provenance/policy before admitting; idempotent on retry.",
+      "description": "Promote an artifact version into an environment with a strategy. The target (which service/web/mobile surface) is inferred from the artifact's artifacts.target, so one call updates exactly one (env, target) live-version row. Verifies signature/provenance/policy before admitting; idempotent on retry.",
       "request": "{ artifactVersion, env, strategy: 'canary'|'blue-green'|'rolling' } + Idempotency-Key",
-      "response": "{ deploymentId, state: 'pending_approval'|'ramping' }"
+      "response": "{ deploymentId, target, state: 'pending_approval'|'ramping' }"
     },
     {
       "method": "POST",
       "path": "/deployments/{id}/approve",
-      "description": "Approve (or reject) a promotion gated on policy; records actor, policy, and expiry.",
+      "description": "Approve (or reject) a promotion gated on policy. RBAC-gated: only the policy's approver role may call it, and separation-of-duties can require an approver other than the run's committer. The actor is the verified principal from the auth context (not a body field); records actor, policy, and expiry.",
       "request": "{ decision: 'approved'|'rejected', overrideReason? }",
       "response": "{ approvalId, state }"
     },
@@ -438,9 +438,9 @@
     {
       "method": "GET",
       "path": "/environments/{env}/history",
-      "description": "Ledger of versions deployed to an environment: who approved, when, gate results, current live + previous-good.",
-      "request": "(env in path; ?limit=N)",
-      "response": "{ live, prevGood, deployments[] }"
+      "description": "Ledger of versions deployed to an environment: who approved, when, gate results, current live + previous-good. Optionally filter by ?target= for one service/web/mobile surface; without it, returns the per-target live and previous-good map for the whole environment.",
+      "request": "(env in path; ?target=&limit=N)",
+      "response": "{ targets: { [target]: { live, prevGood } }, deployments[] }"
     },
     {
       "method": "POST",
@@ -681,11 +681,15 @@
     },
     {
       "name": "environment_versions",
-      "note": "Source of truth for what is live per environment.",
+      "note": "Source of truth for what is live per (environment, target). Keyed by (env, target) so each of the ~40 services, the web bundle, and each mobile surface has its own live/previous-good row — 'which version of checkout is live in prod?' resolves independently of the web bundle. target maps back to artifacts.target.",
       "fields": [
         {
           "name": "env",
-          "type": "varchar PK"
+          "type": "varchar PK (with target)"
+        },
+        {
+          "name": "target",
+          "type": "varchar PK (service/web/ios/android name; FK -> artifacts.target)"
         },
         {
           "name": "live_version",
@@ -711,7 +715,7 @@
     },
     {
       "name": "deployment_steps",
-      "note": "Rollout state machine for one promotion.",
+      "note": "Rollout state machine for one promotion of one (env, target). One row per promotion, not per rollout step — each state transition (ramp/pause/abort/rollback) is appended to audit_events, which is the per-deployment history.",
       "fields": [
         {
           "name": "deployment_id",
@@ -724,6 +728,10 @@
         {
           "name": "env",
           "type": "varchar FK"
+        },
+        {
+          "name": "target",
+          "type": "varchar (FK -> artifacts.target; which service/web/mobile surface this promotion moves)"
         },
         {
           "name": "state",
@@ -983,7 +991,9 @@
         "nodes": [
           "Dev",
           "Git",
+          "Trigger",
           "Orchestrator",
+          "Deployer",
           "K8s"
         ],
         "links": [
@@ -1018,7 +1028,7 @@
       "title": "2. Model the Pipeline as a DAG on Ephemeral Runners",
       "description": [
         "Replace the script with an orchestrator that turns each run into a DAG of jobs (lint, build, unit, integration, package) and dispatches them to a pool of ephemeral, single-use runners.",
-        "Ephemeral runners give hermetic, reproducible builds (clean state every time) and let independent jobs run in parallel. The orchestrator persists run → stage → job → attempt state with runner leases, a retry policy, queue/start/end times, and log pointers, so a crashed run resumes the unfinished jobs or fails cleanly, a flaky job reruns as a new attempt, and a lost runner's lease expires and reschedules.",
+        "Ephemeral runners give hermetic, reproducible builds (clean state every time) and let independent jobs run in parallel. The orchestrator persists run → stage → job → attempt state with runner leases, a retry policy, queue/start/end times, and log pointers, so a crashed run resumes its unfinished jobs or fails cleanly, a flaky job reruns as a new attempt, and a lost runner's lease expires and reschedules.",
         "Heterogeneous targets need heterogeneous runners: Linux containers for backend and web, dedicated macOS hosts for iOS (Xcode), and Linux again for Android."
       ],
       "view": {
@@ -1230,7 +1240,7 @@
       "id": "fast-feedback",
       "title": "3. Fast Feedback: Affected-Only Builds + Caching",
       "description": [
-        "A clean runner every time is reproducible but slow: each one re-downloads dependencies and recompiles unchanged code. Two levers cut PR latency to the target.",
+        "A clean runner every time is reproducible but slow: each one re-downloads dependencies and recompiles unchanged code from scratch. Two levers cut PR latency to the target.",
         "First, affected-only builds: compute the dependency graph and run jobs only for targets the diff touches — a web-only change shouldn't build 40 backend services or the mobile apps.",
         "Second, a shared build cache keyed by content (lockfile hash, source hash): restore dependency caches, compiler/test caches, and container layers so unchanged work is skipped while staying hermetic."
       ],
@@ -1409,7 +1419,8 @@
             "Speculative/batched execution: test PRs in batches against the projected head to amortize CI cost; if a batch fails, bisect to find the culprit and requeue the innocents.",
             "Flaky tests poison this: one flaky test in a batch can fail the whole batch, starve the queue, and hide which PR actually broke. Bound reruns, attribute failures per test, and quarantine known flakes so they don't gate the queue.",
             "Record every attempt (job_attempts) — never let an unaudited 'rerun until green' silently convert a real red into a green. Track per-test flake_rate and owner in test_results; quarantine is bounded, visible, and audited, not a permanent mute.",
-            "Keep a confidence signal: blocking tests gate merges; quarantined/non_blocking ones are reported to owners but don't block, with a periodic full run to catch regressions hidden by selection."
+            "Keep a confidence signal: blocking tests gate merges; quarantined/non_blocking ones are reported to owners but don't block, with a periodic full run to catch regressions hidden by selection.",
+            "Scope decision: for this interview the merge queue stays a deep-dive/follow-up, not core control-plane state — the run/stage/job/attempt and test_results model already supports the reasoning. Making it main-path would add a merge_queue_entries (batch, projected-head, status) table and runner queue metadata (job class pr/main/release/mobile, priority, deadline, pool, lease) to make speculative batching and fairness real rather than conceptual."
           ]
         }
       ],
@@ -1463,6 +1474,7 @@
       ],
       "view": {
         "nodes": [
+          "Orchestrator",
           "RunnerPool",
           "Cache",
           "Registry",
@@ -1698,9 +1710,25 @@
             "Once all surfaces carry the code, ramp the flag centrally (1% → 100%); a single kill switch disables the feature everywhere without any redeploy.",
             "The flag service is external to CI/CD but a hard dependency: it owns flag ownership, rollout %, kill-switch state, and audit history, and the release records reference required_flags + min_backend_version."
           ]
+        },
+        {
+          "title": "Authorization & separation-of-duties (who may ship)",
+          "points": [
+            "Privileged actions — prod approval, deploy, rollback, mobile halt, test quarantine — are RBAC-gated by role, not open to any authenticated user. Production is a protected environment whose policy names which approver role may admit a promotion.",
+            "Separation-of-duties: the author of a risky change must not be the sole approver for prod. The approval policy can require an approver distinct from the run's committer (and optionally two approvers for high-blast-radius targets).",
+            "Actor identity comes from the request's auth context (OIDC/SSO token), never a user-supplied 'actor' field in the body. approvals/audit_events record that verified principal, the policy id, and timestamp, so 'who shipped what where' is non-repudiable.",
+            "Store and signing credentials belong to a release service identity (a machine principal with short-lived tokens), not broad human accounts — humans approve, the service holds the keys and submits to App Store Connect / Play.",
+            "Break-glass: an emergency override exists but is itself a privileged, time-boxed, loudly-audited path (override role + reason recorded), so the safe default is never bypassed silently."
+          ]
         }
       ],
       "concepts": [
+        {
+          "term": "Separation of duties",
+          "definition": "The principal who authors or triggers a risky change is not the only one allowed to approve it for production.",
+          "whyItMatters": "Stops a single compromised or mistaken account from shipping to all users; makes prod releases a deliberate, witnessed act.",
+          "example": "The prod policy requires an approver from the release-approver role who is not the run's committer; break-glass needs an override role and a recorded reason."
+        },
         {
           "term": "Canary release",
           "definition": "Send a small % of traffic to the new version, compare health, then ramp or abort.",
@@ -1885,7 +1913,7 @@
       "description": [
         "Make the canary self-driving. Wire the deployment controller to observability: every rollout step compares the canary's golden signals (error rate, latency, saturation) and the service's SLO error budget against the stable version.",
         "If a gate fails, the controller automatically aborts the ramp and rolls back to the previous known-good version — instantly for services/web because the old version is still running and you just shift traffic back. Deploy markers correlate the regression with the exact version.",
-        "This closes the loop: bad releases are detected and reverted without a human in the critical path, satisfying the 'no bad version reaches everyone' requirement.",
+        "This closes the loop: bad releases are detected and reverted without a human in the critical path, which satisfies the 'no bad version reaches everyone' requirement.",
         "Rollout is a state machine, not a single shift: pending_approval → ramping → (paused) → live, or → aborted → rollback_in_progress → rolled_back, with manual override and a post-rollback verification step. A gate needs explicit inputs — which signal, what window, what threshold, and a minimum sample size — so 'metrics healthy' can't hide a noisy or under-sampled canary."
       ],
       "view": {
@@ -2065,12 +2093,13 @@
       "description": [
         "Mobile breaks the server model: you can't shift traffic, users update on their own schedule, and Apple/Google gate releases with review. The pipeline reflects this different cadence.",
         "CI signs the binaries (iOS .ipa on a macOS runner, Android .aab) and the deployer uploads to App Store Connect and Google Play. Internal/TestFlight and Play internal tracks get the build first for QA, then it's submitted for review.",
-        "Release safely with staged rollout — Play's percentage rollout and phased App Store release expose the build to a growing fraction of users. There is no instant rollback (you can't force-downgrade users): you can halt the rollout and ship a forward-fix or, on Play, roll back to a prior version for users who haven't updated yet. Feature flags plus a server-driven kill switch are the real 'rollback' for binaries already installed on devices.",
+        "Release safely with staged rollout — Play's percentage rollout and phased App Store release expose the build to a growing fraction of users. There is no instant rollback (you can't force-downgrade users): you can halt the rollout and ship a forward-fix or, on Play, roll back to a prior version for users who haven't updated yet. For binaries already installed on devices, feature flags plus a server-driven kill switch are the real 'rollback'.",
         "The store workflow is asynchronous and stateful, so the pipeline tracks it rather than controlling it. A release advances through tracks (internal/TestFlight or Play internal → closed/open → production) and a review status (pending → in_review → approved/rejected) that the pipeline learns about via store callbacks or polling. Crash-free sessions and adoption metrics feed a crash gate that can halt the staged rollout, just like SLO gates do for services.",
         "Version skew is a first-class concern: because users update on their own schedule, the backend must support old clients for weeks. Each release records a min_backend_version and the kill switches it depends on, and a compatibility policy defines how long old clients are supported."
       ],
       "view": {
         "nodes": [
+          "Orchestrator",
           "RunnerPool",
           "Signing",
           "Registry",
@@ -2105,6 +2134,7 @@
           ],
           "view": {
             "nodes": [
+              "Orchestrator",
               "RunnerPool",
               "Signing",
               "Deployer",
@@ -2135,6 +2165,7 @@
           ],
           "view": {
             "nodes": [
+              "Orchestrator",
               "RunnerPool",
               "Signing",
               "Deployer",
@@ -2164,6 +2195,7 @@
           ],
           "view": {
             "nodes": [
+              "Orchestrator",
               "RunnerPool",
               "Signing",
               "Deployer",
@@ -2361,7 +2393,8 @@
         "K8s",
         "CDN",
         "AppStore",
-        "Metrics"
+        "Metrics",
+        "FlagService"
       ],
       "links": [
         "dev-git",

@@ -120,7 +120,7 @@
       {
         "id": "User",
         "label": "Searcher",
-        "type": "client",
+        "type": "actor",
         "category": "boundary",
         "traits": [],
         "description": "Issues queries and reads ranked results."
@@ -247,10 +247,14 @@
   "capacityDiagram": [
     "graph LR",
     "  Docs[100B+ documents]",
-    "  Index[Sharded inverted index]",
-    "  QPS[~100K queries/s]",
-    "  Docs --> Index",
-    "  Index --> QPS"
+    "  Shards[~10K shards x 3 replicas]",
+    "  QPS[~100K QPS]",
+    "  Miss[~30K cache-miss QPS]",
+    "  Fanout[~300M shard-requests/s]",
+    "  Docs --> Shards",
+    "  QPS --> Miss",
+    "  Miss --> Fanout",
+    "  Shards --> Fanout"
   ],
   "requirements": {
     "functional": [
@@ -275,33 +279,53 @@
       "note": "Drives index size and shard count."
     },
     {
-      "label": "Queries per second",
-      "value": "~100,000",
-      "note": "Replicate shards to serve it."
+      "label": "Index size",
+      "value": "~10s of PB",
+      "note": "100B docs x ~5KB parsed content -> ~500TB raw text; postings + positions + per-doc metadata roughly equal the text, so the searchable index is ~PB-class and the doc store plus raw HTML pushes the total into tens of PB."
     },
     {
-      "label": "Index size",
-      "value": "PBs",
-      "note": "Posting lists across all terms; document-partitioned."
+      "label": "Shard count",
+      "value": "~10,000 shards x ~10M docs",
+      "note": "Target ~100GB-200GB of postings per shard so each shard's working set stays in RAM/SSD; 100B docs / 10M per shard ~= 10K primary shards."
+    },
+    {
+      "label": "Replicas",
+      "value": "3x+ per shard",
+      "note": "Replicas serve QPS and survive shard loss; total serving fleet ~= 10K shards x 3 = ~30K index servers (plus more replicas for hot shards)."
+    },
+    {
+      "label": "Queries per second",
+      "value": "~100,000",
+      "note": "Assume a ~60-70% result-cache hit rate on skewed query traffic, so only ~30-40K QPS actually scatter to shards."
+    },
+    {
+      "label": "Scatter fan-out",
+      "value": "~30K x 10K = 300M shard-requests/s",
+      "note": "Cache-miss QPS x shard count. Each replica set sees ~30K req/s; with 3 replicas that is ~10K req/s per index server, which sets the per-server CPU/IO budget."
+    },
+    {
+      "label": "Per-query work",
+      "value": "top-k ~100-1000 per shard",
+      "note": "Each shard returns a small top-k; the broker merges 10K x top-k into a global candidate set, then phase-2 re-ranks only the top ~1000. Network: ~10K shards x ~1KB top-k ~= ~10MB gathered per cache-miss query."
+    },
+    {
+      "label": "Deadline budget",
+      "value": "< 1s p99",
+      "note": "~Few ms broker, ~100-200ms shard fan-out (bounded by slowest replica + hedging), ~50-100ms merge/re-rank, ~tens of ms hydration. Shards that miss the deadline are dropped -> partial results rather than a timeout."
     },
     {
       "label": "Crawl rate",
       "value": "billions/day",
-      "note": "Continuous, politeness-bounded."
-    },
-    {
-      "label": "Query latency",
-      "value": "< 1s p99",
-      "note": "Despite scatter across many shards."
+      "note": "~1B fetches/day ~= ~12K fetches/s sustained; at ~2MB avg page that is ~25GB/s ~= 200Gbps of ingress, before per-host politeness caps cut effective throughput."
     }
   ],
   "api": [
     {
       "method": "GET",
       "path": "/search",
-      "description": "Run a query and return ranked results.",
-      "request": "?q=distributed+systems&page=1",
-      "response": "{ \"results\": [ { \"url\": \"...\", \"title\": \"...\", \"snippet\": \"...\" } ], \"total\": 12000 }",
+      "description": "Run a query and return ranked results. q supports multi-term, quoted phrases (\"exact match\"), and basic boolean operators (+required, -excluded, OR). hl/gl set language and country for ranking/locale; num+cursor page results (deep pagination is capped); freshness biases toward recent content.",
+      "request": "?q=%22distributed+systems%22+-tutorial&hl=en&gl=us&num=10&cursor=&freshness=any",
+      "response": "{ \"results\": [ { \"url\": \"...\", \"title\": \"...\", \"snippet\": \"...\", \"crawledAt\": \"...\" } ], \"total\": 12000, \"nextCursor\": \"...\" }",
       "sequence": {
         "participants": [
           {
@@ -390,11 +414,11 @@
       "fields": [
         {
           "name": "doc_id",
-          "type": "bigint PK"
+          "type": "bigint PK (stable internal id)"
         },
         {
-          "name": "url",
-          "type": "varchar"
+          "name": "canonical_url",
+          "type": "varchar (canonicalized; dupes/redirects map here)"
         },
         {
           "name": "title",
@@ -402,11 +426,23 @@
         },
         {
           "name": "content_hash",
-          "type": "hash (dedup)"
+          "type": "hash (near-dup clustering)"
         },
         {
           "name": "page_score",
           "type": "float (query-independent, e.g. PageRank)"
+        },
+        {
+          "name": "quality_score",
+          "type": "float (spam/quality signal; lower demotes)"
+        },
+        {
+          "name": "current_version",
+          "type": "bigint (FK -> doc_versions)"
+        },
+        {
+          "name": "suppressed",
+          "type": "bool (takedown / safe-search / spam hide)"
         },
         {
           "name": "last_crawled",
@@ -415,24 +451,104 @@
       ]
     },
     {
+      "name": "doc_versions",
+      "note": "Content lifecycle per doc: each crawl that materially changes content is a new version.",
+      "fields": [
+        {
+          "name": "version_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "doc_id",
+          "type": "bigint FK"
+        },
+        {
+          "name": "content_hash",
+          "type": "hash"
+        },
+        {
+          "name": "segment_id",
+          "type": "string (which index segment carries this version)"
+        },
+        {
+          "name": "fetched_at",
+          "type": "timestamp"
+        },
+        {
+          "name": "status",
+          "type": "enum(live, superseded, deleted)"
+        }
+      ]
+    },
+    {
+      "name": "index_segments",
+      "note": "Immutable index units; serving reads the published set.",
+      "fields": [
+        {
+          "name": "segment_id",
+          "type": "string PK"
+        },
+        {
+          "name": "shard_id",
+          "type": "int"
+        },
+        {
+          "name": "generation",
+          "type": "bigint (monotonic; readers refresh to latest published)"
+        },
+        {
+          "name": "doc_count",
+          "type": "int"
+        },
+        {
+          "name": "tombstones",
+          "type": "bitset/list<doc_id> (deleted/suppressed docs to skip)"
+        },
+        {
+          "name": "state",
+          "type": "enum(building, validated, published, merging, retired)"
+        }
+      ]
+    },
+    {
       "name": "url_frontier",
-      "note": "Crawl queue state.",
+      "note": "Crawl queue state, per canonical URL.",
       "fields": [
         {
           "name": "url",
-          "type": "string"
+          "type": "string (raw)"
         },
         {
-          "name": "priority",
-          "type": "float"
+          "name": "canonical_url",
+          "type": "string (post-canonicalization key)"
         },
         {
           "name": "host",
           "type": "string (politeness bucket)"
         },
         {
+          "name": "priority",
+          "type": "float (importance x freshness need)"
+        },
+        {
+          "name": "crawl_status",
+          "type": "enum(pending, fetching, done, failed, blocked)"
+        },
+        {
+          "name": "fetch_attempts",
+          "type": "int (drives backoff / give-up)"
+        },
+        {
+          "name": "robots_policy",
+          "type": "ref (cached per-host robots rules + key)"
+        },
+        {
+          "name": "change_freq",
+          "type": "float (observed; sets recrawl interval)"
+        },
+        {
           "name": "next_fetch_at",
-          "type": "timestamp"
+          "type": "timestamp (politeness delay or retry/backoff time)"
         }
       ]
     }
@@ -488,9 +604,9 @@
       "what": "Cache popular query results and hot document snippets.",
       "whenToUse": "Skewed query/document popularity (a few queries dominate).",
       "steps": [
-        "serve"
+        "cache"
       ],
-      "group": "Shard the Index and Scatter-Gather Queries"
+      "group": "Caching for QPS and Latency"
     }
   ],
   "steps": [
@@ -498,7 +614,7 @@
       "id": "naive",
       "title": "1. Naive: Scan Every Document for the Query Terms (the baseline)",
       "description": [
-        "Start with the simplest thing that works. Store the fetched pages in a document store, and on each search read through every document checking whether it contains the query terms, collecting the matches.",
+        "Start with the simplest thing that works. Assume pages have already been fetched somehow (the next step builds the crawler) and stored in a document store; on each search read through every document checking whether it contains the query terms, collecting the matches.",
         "This is correct and trivial — and it is hopeless at web scale. A single query would have to scan 100B+ documents (petabytes), so even one search takes far longer than the sub-second budget, and serving ~100K queries/sec this way is physically impossible. The cost is linear in the corpus size for every single query.",
         "So the baseline motivates everything that follows: instead of scanning documents per query, build an inverted index once (term -> the documents containing it) so a query becomes a posting-list lookup, then shard that index across machines and scatter-gather queries to stay sub-second at scale."
       ],
@@ -510,7 +626,12 @@
         ],
         "caption": "The searcher's query hits the query service, which scans every document in the document store looking for the terms.",
         "links": [
-          "user-query"
+          "user-query",
+          {
+            "from": "QuerySvc",
+            "to": "DocStore",
+            "label": "scan every document"
+          }
         ],
         "highlight": [
           "QuerySvc",
@@ -546,6 +667,7 @@
       "description": [
         "A crawler fleet fetches pages, but you can't just BFS naively: you must be polite (obey robots.txt, rate-limit per host), avoid re-fetching unchanged pages, and prioritize important/fresh URLs.",
         "A URL frontier is a prioritized, politeness-aware queue: it hands out URLs respecting per-host delays and priority. Crawlers fetch, store the raw page, dedup by URL and content hash, and enqueue newly discovered links.",
+        "Production crawling needs more than fetch-and-store. Canonicalize URLs (strip tracking params, resolve redirects) so the same page isn't crawled under many URLs; cache robots.txt per host so you don't refetch it every request; isolate DNS/fetch with timeouts; retry transient failures with exponential backoff and host-level backoff on 429/5xx; cluster near-duplicate content by hash; detect crawler traps (infinite calendars, faceted-URL explosions) and cap depth/URLs per host; and seed from sitemaps. A recrawl policy driven by each page's observed change frequency decides who gets re-fetched soon vs. rarely.",
         "A seen-URL/content store prevents re-crawling the same page and detects duplicate content across URLs."
       ],
       "view": {
@@ -581,10 +703,10 @@
         }
       ],
       "probeLinks": [
+        "nutch-docs",
+        "heritrix",
         "bigtable-paper",
-        "percolator-paper",
-        "lucene-docs",
-        "elasticsearch-docs"
+        "percolator-paper"
       ],
       "patterns": [
         "Politeness-aware crawl frontier"
@@ -602,6 +724,23 @@
           "trap": "Naive BFS crawling without per-host limits.",
           "why": "You DDoS sites, get blocked, and waste budget re-fetching unchanged pages.",
           "instead": "A prioritized frontier with politeness and content-hash dedup."
+        },
+        {
+          "trap": "Treating every distinct URL as a distinct page.",
+          "why": "Tracking params, session IDs, and infinite faceted/calendar URLs explode the frontier and bloat the index with duplicates (crawler traps).",
+          "instead": "Canonicalize URLs, cluster by content hash, and cap depth/URLs per host."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A host starts returning 429/5xx (or its robots.txt suddenly disallows you).",
+          "expectedBehavior": "The crawler applies host-level backoff (raises next_fetch_at, slows that politeness bucket) and re-reads/respects the cached robots policy; it does not keep hammering.",
+          "mitigation": "Per-host backoff + retry budget with exponential delay; robots cache with TTL; give up after N failed attempts and lower priority."
+        },
+        {
+          "scenario": "A crawler trap (infinite calendar / faceted links) floods the frontier.",
+          "expectedBehavior": "Depth and per-host URL caps plus duplicate-cluster detection stop the explosion; the trap's near-identical pages are deduped by content hash.",
+          "mitigation": "Per-host URL budget, max crawl depth, content-hash near-dup clustering, and trap heuristics on URL patterns."
         }
       ],
       "flows": [
@@ -683,7 +822,7 @@
       "title": "3. Build the Inverted Index",
       "description": [
         "To answer 'which docs contain these words' fast, build an inverted index: for each term, a posting list of the documents (and positions) containing it — the opposite of scanning every document.",
-        "The indexing pipeline parses each stored doc, tokenizes/normalizes terms (lowercase, stemming), and writes postings. Indexing is a batch/stream pipeline that produces immutable index segments, periodically merged.",
+        "The indexing pipeline parses each stored doc, assigns a compact internal docID, tokenizes/normalizes terms (lowercase, stemming), and writes postings. Concretely: a term dictionary maps each term to its posting list; postings are delta-encoded and compressed (docIDs are sorted and gap-encoded) so a multi-PB corpus stays affordable; and per-block skip lists / block-max metadata let query execution skip whole chunks of a posting list, which is why a posting-list lookup is fast even for common terms. Indexing is a batch/stream pipeline that produces immutable index segments, periodically merged.",
         "Also extract links to build the link graph used for query-independent scoring."
       ],
       "view": {
@@ -740,8 +879,9 @@
       "title": "4. Shard the Index and Scatter-Gather Queries",
       "description": [
         "The index spans petabytes, so partition it by document: each shard holds the full inverted index for its slice of the corpus. (Document partitioning beats term partitioning here — each shard answers independently and load is even.)",
-        "A query is scattered to all shards in parallel; each returns its top-k candidates for the query, and an aggregator merges them. Replicate each shard for QPS and availability.",
-        "This scatter-gather is the latency challenge: total latency is the slowest shard, so you bound per-shard work and use the cheap first-phase scoring to limit candidates."
+        "A query is scattered to all shards in parallel; each returns its top-k candidates for the query, and an aggregator merges them. Replicate each shard for QPS and availability — concretely ~10K primary shards (~10M docs each) x ~3 replicas. 'Scatter to all shards' means hitting one chosen replica per primary partition, not broadcasting to every replica.",
+        "At ~100K QPS, the broker is a first-class component, not a single box. The path is really: parse/rewrite the query -> a broker that fans out to one replica per partition -> per-shard top-k retrieval -> merge -> re-rank -> hydrate snippets. Each broker picks the fastest/least-loaded replica, propagates a deadline so shards self-abort, and hedges (sends a duplicate request to a second replica if the first is slow). Per-shard top-k is capped so the gathered candidate set stays small.",
+        "This scatter-gather is the latency challenge: total latency is the slowest shard, so you bound per-shard work with deadlines, hedge slow replicas, and accept partial results (drop shards that miss the deadline) rather than blow the sub-second budget."
       ],
       "view": {
         "nodes": [
@@ -882,7 +1022,23 @@
       "bottlenecks": [
         {
           "issue": "Tail latency: the slowest shard sets query latency.",
-          "mitigation": "Replicas + hedged requests; cap per-shard work; skip slow shards with partial results."
+          "mitigation": "Replicas + hedged requests; per-shard deadline + cap on top-k work; skip slow shards with partial results."
+        },
+        {
+          "issue": "Fan-out amplification: cache-miss QPS x shard count is huge (~30K x 10K ~= 300M shard-requests/s).",
+          "mitigation": "High result-cache hit rate to cut miss QPS; balanced document partitioning so per-replica load is even; add replicas to hot shards."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "One replica goes slow (GC pause, hot shard) and threatens the deadline.",
+          "expectedBehavior": "The broker's hedge request to a second replica returns first; the slow shard's late reply is ignored. If no replica answers in time, that shard is dropped and the query returns partial results.",
+          "mitigation": "Request hedging + deadline propagation + partial-result merge; per-shard top-k cap to bound shard work."
+        },
+        {
+          "scenario": "Result-cache node fails and a burst of popular queries all miss at once (cache stampede).",
+          "expectedBehavior": "A single-flight / request-coalescing guard lets one query do the scatter-gather while duplicates wait for its result; serving degrades in load, not correctness.",
+          "mitigation": "Single-flight per query key, cache warming for top queries, and TTL jitter so entries don't expire in lockstep."
         }
       ],
       "flows": [
@@ -978,7 +1134,7 @@
       "description": [
         "How you shard the index is a fork with big consequences. Document partitioning gives each shard the full index for a slice of documents: every shard can answer any query independently, load is even, and a multi-term query just runs locally per shard — but every query fans out to all shards (scatter-gather).",
         "Term partitioning splits by term (a shard owns certain terms' posting lists): a single-term query hits one shard, but a multi-term query must ship and intersect huge posting lists across shards, and popular terms create hotspots.",
-        "Web search overwhelmingly uses document partitioning — the scatter-gather cost is predictable and parallelizable, whereas term partitioning's cross-shard intersections and hotspots are worse at this scale."
+        "Web search uses document partitioning as the default — the scatter-gather cost is predictable and parallelizable, whereas term partitioning's cross-shard intersections and hotspots are worse at this scale. Real systems still add nuance on top: tiered indexes (a small hot tier served first), hybrid schemes, and special handling for very common terms — so 'document-partition everything' is the right starting point, not the whole story."
       ],
       "view": {
         "nodes": [
@@ -1027,8 +1183,10 @@
       "title": "5. Rank Results",
       "description": [
         "Relevance is more than 'contains the words'. Use a two-phase approach: each shard cheaply retrieves and scores candidates (e.g. TF-IDF/BM25 text relevance), then the aggregator re-ranks the merged candidate set with a richer model.",
-        "Blend signals: text relevance, query-independent page score (link-graph authority like PageRank), freshness, and quality. The expensive re-rank runs only on the small merged candidate set, not the whole corpus.",
-        "Query-independent scores (page authority) are precomputed offline from the link graph so they're a cheap lookup at query time."
+        "Blend signals: text relevance, query-independent page score (link-graph authority like PageRank), freshness, and a spam/quality score. The expensive re-rank runs only on the small merged candidate set, not the whole corpus.",
+        "Defending quality is not optional for web search: a per-doc spam/quality score (computed offline from link patterns, content heuristics, and known-bad signals, stored on the document and looked up at re-rank time) demotes link farms and low-quality pages, and suppressed/takedown docs are filtered out entirely. Freshness scoring biases recent content up for time-sensitive queries.",
+        "Query-independent scores (page authority and spam/quality) are precomputed offline from the link graph and content so they're a cheap lookup at query time.",
+        "Out of scope here (worth naming): ads, personalized ranking, semantic/vector retrieval, query understanding (synonyms/intent), and safe-search filtering depth — this case focuses on the core text + authority + quality ranking."
       ],
       "view": {
         "nodes": [
@@ -1055,11 +1213,11 @@
       "options": [
         {
           "name": "Two-phase: cheap recall + learned re-rank (default)",
-          "description": "Phase-1 BM25 narrows matches to a small candidate set per shard, then a learned model re-ranks the merged top candidates using text, authority, and freshness signals.",
+          "description": "Phase-1 BM25 narrows matches to a small candidate set per shard, then a learned model re-ranks the merged top candidates using text, authority, freshness, and spam/quality signals.",
           "pros": [
             "Phase-1 BM25 cheaply narrows 100K matches to a small candidate set per shard.",
             "The expensive learned model runs only on the merged top candidates, bounding latency.",
-            "Blends text relevance, precomputed page authority, and freshness for strong final ordering."
+            "Blends text relevance, precomputed page authority, freshness, and a spam/quality score for strong, abuse-resistant ordering."
           ],
           "cons": [
             "A good document can be cut in phase 1 before the re-ranker ever sees it (recall ceiling).",
@@ -1269,9 +1427,9 @@
       "id": "cache",
       "title": "6. Caching for QPS and Latency",
       "description": [
-        "Query popularity is heavily skewed: a small set of queries recurs constantly. Cache full results for popular queries so repeats skip scatter-gather entirely.",
+        "Query popularity is heavily skewed: a small set of queries recurs constantly. Cache full results for popular queries so repeats skip scatter-gather entirely. Assume a ~60-70% hit rate on the result cache — that is what turns ~100K QPS into only ~30-40K QPS actually scattering to shards, which is what makes the fleet size affordable.",
         "Cache hot document metadata/snippets so result hydration doesn't refetch per query. Both caches cut both latency and load.",
-        "Bound cache staleness with TTLs so fresh content still surfaces; invalidate or expire result-cache entries when the index for those terms updates materially."
+        "Bound cache staleness with TTLs (short for fresh/news-like queries, longer for stable ones) so fresh content still surfaces; invalidate or expire result-cache entries when a new index segment publishes documents matching those terms. Protect against stampede: when a hot entry expires, a single-flight guard lets one request recompute while duplicates wait, and TTL jitter avoids synchronized expiry. Warm the cache for the top queries after a big crawl/segment publish."
       ],
       "view": {
         "nodes": [
@@ -1329,21 +1487,24 @@
       "title": "7. Freshness and Continuous Indexing",
       "description": [
         "The crawl never stops, so the index must update continuously. Indexing produces immutable segments that are added and periodically merged; serving reads the current segment set, so new content appears without rebuilding the whole index.",
-        "Prioritize freshness in the crawl frontier (re-crawl fast-changing or important pages sooner) and propagate new segments to shards quickly so breaking content is searchable within a bounded time.",
+        "Changes and deletes need real semantics, not just appends. Because segments are immutable, an updated page is written as a new version in a new segment and the old version is marked in a tombstone list so serving skips it; deletions, redirects, and takedowns/spam suppression are the same tombstone mechanism. The serving visibility contract is generation-based: an indexer builds a segment, validates it, then flips a publish marker that bumps the generation; readers atomically refresh to the latest published generation, so a query sees a consistent segment set. A bad segment is handled by not publishing it (or rolling the generation back), and background merge compacts small segments and drops tombstoned docs.",
+        "Prioritize freshness in the crawl frontier (re-crawl fast-changing or important pages sooner, driven by observed change frequency) and propagate new segments to shards quickly so breaking content is searchable within a bounded time. Tie result-cache invalidation to segment publishes that touch matching terms/docs, not a vague 'material' rule.",
         "Recompute query-independent scores (link graph / PageRank) periodically as the graph evolves; serve with the latest available scores."
       ],
       "view": {
         "nodes": [
           "Crawler",
           "Frontier",
+          "DocStore",
           "Indexer",
           "IndexShards",
           "LinkGraph"
         ],
-        "caption": "The crawler and frontier keep discovering pages while the indexing pipeline continuously writes postings to the index shards and updates the link graph.",
+        "caption": "The crawler and frontier keep discovering pages into the document store while the indexing pipeline continuously writes postings to the index shards and updates the link graph.",
         "links": [
           "crawler-frontier",
           "frontier-crawler",
+          "crawler-doc",
           "doc-indexer",
           "indexer-shards",
           "indexer-linkgraph"
@@ -1454,13 +1615,18 @@
           "scenario": "An index shard is lost.",
           "expectedBehavior": "A replica serves it; the shard can be rebuilt from the document store / segments.",
           "mitigation": "Shard replication + rebuildable index from durable docs."
+        },
+        {
+          "scenario": "A bad segment is built (corrupt postings / quality regression) during a high-news crawl.",
+          "expectedBehavior": "Validation fails the segment so the publish marker never advances to it, or the generation is rolled back; readers keep serving the last good generation. Stale result-cache entries are flushed on the eventual good publish.",
+          "mitigation": "Build -> validate -> atomic publish-marker flip with rollback; generation-based reader refresh; cache invalidation tied to publishes."
         }
       ]
     }
   ],
   "finalDesign": {
     "title": "Final Design — Web Search Engine",
-    "description": "A crawler fleet pulls from a politeness-aware URL frontier, dedups by URL/content, and stores raw pages. An indexing pipeline parses docs into a document-partitioned inverted index (immutable, merged segments) and builds a link graph for query-independent page scores. The query service checks a result cache, otherwise scatters the query to all (replicated) shards, gathers per-shard top-k candidates, and a ranker re-ranks the merged set blending text relevance with page authority and freshness; snippets hydrate from a doc cache. Popular queries and hot docs are cached; the crawl + segment-based indexing run continuously so new content is searchable within a bounded time.",
+    "description": "A crawler fleet pulls from a politeness-aware URL frontier (canonicalization, robots cache, host backoff, recrawl by change frequency), dedups by URL/content, and stores raw pages. An indexing pipeline parses docs into a document-partitioned inverted index (~10K shards x ~3 replicas) of immutable, generation-versioned segments, and builds a link graph for query-independent page and spam/quality scores. The query service parses/rewrites the query, checks a result cache (~60-70% hit), otherwise a broker scatters to one replica per partition with deadline propagation and hedging, gathers per-shard top-k, and a ranker re-ranks the merged set blending text relevance, page authority, freshness, and quality (suppressing spam/takedown docs); snippets hydrate from a doc cache, with partial results when a shard misses its deadline. Popular queries and hot docs are cached (single-flight + TTL jitter against stampede); the crawl + segment-based indexing run continuously, publishing new generations atomically so new content is searchable within a bounded time and bad segments can be rolled back. Explicitly out of scope: ads, personalized ranking, semantic/vector retrieval, query suggestions, image/video search, and legal takedown workflow.",
     "view": {
       "nodes": [
         "Crawler",
@@ -1510,6 +1676,14 @@
       {
         "requirement": "Answer keyword queries",
         "how": "Inverted index + scatter-gather over shards.",
+        "steps": [
+          "index",
+          "serve"
+        ]
+      },
+      {
+        "requirement": "Multi-term queries and basic operators",
+        "how": "Query parse/rewrite turns phrases and +/-/OR operators into posting-list intersections/unions; positions in postings support phrase (\"exact\") matching.",
         "steps": [
           "index",
           "serve"

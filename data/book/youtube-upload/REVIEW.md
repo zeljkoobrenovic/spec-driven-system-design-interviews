@@ -5,187 +5,170 @@ Review date: 2026-06-09
 
 ## Executive Summary
 
-This is a strong, coherent walkthrough for a YouTube-style upload and playback pipeline. The step order is natural: naive baseline, resumable upload, async queue, transcode fanout, CDN playback, view counting, and storage/reliability. The structured diagrams are clean and the option sets for transcoding, streaming, and counting teach real trade-offs.
+This review reflects the dataset after commit `fac974d` (`Improve YouTube upload interview per REVIEW.md`). The recent pass addressed most of the previous high-impact gaps: capacity is now numeric, resumable upload has explicit chunk/resume/complete APIs, upload parts and transcode tasks are modeled, the CDN path separates control plane from data plane, and view counting now has event semantics.
+
+The case is now a strong book-quality walkthrough. The remaining issues are narrower: one API sequence still blurs upload-session creation with the complete upload lifecycle, the transcode lease/queue ownership model should be made unambiguous, and the new access-control requirement needs backing fields and `satisfies` coverage.
 
 | Area | Score | Notes |
 | --- | ---: | --- |
-| System design soundness | 4/5 | Correct high-level architecture, but upload, job, playback, and count contracts need more concrete state. |
-| Production realism | 3/5 | Mentions retries, idempotency, CDN, and cost, but operational details are compressed and several edge cases are only implied. |
-| Pedagogical flow | 4/5 | Clear problem-by-problem progression with good prompts and recaps. |
-| Dataset/rendering fit | 4/5 | JSON parses; structured node/link references, pattern steps, probe links, and `satisfies` step IDs resolve. |
-| Overall | 4/5 | Usable as a book case after adding more quantitative and state-machine depth. |
+| System design soundness | 4.5/5 | Much stronger quantitative and state-machine detail; a few ownership and policy-state details remain. |
+| Production realism | 4/5 | Good upload, transcode, CDN, and view-count realism; access-control/moderation state and queue-vs-task-store semantics need one more pass. |
+| Pedagogical flow | 4.5/5 | The seven-step arc remains clean, and the old gaps now mostly become teaching strengths. |
+| Dataset/rendering fit | 4/5 | JSON parses, structured references resolve, and diagrams fit the renderer; step-level probe links are still too generic. |
+| Overall | 4.5/5 | Ready to use, with a small follow-up pass recommended before treating it as a flagship media case. |
 
 ## What Works Well
 
-- The naive baseline is effective: it exposes why the design needs resumable upload, asynchronous processing, renditions, CDN delivery, and eventual view counts.
-- The core architecture uses the right split: transactional metadata, raw/rendition object storage, transcode workers, job queue, playback service, CDN, and async view-count pipeline.
-- The option sets are practical. Segment-parallel transcoding, pull-through CDN, pre-warming, progressive download, direct counters, and aggregate counters are real alternatives rather than strawmen.
-- The wrap-up maps requirements to steps cleanly, and the interview script gives a candidate a usable time-boxed narrative.
-- Renderer-facing structure is mostly healthy: main step views, option views, final-design links, patterns, `satisfies` steps, and probe links all resolve.
+- The previous P1 findings were materially addressed. Capacity now ties numbers to upload, transcode, CDN, storage, and view-event design choices.
+- Resumable upload is now concrete: session create, part upload, resume probe, completion, checksums/ETags, idempotency, expiry, and committed source keys are all represented.
+- Transcoding now teaches the important production idea: segment/rendition tasks, leases, attempts, deterministic output keys, dead-lettering, and coordinator validation.
+- The playback/CDN step is much clearer. It says the playback service authorizes and mints tokens, while segment traffic goes directly from player to CDN.
+- View counting now defines the event shape, threshold, dedup window, late events, bot/fraud filtering, and the public-versus-authoritative count split.
+- The naive baseline diagram now shows direct serving of the original file, and Step 2 now highlights metadata state.
 
-## Highest-Impact Issues
+## Highest-Impact Remaining Issues
 
-### 1. Capacity is too qualitative to drive design choices
+### 1. The upload API sequence conflates session creation with the full upload lifecycle
 
-The capacity section uses broad labels such as "100s of hours/min", "~5-8 renditions", "millions", and "watch >> upload". Those are directionally right, but they do not convert into the quantities the architecture depends on: upload ingress bandwidth, transcode-hours per uploaded hour, worker fleet size, object storage growth, CDN cache miss/origin bandwidth, view-event throughput, or metadata write rate.
+The API entry for `POST /v1/uploads` has a sequence that includes `PUT chunks`, storing the source, creating the video as `processing`, enqueueing transcode jobs, and returning `202 processing`. That is a useful lifecycle diagram, but it is attached to the session-create endpoint whose response is only `uploadId`, `videoId`, `partSize`, and `expiresAt`.
 
-Why it matters: the later choices depend on those numbers. Segment-parallel transcoding is easier to justify if the case says, for example, that one uploaded hour may require several compute-hours across codec/rendition ladders. CDN pull-through versus proactive pre-warm is easier to compare if origin miss traffic and hot/long-tail ratios are estimated.
+Why it matters: readers may infer that `POST /v1/uploads` blocks until chunks are uploaded and transcode jobs are enqueued. The prose correctly says jobs start only after `POST /complete`, so the API sequence should not undercut that.
 
-Concrete fix: expand `capacity` with calculated bullets: uploaded GB/min, source-plus-rendition storage multiplier, transcode compute multiplier, approximate segment requests/sec at CDN edge, expected origin miss ratio, and view event rate. Tie each number to the step it motivates.
+Concrete fix: make `POST /v1/uploads` show only session creation and return `201/200` with the upload session. Move the lifecycle sequence to `POST /v1/uploads/{uploadId}/complete` or to Step 2 as "resumable upload lifecycle". The `202 processing` response belongs after complete, not after start.
 
-### 2. Resumable upload is underspecified as an API and state machine
+### 2. Transcode lease ownership is still ambiguous between `JobQ` and `rendition_tasks`
 
-The API has `POST /v1/uploads`, but the chunk upload mechanics are only described in prose. There is no explicit chunk endpoint, complete/commit endpoint, offset reconciliation, checksum/ETag handling, idempotency key, upload expiration, duplicate chunk behavior, or conflict response when the client and server disagree about `received_bytes`. The `upload_sessions` model only has `upload_id`, `video_id`, `received_bytes`, and `total_bytes`.
+The data model adds `rendition_tasks` with `state`, `attempt`, and `lease_until`, but the failure sequence says workers claim the task from `JobQ`. That leaves the source of truth unclear: is the queue visibility timeout the lease, or is `rendition_tasks` in the metadata store the leaseable task table?
 
-Why it matters: resumable upload is one of the core requirements. In interviews, the difference between "upload in chunks" and a production-ready resumable protocol is the server-side state and retry semantics.
+Why it matters: this is the core correctness mechanism for retries and dead-lettering. A candidate needs a coherent answer for atomic claim, duplicate deliveries, crash recovery, and task completion.
 
-Concrete fix: add API entries for `PUT/PATCH /v1/uploads/{uploadId}/chunks`, `GET /v1/uploads/{uploadId}` for resume offset, and `POST /v1/uploads/{uploadId}/complete`. Extend `upload_sessions` with owner, status, part size, checksum/ETag list or manifest, expires_at, created_at/updated_at, idempotency key, and committed source object key.
+Concrete fix: choose one model explicitly. One good version: queue messages are wake-ups, while `rendition_tasks` in `MetaDB` is the source of truth; workers atomically claim rows by setting `state=leased, lease_until=T`, then ack or let queue messages expire. Another valid version: the queue owns delivery leases and `rendition_tasks` only stores durable result state. The current text mixes both.
 
-### 3. Transcode fanout needs explicit job and segment state
+### 3. Access control is now a requirement, but the data model and `satisfies` section do not back it
 
-Step 4 says jobs are idempotent and retryable, split on keyframe boundaries, and stitch outputs. Step 7 mentions dead-lettering. The data model, however, has no transcode job table, segment task table, attempt/lease fields, idempotency key, coordinator state, dead-letter representation, partial output naming, or quality-validation result.
+The non-functional requirements now include public, unlisted, private, and geo-restricted playback. Step 5 explains tokenized CDN access well, but `videos` lacks visibility/policy fields, there is no ACL or geo-policy model, and `satisfies.nonFunctional` does not include the access-control requirement.
 
-Why it matters: segment-parallel transcoding is the staff-level concept in the case. Without modeling how tasks are claimed, retried, deduplicated, stitched, and marked failed, the design risks sounding like "put it in a queue" rather than a real media-processing pipeline.
+Why it matters: the dataset correctly calls out CDN cacheability plus authorization as a requirement. Without backing state, the playback service has no clear source for deciding who may receive a manifest/token.
 
-Concrete fix: add a `transcode_jobs` or `rendition_tasks` model with `(video_id, rendition, segment_id)`, `state`, `attempt`, `lease_until`, `input_range/keyframe_range`, `output_key`, `checksum`, `error_code`, and timestamps. Add a coordinator/orchestrator node or clarify that `MetaSvc` owns coordination. Add a sequence flow for worker crash/retry and dead-letter handling.
-
-### 4. Playback/CDN security and cache boundaries are blurry
-
-The playback path says the playback service returns a manifest and signed segment URLs, and the diagram includes a `play-cdn` link labeled "signed segment URLs". This can imply the service calls the CDN for every playback request. The design also does not clarify how authorization, private/unlisted videos, TTLs, CDN cache keys, origin shielding, invalidation, geo restrictions, or DRM/signed-cookie trade-offs work.
-
-Why it matters: global playback is where the read fanout lives. A strong answer needs to keep the playback service out of the hot segment path while still enforcing access control and preserving CDN cacheability.
-
-Concrete fix: make the control-plane/data-plane split explicit: playback service authorizes and returns a manifest plus tokenized URLs/cookies; the player fetches segments directly from CDN; CDN origin-fetches from rendition storage on miss. Add cache key/TTL notes and explain how private content avoids leaking while public content remains cacheable.
-
-### 5. View counting lacks the semantics that make counts credible
-
-The view-count step correctly rejects synchronous counter increments, but it does not define the view event schema, dedup key, watch-duration threshold, bot/fraud filters, late-event handling, windowing, exact-versus-approximate boundary, or which counts are public display versus monetization/audit counts.
-
-Why it matters: view counting is a business-facing metric. A public eventually consistent counter is fine, but revenue, recommendations, abuse detection, and analytics may need different accuracy and retention guarantees.
-
-Concrete fix: add a view event shape `(video_id, viewer/session/device, playback_start, watched_seconds, event_time, request_id)`, define when a view is counted, and separate public approximate counts from authoritative analytics/monetization pipelines if they are in scope.
+Concrete fix: add `visibility`, `owner_id`, `geo_policy_id`, `policy_status` or `moderation_state`, and either an ACL/share table or an explicit "private videos require an authorization check against creator-owned ACLs" note. Add a `satisfies.nonFunctional` entry for access control, mapped to `stream` and possibly `upload`.
 
 ## System Design Soundness
 
-Requirements are scoped well for upload, transcode, stream, status, and counts. The non-functional list captures resumability, asynchronous processing, durability, CDN playback, and independent scaling. The main weakness is that the requirements do not name privacy/security, abuse/moderation, content validation, or operational SLOs, even as follow-ups mention DRM and codec migration.
+The core architecture is now sound: resumable upload to object storage, metadata-backed state, asynchronous processing through a queue and worker fleet, durable rendition storage, CDN-backed playback, and async view counting. The latest changes make the architecture much more defensible because the state surfaces are visible instead of implied.
 
-Capacity is directionally correct but not yet actionable. It should quantify the multiplier effects: one source produces multiple renditions and many segments; upload throughput becomes transcode queue depth; watch traffic becomes CDN segment QPS and origin miss bandwidth; view events become stream-processing load.
+Capacity is substantially better than before. The estimates now connect upload ingress, transcode compute multiplier, worker backlog, storage growth, CDN QPS, origin miss traffic, and view-event throughput to specific steps. The main improvement left is to expose assumptions and ranges: `300 hr/min -> 0.5 GB/s` depends heavily on source bitrate, and source-plus-rendition storage can vary widely by codec ladder and retention policy.
 
-The API is serviceable for a first pass, but it is too compact for this domain. Upload status, chunk writes, completion, playback manifest retrieval, and view-event ingestion should be separate contracts, even if some are summarized. The status endpoint should distinguish `uploading`, `processing`, `ready_to_watch`, `fully_processed`, `failed`, and per-rendition failure.
+The API shape is mostly strong. The separate chunk upload, resume probe, complete endpoint, status endpoint, playback endpoint, and view-ingest endpoint are exactly the right direction. The main API flaw is the misplaced lifecycle sequence under `POST /v1/uploads`.
 
-The data model captures the basic entities but misses the most important operational entities: upload parts/checksums, transcode jobs, segment tasks, attempts, DLQ records, manifests/segments, and view events/windows. Adding those would make the case much more production-realistic without changing the high-level architecture.
+The data model now covers the important operational entities: `upload_sessions`, `upload_parts`, `rendition_tasks`, and `view_events`. It should add access/policy state and either explicit manifest/segment metadata or a note that `renditions.manifest_key` is the manifest root from which segments are derived.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: One-Shot Upload, Serve the Original File
 
-Strong baseline and a useful decision prompt. The diagram includes `Viewer` but does not show a link from the stored original/origin to the viewer, so the visual does not fully match "serve the original file". Add a local view link such as `RawStore -> Viewer` or `UploadSvc -> Viewer` labeled "serve original" to make the failure visible.
+This is now a strong baseline. The added `naive-serve` link fixes the old visual gap, and the trap makes the failure mode clear. Keep it as the opening contrast.
 
 ### Step 2: Resumable Chunked Upload
 
-The concept is introduced at the right time. The step should go deeper on offset reconciliation, duplicate chunks, checksums, chunk manifests, idempotency, and upload finalization. The explicit highlight only marks `UploadSvc` and `RawStore`, but this step also introduces `MetaSvc` and `MetaDB`; highlighting the metadata state would better match the lesson.
+This step is much stronger after the update. It teaches session state, part checksums, idempotent resends, resume probes, conflict detection, completion, and expiry. The only remaining issue is presentation: the API sequence should not make start-session look like it includes chunk upload and transcode enqueue.
 
 ### Step 3: Decouple Processing with a Job Queue
 
-Good transition from durable source to asynchronous processing. The step should clarify who enqueues jobs and when: only after the upload is committed, not merely after the first chunks arrive. Consider adding a short failure path for an upload that never completes or a queue publish that fails after metadata is updated.
+Good progression from durable upload to async processing. The reconciler note for "metadata write succeeds but queue publish fails" is an important production detail. Consider tying it to the `rendition_tasks` source-of-truth decision so Step 3 and Step 4 use the same queue/task mental model.
 
 ### Step 4: Transcode Fanout into Renditions
 
-This is one of the strongest steps. The three options are useful and realistic. The missing part is state: segment tasks, coordinator ownership, retries, leases, idempotent output keys, partial-output cleanup, and quality validation should be explicit. A failure drill exists for worker crash, but the architecture/data model does not yet show where that retry state lives.
+This is now one of the best parts of the dataset. Segment-parallel fanout, task leases, deterministic output keys, retry, dead-letter, and coordinator validation are exactly the right concepts. Clarify whether the lease is held in `JobQ` or `rendition_tasks`, and the step will be very strong.
 
 ### Step 5: Adaptive Bitrate Streaming via CDN
 
-Good explanation of HLS/DASH and pull-through CDN. The progressive-download alternative is a good teaching contrast. Tighten the data-plane/control-plane explanation so the playback service is not perceived as proxying segment traffic or calling the CDN on every segment. Add cache TTL, signing, private-video authorization, and CDN origin-shield notes.
+The control-plane/data-plane explanation is now clear and production-shaped. Cache keys, TTLs, origin shield, private/unlisted access, and tokenized URLs are all useful details. The next improvement is to back this with data model fields and a `satisfies` row for access control.
 
 ### Step 6: View Counting at Scale
 
-The option comparison is good. To raise the bar, define a view event, counting threshold, dedup window, late-arrival behavior, and bot/fraud filtering. Also separate public approximate counts from analytics or monetization-grade records.
+This step is much more realistic after the update. It defines the event, counting threshold, dedup window, late events, bot/fraud filtering, and approximate versus authoritative counts. A small sequence flow for view ingestion, windowing, and writeback would make the renderer experience match the quality of the prose.
 
 ### Step 7: Storage, Cost, and Reliability at Scale
 
-The step closes the case with the right themes: storage tiers, retryable jobs, dead letters, per-rendition status, and independent scaling. It is doing too much at once, though. Some reliability and observability concerns should be introduced earlier where the relevant mechanism appears, then summarized here.
+This works well as synthesis rather than a catch-all. It now references mechanisms introduced earlier and names useful SLO signals. It could be slightly stronger with concrete retention/tiering policies, but that is lower priority.
 
 ## Final Design Review
 
-The final design accurately integrates the main nodes and links introduced in the steps. It says jobs are idempotent and retryable, view events are deduped, and ingestion/serving scale independently. This is the right final architecture.
+The final design now integrates the steps well. It names upload session/part state, transcode task/coordinator state, manifest/segment metadata, view-event aggregation state, and operational SLO monitoring. The description also correctly keeps the playback service out of the segment hot path.
 
-The final design would be stronger if it named the missing state surfaces: upload session/part state, transcode task/coordinator state, manifest/segment metadata, view-event aggregation state, and operational monitoring. It should also mention the playback service as a control-plane service that authorizes and returns manifests/tokens, not as part of the segment delivery path.
+The final design should inherit the same two clarifications as the steps: where transcode leases live, and where playback authorization policy lives. Once those are explicit, the final architecture will read as coherent end to end.
 
 ## Concept Introduction and Learning Flow
 
-Concepts are staged well: resumable upload, async pipeline, fanout, ABR/CDN, and async counting arrive just before they are used. The pattern tags reinforce that flow.
+The concept sequence is strong: naive upload, resumability, async queue, fanout, ABR/CDN, async counting, and operational synthesis. Concepts arrive near the step where they matter, and the recaps expose the next problem naturally.
 
-The main learning gap is that several production concepts are referenced only after the design already depends on them. Idempotency, retries, leases, DLQs, cache keys, signed URL TTLs, and dedup windows should each appear near the step where the reader first needs them.
+The remaining learning-flow issue is mostly in supporting links. The dataset has good references in `toProbeFurther`, but several step-level `probeLinks` are generic or mismatched. For example, `views` should point to stream-processing/counting references such as `kafka-design`, and `scale` should point to `sre-monitoring` and possibly `borg-paper`.
 
 ## Step-to-Final-Design Coherence
 
-The sequence of steps builds cleanly toward the final design. Each step's recap exposes the next problem, which is excellent for interview pacing. The final design contains all major components introduced by the steps.
+Coherence is now high. The final design contains the main components introduced by the steps, and the major old mismatches were fixed: Step 1 shows direct serving, Step 2 highlights metadata, Step 4 models retry state, Step 5 separates CDN data path from playback control plane, and Step 6 defines counting semantics.
 
-The weak spots are semantic rather than structural: Step 1 visually omits serving to the viewer; Step 2 introduces metadata but does not highlight it; Step 4 relies on unmodeled task state; Step 5 has a potentially misleading playback-to-CDN link; Step 6 introduces an event pipeline without event semantics.
+The only coherence gaps left are semantic: API sequence placement, transcode task ownership, and access-policy state.
 
 ## Realism Compared With Production Systems
 
-For a book-style interview case, the high-level architecture is realistic. The design correctly avoids serving from origin, treats transcoding as asynchronous, stores immutable media in object storage, and separates read-heavy playback from write-heavy processing.
+For a system-design interview, this is now realistic. It does not pretend that "put it in a queue" solves transcoding; it describes the state needed for retries. It does not put the playback service in the hot path. It treats view counts as business metrics with different accuracy requirements.
 
-Production systems would also need:
+Production systems would still need more detail on:
 
-- Upload part manifests, checksums, resumability probes, and failed/expired session cleanup.
-- Virus/malware scanning, content policy/moderation hooks, and possibly copyright matching before publishing.
-- Worker leases, attempts, retry backoff, dead-letter queues, and idempotent output paths.
-- Codec ladder policy, device compatibility, quality scoring, thumbnail/preview generation, and re-transcode workflows.
-- CDN cache policy, signed URL/cookie strategy, private video authorization, origin shielding, and invalidation.
-- View-event dedup/fraud rules, late event handling, and separate public/analytics/monetization counts.
-- Observability: queue age, transcode latency percentiles, per-rendition failure rate, playback start latency, rebuffering ratio, CDN hit ratio, origin egress, and upload completion rate.
+- Creator quotas, upload admission control, and rate limiting.
+- Visibility, ACLs, geo policy, moderation/copyright state, and publish gates.
+- Exact queue/task-store ownership for transcode leases.
+- Manifest versioning, segment metadata, codec ladder policy, and re-transcode workflows.
+- Alerting thresholds and runbook actions for queue age, upload failures, CDN hit ratio, origin egress, and playback quality.
 
 ## Dataset and Renderer-Facing Observations
 
 - JSON parses successfully.
-- Main step `view.nodes`, option `view.nodes`, and final-design nodes resolve to `highLevelArchitecture.nodes`.
-- Main step `view.links`, option `view.links`, and final-design links resolve to `highLevelArchitecture.links` when they are string references.
-- `satisfies.functional[*].steps`, `satisfies.nonFunctional[*].steps`, dataset pattern steps, and step `probeLinks` resolve.
-- Canonical node types are valid for the current template set: `client`, `database`, `edge`, `object-storage`, `queue`, `service`, `stream`, and `worker`.
+- Main step views, option views, and final-design view nodes resolve to `highLevelArchitecture.nodes`.
+- Main step views, option views, and final-design link references resolve to `highLevelArchitecture.links` when they are string references.
+- `satisfies[*].steps` and dataset pattern steps resolve to real step IDs.
+- Canonical node types used by the dataset are valid for the current template set: `client`, `database`, `edge`, `object-storage`, `queue`, `service`, `stream`, and `worker`.
 - No raw `diagram` fields appear under structured step/final-design areas.
-- Step 1 has an isolated `Viewer` node in its view. That is valid JSON but weak rendering semantics.
-- The API examples use stringified request/response bodies. If the schema supports richer structured examples, structured request/response fields would make the API section easier to compare and evolve.
+- Step-level `probeLinks` need retargeting. Several steps point to a repeated media/storage set even when better local references exist for queues, operations, and view-event pipelines.
+- `REVIEW.md` is repo-only; no docs rebuild is needed for this review update.
 
 ## Recommended Edits, Prioritized
 
-### P1: Make capacity numeric and tie it to architecture decisions
+### P1: Fix the upload lifecycle sequence
 
-Add concrete estimates for upload GB/min, transcode compute multiplier, worker count/backlog, storage multiplier, CDN edge QPS, origin miss bandwidth, and view-event throughput. Reference the steps each estimate motivates.
+Move the full upload/chunk/complete/enqueue sequence away from `POST /v1/uploads`, or rename it as a lifecycle flow. Make start-session return only the upload session, and make `POST /complete` return `202 processing`.
 
-### P1: Expand resumable upload API and data model
+### P1: Clarify transcode task ownership
 
-Add chunk upload, resume status, and complete endpoints. Extend `upload_sessions` and/or add `upload_parts` with checksums, offsets, part IDs, status, ownership, expiration, and commit metadata.
+State whether `JobQ` or `rendition_tasks` owns leases. Prefer making `rendition_tasks` in `MetaDB` the durable source of truth and using queue messages as scheduling wake-ups, unless the dataset wants to teach queue visibility timeouts directly.
 
-### P1: Add transcode job/task state
+### P1: Back access control with data and `satisfies`
 
-Model segment/rendition jobs, leases, attempts, idempotency keys, output keys, state transitions, DLQ records, and coordinator ownership. Add at least one failure/retry sequence.
+Add visibility/ACL/geo/moderation fields or a small policy table, and add a non-functional `satisfies` item for playback access control.
 
-### P2: Tighten playback/CDN control-plane language
+### P2: Add a view-count sequence flow
 
-Clarify that playback service authorizes and returns manifests/tokens while the player fetches segments directly from CDN. Add cache key, TTL, signed URL/cookie, origin shield, and private content notes.
+Show `Viewer -> ViewPipe -> dedup/window -> MetaSvc/MetaDB`, with public approximate count separated from authoritative analytics/monetization.
 
-### P2: Define view-count semantics
+### P2: Add ranges or assumptions to capacity
 
-Add event schema, counting threshold, dedup window, late-event behavior, bot/fraud filtering, and public-versus-authoritative count distinction.
+Keep the numeric bullets, but make source bitrate, rendition ladder, storage multiplier, CDN miss ratio, and event-throughput assumptions explicit.
 
-### P2: Improve diagram semantics
+### P3: Retarget step-level probe links
 
-Add a naive serving link to Step 1, highlight metadata in Step 2, and reconsider the `play-cdn` link label so it does not imply a hot-path CDN call from playback service.
-
-### P3: Spread operations throughout the steps
-
-Introduce observability, backpressure, and failure modes near the mechanism they belong to, then keep Step 7 as the synthesis.
+Use `s3-multipart` for upload, `ffmpeg-docs`/`netflix-vmaf` for transcoding, `apple-hls`/`dash-if` for streaming, `kafka-design` for view counting, and `sre-monitoring`/`borg-paper` for operations and fleet scaling.
 
 ## What Not To Change
 
-- Keep the seven-step arc. It is clean and interview-friendly.
-- Keep the naive baseline; it is a strong teaching device.
-- Keep the option sets for transcode, streaming, and view counting.
-- Keep the metadata/blob/CDN split as the central design frame.
-- Keep view counting eventually consistent for the public display counter.
+- Keep the seven-step arc.
+- Keep the naive baseline.
+- Keep the concrete capacity bullets.
+- Keep the upload session/part model.
+- Keep segment-parallel transcoding as the default option.
+- Keep the control-plane/data-plane CDN explanation.
+- Keep public view counts eventually consistent and separate from authoritative analytics/monetization.
 
 ## Bottom Line
 
-This dataset is structurally sound and already teaches the core YouTube upload/streaming architecture well. The next improvement pass should make the design more concrete: quantitative capacity, explicit upload protocol state, transcode task state, CDN/security boundaries, and view-count semantics.
+The recent changes turned this from a good high-level case into a strong, production-shaped interview walkthrough. One targeted cleanup pass on API sequencing, task ownership, and access-policy state would make it ready as a flagship media-system dataset.

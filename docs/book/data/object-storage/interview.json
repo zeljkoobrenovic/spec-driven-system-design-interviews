@@ -257,53 +257,90 @@
   ],
   "requirements": {
     "functional": [
-      "PUT an object (bucket + key + bytes) and GET it back.",
-      "DELETE an object; list objects in a bucket by prefix.",
-      "Support very large objects via multipart upload.",
-      "Object versioning (optional, configurable per bucket).",
-      "Read-after-write visibility for new objects."
+      "PUT an object (bucket + key + bytes) and GET it back; DELETE and HEAD by key.",
+      "List objects in a bucket by prefix with a delimiter and a pagination cursor.",
+      "Support very large objects via multipart upload (initiate / upload part / complete / abort).",
+      "Object versioning (optional, per-bucket): versioned reads, delete markers, latest-pointer semantics.",
+      "Per-tenant/bucket authorization on every operation; per-bucket quotas.",
+      "Idempotent, conditional writes (content checksum, idempotency key, If-Match/If-None-Match)."
     ],
     "nonFunctional": [
-      "Extreme durability (e.g. 11 nines) — effectively never lose data.",
-      "High availability for GET/PUT.",
+      "Extreme durability (e.g. 11 nines) — effectively never lose data, maintained over time via repair.",
+      "High availability for GET/PUT, degrading to reconstruction/alternate replicas under node loss.",
       "Scale to trillions of objects and exabytes across many failure domains.",
-      "Storage-efficient (control the cost of durability).",
-      "Strong-enough consistency: a successful PUT is immediately readable."
+      "Storage-efficient (control the cost of durability — hybrid replication/EC by object class).",
+      "Strong consistency for GET/HEAD AND for LIST: a successful PUT/DELETE is immediately reflected in both a read and a prefix listing.",
+      "Encryption at rest (envelope/KMS) and in transit; tenant isolation; auditable access."
     ]
   },
   "capacity": [
     {
       "label": "Objects",
-      "value": "trillions",
-      "note": "Metadata at this scale must shard heavily."
+      "value": "~10 trillion",
+      "note": "At ~1 KB metadata each ≈ 10 PB logical metadata before indexes/replicas — must shard heavily (Step 7)."
     },
     {
       "label": "Total bytes",
-      "value": "exabytes",
+      "value": "exabytes (~1 EB)",
       "note": "Across thousands of data nodes / many zones."
+    },
+    {
+      "label": "Object size",
+      "value": "avg ~4 MB, p95 ~64 MB, range bytes→TBs",
+      "note": "~70% of objects are small (<1 MB) but most bytes live in large objects — multipart needed above ~100 MB."
+    },
+    {
+      "label": "Peak PUT/s",
+      "value": "~300k/s",
+      "note": "Drives metadata write capacity + index update throughput."
+    },
+    {
+      "label": "Peak GET/s",
+      "value": "~3M/s",
+      "note": "~10:1 read:write; hot objects CDN/cache-fronted to offload data nodes."
+    },
+    {
+      "label": "Peak LIST/s",
+      "value": "~50k/s",
+      "note": "Served from the derived ordered bucket index, not the point store."
+    },
+    {
+      "label": "Peak DELETE/s",
+      "value": "~30k/s",
+      "note": "Logical delete (metadata) is cheap; reclamation is async GC."
     },
     {
       "label": "Durability target",
       "value": "~11 nines",
-      "note": "Drives replication factor / erasure scheme."
+      "note": "Drives EC/replication scheme AND repair speed — see repair budget below."
     },
     {
-      "label": "Object size",
-      "value": "bytes to TBs",
-      "note": "Multipart needed for large objects."
+      "label": "Storage overhead",
+      "value": "~1.4× (EC 10+4) cold, ~3× (replica) hot",
+      "note": "Hybrid keeps the exabyte tier near 1.4× raw instead of 3×."
+    },
+    {
+      "label": "Repair budget",
+      "value": "restore redundancy < ~30 min/node, < ~4 h/rack",
+      "note": "Repair must outrun further failures or the durability math breaks; throttled to a fraction of node bandwidth."
+    },
+    {
+      "label": "Metadata footprint",
+      "value": "~10 PB (incl. versions) + indexes",
+      "note": "10T objects × ~1 KB; replicated/indexed copies multiply it. Sized in Step 7."
     },
     {
       "label": "Failure domains",
       "value": "racks / zones",
-      "note": "Spread copies/shards across them."
+      "note": "Spread copies/shards across them; hot-bucket skew can be 100×+ the average — hash-shard + cache."
     }
   ],
   "api": [
     {
       "method": "PUT",
       "path": "/{bucket}/{key}",
-      "description": "Store an object. Data is replicated/erasure-coded; metadata committed last.",
-      "request": "(object bytes; headers: content-type, etc.)",
+      "description": "Store an object. The Metadata Service coordinates: authorize + admission-check (quota), pick placement, write data durably, and only then commit metadata (read-after-write). Headers carry a content checksum and optional idempotency key so a retried PUT after a client timeout returns the same versionId instead of duplicating.",
+      "request": "(object bytes; headers: Authorization, content-type, x-checksum-sha256, optional x-idempotency-key, optional If-None-Match: * for create-only, optional x-storage-class, optional x-sse-kms-key-id)",
       "response": "{ \"versionId\": \"v_3\", \"etag\": \"...\" }",
       "sequence": {
         "participants": [
@@ -325,6 +362,10 @@
           {
             "id": "DataNodes",
             "label": "Data Nodes"
+          },
+          {
+            "id": "MetaDB",
+            "label": "Metadata Store"
           }
         ],
         "messages": [
@@ -332,13 +373,13 @@
             "from": "Client",
             "to": "MetaSvc",
             "arrow": "->>",
-            "label": "PUT bucket/key"
+            "label": "PUT bucket/key (authz + quota + idempotency check)"
           },
           {
             "from": "MetaSvc",
             "to": "Placement",
             "arrow": "->>",
-            "label": "choose nodes"
+            "label": "choose nodes (placement epoch)"
           },
           {
             "from": "Client",
@@ -351,6 +392,18 @@
             "to": "DataNodes",
             "arrow": "->>",
             "label": "write shards (durable quorum)"
+          },
+          {
+            "from": "EC",
+            "to": "MetaSvc",
+            "arrow": "-->>",
+            "label": "durable placement receipt (shards acked)"
+          },
+          {
+            "from": "MetaSvc",
+            "to": "MetaDB",
+            "arrow": "->>",
+            "label": "commit version + latest + index (one txn)"
           },
           {
             "from": "MetaSvc",
@@ -410,17 +463,169 @@
       }
     },
     {
+      "method": "HEAD",
+      "path": "/{bucket}/{key}",
+      "description": "Return object metadata (size, etag, version, content-type, storage class) without the body. Same strong consistency as GET.",
+      "request": "(bucket/key in path; optional ?versionId=)",
+      "response": "200 headers: Content-Length, ETag, x-version-id, x-storage-class, x-checksum-sha256 (or 404 / 404+delete-marker)"
+    },
+    {
+      "method": "DELETE",
+      "path": "/{bucket}/{key}",
+      "description": "Delete an object. On a versioned bucket a DELETE without versionId writes a delete marker (latest read returns 404) and keeps prior versions; DELETE ?versionId= permanently removes that version. On a non-versioned bucket it logically deletes; bytes are reclaimed asynchronously by GC.",
+      "request": "Headers: Authorization (SigV4-style), optional x-idempotency-key, optional If-Match. Optional ?versionId=",
+      "response": "204 (or 200 { \"deleteMarkerVersionId\": \"v_4\" } on a versioned bucket)"
+    },
+    {
+      "method": "GET",
+      "path": "/{bucket}?prefix=&delimiter=&cursor=&max-keys=",
+      "description": "List keys in a bucket by prefix. delimiter='/' rolls keys up into common prefixes (pseudo-directories); cursor paginates; results are strongly consistent with prior PUT/DELETE (the bucket index is part of the metadata commit). Range reads via 'Range:' header are supported on object GET.",
+      "request": "Query: prefix, delimiter, cursor (opaque continuation token), max-keys. Header: Authorization.",
+      "response": "{ \"keys\": [{ \"key\": \"...\", \"etag\": \"...\", \"size\": 123, \"versionId\": \"v_3\", \"lastModified\": \"...\" }], \"commonPrefixes\": [\"photos/\"], \"nextCursor\": \"...\", \"isTruncated\": true }"
+    },
+    {
       "method": "POST",
       "path": "/{bucket}/{key}?uploads",
-      "description": "Initiate a multipart upload; client then PUTs parts and completes.",
-      "request": "(initiate; then PUT part N; then complete)",
+      "description": "Initiate a multipart upload. Returns an uploadId the client uses to upload parts and then complete or abort.",
+      "request": "Headers: Authorization, content-type, optional x-storage-class, optional x-sse-kms-key-id (encryption key reference).",
       "response": "{ \"uploadId\": \"u_9\" }"
+    },
+    {
+      "method": "PUT",
+      "path": "/{bucket}/{key}?partNumber={n}&uploadId={id}",
+      "description": "Upload one part of a multipart upload. Parts are uploaded independently and in parallel; each is stored durably and returns an etag. Re-uploading the same partNumber replaces it (idempotent at part granularity).",
+      "request": "(part bytes; headers: x-checksum-sha256 for the part). Min part size enforced except the last part.",
+      "response": "{ \"etag\": \"...\", \"partNumber\": 3 }"
+    },
+    {
+      "method": "POST",
+      "path": "/{bucket}/{key}?uploadId={id} (complete)",
+      "description": "Complete the multipart upload. The server validates the submitted part list (numbers, sizes, etags) against stored parts, assembles the object, and commits its metadata atomically exactly once — the object becomes visible only here. An idempotency key makes a retried complete return the same versionId.",
+      "request": "{ \"parts\": [{ \"partNumber\": 1, \"etag\": \"...\" }, ...] }. Headers: Authorization, optional x-idempotency-key.",
+      "response": "{ \"versionId\": \"v_7\", \"etag\": \"...\" } (or 400 if a part is missing/mismatched)",
+      "sequence": {
+        "participants": [
+          {
+            "id": "Client"
+          },
+          {
+            "id": "Uploader",
+            "label": "Upload Coordinator"
+          },
+          {
+            "id": "DataNodes",
+            "label": "Data Nodes"
+          },
+          {
+            "id": "MetaSvc",
+            "label": "Metadata Service"
+          },
+          {
+            "id": "MetaDB",
+            "label": "Metadata Store"
+          }
+        ],
+        "messages": [
+          {
+            "from": "Client",
+            "to": "Uploader",
+            "arrow": "->>",
+            "label": "complete(uploadId, part list)"
+          },
+          {
+            "from": "Uploader",
+            "to": "DataNodes",
+            "arrow": "->>",
+            "label": "verify parts durable + checksums/sizes"
+          },
+          {
+            "type": "alt",
+            "label": "all parts present & valid",
+            "messages": [
+              {
+                "from": "Uploader",
+                "to": "MetaSvc",
+                "arrow": "->>",
+                "label": "assemble object, commit version (idempotent)"
+              },
+              {
+                "from": "MetaSvc",
+                "to": "MetaDB",
+                "arrow": "->>",
+                "label": "commit version + latest + index (one txn)"
+              },
+              {
+                "from": "Uploader",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "200 versionId (object now visible)"
+              }
+            ],
+            "else": {
+              "label": "missing / mismatched part",
+              "messages": [
+                {
+                  "from": "Uploader",
+                  "to": "Client",
+                  "arrow": "-->>",
+                  "label": "400 (no commit; parts stay until abort/TTL GC)"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "method": "DELETE",
+      "path": "/{bucket}/{key}?uploadId={id} (abort)",
+      "description": "Abort an in-progress multipart upload. Marks the upload aborted so GC reclaims its parts after a TTL; uncompleted uploads are also reaped by a TTL even without an explicit abort.",
+      "request": "Headers: Authorization.",
+      "response": "204"
     }
   ],
   "dataModel": [
     {
-      "name": "objects (metadata)",
-      "note": "Authoritative object record; sharded by bucket/key hash.",
+      "name": "buckets",
+      "note": "Tenant-owned namespace + policy/quota state. Authorization and admission checks read this on every operation.",
+      "fields": [
+        {
+          "name": "bucket",
+          "type": "string PK"
+        },
+        {
+          "name": "account_id",
+          "type": "owning tenant"
+        },
+        {
+          "name": "versioning",
+          "type": "enum(off, enabled, suspended)"
+        },
+        {
+          "name": "policy",
+          "type": "IAM-style access policy (json)"
+        },
+        {
+          "name": "quota",
+          "type": "{ bytes, object_count, req_rate }"
+        },
+        {
+          "name": "usage",
+          "type": "{ bytes, object_count } (counters)"
+        },
+        {
+          "name": "default_sse",
+          "type": "KMS key ref / encryption default"
+        },
+        {
+          "name": "lifecycle",
+          "type": "rules (tiering / expiry / abort-MPU TTL)"
+        }
+      ]
+    },
+    {
+      "name": "object_versions",
+      "note": "One immutable row per (bucket, key, version_id). Sharded by bucket/key hash. Delete markers are versions with is_delete_marker=true.",
       "fields": [
         {
           "name": "bucket",
@@ -432,47 +637,93 @@
         },
         {
           "name": "version_id",
-          "type": "string"
+          "type": "string PK (with bucket,key)"
         },
         {
           "name": "size",
           "type": "bigint"
         },
         {
-          "name": "etag",
-          "type": "hash of content"
+          "name": "etag / checksum_sha256",
+          "type": "content hash"
         },
         {
           "name": "placement",
-          "type": "list<data_node, shard_idx> / EC layout"
+          "type": "{ epoch, scheme: replica|EC, list<node, shard_idx> }"
+        },
+        {
+          "name": "storage_class",
+          "type": "enum(hot, cold, ...) (drives replica vs EC)"
+        },
+        {
+          "name": "sse_key_ref",
+          "type": "envelope/KMS key id"
+        },
+        {
+          "name": "is_delete_marker",
+          "type": "bool"
+        },
+        {
+          "name": "retention",
+          "type": "{ mode, retain_until, legal_hold }"
         },
         {
           "name": "state",
-          "type": "enum(committed, deleting)"
+          "type": "enum(pending_data, data_durable, committed, deleted, gc_eligible)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp"
         }
       ]
     },
     {
-      "name": "data shards (on data nodes)",
-      "note": "The actual bytes: replicas or erasure-coded fragments.",
+      "name": "object_latest",
+      "note": "Per (bucket, key) pointer to the current version (or a delete marker). Atomically flipped on PUT/DELETE so reads see one consistent version.",
       "fields": [
         {
-          "name": "shard_id",
-          "type": "(object, idx)"
+          "name": "bucket_key",
+          "type": "PK"
         },
         {
-          "name": "node_id",
-          "type": "which disk/node"
+          "name": "latest_version_id",
+          "type": "fk -> object_versions"
         },
         {
-          "name": "checksum",
-          "type": "for scrub/repair"
+          "name": "is_delete_marker",
+          "type": "bool (latest read returns 404)"
+        }
+      ]
+    },
+    {
+      "name": "bucket_index",
+      "note": "Derived, key-ordered listing index. Updated in the SAME metadata commit as object_latest, so LIST is strongly consistent with PUT/DELETE. Pagination cursor is the last (key, version) returned.",
+      "fields": [
+        {
+          "name": "bucket",
+          "type": "string (index partition)"
+        },
+        {
+          "name": "key",
+          "type": "string (ordered)"
+        },
+        {
+          "name": "latest_version_id",
+          "type": "visible version"
+        },
+        {
+          "name": "visible",
+          "type": "bool (false if latest is a delete marker)"
+        },
+        {
+          "name": "size / etag / last_modified",
+          "type": "denormalized for listing"
         }
       ]
     },
     {
       "name": "multipart_uploads",
-      "note": "In-progress large uploads.",
+      "note": "In-progress large uploads. Reaped by GC on abort or after a lifecycle TTL.",
       "fields": [
         {
           "name": "upload_id",
@@ -483,12 +734,78 @@
           "type": "target"
         },
         {
-          "name": "parts",
-          "type": "list<part_no, etag, location>"
+          "name": "storage_class / sse_key_ref",
+          "type": "carried to the final object"
         },
         {
           "name": "state",
           "type": "enum(in_progress, completed, aborted)"
+        },
+        {
+          "name": "created_at / ttl",
+          "type": "for abandoned-upload GC"
+        }
+      ]
+    },
+    {
+      "name": "multipart_parts",
+      "note": "One row per uploaded part; validated against the submitted list at complete.",
+      "fields": [
+        {
+          "name": "upload_id",
+          "type": "fk (PK with part_number)"
+        },
+        {
+          "name": "part_number",
+          "type": "int"
+        },
+        {
+          "name": "size / etag / checksum",
+          "type": "validated at complete (min size except last)"
+        },
+        {
+          "name": "placement",
+          "type": "shards for this part"
+        }
+      ]
+    },
+    {
+      "name": "shard_placements (on data nodes)",
+      "note": "The actual bytes: replicas or erasure-coded fragments. Scrubbed and repaired against the metadata placement.",
+      "fields": [
+        {
+          "name": "shard_id",
+          "type": "(object_version, idx)"
+        },
+        {
+          "name": "node_id",
+          "type": "disk/node (failure domain)"
+        },
+        {
+          "name": "placement_epoch",
+          "type": "which placement map this shard belongs to"
+        },
+        {
+          "name": "checksum",
+          "type": "for scrub/repair (quarantine on mismatch)"
+        }
+      ]
+    },
+    {
+      "name": "idempotency_keys",
+      "note": "Dedupes retried PUT / complete / DELETE after client timeouts, mapping a key to the result it already produced.",
+      "fields": [
+        {
+          "name": "idem_key",
+          "type": "(account, key) PK"
+        },
+        {
+          "name": "result",
+          "type": "{ version_id, etag, status }"
+        },
+        {
+          "name": "expires_at",
+          "type": "ttl"
         }
       ]
     }
@@ -518,6 +835,16 @@
       "whenToUse": "Cost-efficient durability for large/cold objects.",
       "steps": [
         "durability"
+      ],
+      "group": "Durability: Replication vs Erasure Coding"
+    },
+    {
+      "name": "Tiered redundancy by object class",
+      "what": "Replicate hot/small objects (fast, cheap repair) and erasure-code cold/large ones (low overhead), migrating between tiers via a lifecycle policy as objects cool.",
+      "whenToUse": "The chosen durability policy: it keeps exabyte storage near 1.4× while keeping hot reads/repair fast.",
+      "steps": [
+        "durability",
+        "replication-vs-ec"
       ],
       "group": "Durability: Replication vs Erasure Coding"
     },
@@ -555,7 +882,7 @@
       "title": "1. Naive: Store the Blob on One Fileserver (the baseline)",
       "description": [
         "Start with the simplest thing that works: a single fileserver with a disk. PUT writes the object's bytes to a local file named by bucket/key; GET reads that file back. For a handful of objects this is a correct, complete object store.",
-        "It fails the two headline requirements immediately. Durability: one disk holds the only copy, so a disk failure (which is routine at scale) loses the object outright — nowhere near the 11-nines target. Scale: one server's disk caps total bytes and object count, and one machine's network caps throughput, so exabytes and trillions of objects are impossible.",
+        "It fails the two headline requirements immediately, and the capacity numbers show why each ceiling is independent. Durability: one disk holds the only copy, so a disk failure (routine at scale) loses the object outright — nowhere near 11 nines. Scale: one server's disk caps total bytes (we need exabytes), its filesystem caps object count (we need trillions), and its NIC caps throughput (we need ~300k PUT/s and ~3M GET/s). No single box clears any of the three.",
         "So the baseline motivates the design. To never lose data you need multiple copies on independent hardware (replication / erasure coding), and to scale you must separate the small, queryable mapping (which object lives where) from the bulk bytes so each scales on its own. The next two steps introduce exactly that split and that redundancy."
       ],
       "view": {
@@ -599,8 +926,8 @@
       "title": "2. Split Metadata from Data",
       "description": [
         "Two very different problems: a tiny, queryable mapping (bucket/key -> where the bytes live) and the bulk bytes themselves. Keep them in separate planes. The metadata service owns the key->location/version mapping in a sharded transactional store; data nodes store the actual object bytes.",
-        "A request resolves metadata first (locations, version), then streams bytes to/from data nodes. This lets metadata be consistent and heavily sharded (by bucket/key hash) while raw storage scales independently and cheaply across thousands of disks.",
-        "Everything queryable (listing, versions, placement) lives in metadata; the data plane just stores and serves opaque bytes."
+        "Metadata is authoritative for existence and for control: it's the source of truth for whether an object exists, and it's where authorization (bucket policy / tenant ownership) and quota admission are enforced on every operation. Data nodes are never authoritative — a reader must resolve metadata first and should never trust raw bytes without a committed metadata pointer.",
+        "A request resolves metadata first (authz, locations, version), then streams bytes to/from data nodes. This lets metadata be consistent and heavily sharded (by bucket/key hash) while raw storage scales independently and cheaply across thousands of disks. Everything queryable (listing, versions, placement, ownership, encryption key reference) lives in metadata; the data plane just stores and serves opaque (encrypted) bytes."
       ],
       "view": {
         "nodes": [
@@ -680,8 +1007,48 @@
       },
       "options": [
         {
-          "name": "Erasure coding (k+m fragments) (default)",
-          "description": "Each object is split into k data plus m parity fragments spread across failure domains, and any k of them reconstruct it, tolerating m losses.",
+          "name": "Tiered: replicate hot/small, erasure-code cold/large (default)",
+          "description": "A lifecycle policy classifies objects by class: replicate hot/small ones (3×) for fast cheap repair and low read latency, and erasure-code cold/large ones (e.g. 10+4 ≈ 1.4×) for low overhead, migrating from replicas to EC as objects cool. This is what real stores do, and it keeps the exabyte tier near 1.4× instead of 3×.",
+          "pros": [
+            "Best of both: fast cheap-repair replication for hot/small objects, low-overhead EC for the large/cold bytes that dominate the bill.",
+            "Storage cost tracks the access pattern instead of one blanket policy — exabytes stay near 1.4×.",
+            "Objects transition tiers (replicated → erasure-coded) as they cool, via the lifecycle policy."
+          ],
+          "cons": [
+            "Two redundancy code paths to build, test, and operate.",
+            "Needs a classifier/lifecycle policy to decide and migrate object classes.",
+            "Tier transitions move bytes and rewrite redundancy, consuming background bandwidth."
+          ],
+          "view": {
+            "nodes": [
+              "MetaSvc",
+              "Placement",
+              "EC",
+              "DataNodes"
+            ],
+            "caption": "The Placement Service replicates hot/small objects directly to Storage Data Nodes while routing cold/large ones through the Replication / Erasure Coder to write shards.",
+            "links": [
+              "meta-placement",
+              {
+                "from": "Placement",
+                "to": "DataNodes",
+                "label": "replicate hot/small"
+              },
+              "placement-ec",
+              "ec-datanodes"
+            ],
+            "highlight": [
+              "Placement"
+            ],
+            "groups": [
+              "meta-plane",
+              "data-plane"
+            ]
+          }
+        },
+        {
+          "name": "Erasure coding everywhere (k+m fragments)",
+          "description": "Each object is split into k data plus m parity fragments spread across failure domains, and any k of them reconstruct it, tolerating m losses — applied uniformly to all objects.",
           "pros": [
             "Far lower storage overhead than copies — e.g. 10+4 is ~1.4x while tolerating any 4 fragment losses.",
             "Hits 11 nines on large/cold data without paying 3x storage everywhere.",
@@ -690,7 +1057,7 @@
           "cons": [
             "A read may gather k fragments, adding latency versus reading one whole copy.",
             "Repairing one lost fragment reads many others (repair amplification), costing bandwidth.",
-            "Encode/decode CPU on write and reconstruction; awkward for tiny hot objects."
+            "Encode/decode CPU on write and reconstruction; awkward and slow for tiny hot objects."
           ],
           "view": {
             "nodes": [
@@ -716,7 +1083,7 @@
           }
         },
         {
-          "name": "Full N-way replication",
+          "name": "Full N-way replication everywhere",
           "description": "N complete copies of each object are stored across distinct failure domains; any single copy serves a read and a lost copy is replaced by copying a survivor.",
           "pros": [
             "Simplest scheme: any single copy serves a read with no reconstruction.",
@@ -751,46 +1118,6 @@
               "data-plane"
             ]
           }
-        },
-        {
-          "name": "Tiered: replicate hot/small, erasure-code cold/large",
-          "description": "A lifecycle policy classifies objects, replicating hot/small ones for fast cheap repair and erasure-coding cold/large ones for low overhead, migrating between tiers as they cool.",
-          "pros": [
-            "Best of both: fast cheap-repair replication for hot/small objects, low-overhead EC for large/cold ones.",
-            "Storage cost tracks the access pattern instead of one blanket policy.",
-            "Objects can transition tiers (replicated -> erasure-coded) as they cool."
-          ],
-          "cons": [
-            "Two redundancy code paths to build, test, and operate.",
-            "Needs a classifier/lifecycle policy to decide and migrate object classes.",
-            "Tier transitions move bytes and rewrite redundancy, consuming background bandwidth."
-          ],
-          "view": {
-            "nodes": [
-              "MetaSvc",
-              "Placement",
-              "EC",
-              "DataNodes"
-            ],
-            "caption": "The Placement Service replicates hot/small objects directly to Storage Data Nodes while routing cold/large ones through the Replication / Erasure Coder to write shards.",
-            "links": [
-              "meta-placement",
-              {
-                "from": "Placement",
-                "to": "DataNodes",
-                "label": "replicate hot/small"
-              },
-              "placement-ec",
-              "ec-datanodes"
-            ],
-            "highlight": [
-              "Placement"
-            ],
-            "groups": [
-              "meta-plane",
-              "data-plane"
-            ]
-          }
         }
       ],
       "decisionPrompt": "Replication or erasure coding? How do you hit 11 nines without paying 3x storage everywhere?",
@@ -816,14 +1143,15 @@
       ],
       "patterns": [
         "Replication for durability",
-        "Erasure coding"
+        "Erasure coding",
+        "Tiered redundancy by object class"
       ],
       "whyNow": [
         "Durability is the headline requirement; the replication-vs-EC tradeoff (and cross-domain placement) is the central senior decision."
       ],
       "recap": {
         "before": "One fragile copy.",
-        "after": "Data redundantly stored across failure domains; durability target met.",
+        "after": "Tiered durability — replicate hot/small, erasure-code cold/large — across failure domains; target met near 1.4× overhead.",
         "newRisk": "A reader could see an object whose metadata committed before its data finished — ordering matters."
       },
       "traps": [
@@ -887,9 +1215,9 @@
       "id": "consistency",
       "title": "4. Read-After-Write via Commit Ordering",
       "description": [
-        "With two planes, ordering is the consistency lever. On PUT, write the object's data durably to its nodes first (replicas/fragments acknowledged), then commit the metadata pointing to it last. The object becomes visible only once both exist.",
-        "This commit-metadata-last ordering gives read-after-write: a successful PUT response means metadata is committed and data is durable, so an immediate GET resolves and serves it. A crash mid-PUT leaves orphan data (no metadata pointer) that GC later reclaims — never a dangling pointer to missing bytes.",
-        "Versioning fits here: a new PUT creates a new version and atomically flips the 'latest' pointer, so reads see a consistent version."
+        "With two planes, ordering is the consistency lever. The Metadata Service is the write coordinator: it authorizes, picks placement, has the data written durably to its nodes first (replicas/fragments acknowledged via a durable placement receipt), then commits the metadata pointing to it last. The object becomes visible only once both exist, and the coordinator owns retries after a client timeout.",
+        "The write state machine is explicit: pending_data → data_durable (shards acked) → committed → deleting/delete_marker → gc_eligible → reclaimed. The 'committed' step writes the new version, flips the latest pointer, and updates the bucket index in one MetaDB transaction, so GET and LIST observe the same version. A crash before 'committed' leaves orphan data (no pointer) that GC later reclaims — never a dangling pointer to missing bytes.",
+        "This gives read-after-write for GET/HEAD and for LIST. Retried PUTs are deduplicated by an idempotency key so a client that times out and retries gets the same versionId instead of a duplicate object. Versioning fits cleanly: a new PUT creates a new version and atomically flips the latest pointer; a DELETE on a versioned bucket writes a delete marker as the new latest."
       ],
       "view": {
         "nodes": [
@@ -1035,9 +1363,21 @@
       ],
       "recap": {
         "before": "Possible dangling pointers / invisible writes.",
-        "after": "Read-after-write; crashes leave reclaimable orphans, not corruption.",
+        "after": "Read-after-write (GET + LIST); crashes leave reclaimable orphans, not corruption.",
         "newRisk": "Very large objects can't be a single streamed PUT — they need multipart."
       },
+      "failureDrills": [
+        {
+          "scenario": "Client times out after the data write but before it sees the 200, then retries the PUT.",
+          "expectedBehavior": "The idempotency key matches the in-flight/committed write, so the retry returns the same versionId instead of creating a duplicate object or duplicate version.",
+          "mitigation": "Idempotency-key record keyed per (account, key); the coordinator owns completion."
+        },
+        {
+          "scenario": "Data shards are durable but the metadata commit fails (coordinator crash).",
+          "expectedBehavior": "No version is visible; the orphan shards carry no live metadata pointer and are reclaimed by GC after their placement is proven unreferenced.",
+          "mitigation": "Commit-metadata-last + GC mark/sweep against committed placements."
+        }
+      ],
       "flows": [
         {
           "name": "PUT: data durable first, metadata committed last",
@@ -1131,9 +1471,9 @@
       "id": "multipart",
       "title": "5. Multipart Upload for Large Objects",
       "description": [
-        "A multi-GB/TB object can't be one atomic streamed request (failures waste everything, and it ties up a connection). Initiate a multipart upload, then PUT independent parts (in parallel, resumable), each durably stored and acknowledged with an etag.",
-        "When all parts are in, 'complete' assembles them into the final object and commits metadata atomically — the object appears only on completion. Parts can be retried/re-uploaded independently before completion.",
-        "Abandoned uploads (never completed) leave parts that GC reclaims after a TTL, so failed large uploads don't leak storage."
+        "A multi-GB/TB object can't be one atomic streamed request (failures waste everything, and it ties up a connection). Initiate a multipart upload to get an uploadId, then PUT independent parts (in parallel, resumable), each durably stored and acknowledged with an etag and recorded in a part record (number, size, checksum, placement). Re-uploading a part number replaces it, so retries are idempotent at part granularity.",
+        "Complete validates before it commits: the submitted part list must match stored parts on number, etag/checksum and minimum size (all but the last), and the upload must be in_progress. Only then does the coordinator assemble the object and commit its metadata atomically exactly once — guarded by an idempotency key so a retried complete returns the same versionId. The object appears only on completion.",
+        "Abort is first-class: it marks the upload aborted so GC reclaims its parts; uploads that are never completed or aborted are reaped after a lifecycle TTL, so failed large uploads don't leak storage."
       ],
       "view": {
         "nodes": [
@@ -1258,9 +1598,9 @@
       "id": "maintenance",
       "title": "6. Scrubbing, Repair, and Garbage Collection",
       "description": [
-        "Durability isn't a one-time write property — disks rot and nodes die continuously. A background scrubber reads shards, verifies checksums, and flags lost/corrupt ones; the repair process rebuilds missing replicas/fragments (re-replicate or re-encode from surviving fragments) to restore the target redundancy.",
-        "Repair speed matters: durability math assumes lost redundancy is restored before further failures accumulate, so repair is prioritized and parallelized.",
-        "Garbage collection reclaims space from deleted objects (data lingers until metadata says it's safe to remove) and from abandoned multipart parts — keeping cost bounded without risking live data."
+        "Durability isn't a one-time write property — disks rot and nodes die continuously. A background scrubber reads shards on a cadence (e.g. every shard re-verified within a 2-week cycle), recomputes checksums, and quarantines any shard that fails verification so a corrupt copy is never served or counted as live before it's replaced. The repair process rebuilds missing/quarantined replicas/fragments (re-replicate, or re-encode from surviving fragments) to restore the target redundancy.",
+        "Repair speed matters: the durability math assumes lost redundancy is restored before further failures accumulate, so repair is prioritized (objects closest to losing their last redundancy first) and parallelized across many source/target nodes. Repair bandwidth is throttled to a fraction of node bandwidth and isolated from serving traffic so a big rebuild doesn't starve GET/PUT — targets are roughly < 30 min to re-protect a lost node and < 4 h for a lost rack.",
+        "Garbage collection reclaims space safely: it deletes a shard only after proving the object version is deleted/expired (retention window passed) AND its placement is unreferenced by any committed metadata — a mark/sweep or placement-epoch check, never deleting bytes a live version still points at. It also reaps abandoned multipart parts past their TTL — keeping cost bounded without risking live data."
       ],
       "view": {
         "nodes": [
@@ -1310,8 +1650,18 @@
       "failureDrills": [
         {
           "scenario": "A whole rack of data nodes is lost.",
-          "expectedBehavior": "Objects remain readable from copies/fragments in other domains; repair rebuilds the lost redundancy with priority.",
-          "mitigation": "Cross-domain placement + prioritized parallel repair before further loss."
+          "expectedBehavior": "Objects remain readable from copies/fragments in other domains; repair rebuilds the lost redundancy with priority, ordered by how close each object is to losing its last spare.",
+          "mitigation": "Cross-domain placement + prioritized, throttled parallel repair before further loss."
+        },
+        {
+          "scenario": "A GET resolves placement but one shard fails its checksum / is missing.",
+          "expectedBehavior": "The read falls back to another replica, or for an EC object gathers k other fragments and reconstructs the bytes; the bad shard is quarantined and a repair is queued. The client still gets correct data.",
+          "mitigation": "Degraded read (alternate replica / EC reconstruction) + checksum quarantine + repair enqueue."
+        },
+        {
+          "scenario": "GC is about to free a shard that a live version still references.",
+          "expectedBehavior": "GC refuses: it only reclaims placements unreferenced by any committed metadata and past the retention window, so live data is never deleted even under races with a concurrent PUT.",
+          "mitigation": "Mark/sweep against committed placements + placement-epoch check + retention guard."
         }
       ]
     },
@@ -1319,9 +1669,9 @@
       "id": "scale",
       "title": "7. Listing, Sharding, and Availability at Scale",
       "description": [
-        "Metadata is the scaling pressure point: shard the metadata store by bucket/key hash across many partitions so trillions of objects and PUT/GET resolution stay fast. Replicate metadata for availability and read-after-write.",
-        "Prefix listing ('list keys under foo/') is served from a derived bucket index ordered by key, kept in sync from metadata — a flat key space with delimiter-based prefix queries (S3 has no real directories).",
-        "Keep the data path highly available: any replica/enough fragments serve a GET, requests route around failed nodes, and hot objects can be cached/CDN-fronted. The metadata + data planes scale and fail independently."
+        "Metadata is the scaling pressure point: shard the metadata store by bucket/key hash across many partitions so trillions of objects and PUT/GET resolution stay fast. (At ~10T objects × ~1 KB that's ~10 PB of metadata before indexes/replicas — far past one box.) Replicate each shard for availability and read-after-write.",
+        "Prefix listing ('list keys under foo/') is served from a derived bucket index ordered by key — a flat key space with delimiter-based prefix queries (S3 has no real directories). To keep LIST strongly consistent with PUT/DELETE, the bucket index row is updated in the SAME metadata commit transaction that flips the latest pointer (it's a co-located derived index partitioned by bucket, not an async-replicated copy), so a just-committed key appears in listings immediately. Pagination uses an opaque cursor (the last returned key/version); concurrent writes/deletes after the cursor simply show up on the next page.",
+        "Keep the data path highly available: any replica/enough fragments serve a GET, a failed/corrupt shard falls back to an alternate replica or EC reconstruction, requests route around failed nodes, and hot objects can be cached/CDN-fronted. The metadata + data planes scale and fail independently."
       ],
       "view": {
         "nodes": [
@@ -1349,17 +1699,17 @@
       },
       "options": [
         {
-          "name": "Derived ordered bucket index for listing (default)",
-          "description": "A separate key-ordered index, kept in sync from the hash-sharded metadata, serves prefix listings as a cheap ordered range scan with delimiter-based common-prefix queries.",
+          "name": "Derived ordered bucket index, committed with metadata (default)",
+          "description": "A key-ordered index partitioned by bucket, updated in the same metadata commit transaction that flips the latest pointer, serves prefix listings as a cheap ordered range scan with delimiter-based common-prefix queries — strongly consistent with PUT/DELETE.",
           "pros": [
             "Prefix listing ('list keys under foo/') is a cheap ordered range scan over the index.",
-            "Decouples listing from the hash-sharded metadata store, which is optimized for point PUT/GET.",
-            "Delimiter-based common-prefix queries work over a flat key space without real directories."
+            "Strong list-after-write: committing the index in the same transaction as the latest pointer means a just-written/deleted key is immediately correct in listings.",
+            "Delimiter-based common-prefix queries work over a flat key space without real directories, with opaque-cursor pagination."
           ],
           "cons": [
-            "The index is a second copy of key data that must be kept in sync from metadata.",
-            "Sync lag means a just-written key can be momentarily missing from listings.",
-            "A hot bucket concentrates listing load on its index range."
+            "The index is a second derived structure to maintain, and coupling it into the commit makes the write path do more work.",
+            "A hot bucket concentrates listing load on its index range — mitigate with caching and splitting hot index ranges.",
+            "Cross-shard buckets need the index partitioned by bucket while objects are hash-sharded by key, so the commit spans the object shard and the bucket's index partition."
           ],
           "view": {
             "nodes": [
@@ -1425,15 +1775,15 @@
       "concepts": [
         {
           "term": "Flat key space + prefix listing",
-          "definition": "Keys are flat strings; 'directories' are prefix queries with a delimiter, served from an ordered index.",
-          "whyItMatters": "Scales listing without a real filesystem tree.",
-          "example": "List delimiter='/' prefix='photos/' returns photos/ keys + common prefixes.",
+          "definition": "Keys are flat strings; 'directories' are prefix queries with a delimiter, served from an ordered bucket index committed in the same transaction as the object so listing is strongly consistent.",
+          "whyItMatters": "Scales listing without a real filesystem tree, and keeps LIST as consistent as GET.",
+          "example": "List delimiter='/' prefix='photos/' returns photos/ keys + common prefixes, including a key PUT a millisecond ago.",
           "group": "Listing, Sharding, and Availability at Scale"
         }
       ],
       "recap": {
         "before": "Single metadata store; no listing.",
-        "after": "Sharded metadata, prefix listing, HA data path.",
+        "after": "Sharded metadata, strongly-consistent prefix listing (index committed with the object), HA data path with degraded reads.",
         "newRisk": "Metadata hot shards (a hot bucket) and repair bandwidth — bounded by hashing, caching, and throttled repair."
       },
       "bottlenecks": [
@@ -1450,7 +1800,7 @@
   ],
   "finalDesign": {
     "title": "Final Design — Object Store",
-    "description": "A metadata service (sharded by bucket/key, replicated) maps keys to versions and placement; data nodes store the bytes as replicas or erasure-coded fragments spread across failure domains for durability. PUT writes data durably first then commits metadata last (read-after-write); large objects use multipart upload completed atomically. A scrubber + repair process continuously verify checksums and rebuild lost redundancy, while GC reclaims deleted objects and abandoned uploads. Prefix listing is served from a derived ordered bucket index; the metadata and data planes scale and remain available independently, with hot objects cached/CDN-fronted.",
+    "description": "A metadata service (sharded by bucket/key, replicated) is the write coordinator: it authorizes against bucket policy, enforces per-tenant quotas, maps keys to versions and placement, and commits the version + latest pointer + bucket index in one transaction. Data nodes store bytes with a tiered redundancy policy — replicate hot/small objects (3×) and erasure-code cold/large ones (~1.4×) across failure domains, migrating tiers as objects cool. PUT writes data durably first (durable placement receipt) then commits metadata last, deduplicated by idempotency key, giving read-after-write for GET, HEAD, and LIST; the explicit write state machine is pending_data → data_durable → committed → deleting/delete_marker → gc_eligible → reclaimed. Large objects use multipart upload, validated and committed exactly once on complete. A scrubber + repair process continuously verify checksums, quarantine bad shards, and rebuild lost redundancy under throttled, prioritized repair; GC reclaims only unreferenced placements past retention plus abandoned uploads. Data at rest is envelope/KMS-encrypted; access is authorized and audited. The metadata and data planes scale and remain available independently, with degraded reads (alternate replica / EC reconstruction) and hot objects cached/CDN-fronted.",
     "view": {
       "nodes": [
         "Client",
@@ -1502,29 +1852,46 @@
       },
       {
         "requirement": "DELETE + prefix list",
-        "how": "Metadata delete (GC reclaims); ordered bucket index.",
+        "how": "Logical metadata delete / delete marker (GC reclaims later); strongly-consistent ordered bucket index committed with the object.",
         "steps": [
+          "consistency",
           "maintenance",
           "scale"
         ]
       },
       {
         "requirement": "Large objects",
-        "how": "Multipart upload completed atomically.",
+        "how": "Multipart upload: part records validated, committed exactly once on complete; abort/TTL GC.",
         "steps": [
           "multipart"
         ]
       },
       {
         "requirement": "Versioning",
-        "how": "New version + atomic latest pointer in metadata.",
+        "how": "Immutable version rows + atomic latest pointer; DELETE writes a delete marker.",
         "steps": [
           "consistency"
         ]
       },
       {
-        "requirement": "Read-after-write",
-        "how": "Commit metadata after data is durable.",
+        "requirement": "Read-after-write (GET + LIST)",
+        "how": "Commit version + latest + index in one txn after data is durable; idempotency-keyed.",
+        "steps": [
+          "consistency",
+          "scale"
+        ]
+      },
+      {
+        "requirement": "Authorization + quotas",
+        "how": "Bucket policy checked and per-tenant quota admission-controlled on every operation by the metadata coordinator.",
+        "steps": [
+          "split",
+          "consistency"
+        ]
+      },
+      {
+        "requirement": "Idempotent / conditional writes",
+        "how": "Idempotency key dedupes retried PUT/complete/DELETE; If-Match/If-None-Match guard conditional writes.",
         "steps": [
           "consistency"
         ]
@@ -1541,9 +1908,10 @@
       },
       {
         "requirement": "Storage efficiency",
-        "how": "Erasure coding for low-overhead durability.",
+        "how": "Tiered redundancy: replicate hot/small, erasure-code cold/large (~1.4×).",
         "steps": [
-          "durability"
+          "durability",
+          "replication-vs-ec"
         ]
       },
       {
@@ -1556,30 +1924,210 @@
       },
       {
         "requirement": "High availability",
-        "how": "Replicated metadata; any copy/enough fragments serve reads.",
+        "how": "Replicated metadata; any copy/enough fragments serve reads; degraded reads reconstruct around failed/corrupt shards.",
         "steps": [
+          "maintenance",
           "scale"
+        ]
+      },
+      {
+        "requirement": "Encryption + tenant isolation",
+        "how": "Envelope/KMS encryption at rest with per-object key reference; TLS in transit; per-bucket authorization and audit.",
+        "steps": [
+          "split",
+          "consistency"
         ]
       }
     ]
   },
+  "technologyChoices": [
+    {
+      "concern": "Metadata store (key→version/placement, sharded + transactional)",
+      "steps": [
+        "split",
+        "scale"
+      ],
+      "selfHosted": [
+        "FoundationDB",
+        "TiKV",
+        "CockroachDB",
+        "Cassandra/ScyllaDB (for scale, weaker txn)"
+      ],
+      "cloud": {
+        "aws": [
+          "DynamoDB",
+          "Aurora"
+        ],
+        "gcp": [
+          "Spanner",
+          "Bigtable"
+        ],
+        "azure": [
+          "Cosmos DB"
+        ]
+      },
+      "tradeoff": [
+        "Self-hosting FoundationDB/TiKV gives strong transactions across the version+latest+index commit, but you operate the sharding, repair, and upgrades yourself.",
+        "Managed stores (DynamoDB/Spanner) remove ops but constrain transaction scope and can dominate cost at trillions of small rows."
+      ],
+      "makesIrrelevant": [
+        "A managed auto-sharding transactional store removes most of the hand-rolled metadata partitioning logic in Step 7."
+      ]
+    },
+    {
+      "concern": "Data-node storage engine (durable shard placement)",
+      "steps": [
+        "durability",
+        "maintenance"
+      ],
+      "selfHosted": [
+        "Ceph (RADOS)",
+        "MinIO",
+        "SeaweedFS",
+        "Custom log-structured store on bare disks"
+      ],
+      "cloud": {
+        "aws": [
+          "S3",
+          "EBS-backed nodes"
+        ],
+        "gcp": [
+          "Cloud Storage",
+          "Persistent Disk"
+        ],
+        "azure": [
+          "Blob Storage",
+          "Managed Disks"
+        ]
+      },
+      "tradeoff": [
+        "Building on raw disks lets you control erasure-coding scheme, placement, and repair throttling precisely (the whole point of this interview).",
+        "If a managed object store (S3/GCS/Blob) is acceptable, most of this design collapses to using it — choose self-host only when you need the control or the unit economics at exabyte scale."
+      ],
+      "makesIrrelevant": [
+        "Using a managed object store as the data plane makes Steps 3–6 (EC, repair, GC) someone else's problem."
+      ]
+    },
+    {
+      "concern": "Repair / index / lifecycle event queue",
+      "steps": [
+        "maintenance",
+        "scale"
+      ],
+      "selfHosted": [
+        "Kafka",
+        "RabbitMQ",
+        "Redis Streams"
+      ],
+      "cloud": {
+        "aws": [
+          "SQS",
+          "Kinesis"
+        ],
+        "gcp": [
+          "Pub/Sub"
+        ],
+        "azure": [
+          "Service Bus",
+          "Event Hubs"
+        ]
+      },
+      "tradeoff": [
+        "A durable log (Kafka) gives replayable repair/GC work and tier-transition events; a managed queue removes broker ops but caps retention/throughput tuning."
+      ]
+    },
+    {
+      "concern": "Edge / CDN for hot objects",
+      "steps": [
+        "scale"
+      ],
+      "selfHosted": [
+        "Nginx/Varnish cache tier",
+        "Apache Traffic Server"
+      ],
+      "cloud": {
+        "aws": [
+          "CloudFront"
+        ],
+        "gcp": [
+          "Cloud CDN"
+        ],
+        "azure": [
+          "Front Door / Azure CDN"
+        ]
+      },
+      "tradeoff": [
+        "A CDN offloads hot-object GETs from data nodes and metadata; self-hosting a cache tier is only worth it for private/regional traffic the CDN can't serve."
+      ]
+    },
+    {
+      "concern": "Encryption key management (envelope/KMS)",
+      "steps": [
+        "split",
+        "consistency"
+      ],
+      "selfHosted": [
+        "HashiCorp Vault",
+        "Custom HSM-backed KMS"
+      ],
+      "cloud": {
+        "aws": [
+          "KMS"
+        ],
+        "gcp": [
+          "Cloud KMS"
+        ],
+        "azure": [
+          "Key Vault"
+        ]
+      },
+      "tradeoff": [
+        "Envelope encryption with a managed KMS keeps per-object data keys cheap to rotate; self-hosting Vault/HSM is for strict key-custody or air-gapped requirements."
+      ]
+    },
+    {
+      "concern": "Observability (durability risk, repair lag, orphan bytes, index lag)",
+      "steps": [
+        "maintenance",
+        "scale"
+      ],
+      "selfHosted": [
+        "Prometheus + Grafana",
+        "OpenTelemetry"
+      ],
+      "cloud": {
+        "aws": [
+          "CloudWatch"
+        ],
+        "gcp": [
+          "Cloud Monitoring"
+        ],
+        "azure": [
+          "Monitor"
+        ]
+      },
+      "tradeoff": [
+        "Durability is invisible until it's gone — you must alert on objects below target redundancy, repair backlog, scrub coverage, orphan/GC bytes, hot buckets, and checksum failures, not just request errors."
+      ]
+    }
+  ],
   "interviewScript": [
     {
       "phase": "Scope & requirements",
       "time": "first 5 min",
       "say": [
-        "Confirm PUT/GET/DELETE/list by key, multipart, optional versioning.",
-        "Pin extreme durability and read-after-write as the hard goals.",
-        "Establish exabyte/trillion-object scale across failure domains."
+        "Confirm PUT/GET/HEAD/DELETE/prefix-list, multipart, optional versioning, authz + quotas, idempotent/conditional writes.",
+        "Pin extreme durability and read-after-write (state it covers GET, HEAD, AND LIST) as the hard goals.",
+        "Establish exabyte/trillion-object scale across failure domains, and put rough numbers on PUT/GET/LIST rates and object-size mix."
       ]
     },
     {
       "phase": "High-level design",
       "time": "next 10 min",
       "say": [
-        "Split metadata plane from data plane.",
-        "Durability via replication or erasure coding across domains.",
-        "Commit metadata last for read-after-write."
+        "Split metadata plane from data plane; metadata is authoritative and enforces authz + quotas.",
+        "Tiered durability: replicate hot/small, erasure-code cold/large, across failure domains.",
+        "Metadata service is the write coordinator: data durable first, then commit version + latest + index in one txn (read-after-write for GET and LIST)."
       ]
     },
     {
@@ -1595,9 +2143,9 @@
       "phase": "Wrap-up",
       "time": "final 5 min",
       "say": [
-        "Map requirements to mechanisms.",
-        "Tradeoffs: replication vs EC (cost vs read/repair), repair speed vs serving, metadata hot shards.",
-        "Mention lifecycle policies and cross-region replication as extensions."
+        "Map requirements to mechanisms; call out the write state machine and GC/repair safety invariants.",
+        "Tradeoffs: tiered replication vs EC (cost vs read/repair), repair speed vs serving, strong-LIST cost, metadata hot shards.",
+        "Mention encryption/KMS, cross-region replication, lifecycle/retention/legal-hold, and object lock as extensions."
       ]
     }
   ],
@@ -1613,25 +2161,28 @@
     {
       "level": "Senior",
       "expectations": [
-        "Designs replication/EC across failure domains.",
-        "Commit-metadata-last for read-after-write.",
-        "Multipart + scrub/repair/GC."
+        "Designs tiered replication/EC across failure domains.",
+        "Commit-metadata-last as an explicit write state machine for read-after-write; idempotent retries.",
+        "Multipart with validated exactly-once complete + scrub/repair/GC with safety invariants."
       ]
     },
     {
       "level": "Staff",
       "expectations": [
-        "Reasons about EC schemes and repair-speed vs durability math.",
-        "Designs metadata sharding and prefix listing at scale.",
-        "Discusses failure-domain placement and hot-shard mitigation precisely."
+        "Reasons about EC schemes and repair-speed vs durability math with real numbers.",
+        "Designs metadata sharding and strongly-consistent prefix listing at scale, with cursor semantics.",
+        "Threads authz, quotas, encryption, degraded reads, and hot-shard mitigation precisely; states GC non-reachability proof."
       ]
     }
   ],
   "followUps": [
     "Replication vs erasure coding — when does each win, and what's the read/repair cost of EC?",
     "How fast must repair be to maintain 11 nines, and why?",
-    "How do you implement prefix listing over a flat, sharded key space?",
-    "How would you add cross-region replication and lifecycle (tiering/expiry) policies?",
+    "How do you make prefix LIST strongly consistent with PUT/DELETE over a flat, sharded key space, and what's the cost?",
+    "How does a retried PUT or multipart complete after a client timeout avoid duplicating the object?",
+    "How does GC prove a shard is safe to delete without ever removing live data?",
+    "How would you add per-tenant authorization, quotas, and envelope/KMS encryption?",
+    "How would you add cross-region replication and lifecycle (tiering/expiry/retention/legal-hold) policies?",
     "How do you keep a hot object/bucket from overloading one metadata shard or data node?"
   ],
   "toProbeFurther": {

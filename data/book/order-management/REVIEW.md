@@ -5,390 +5,376 @@ Review date: 2026-06-09
 
 ## Executive Summary
 
-This is a strong teaching dataset. The main path is coherent: reject the
-single-transaction baseline, introduce a durable lifecycle state machine, add
-inventory reservation, coordinate the order with a saga, defer payment capture
-until fulfillment, publish status changes with an outbox, then close with
-cancellations, returns, and scale.
+The recent changes moved this from a strong outline to a mature OMS interview
+case. The prior high-impact gaps around qualitative capacity, thin APIs, a
+minimal data model, missing final flows, missing reconciliation, and absent
+technology choices are now largely addressed. The dataset now has numeric load
+assumptions, line-level order modeling, payment and WMS webhook APIs, richer
+idempotency/reconciliation language, a `Reconciler` node, three final sequence
+flows, and five technology-choice sections.
+
+The remaining issues are more about precision than missing foundations. The
+main one is the fulfillment handoff: the current flow says a WMS `shipped`
+event triggers payment capture, which can conflict with the stated invariant
+"never ship without payment" unless "shipped" means a pre-carrier handoff state.
+The other opportunities are to make operational repair data more concrete, split
+outbox table/relay/broker mechanics more clearly, and tighten a few API edge
+cases.
 
 | Axis | Rating | Notes |
 | --- | --- | --- |
-| System design soundness | 4/5 | Core OMS mechanisms are right, but capacity, data modeling, and external-side-effect reconciliation need more precision. |
-| Production realism | 3.5/5 | Good treatment of sagas, idempotency, outbox, and auth/capture; thin on payment/WMS callbacks, partial fulfillment, operations, security, and support workflows. |
-| Pedagogical flow | 4.5/5 | The steps build naturally and the option sets teach real trade-offs. |
-| Step-to-final coherence | 4/5 | The final design includes all introduced components, but it does not surface the richer line-level, reconciliation, and operational details implied by the narrative. |
-| Dataset/rendering fit | 4.5/5 | Structured views, links, highlights, sequence data, and `satisfies.steps` references are internally consistent. |
+| System design soundness | 4.5/5 | The core OMS mechanisms are credible; the ship/capture boundary needs sharper semantics. |
+| Production realism | 4.25/5 | Strong on sagas, reservations, idempotency, callbacks, reconciliation, and line-level state; support/admin repair and provider limits could be more explicit. |
+| Pedagogical flow | 4.5/5 | The sequence teaches one problem at a time and the recent transition-matrix concept improves the lifecycle step. |
+| Step-to-final coherence | 4.5/5 | Final design now includes the components and flows introduced earlier, with only a few compressed operational details. |
+| Dataset/rendering fit | 4.75/5 | Structured views, sequence references, highlights, step slugs, and canonical node types are internally consistent. |
 
 ## What Works Well
 
-- The walkthrough has a clear interview arc: naive synchronous flow -> lifecycle
-  source of truth -> inventory reservation -> saga -> fulfillment -> outbox ->
-  cancellation/return compensation.
-- The option sets are not strawmen. Inventory, saga, fulfillment payment timing,
-  and outbox alternatives each compare plausible production choices.
-- The dataset introduces concepts just in time: state machine in step 2,
-  reservation in step 3, saga/idempotent step in step 4, auth/capture in step 5,
-  and outbox in step 6.
-- The `satisfies` section maps requirements back to concrete steps and the
-  interview script gives a candidate-friendly path through the material.
-- Renderer-facing references are in good shape: step view nodes resolve to
-  `highLevelArchitecture.nodes`, view links resolve to
-  `highLevelArchitecture.links`, highlights stay inside their views, and
-  `satisfies[*].steps[*]` slugs resolve to real step IDs.
+- The walkthrough has a clean interview arc: reject a single synchronous
+  transaction, persist the lifecycle, reserve inventory, coordinate a saga,
+  defer payment capture, publish status changes through an outbox, then handle
+  cancellation/return compensation and scale.
+- Capacity is now concrete: 1M/day baseline, 10M/day peak, roughly 350
+  orders/sec at a 3x spike, item reservation writes, state writes, payment
+  calls, outbox events, storage/day, and the distinction between order-id
+  sharding and hot SKU+warehouse contention.
+- The API surface now matches the architecture much better: order placement,
+  order lookup, cancellation, returns, payment webhooks, and WMS shipment
+  webhooks are all represented.
+- The data model now carries the behavior promised by the narrative:
+  `order_items`, `inventory_reservations`, `payment_attempts`, `shipments`,
+  `returns`, `idempotency_keys`, and `outbox_events` are all present.
+- The final design now includes `Reconciler / Ops Worker` and sequence flows for
+  the happy path, payment ambiguity, and cancel-vs-return branches.
+- Requirements now call out security/privacy and observability/operations rather
+  than treating them as hidden production concerns.
 
 ## Highest-Impact Issues
 
-### 1. Capacity is qualitative instead of a load model
+### 1. The fulfillment flow blurs "ready to ship" and "shipped"
 
-The capacity section says "millions" of orders per day and notes sharding by
-order id, but it never turns that into real work units. For an OMS, the hard
-parts are not just order count; they are item-level reservations, state
-transition writes, outbox publishes, payment calls, WMS callbacks, and hot-SKU
-contention.
-
-Concrete fix:
-
-- Pick one or two explicit scenarios, such as 1M orders/day baseline and 10M
-  orders/day peak.
-- Derive average and peak orders/sec with a peak multiplier.
-- Estimate average items/order, reservation writes/sec, payment auth/capture
-  calls/sec, state transitions/order, outbox events/order, and shipment
-  callbacks/sec.
-- Add storage estimates for `orders`, transition history, outbox rows, and
-  retention windows.
-- Call out the difference between order-id sharding and SKU/warehouse hot spots;
-  the former does not solve contention on a popular SKU.
-
-### 2. The data model does not support the behavior the narrative promises
-
-The current model has `orders`, `order_events`, and `inventory`. That is enough
-for the overview diagram, but too thin for multi-item orders, split shipments,
-partial cancellation, returns, auth/capture/refund tracking, idempotent retries,
-and outbox delivery.
-
-Concrete fix: add or expand entities for:
-
-- `order_items` with line-level quantity, price, state, warehouse allocation,
-  and cancellation/return status.
-- `inventory_reservations` with SKU, warehouse, quantity, order/item reference,
-  reservation state, expiry, and release/consume timestamps.
-- `payments` or `payment_attempts` with provider payment intent, auth ID,
-  capture ID, refund ID, amount, currency, state, and reconciliation status.
-- `fulfillment_units` / `shipments` with package-level state, carrier/tracking,
-  warehouse, and item allocations.
-- `returns` / `return_items` with eligibility, received state, restock decision,
-  and refund link.
-- `idempotency_keys` scoped by customer, endpoint, request fingerprint, and TTL.
-- `outbox_events` with event ID, aggregate ID, type, payload version, publish
-  status, attempts, and next retry.
-
-### 3. The API is narrower than the architecture
-
-The three APIs are useful but under-specify fields later needed by the design.
-`POST /v1/orders` does not expose customer identity, shipping address, currency,
-line-item IDs, fulfillment preference, or request fingerprinting. The cancel API
-has no idempotency key and does not distinguish full cancel, partial cancel,
-return after delivery, or refund-only correction. There is also no external WMS
-or payment callback surface, even though the architecture depends on async
-shipment events and ambiguous payment states.
+The dataset says the system must "never ship without payment." Step 5 and the
+final happy-path flow say a warehouse `shipped` event arrives, then the order
+service captures payment, consumes the reservation, and transitions the order.
+If `shipped` means the package has left the warehouse or carrier handoff already
+happened, the capture can fail after the item has shipped. That violates the
+invariant the interview is trying to teach.
 
 Concrete fix:
 
-- Expand `POST /v1/orders` request/response with customer, address, currency,
-  line IDs, idempotency metadata, reservation TTL, and initial payment/auth
+- Change the WMS event in Step 5 and the final happy path from `shipped` to
+  `ready_to_ship`, `packed`, or `label_created`.
+- Capture payment after that pre-ship event, then tell fulfillment to release
+  the package to the carrier and mark the line `shipped`.
+- Add a failure branch: if capture fails or auth expired, re-authorize/capture
+  idempotently or park the order before carrier handoff.
+- If the intent is that `shipped` means "ready for shipment" in this dataset,
+  rename it anyway; interview candidates will usually read `shipped` as an
+  irreversible external side effect.
+
+### 2. Operational repair is named, but the data contract is still thin
+
+The requirements mention stuck orders, support dashboards, audited support
+actions, retry/DLQ counts, and manual repair. The architecture has a
+`Reconciler / Ops Worker`, but the data model does not yet show the durable
+objects that make those workflows reliable.
+
+Concrete fix:
+
+- Add `reconciliation_jobs` or `external_operations` for payment/WMS operations
+  with provider IDs, next retry time, current state, and last error.
+- Add `webhook_events` or equivalent dedupe records for payment and WMS
+  callback IDs, signature validation result, received timestamp, and apply
   status.
-- Add `POST /v1/orders/{id}/cancel` with idempotency key, line items, reason,
-  and allowed-state behavior.
-- Add `POST /v1/orders/{id}/returns` or a separate return flow for delivered
-  goods.
-- Add callback/webhook-style APIs or sequence flows for payment provider events
-  and warehouse shipment events.
-- Make `GET /v1/orders/{id}` show line items, shipments, payment state,
-  transition history, and pending compensations.
+- Add `support_actions` or `order_admin_audit` for who changed what, why, and
+  which compensating action was triggered.
+- Optionally add an admin/support API sketch for parking, replaying, or manually
+  resolving stuck orders.
 
-### 4. External side-effect reconciliation is mentioned but not modeled
+### 3. The outbox still compresses table, relay, and broker into one node
 
-The saga step correctly says ambiguous timeouts should be reconciled, not
-blindly retried. The final design, data model, and diagrams do not show how that
-happens. Payment and WMS operations are the exact places where the system needs
-provider IDs, callback dedupe, status polling, retry policy, and manual
-intervention queues.
+The data model and technology choices now describe outbox mechanics, relay, CDC,
+broker, retries, and DLQ. The diagrams still use `Event Outbox / Bus` as a
+single node. That is acceptable for a compact overview, but it hides a common
+interview distinction: the outbox table is part of the local transaction, while
+the relay and broker are separate delivery infrastructure.
 
 Concrete fix:
 
-- Add a `Reconciler` or `OpsWorker` node, or make reconciliation explicit in the
-  order service responsibilities.
-- Track external operation IDs and states in the payment and fulfillment data
-  model.
-- Add failure drills for auth timeout, capture timeout, WMS shipped callback
-  duplicated/out of order, refund failure, and reservation expiry.
-- Define when the system retries, when it polls provider state, and when it
-  parks the order for support review.
+- In the final design caption or view, split `Outbox` into `Outbox Table`,
+  `Outbox Relay`, and `Event Broker` if the diagram can stay readable.
+- Add a short sequence flow for transition commit -> outbox row -> relay publish
+  -> notification consumer dedupe.
+- Keep the warning that outbox is at-least-once delivery; consumers still need
+  event-ID dedupe.
 
-### 5. Order-level state hides line-level fulfillment and return complexity
+### 4. Capacity is quantified, but not tied to operational thresholds
 
-The requirements say orders span multiple items, and the follow-ups mention
-split shipments and partial cancellation. The main model still presents one
-order-level state: placed -> paid -> fulfilling -> shipped -> delivered ->
-cancelled/returned. That is clear for teaching, but it can mislead candidates
-about real OMS behavior.
+The new capacity section is much better than before. The next step is to turn
+the numbers into design thresholds: queue depth, retry budget, provider rate
+limits, hot-SKU fallback behavior, and latency targets.
 
 Concrete fix:
 
-- Keep the order-level lifecycle, but add line-item and fulfillment-unit states.
-- Show how an order can be partially shipped, partially cancelled, partially
-  returned, and still have a coherent customer-facing summary state.
-- Tie inventory reservations to line items and warehouse allocations, not just
-  to a single SKU counter.
+- Add target latency/SLO assumptions for order placement, status reads,
+  fulfillment updates, and notification freshness.
+- Estimate WMS/payment retry amplification during provider incidents.
+- State when hot SKU+warehouse contention moves from conditional updates to a
+  hold queue, token bucket, or pre-allocated reservation buckets.
+- Mention PSP/WMS rate limits and backpressure, because external providers are
+  often the limiting factor before the order store is.
+
+### 5. API examples should tighten edge-case semantics
+
+The APIs are now broad enough, but a few examples can be more precise.
+`POST /v1/orders` includes `customerId` in the request body; in a secure retail
+API this should normally come from the authenticated principal, or the example
+should explicitly say it is validated. `POST /v1/orders/{id}/cancel` accepts
+`lineIds`, but the sample response always says `"state": "cancelled"`, which is
+wrong for partial cancellation.
+
+Concrete fix:
+
+- Say `customerId` is derived from auth context for customer calls, not trusted
+  blindly from the body.
+- Make cancel responses line-aware: `partially_cancelled`, per-line states, and
+  refund/void status.
+- Add webhook authentication/signature validation to the payment and WMS webhook
+  descriptions.
+- Include compensation status in responses where refund, void, release, or
+  restock work is asynchronous.
 
 ## System Design Soundness
 
-Requirements are focused and appropriate for an OMS interview. The strongest
-requirements are cross-service consistency, idempotency, crash resume, audit,
-and scale. Missing or underplayed requirements include customer authorization,
-PCI/tokenization boundaries, PII handling, support/admin visibility, return
-eligibility rules, and reconciliation SLAs for external providers.
+The requirements are now strong for an OMS interview. They cover multi-item
+orders, line-level state, split shipments, cancellations/returns, idempotency,
+crash resume, audit, scale, security/privacy, and operations. The one wording
+to watch is the "never ship without payment" invariant; it should be reconciled
+with the capture-on-shipment flow as described above.
 
-The architecture is directionally sound. Order Service as an orchestrator,
-Order Store as state-machine source of truth, Inventory Service, Payment
-Service, Fulfillment/WMS, Returns, and Outbox/Notification are the right
-components. The main architecture issue is that `Outbox` currently represents
-both an outbox table and a bus/relay. That is acceptable for a compact diagram,
-but a production review should separate the table, relay, and broker or at
-least describe the split in the caption.
+The capacity model is credible and useful. It teaches that order volume turns
+into multiple write streams: line reservations, state history, payment calls,
+outbox events, and WMS callbacks. The best remaining addition is an operational
+layer: latency targets, retry amplification, external provider budgets, and
+backpressure behavior under WMS/PSP incidents.
 
-Consistency is handled well at the conceptual level: no 2PC, use local
-transactions, compensate failed downstream work, and make retries idempotent.
-The remaining gap is exact idempotency scope. The dataset should say whether
-keys are per customer plus endpoint plus request fingerprint, how long they are
-retained, and which external provider keys are reused on retry.
+The API and data model are now close to the design. The added webhook APIs are
+important because OMS correctness depends on asynchronous provider events.
+The added tables make line-level fulfillment, partial cancellation, returns,
+provider IDs, idempotency, and outbox delivery explicit. The missing data is
+mostly operational: webhook dedupe, reconciliation jobs, support actions, and
+manual repair audit.
 
-Reliability is strongest around saga resume and outbox delivery. It is weaker
-around dead-letter handling, stuck orders, provider outages, out-of-order
-callbacks, and operational repair. Those are common OMS interview probes and
-worth making visible.
+The architecture is sound: an order-service orchestrator owns state transitions,
+inventory handles reservations, payment owns auth/capture/refund, fulfillment
+integrates WMS, outbox handles status events, returns handles refund/restock,
+and reconciliation handles ambiguous external work. The design correctly avoids
+2PC and leans on local transactions plus compensation.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: One Synchronous Transaction
 
-This is a good baseline because it creates the exact failure that motivates the
-rest of the design: charged customer, inconsistent stock/order state, and no
-resume point. Keep it.
+This remains a good rejected baseline. It creates the exact failures the rest
+of the interview solves: no durable resume point, cross-service transaction
+fantasy, and stranded payment/inventory side effects.
 
-Improvement: make it explicit that this step is intentionally rejected and that
-its useful output is the list of invariants the later design must preserve.
+Improvement: keep explicitly framing this as an anti-pattern whose useful
+output is the invariant list for the real design.
 
 ### Step 2: The Order Lifecycle State Machine
 
-This is the right first real design move. It teaches that the order state is not
-just a display field; it is the durable coordinator for valid transitions,
-audit, and resume.
+The added allowed-transition matrix concept is a meaningful improvement. It
+makes the state machine concrete: triggers, guards, and invalid transitions are
+checked rather than implied.
 
-Improvement: add a transition table or compact state matrix with allowed
-triggers and guards. Examples: `paid -> fulfilling` requires authorized payment
-and reserved inventory; `fulfilling -> shipped` requires WMS shipment ack and
-successful capture; `delivered -> returned` requires return acceptance.
+Improvement: consider adding a tiny line-state/aggregate-state example, because
+the requirements now include partial shipment, partial cancel, and partial
+return. That would connect this step even more directly to the later data model.
 
 ### Step 3: Inventory Reservation
 
-The race-condition prompt is strong, and the options teach real contention
-patterns. The "Reservation hold with TTL" option is especially relevant.
+This step is strong. It now consistently talks about atomic reservation per
+SKU+warehouse rather than just an order-level decrement. The capacity section's
+hot-SKU warning supports the lesson well.
 
-Improvement: the default option name, "Atomic conditional decrement", can read
-like selling stock immediately, while the narrative says reserve now and
-decrement on ship. Rename or reframe the default as an atomic conditional
-reservation update. Add warehouse dimension and reservation expiry because
-inventory is usually SKU plus location, not only SKU.
+Improvement: add one sentence about what happens when reservation TTL expires
+while payment authorization is still ambiguous. That edge case connects
+inventory, saga, and reconciliation.
 
 ### Step 4: Cross-Service Saga with Compensation
 
-This is the strongest step. It correctly contrasts orchestration, choreography,
-and 2PC; it also introduces idempotent steps and compensation.
+This is one of the strongest steps. The options compare orchestration,
+choreography, and 2PC without strawmen, and the added ambiguity flow correctly
+teaches "reconcile, don't blindly retry" for payment timeouts.
 
-Improvement: add an explicit ambiguous-provider branch. For example, if payment
-authorization times out, the orchestrator should record `auth_pending`, poll or
-wait for webhook confirmation, and only retry with the same provider idempotency
-key. This is a more production-realistic lesson than only success/failure.
+Improvement: the same ambiguity concept applies to WMS callbacks. A short note
+that WMS state is also reconciled by event ID/status polling would round out
+the provider story.
 
 ### Step 5: Fulfillment Orchestration
 
-The authorize-at-order/capture-on-ship trade-off is a good senior-level signal.
-The text correctly notes async WMS events, split shipments, and auth expiry.
+The auth-at-order/capture-before-shipment lesson is important and realistic.
+The current wording needs the ship/capture boundary fix described in the first
+highest-impact issue. This is the main remaining soundness gap in the walkthrough.
 
-Improvement: add a structured sequence flow for shipment: warehouse event ->
-order service validates state -> capture payment -> consume reservation ->
-transition shipped -> outbox event. Include capture failure and auth-expiry
-paths because they are central to physical-goods OMS correctness.
+Improvement: model WMS as `packed/ready_to_ship -> capture -> release_to_ship`
+instead of `shipped -> capture`. Then duplicate/out-of-order WMS callbacks can
+be handled without implying the package already left unpaid.
 
 ### Step 6: Reliable Status Events (Outbox)
 
-This step is well placed and explains the dual-write problem clearly. The
-options also distinguish outbox, dual write, and CDC well.
+The outbox step is well placed and the traps are good. It correctly says the
+outbox gives committed events at-least-once and consumers need dedupe.
 
-Improvement: add delivery mechanics: relay, broker, consumer dedupe key,
-publish attempts, DLQ/stuck row alert, and event schema version. Also clarify
-that the outbox guarantees committed events are eventually published at least
-once; it does not make downstream side effects exactly once.
+Improvement: add one sequence flow or final-design split that shows outbox
+table, relay, broker, and consumer dedupe. The technology choices already
+contain the material; the teaching view just needs to surface it.
 
 ### Step 7: Cancellations, Returns, and Scale
 
-This is the right wrap-up step, but it currently carries too much: cancel,
-return, compensation, idempotency, sharding, resume, and scale.
+This step is much better now that the data model supports line-level
+compensation and return disposition. It still carries a lot of material:
+cancellation, return, refund, restock, partial line handling, sharding, resume,
+and operations.
 
-Improvement: either split it into sub-steps or add more structure inside the
-step. Cancel-before-ship, return-after-delivery, partial cancellation, partial
-return, refund failure, and restock disposition are different workflows. The
-current step names them but does not fully model them.
+Improvement: if the dataset grows again, split this into sub-steps or add a
+more structured internal flow: cancel before ship, return after delivery, refund
+failure, and restock disposition are different workflows.
 
 ## Final Design Review
 
-The final design integrates the main components introduced by the steps and
-does not introduce unrelated components. That is good.
+The final design now integrates the step-level components cleanly. It includes
+the Reconciler, uses the order store as the saga/state-machine source of truth,
+keeps inventory and payment separate, routes through fulfillment/WMS, emits via
+outbox, notifies the customer, and includes returns.
 
-The final design should be strengthened with at least one final sequence flow.
-Recommended final flows:
+The three final sequence flows are the right set: happy path, payment
+ambiguity, and cancel-vs-return. The payment ambiguity flow directly addresses
+one of the old review's missing pieces.
 
-- Happy path: place order -> reserve -> authorize -> fulfill -> WMS shipped ->
-  capture -> consume reservation -> outbox notification.
-- Payment ambiguity: authorize or capture timeout -> reconcile provider state ->
-  advance, retry safely, or compensate.
-- Cancellation/return: cancel before ship and return after delivery as separate
-  branches.
-
-The final diagram could also add, or explicitly mention in the caption, a
-reconciliation worker, webhook receiver, outbox relay/broker split, and
-observability/support tooling.
+The final happy path should be adjusted to avoid the "shipped before capture"
+ambiguity. Otherwise the final design is coherent and does not introduce
+unmotivated components.
 
 ## Concept Introduction and Learning Flow
 
-The concept staging is strong. The dataset introduces each major idea when the
-candidate needs it, and the decision prompts are realistic.
+The concept staging is strong:
 
-Missing concepts worth adding:
+- Step 2 introduces the state machine and transition guards.
+- Step 3 introduces inventory reservation.
+- Step 4 introduces saga, compensation, idempotent steps, and ambiguous payment
+  reconciliation.
+- Step 5 introduces auth/capture timing and WMS callback realism.
+- Step 6 introduces transactional outbox and consumer dedupe.
+- Step 7 introduces line-level compensation and return disposition.
 
-- Idempotency scope and request fingerprinting.
-- Provider-level idempotency keys for payment auth/capture/refund.
-- Reservation TTL and expiry worker.
-- Line-item state versus aggregate order state.
-- Reconciliation for ambiguous external side effects.
-- Outbox relay, consumer dedupe, and DLQ handling.
-- Operational support for stuck orders and manual repair.
+Missing concepts worth adding, if there is room:
+
+- Webhook event dedupe and signature validation.
+- Support/admin repair workflow and audit trail.
+- Backpressure/rate limits for PSP and WMS dependencies.
+- A small aggregate-state derivation rule from line states.
 
 ## Step-to-Final-Design Coherence
 
-The final design contains all step-level nodes: client, gateway, order service,
-order store, inventory, inventory store, payment, fulfillment, warehouse,
-outbox, notification, and returns. The step sequence also builds logically.
+The final design contains all major step-level nodes: client, gateway, order
+service, order store, inventory, inventory store, payment, fulfillment,
+warehouse/WMS, outbox, notification, returns, and reconciler. The data model and
+final flows now preserve most of the details introduced along the way.
 
-The coherence gap is detail loss. Several ideas introduced in text do not
-become visible in the final artifacts:
+The remaining coherence gaps are narrow:
 
-- Split shipments and partial cancellation remain follow-up topics, not modeled
-  structures.
-- Auth expiry and capture failure are described but not represented in state,
-  data, or flows.
-- Reconciliation is named but has no component or data fields.
-- Outbox retry and dedupe are described but not represented in the data model.
+- Step 5 and final design need the same pre-ship capture semantics.
+- Outbox internals are described in prose/data but compressed in the final view.
+- Operations are named in requirements and architecture but not represented as
+  durable support/reconciliation records.
 
 ## Realism Compared With Production Systems
 
-Production OMS systems spend much of their complexity budget on edge cases:
-provider callbacks, race conditions, order amendments, fraud/manual holds,
-warehouse substitutions, returns eligibility, partial refunds, stuck workflows,
-and customer-support tooling. This dataset has the right foundation but should
-make a few of those operational realities first-class.
+This is now production-plausible for an interview case. It covers the hard OMS
+themes: line-level state, inventory holds, saga resume, idempotency keys,
+payment auth/capture/refund, WMS callbacks, returns, outbox delivery, and
+reconciliation.
 
-Specific realism gaps:
+The remaining realism gaps are the kinds a senior interviewer may probe:
 
-- Payment side effects need provider operation IDs, statuses, idempotency keys,
-  auth expiry, capture failure, refund failure, and reconciliation.
-- Warehouse events need dedupe, ordering, status mapping, and support for split
-  fulfillment units.
-- Inventory reservations need expiry, release, consume, and location/warehouse
-  dimensions.
-- Security and privacy are absent: authenticate customers, authorize order
-  access, tokenize payment data, protect PII, and audit support actions.
-- Observability is absent: stuck-saga metrics, outbox lag, retry counts,
-  payment/WMS error rates, DLQs, and support dashboards.
+- Exactly when payment is captured relative to warehouse/carrier handoff.
+- How webhook events are authenticated, deduped, ordered, and replayed.
+- How support agents safely resolve stuck orders without breaking audit or
+  double-refunding.
+- How retry storms, DLQs, and external provider rate limits affect capacity.
+- How aggregate order state is derived from line and shipment states.
 
 ## Dataset and Renderer-Facing Observations
 
 - JSON parsing succeeds.
 - No reviewed step uses raw Mermaid architecture diagrams; views are structured.
-- View nodes and links resolve to canonical high-level architecture entries.
+- Step view nodes and links resolve to high-level architecture entries.
 - Explicit highlights resolve inside their views.
+- Step and final sequence participants resolve for nested message blocks.
 - `satisfies.functional[*].steps` and `satisfies.nonFunctional[*].steps` all
   resolve to real step IDs.
 - Canonical node types used in the dataset are valid: `client`, `edge`,
-  `orchestrator`, `database`, `service`, `external`, and `queue`.
-- The dataset has no `technologyChoices`. That field is optional, but adding it
-  would bring this book case closer to richer reference cases.
-- The dataset has no generated AI visuals or explainer comic. Optional, but
-  useful if this case is intended to be a flagship book entry.
-- `finalDesign.flows` is empty. This is valid, but a final happy-path sequence
+  `orchestrator`, `database`, `service`, `external`, `queue`, and `worker`.
+- `technologyChoices` is present and relevant. The payments concern is slightly
+  schema-awkward because PSPs such as Stripe/Adyen/Braintree are described in
+  tradeoff text but not represented as selectable chips.
+- `finalDesign.flows` now has three useful sequence flows.
+- The dataset has no generated AI visuals or explainer comic. That is optional,
+  not a correctness issue.
+- `toProbeFurther` has one link; adding a few more OMS/payment/WMS references
   would improve the wrap-up.
 
 ## Recommended Edits, Prioritized
 
-### P1: Add a numeric capacity model
+### P1: Tighten fulfillment ship/capture ordering
 
-Turn "millions/day" into peak orders/sec, item reservations/sec, state writes,
-outbox events, payment calls, WMS callbacks, storage/day, and hot-SKU
-contention assumptions.
+Rename the WMS "shipped" trigger to `ready_to_ship` or `packed`, capture payment
+before carrier handoff, then mark shipped only after capture succeeds. Update
+Step 5, the final happy-path flow, and the WMS webhook example consistently.
 
-### P1: Expand API and data model to match promised behavior
+### P1: Add operational repair persistence
 
-Add line items, reservations, payment attempts, fulfillment units/shipments,
-returns, idempotency keys, and outbox event entities. Expand API examples to
-include customer, shipping, currency, line-level IDs, idempotency, and
-cancel/return variants.
+Add durable records for reconciliation jobs/external operations, webhook event
+dedupe, and audited support actions. This would make the `Reconciler / Ops
+Worker` and support-dashboard requirement concrete.
 
-### P1: Model external-side-effect reconciliation
+### P2: Make outbox internals visible
 
-Add payment/WMS callback or reconciliation flows, provider operation IDs,
-idempotent retry rules, and stuck-order handling.
+Either split the final design into outbox table, relay, and broker nodes, or add
+a short outbox sequence flow. Keep the at-least-once and consumer-dedupe lesson.
 
-### P2: Make partial fulfillment and returns concrete
+### P2: Tie capacity to thresholds and backpressure
 
-Represent line-item state and shipment units so split shipments, partial
-cancellation, and partial returns are not only follow-up questions.
+Add latency/SLO assumptions, provider rate limits, retry amplification, queue
+depth/backlog behavior, and hot-SKU fallback thresholds.
 
-### P2: Add final design sequence flows
+### P2: Refine API edge cases
 
-Add at least happy path and cancellation/return flows under `finalDesign.flows`.
-Include payment capture and stock consumption on shipment.
+Clarify customer identity from auth context, partial-cancel response states,
+webhook signature validation, and async compensation status.
 
-### P2: Separate outbox mechanics
+### P3: Add book polish
 
-Represent or describe outbox table, relay, broker, consumer dedupe, retries,
-DLQ, and lag monitoring.
-
-### P2: Add security, privacy, and operations requirements
-
-Add non-functional requirements or notes for authz, payment token boundaries,
-PII retention, support auditability, alerting, and stuck saga repair.
-
-### P3: Add book polish fields
-
-Add `technologyChoices`, more failure drills/traps, and optional generated
-visual assets if this should match the richer book entries.
+Add more probe links, optional AI visuals/explainer comic, and a cleaner way to
+represent PSP choices in `technologyChoices`.
 
 ## What Not To Change
 
-- Keep the current teaching order. It is the dataset's biggest strength.
-- Keep the saga and outbox as separate steps; they solve different failures and
-  each deserves its own treatment.
-- Keep the option sets for inventory, saga style, payment timing, and outbox;
-  they are useful interview trade-off material.
-- Keep the concise high-level architecture unless adding operational nodes is
-  clearly tied to a new teaching point.
+- Keep the current teaching order; it is still the dataset's biggest strength.
+- Keep saga and outbox as separate steps; they solve different failure modes.
+- Keep line-level state and compensation first-class.
+- Keep the Reconciler in the final design; it is the right way to teach
+  ambiguous external side effects.
+- Keep the quantitative capacity model and the hot-SKU warning.
 
 ## Bottom Line
 
-The dataset is already a credible OMS interview walkthrough. Its main weakness
-is not the architecture direction; it is that several production-grade details
-are described in prose but not carried into capacity math, APIs, data model,
-flows, or final design. A focused pass on numeric capacity, line-level order
-state, payment/WMS reconciliation, and operational visibility would raise it
-from a strong teaching case to a flagship book case.
+The recent changes closed the old major review gaps. This is now a credible,
+book-quality OMS interview walkthrough. The highest-value next edit is to make
+the warehouse/payment handoff precise so the design never implies a package can
+ship before capture succeeds. After that, operational repair persistence and a
+clearer outbox table/relay/broker split would move the case from strong to
+excellent.

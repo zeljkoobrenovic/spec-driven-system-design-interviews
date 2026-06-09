@@ -530,7 +530,7 @@
         },
         {
           "name": "state",
-          "type": "enum(placed, paid, fulfilling, partially_shipped, shipped, delivered, cancelled, partially_returned, returned)"
+          "type": "enum(placed, paid, fulfilling, partially_shipped, shipped, delivered, cancelled, partially_cancelled, partially_returned, returned)"
         },
         {
           "name": "saga_step",
@@ -884,8 +884,9 @@
       "title": "2. The Order Lifecycle State Machine",
       "description": [
         "Model the order as an explicit state machine: placed -> paid -> fulfilling -> shipped -> delivered, with cancel/return branches. The order store persists the current state and every transition as the source of truth.",
-        "Transitions are triggered by events and guarded: placed -> paid requires an authorized payment and reserved inventory; paid -> fulfilling on warehouse routing; fulfilling -> shipped requires a WMS shipment ack and a successful capture; shipped -> delivered on a delivery event; and delivered -> returned requires an accepted return. Invalid transitions (e.g. ship an unpaid order) are rejected. The append-only transition history gives auditability and lets a crashed orchestrator resume from the persisted state.",
-        "This state machine is the backbone — inventory, payment, fulfillment, and notifications all hang off transitions, and 'what state is this order in' has exactly one authoritative answer."
+        "Transitions are triggered by events and guarded. The allowed-transition matrix (trigger → guard) is the contract: placed → paid requires an authorized payment AND reserved inventory; paid → fulfilling requires successful warehouse routing; fulfilling → shipped requires a WMS shipment ack AND a successful capture (re-auth if expired); shipped → delivered requires a carrier delivery event; delivered → returned requires an accepted, eligible return; and any cancellable state (placed/paid/fulfilling, before ship) → cancelled releases the reservation and voids/refunds. Invalid transitions (e.g. ship an unpaid order, cancel an already-shipped line) are rejected by the guard, not just by convention.",
+        "Two levels of state coexist: the aggregate order state above, and per-line item state (reserved → allocated → shipped → delivered, with cancelled/returned branches) underneath it. The aggregate is *derived* from the lines — an order with some lines shipped and some pending rolls up to partially_shipped — so split shipments and partial cancel/return are first-class, not special cases.",
+        "This state machine is the backbone — inventory, payment, fulfillment, and notifications all hang off transitions, the append-only transition history gives auditability, and a crashed orchestrator resumes from the persisted state. 'What state is this order in' has exactly one authoritative answer."
       ],
       "view": {
         "nodes": [
@@ -934,7 +935,19 @@
         "before": "A single synchronous transaction with no resume point.",
         "after": "A durable, auditable order lifecycle as the source of truth.",
         "newRisk": "An order touches inventory, payment, and fulfillment — separate services, not one transaction."
-      }
+      },
+      "traps": [
+        {
+          "trap": "Treating order state as a single display field updated wherever convenient.",
+          "why": "If any service can flip the state, guards aren't enforced and an order can reach impossible states (shipped-but-unpaid); resume and audit become unreliable.",
+          "instead": "Make the order store the only writer of state, validate every transition against the allowed-transition matrix, and append each transition to history."
+        },
+        {
+          "trap": "Modeling only one order-level state for a multi-item order.",
+          "why": "Split shipments, partial cancellation, and partial returns can't be represented, so the aggregate state lies about what actually happened to each line.",
+          "instead": "Keep per-line item state and derive the aggregate (partially_shipped, partially_returned) from the lines."
+        }
+      ]
     },
     {
       "id": "inventory",
@@ -1621,6 +1634,18 @@
         "after": "Warehouse-orchestrated fulfillment; capture on ship; tracked to delivery.",
         "newRisk": "Customers and downstream systems need timely, reliable status — not lost updates."
       },
+      "traps": [
+        {
+          "trap": "Capturing payment at order placement for physical goods and refunding later if you can't ship.",
+          "why": "It charges the customer before anything ships (often against card-network rules), and a refund is slower and costlier than voiding an auth.",
+          "instead": "Authorize at order, capture only on the shipment event; re-authorize idempotently if the auth expired before a slow fulfillment ships."
+        },
+        {
+          "trap": "Treating a WMS 'shipped' callback as a synchronous, exactly-once, in-order event.",
+          "why": "External warehouses deliver events asynchronously, duplicated, and out of order; applying them blindly double-captures or advances state wrongly.",
+          "instead": "Dedupe on the WMS event id, guard each transition against current line/order state, and ignore stale or duplicate callbacks."
+        }
+      ],
       "flows": [
         {
           "name": "Shipment event -> capture -> consume reservation -> shipped",
@@ -1709,7 +1734,7 @@
       "id": "events",
       "title": "6. Reliable Status Events (Outbox)",
       "description": [
-        "Every state change should notify the customer and feed downstream systems (analytics, fraud, loyalty). Don't publish events in a separate step from the state write — a crash between them diverges the order state and what was announced.",
+        "Every state change should notify the customer and feed downstream systems (analytics, fraud, loyalty). Don't publish events in a separate step from the state write — a crash between them lets the order state and what was announced diverge.",
         "Use the transactional outbox: write the order event into an outbox table in the same transaction as the state transition. A relay polls/tails the outbox and publishes unsent rows to a broker; the notification service and other consumers read from the broker and dedupe on the event id. Each row tracks publish_status, attempts, and next_retry_at; a row stuck past N attempts goes to a DLQ and raises a stuck-row alert, and the event carries a payload_version so schemas can evolve.",
         "This guarantees an event exists iff the transition committed — the customer never gets a 'shipped' email for an order that didn't actually transition. But be precise about the guarantee: the outbox makes committed events eventually published at-least-once; it does NOT make the downstream side effect (the email, the analytics write) exactly-once — consumers must still dedupe on the event id."
       ],
@@ -1886,14 +1911,26 @@
         "before": "Events could diverge from order state.",
         "after": "Status events emitted atomically, delivered at-least-once.",
         "newRisk": "Orders get cancelled and returned — completed steps must be undone correctly."
-      }
+      },
+      "traps": [
+        {
+          "trap": "Assuming the outbox makes the downstream side effect (email, analytics write) exactly-once.",
+          "why": "The relay delivers committed events at-least-once; a redelivered 'shipped' event can send a duplicate email if the consumer doesn't dedupe.",
+          "instead": "Treat the event id as a consumer dedupe key — the outbox guarantees a committed event is eventually published, the consumer guarantees it acts on it once."
+        },
+        {
+          "trap": "Publishing the event after the commit in a separate step (dual write).",
+          "why": "A crash between commit and publish drops the event (shipped, nobody told); a publish that beats a rolled-back txn announces an event that never happened.",
+          "instead": "Write the event row in the same transaction as the transition and let a relay publish it; never cross two systems without atomicity."
+        }
+      ]
     },
     {
       "id": "returns",
       "title": "7. Cancellations, Returns, and Scale",
       "description": [
         "Cancellations and returns are compensation flows over the same saga, and they operate at the line level, not just the whole order. Cancel before shipping: release the inventory reservation and void/refund the payment for the cancelled lines. Return after delivery: check eligibility, receive the item, make a restock decision (restock / discard / refurbish), and refund — each step idempotent and recorded as order transitions.",
-        "Because lines carry their own state, an order can be partially shipped, partially cancelled, and partially returned while still rolling up to a coherent customer-facing summary state (e.g. partially_shipped, partially_returned). Refunds are per-line and reference the original payment attempt. Timing matters: a line can only be cancelled in cancellable states (not once shipped); returns kick off a reverse flow. The order state machine enforces which compensations are valid from the current line/order state.",
+        "Because lines carry their own state, an order can be partially shipped, partially cancelled, and partially returned while still rolling up to a coherent customer-facing summary state (e.g. partially_shipped, partially_cancelled, partially_returned). Refunds are per-line and reference the original payment attempt. Timing matters: a line can only be cancelled in cancellable states (not once shipped); returns kick off a reverse flow. The order state machine enforces which compensations are valid from the current line/order state.",
         "Scale: shard orders by order id (per-order writes serialize locally); the orchestrator is stateless and resumes sagas from the durable order state; the outbox + async consumers scale independently. Everything is auditable via the transition history."
       ],
       "view": {
@@ -1920,6 +1957,22 @@
         ]
       },
       "decisionPrompt": "A delivered order is returned. What gets undone, and how do you avoid double-refunding on a retry?",
+      "concepts": [
+        {
+          "term": "Line-level compensation",
+          "definition": "Cancel/return operate per order line, not only per whole order, so an order can be partially cancelled or returned while other lines proceed.",
+          "whyItMatters": "Real orders span items shipped from different warehouses at different times; whole-order-only compensation can't model partial outcomes.",
+          "example": "Cancel one of three lines: release that line's reservation + refund its amount; the rest still ship. Order rolls up to partially_cancelled.",
+          "group": "Cancellations, Returns, and Scale"
+        },
+        {
+          "term": "Restock disposition",
+          "definition": "On a return, a decision (restock / discard / refurbish) governs whether the returned unit goes back to sellable inventory.",
+          "whyItMatters": "Not every returned item is resellable; refunding without the right disposition either oversells damaged goods or loses good stock.",
+          "example": "Defective return -> refund issued, disposition = discard, inventory NOT incremented.",
+          "group": "Cancellations, Returns, and Scale"
+        }
+      ],
       "patterns": [
         "Compensation on cancel/return",
         "Idempotent transitions"

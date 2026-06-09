@@ -316,10 +316,8 @@ The remaining production realism gaps are specific:
   resolve to real step IDs.
 - Structured `view` and `sequence` data are used; there are no raw Mermaid
   diagrams in steps or final design.
-- The source dataset has `assets.icon`, but no `technologyChoices`, `aiVisuals`,
-  or `explainerComic`. These are optional, but `technologyChoices` would be
-  especially useful for cart KV stores, order databases, workflow engines,
-  payment providers, queues, and observability.
+- The source dataset has `assets.icon` and `technologyChoices`. `aiVisuals`
+  and `explainerComic` remain optional future book enrichments.
 - `probeLinks` are valid, but some are still generic: Step 3 only points to
   PostgreSQL isolation, Step 7 has none, and a pricing/tax/coupon reference set
   would make the further-reading path stronger.
@@ -363,10 +361,11 @@ State whether out-of-stock, validation failures, and permanent payment failures
 are stored as completed idempotency results, and make `order_id` nullable where
 no order is created.
 
-### P3: Retarget probe links and add book enrichments
+### P3: Retarget probe links and add optional visuals
 
 Add pricing/tax/coupon, inventory reservation, payment webhook, and hot-SKU
-contention links. Consider `technologyChoices` for the book wrap-up experience.
+contention links. Consider `aiVisuals` or an `explainerComic` for the book
+wrap-up experience.
 
 ## What Not To Change
 

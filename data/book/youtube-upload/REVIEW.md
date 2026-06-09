@@ -5,9 +5,11 @@ Review date: 2026-06-09
 
 ## Executive Summary
 
-This review reflects the dataset after commit `fac974d` (`Improve YouTube upload interview per REVIEW.md`). The recent pass addressed most of the previous high-impact gaps: capacity is now numeric, resumable upload has explicit chunk/resume/complete APIs, upload parts and transcode tasks are modeled, the CDN path separates control plane from data plane, and view counting now has event semantics.
+This review reflects the dataset after the follow-up pass that addressed the three remaining P1 findings below. The earlier pass had already made capacity numeric, given resumable upload explicit chunk/resume/complete APIs, modeled upload parts and transcode tasks, separated CDN control plane from data plane, and added view-event semantics.
 
-The case is now a strong book-quality walkthrough. The remaining issues are narrower: one API sequence still blurs upload-session creation with the complete upload lifecycle, the transcode lease/queue ownership model should be made unambiguous, and the new access-control requirement needs backing fields and `satisfies` coverage.
+The latest pass closed the remaining gaps: `POST /v1/uploads` now shows session creation only (201) and the full upload/commit/enqueue lifecycle with `202 processing` moved to `POST /complete`; transcode task ownership is now unambiguous (rendition_tasks in MetaDB is the source of truth, queue messages are wake-ups, workers claim rows by atomic CAS); access control is backed by `videos.visibility`/`geo_policy_id`/`moderation_state`, an `access_policies` table, and a `satisfies.nonFunctional` entry. A view-count sequence flow, capacity assumptions/ranges, and retargeted step-level probe links were also added.
+
+The case is now a strong, production-shaped book-quality walkthrough.
 
 | Area | Score | Notes |
 | --- | ---: | --- |
@@ -135,29 +137,29 @@ Production systems would still need more detail on:
 
 ## Recommended Edits, Prioritized
 
-### P1: Fix the upload lifecycle sequence
+### P1: Fix the upload lifecycle sequence — DONE
 
-Move the full upload/chunk/complete/enqueue sequence away from `POST /v1/uploads`, or rename it as a lifecycle flow. Make start-session return only the upload session, and make `POST /complete` return `202 processing`.
+`POST /v1/uploads` now shows session creation only and returns `201` with the session handle (no chunk transfer or transcode enqueue). The full upload/commit/enqueue lifecycle and `202 processing` moved to `POST /v1/uploads/{uploadId}/complete`.
 
-### P1: Clarify transcode task ownership
+### P1: Clarify transcode task ownership — DONE
 
-State whether `JobQ` or `rendition_tasks` owns leases. Prefer making `rendition_tasks` in `MetaDB` the durable source of truth and using queue messages as scheduling wake-ups, unless the dataset wants to teach queue visibility timeouts directly.
+The `rendition_tasks` table in `MetaDB` is now stated as the durable source of truth; `JobQ` messages are scheduling wake-ups. Workers claim a row by atomic CAS (pending→leased, lease_until=T), and crash recovery/dead-lettering reconcile against the row, not the queue. The Step 4 prose, data-model note, failure drill, and the lease-reclaim sequence flow were all updated to this single model, and Step 3's reconciler note was tied to it.
 
-### P1: Back access control with data and `satisfies`
+### P1: Back access control with data and `satisfies` — DONE
 
-Add visibility/ACL/geo/moderation fields or a small policy table, and add a non-functional `satisfies` item for playback access control.
+`videos` gained `visibility`, `geo_policy_id`, and `moderation_state`; a new `access_policies` table holds geo allow/deny lists and the private-share ACL. A `satisfies.nonFunctional` "Access control on playback" entry maps to `stream` and `upload`, and Step 5 + the final design now reference reading this policy state before minting a token.
 
-### P2: Add a view-count sequence flow
+### P2: Add a view-count sequence flow — DONE
 
-Show `Viewer -> ViewPipe -> dedup/window -> MetaSvc/MetaDB`, with public approximate count separated from authoritative analytics/monetization.
+Step 6 now has a `Viewer -> ViewPipe -> dedup/window -> MetaSvc/MetaDB` flow, with the public approximate count separated from an authoritative analytics/monetization branch.
 
-### P2: Add ranges or assumptions to capacity
+### P2: Add ranges or assumptions to capacity — DONE
 
-Keep the numeric bullets, but make source bitrate, rendition ladder, storage multiplier, CDN miss ratio, and event-throughput assumptions explicit.
+Each capacity bullet now states its assumption explicitly (source bitrate, rendition ladder/codec cost, storage multiplier, CDN hit/miss ratio, view-event heartbeat rate) alongside the numbers.
 
-### P3: Retarget step-level probe links
+### P3: Retarget step-level probe links — DONE
 
-Use `s3-multipart` for upload, `ffmpeg-docs`/`netflix-vmaf` for transcoding, `apple-hls`/`dash-if` for streaming, `kafka-design` for view counting, and `sre-monitoring`/`borg-paper` for operations and fleet scaling.
+`s3-multipart` for upload, `ffmpeg-docs`/`netflix-vmaf`/`borg-paper` for transcoding and fleet, `apple-hls`/`dash-if` for streaming, `kafka-design` for the async queue and view counting, and `sre-monitoring`/`borg-paper` for operations.
 
 ## What Not To Change
 

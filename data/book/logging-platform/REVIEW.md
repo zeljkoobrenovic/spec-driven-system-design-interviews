@@ -5,408 +5,391 @@ Review date: 2026-06-09
 
 ## Executive Summary
 
-This is a clear, interview-friendly logging-platform walkthrough. The core arc
-is right: start with write-and-scan, add durable ingestion, parse and control
-cost, build a time-bucketed hot index, tier old data, evaluate alerts on the
-stream, and close with retention/backpressure/rebuildability.
+This dataset is now a strong logging-platform case. The recent hardening pass
+fixed the biggest earlier gaps: capacity is numeric, the API includes ingest
+dedupe/backpressure and async cold query jobs, the data model has tenant,
+source, schema, retention, alert, query-job, segment, and quota records, the
+final design includes a control plane, and the previous local diagram endpoint
+mismatches are resolved.
 
-The dataset is strong as a conceptual case, but it is lighter than the stronger
-book cases on production contracts. The biggest gaps are quantitative capacity
-math, tenant/security/retention policy modeling, richer API and data-model
-contracts, and a more precise cold-query/reindexing story. There are also two
-local view-link endpoint mismatches that should be fixed before relying on the
-rendered diagrams.
+The remaining work is mostly about consistency and production precision. The
+case should make the ordering of redaction, sampling, acknowledgement, and raw
+archival unambiguous; tighten the capacity math and shard/partition sizing;
+align the cold-query diagrams with the async API; and introduce the control
+plane earlier in the step narrative.
 
 | Area | Score | Notes |
 | --- | ---: | --- |
-| System design soundness | 3.9/5 | The pipeline shape is credible, but capacity, query semantics, data ownership, and cold retrieval are under-specified. |
-| Production realism | 3.6/5 | Backpressure, sampling, tiering, and alerting are present; tenancy, privacy, schema evolution, retry/dedupe semantics, and operations need a second pass. |
-| Pedagogical flow | 4.2/5 | The seven-step progression teaches the major pressure points in a good order. |
-| Dataset/rendering fit | 4.0/5 | JSON parses and most references resolve; two view links reference endpoints absent from their local views. |
-| Overall | 3.9/5 | A solid book draft that can become flagship-quality with one hardening pass. |
+| System design soundness | 4.4/5 | The architecture is credible and complete; sampling/durability ordering and sizing details still need precision. |
+| Production realism | 4.2/5 | Good coverage of tenancy, RBAC, retention, quotas, and cold jobs; alert delivery, dedupe state, and operational workflows can be sharper. |
+| Pedagogical flow | 4.4/5 | The seven-step progression teaches the right pressure points in a strong order. |
+| Dataset/rendering fit | 4.7/5 | JSON and target-specific view checks pass; prior local link endpoint issues are fixed. |
+| Overall | 4.4/5 | Close to flagship quality after one consistency pass. |
 
 ## What Works Well
 
-- The scope is crisp: high-throughput durable log ingestion, recent search,
-  cheap long retention, and stream-based alerting.
-- The baseline step motivates the rest of the design instead of jumping straight
-  to Kafka and Elasticsearch.
-- The durable buffer is introduced early and correctly as the main decoupling
-  mechanism between acceptance and downstream indexing.
-- The processing step teaches an important logging tradeoff: raw retention,
-  structured fields, and sampling/quotas for cost control.
-- Time-bucketed indexing is the right central search concept for append-only,
-  time-filtered logs.
-- Hot/cold tiering and stream-based alerting are separated cleanly, so readers
-  see why alerts should not depend on polling a lagging search index.
-- The final design integrates every major component introduced in the steps.
-- Probe links are relevant and the structured sequence diagrams use canonical
-  participant IDs.
+- The scope is clear: durable high-volume ingest, recent search, cheap
+  retention, stream alerts, tenant isolation, and data governance.
+- The baseline step still does useful teaching work by exposing why direct
+  writes and scans fail.
+- The durable buffer, processing pipeline, time-bucketed hot index, cold tier,
+  alert service, lifecycle worker, and control plane form a coherent final
+  architecture.
+- The API is much stronger than before: ingest has batch IDs, partial
+  acceptance, 429 backpressure, and quota semantics; search separates hot
+  synchronous results from async cold jobs; alert-rule CRUD is present.
+- The data model now backs most design claims, including retention policies,
+  parser schemas, alert windows, query jobs, segment metadata, and tenant
+  usage quotas.
+- Security/privacy concerns are no longer an afterthought: source auth, RBAC,
+  redaction, encryption, search audit, and legal hold appear in requirements
+  and the reliability deep dive.
+- Technology choices are useful and domain-specific across collectors, streams,
+  processors, hot search, cold archive, and cold analytics.
 
 ## Highest-Impact Issues
 
-### 1. Capacity is qualitative, so it does not drive design decisions
+### 1. Sampling, redaction, raw archival, and acknowledgement order is still ambiguous
 
-The capacity section uses useful directional labels such as "TBs/day",
-"writes >>> reads", "days", and "months/years", but it never turns them into
-working numbers.
+The design now says accepted logs are durable and at-least-once until deduped,
+but Step 3's default tail-based sampling also says the processor drops most
+healthy debug noise after consuming from the buffer. The final design says the
+processor redacts secrets, samples/quotas, archives raw, and feeds the indexer,
+while the reliability deep dive says redaction must happen at the collector
+before buffering.
 
-Why it matters: logging platforms are dominated by throughput, write
-amplification, index storage, retention cost, and burst headroom. Without a
-sample sizing pass, the reader cannot reason about collector fleet size, stream
-partitions, index shard count, hot-window cost, or cold-store volume.
+Why it matters: these operations define the core correctness contract. If a
+collector acknowledges before redaction, secrets may land in the durable buffer.
+If a processor drops after acknowledgement without raw archival, the platform
+violates "do not drop accepted logs." If all accepted raw logs are archived,
+then "10 TB/day after sampling" should mean kept/indexed volume, not accepted
+firehose volume.
 
-Concrete fix: add a small assumed scale and derived numbers. For example:
-average raw ingest GB/TB per day, peak burst multiplier, average event size,
-events/sec, compression ratio, hot-window indexed footprint, 30/90/365-day cold
-storage, search QPS, alert-rule count, and accepted ingestion latency target.
-Then connect those numbers to design choices such as partition count,
-consumer parallelism, hot index shard count, and lifecycle policy.
+Concrete fix: add an explicit ingest pipeline contract. For example:
 
-### 2. API and data model are too thin for the behavior claimed
+- Collector authenticates, enforces quota, redacts secrets/PII, compresses, and
+  appends to the buffer before acknowledging.
+- Destructive shedding happens only before acknowledgement with 429/partial
+  acceptance, or only for log classes explicitly marked droppable.
+- Accepted events are archived raw or normalized to `RawStore`; sampling mainly
+  controls hot-index inclusion and aggregation weights.
+- Tail sampling may delay indexing/alert enrichment, but it must not silently
+  delete accepted events unless the API contract says so.
 
-The API has `POST /v1/logs` and `GET /v1/search`, but the contracts omit fields
-that the later design needs: tenant/project identity, source/service/env/host,
-schema version, trace/span IDs, compression, batch IDs, idempotency or sequence
-numbers, partial-acceptance details, and explicit throttling/backpressure
-responses. Search lacks pagination/cursors, limits, aggregation syntax,
-timeout/cost controls, and async cold-query behavior. There is no alert-rule
-CRUD API.
+### 2. Capacity numbers are useful but need sanity alignment
 
-The data model has only `log_event` and `index_segment`. It does not model
-tenants, sources, retention policies, schema mappings/parsers, ingestion
-offsets, segment metadata, alert rules, alert state, query jobs, rehydration
-jobs, or quota/usage records.
+The capacity section is much better, but it mixes a "20M events/sec headline"
+with a 700K events/sec average sizing basis. At 500 B/event, 20M events/sec
+would be roughly 10 GB/sec before overhead, far above the 350 MB/sec and 30
+TB/day math that follows. The hot-index sizing also says 100 TB of indexed data
+with only 20-30 hot shards at about 5 TB/shard, which is too coarse for most
+inverted-index search systems and weakens the parallelism/recovery story.
 
-Why it matters: the walkthrough promises per-service retention, quotas,
-streaming alerts, query routing, rebuildable indexes, and multi-tenant
-fairness. Those claims need durable records and external contracts, not just
-component names.
+Why it matters: logging interviews are won or lost on throughput and cost
+reasoning. The numbers should lead naturally to collector fleet size, stream
+partitions, consumer groups, index shards, index nodes, and cold storage cost.
 
-Concrete fix: extend the API and data model with a few targeted records:
-`log_sources`, `retention_policies`, `parser_schemas`, `ingest_batches` or
-offset checkpoints, `index_segments` with bucket/shard/tier/status/source
-offsets, `alert_rules`, `alert_windows`, `alert_events`, `query_jobs`, and
-`tenant_usage_quota`. Add response examples for `429`/backpressure and partial
-batch acceptance.
+Concrete fix: keep one consistent sizing ladder:
 
-### 3. Cold retrieval is underspecified and can read as magic
+- define accepted firehose, post-redaction/post-sampling kept volume, and
+  hot-indexed volume as separate quantities;
+- reconcile average, peak, and incident-burst numbers;
+- replace the 5 TB/shard shortcut with an explicit "shard/segment/node" model;
+- show how 256 stream partitions maps to consumer parallelism and indexing lag.
 
-The tiering step says old ranges scan or rehydrate cold storage, and the final
-design says old logs remain retrievable. That is the right user promise, but the
-mechanism is thin. The dataset does not say what cold data format is used, how
-partitions are cataloged, whether a cold query is synchronous or a job, where
-rehydrated indexes live, how long results are retained, or how cost is bounded.
+### 3. Cold-query behavior is split between async API and synchronous diagrams
 
-Why it matters: "search old logs" is one of the hardest cost/UX tradeoffs in a
-logging platform. A candidate should be able to say whether a 90-day query
-returns interactively, creates a background job, restores a temporary index, or
-requires narrower time/service filters.
+`GET /v1/search` correctly says cold ranges return `202` with a `query_job_id`,
+and `GET /v1/query-jobs/{id}` models polling and TTL. However the API sequence
+and Step 5 flow still show the query service asking `ColdStore` and returning
+"hits" directly to the user.
 
-Concrete fix: add a cold-query path. For example: object storage is partitioned
-by tenant/service/date/hour in compressed columnar or raw chunks; a catalog maps
-time buckets to objects; old queries create `query_jobs`; large jobs require
-time/service filters and cost caps; rehydrated results or temporary indexes
-expire after a TTL.
+Why it matters: cold retrieval is one of the main UX/cost tradeoffs. The
+candidate should learn that old queries may become jobs, may be capped, may
+return temporary results, and may require narrower filters.
 
-### 4. Multi-tenancy, security, and privacy are mostly absent
+Concrete fix: adjust the cold branch in the search sequence and Step 5 flow:
+for old ranges, create `query_job`, return `202`, have a worker scan/rehydrate
+from `ColdStore`, write temporary results or a temporary index, and let the user
+poll/download until `expires_at`.
 
-The requirements and steps mention thousands of services and per-service
-quotas, but not tenant isolation, access control, redaction, encryption, audit
-logs, or retention/legal policy. Logs often contain secrets, tokens, user IDs,
-IP addresses, request payloads, and regulated data. Search and alert access is
-therefore part of the core system design, not a polish topic.
+### 4. The control plane appears late relative to the requirements it supports
 
-Why it matters: a centralized logging platform becomes a sensitive data plane.
-Without RBAC and data controls, "engineer searches logs" is unsafe, especially
-across services, environments, and tenants.
+The final design adds `ControlPlane` and the data model now includes the right
+records, but most step diagrams teach the data plane without showing the
+metadata checks that make it safe: source auth, parser schemas, quotas,
+retention policies, RBAC, alert rules, and query jobs.
 
-Concrete fix: add a requirement and a step/deep dive for operational controls:
-tenant/project isolation, source authentication, field redaction at collection,
-PII/secret detection, encryption, audit trails for queries, per-team RBAC,
-retention/legal hold, and restricted access to production payload logs.
+Why it matters: the design now claims multi-tenant isolation and governance.
+Those are not just final-design boxes; they affect the ingestion path, query
+path, alert path, and lifecycle path.
 
-### 5. Ingestion reliability semantics need sharper wording
+Concrete fix: introduce the control plane earlier, probably in Step 2 or Step 7.
+Add one or two step-level links such as `Collector -> ControlPlane` for source
+auth/quota, `Processor -> ControlPlane` for parser schemas, and `QuerySvc ->
+ControlPlane` for RBAC/segment catalog/query jobs. Keep it visually light, but
+make the dependency visible before the final design.
 
-The ingest step says the collector acknowledges once the batch is buffered,
-which is the correct high-level default. It does not explain producer retries,
-duplicate batches, ordering, partial writes, poison records, or what happens
-when the durable buffer itself approaches saturation. Step 7 says to
-shed/sample at the collector if overwhelmed, but does not distinguish dropping
-low-value logs before acceptance from losing accepted logs.
+### 5. Dedupe, offsets, and rebuildability are described but not fully grounded
 
-Why it matters: "do not drop accepted logs" depends on exact acknowledgement
-semantics. Agents will retry on timeouts, collectors can fail after writing but
-before acknowledging, and downstream processors can encounter malformed or
-poison events.
+The ingest API mentions dedupe by `batch_id`, and `index_segment` has
+`source_offsets`, but there is no durable `ingest_batch`, `event_id`, or
+dedupe-window record. `log_event` also omits `source_id`, `batch_id`, `seq`, and
+sampling weight, even though the request carries `seq` and the sampling option
+warns that counts are distorted without weights.
 
-Concrete fix: state that ingestion is at-least-once until deduped, add
-batch/event IDs or source sequence numbers, define partial-accept responses,
-route poison records to a dead-letter/quarantine path, and make backpressure
-explicit: reject or sample before acknowledgement, never silently drop after
-acknowledgement.
+Why it matters: at-least-once ingestion, retries, partial acceptance, poison
+records, alert aggregation, and rebuildable indexes all depend on durable
+identity and watermarks.
 
-### 6. Two local diagram views reference links whose endpoints are hidden
+Concrete fix: extend the model with either `ingest_batch` or event-level
+identity fields: `source_id`, `batch_id`, `seq`, `event_id`, `accepted_at`,
+`partition`, `offset`, `dedupe_expires_at`, and `sample_weight`. Add a short
+note on dedupe window length and what happens when an agent retries outside it.
 
-The structured references are mostly clean, but two step views include links
-whose source endpoint is not present in the local view:
+### 6. Alerting is architecturally right but delivery operations are thin
 
-- Step `index` includes link `processor-indexer`, whose `from` endpoint is
-  `Processor`, but the view nodes are `Indexer`, `HotIndex`, `QuerySvc`, and
-  `User`.
-- Step `reliability` includes link `raw-cold`, whose `from` endpoint is
-  `RawStore`, but the view nodes are `Lifecycle`, `HotIndex`, `ColdStore`,
-  `Buffer`, and `Processor`.
+The stream-based alert choice is correct, and the `alert_rule`,
+`alert_window`, and `alert_event` records are a good start. The remaining gap is
+delivery: notification routing, retries, suppression/escalation, ownership
+changes, failed webhook behavior, and alert storms during outages.
 
-Why it matters: generated flowcharts are easiest to read when every local edge
-has both endpoints visible. Hidden endpoints can create confusing or malformed
-rendered diagrams depending on the Mermaid generation path.
+Why it matters: logging alerts often fail when the system is already under
+stress. A realistic design should bound repeated notifications and preserve
+delivery evidence.
 
-Concrete fix: either add the missing endpoint node to the view or remove the
-link from that local view. For Step `index`, adding `Processor` or removing
-`processor-indexer` are both reasonable. For Step `reliability`, add `RawStore`
-or remove `raw-cold` from the local view.
+Concrete fix: add a small `NotificationWorker`/route concept or a deep-dive
+point covering delivery retries, dedupe/suppression, escalation policy, and
+alert-storm backpressure.
 
 ## System Design Soundness
 
-The architecture is directionally correct. A durable partitioned buffer,
-stateless collectors, stream processors, raw archive, time-bucketed hot index,
-query router, streaming alert consumer, and lifecycle worker are the right
-building blocks.
+The current architecture is sound. A durable partitioned buffer protects
+ingest; stateless collectors and processors scale horizontally; immutable
+time-bucketed index segments match append-only log data; hot/cold tiering
+matches recent-skewed reads; streaming alerts avoid dependence on index
+freshness; and the control plane now holds the metadata required for tenancy,
+RBAC, quotas, schemas, retention, and query jobs.
 
-The biggest soundness limitation is that the capacity section does not force
-any sizing decisions. A strong answer should estimate events/sec and bytes/sec,
-then use those estimates to justify stream partitions, collector instances,
-indexer parallelism, hot-index storage, cold retention cost, and alert
-aggregation state.
+The main soundness issue is semantic ordering. The design should distinguish
+accepted firehose, redacted durable buffer contents, raw archive contents,
+hot-indexed subset, and cold compressed representation. Those are different
+volumes with different guarantees. Once that is explicit, the capacity math and
+sampling options will read much more cleanly.
 
-The API is useful for a diagram but thin for production. Ingest needs identity,
-idempotency/dedupe, compression, partial acceptance, and backpressure. Search
-needs limits, paging, aggregation syntax, permissions, and async behavior for
-cold ranges. Alerting needs at least a small rule lifecycle contract.
-
-The data model supports the teaching basics but not the production claims. Add
-control-plane records for tenants, sources, policies, schemas, alert rules, and
-query jobs, plus operational state for offsets, segment status, and retention
-lifecycle.
-
-The final design is coherent with the steps, but it blurs `RawStore` and
-`ColdStore`. The dataset should explain whether raw object storage is the cold
-tier, whether cold storage is a distinct archived/compacted representation, and
-how the query service discovers and rehydrates old buckets.
+The data model is now credible, but it would benefit from event/batch identity
+and sampling weight fields. Those small additions would make retry dedupe,
+partial acceptance, weighted dashboard aggregation, and index rebuilds concrete
+instead of prose-only.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: Write Logs Straight to a Database and Scan It
 
-This is a good baseline. It exposes synchronous write pressure, scan-heavy
-search, and unbounded storage growth.
+This remains a good baseline. It surfaces synchronous write pressure,
+scan-heavy search, and unbounded retention before adding infrastructure.
 
-One consistency issue: the title and prose say "database" and "one big table",
-but the view uses `RawStore`, an object-storage node, and the caption says the
-query service scans object storage. Either make the baseline a generic raw
-store/object store or introduce a temporary database-like node for the naive
-case.
+The title still says "database" while the view uses `RawStore` object storage.
+That is acceptable as a simplified baseline, but the prose should be consistent:
+either call it a single raw store or explicitly say the naive version is "one
+shared store/table" before the design evolves into object storage plus indexes.
 
 ### Step 2: Durable High-Throughput Ingestion
 
-This is the right second step. It teaches accepting fast, buffering durably, and
-decoupling downstream index lag from ingestion.
+This is the right first real architecture move. The buffer is the platform's
+backbone and the sequence now teaches ack-after-durable-append.
 
-Add the exact acceptance contract: acknowledgements happen only after durable
-append, retries can duplicate batches, accepted offsets are tracked, and
-overload is expressed as pre-ack throttling/rejection rather than silent loss.
+Add the control-plane check here. Source authentication, per-tenant quota, and
+pre-ack rejection are ingestion concerns, so this step is the natural place to
+show `Collector -> ControlPlane` and to define dedupe state.
 
 ### Step 3: Parse, Structure, and Sample
 
-This step teaches the cost lever well. The options are useful because they
-compare tail-based sampling, head/rate sampling, and keeping all raw data while
-indexing selectively.
+The options are strong and realistic. Tail-based sampling, head/rate sampling,
+and "keep raw, index selectively" teach a real cost-vs-debuggability tradeoff.
 
-Clarify the semantics of "drop". The prose says to sample or drop noisy logs,
-but also says to always archive raw so nothing is permanently lost. That can be
-resolved by separating "drop from hot indexing" from "drop before acceptance"
-and by stating which log classes are eligible for destructive sampling.
+The step needs the clearest wording pass. Separate "drop before acceptance,"
+"archive accepted raw but sample the hot index," and "store sample weights for
+aggregations." Also reconcile whether redaction happens in the collector, the
+processor, or both.
 
 ### Step 4: Time-Bucketed Indexing for Search
 
-The core concept is strong. Immutable time-bucketed inverted indexes are the
-right teaching unit for log search because they explain time pruning, retention,
-and rebuildability.
+This is still the central search lesson. The default inverted-index option and
+the columnar alternative are both valuable, and the data model now includes
+segment status and source offsets.
 
-The step should add more operational detail: shard by tenant/service/time,
-handle high-cardinality fields with allowlists or dynamic mapping controls,
-track segment build status and source offsets, and expose indexing lag as a
-first-class metric. Also fix the local `processor-indexer` view-link endpoint
-mismatch.
+Improve the sizing tie-in. Mention how tenants/services/time buckets map to
+shards or segments, how high-cardinality fields are capped by
+`parser_schema.indexed_fields`, and how indexing lag is monitored against the
+30-second p99 target.
 
 ### Step 5: Hot/Cold Storage Tiering
 
-This is one of the strongest steps. It connects read skew, hot-window cost, and
-retention directly to a tiered architecture.
+The step is conceptually strong and now has a matching `query_job` model. The
+default option correctly makes recent logs fast and old logs cheaper/slower.
 
-The next improvement is to make cold retrieval concrete. Add query jobs,
-catalog metadata, rehydration limits, result TTL, and a clear distinction
-between raw archive, cold archive, and any temporary rehydrated index.
+The diagram/flow should be updated to match the async API. The user should see
+that old queries create jobs and return later, rather than appearing as direct
+ColdStore hits.
 
 ### Step 6: Streaming Alerts
 
-The step makes the right architectural choice: stream-based alerting for
-near-real-time detection, not scheduled polling against a possibly lagging
-index.
+The architectural choice is right: evaluate alert rules on the live stream
+instead of polling a lagging index. The option comparison teaches why index
+polling is tempting but weaker.
 
-Add the rule/control plane. A real alerting subsystem needs `alert_rules`,
-window state, dedupe/suppression, notification routing, ownership, rule
-testing, and alert delivery failure handling. The current component-level
-description is good but leaves those records implied.
+Add one operational detail: rule-state durability and notification delivery.
+`alert_window` and `alert_event` are in the model, but the walkthrough should
+say how state is checkpointed, how duplicate fires are suppressed, and how
+failed deliveries are retried or escalated.
 
 ### Step 7: Retention, Backpressure, and Reliability
 
-This is the right closing step. It names lifecycle enforcement, burst handling,
-consumer lag, quotas, and rebuildable indexes.
+This is a good closing step. It now carries the security/privacy deep dive,
+which is appropriate because logging is a sensitive data plane.
 
-Make it more operational. Add metrics and drills for buffer saturation,
-collector rejection rate, processor/indexer lag, dead-letter volume, hot-index
-health, cold-query cost, lifecycle backlog, and alert-rule evaluation lag. Also
-fix the local `raw-cold` view-link endpoint mismatch.
+The step can do more with explicit operational drills: buffer saturation,
+collector 429 rate, processor/indexer lag, DLQ growth, high-cardinality mapping
+explosion, cold-query cost caps, lifecycle backlog, and alert storm
+suppression. Those drills would make the reliability story feel operated, not
+just architected.
 
 ## Final Design Review
 
-The final design integrates the main mechanics cleanly. It shows agents,
-collectors, a durable buffer, processors, raw archive, indexer, hot index, cold
-store, query service, alert service, and lifecycle worker.
+The final design is coherent and significantly stronger than the earlier
+version. It integrates agents, collectors, buffer, processors, raw archive,
+indexer, hot index, cold store, query service, alert service, lifecycle worker,
+and a control plane/metadata store.
 
-The missing pieces are the control plane and the operational state around the
-data plane: tenant/source configuration, parser/schema rules, retention
-policies, access controls, quotas, alert rules, query jobs, and segment/catalog
-metadata. Adding those does not require many new boxes in the main diagram; a
-small "Control Plane / Metadata Store" node plus explicit data-model records
-would make the final design much more production-realistic.
+The final description now says the right things: authenticated sources,
+redaction, sampling/quotas, raw archival, time-bucketed hot segments, async
+cold query jobs, stream alerting, lifecycle policy, tenant isolation, RBAC, and
+rebuildability.
+
+The remaining final-design improvement is to make the data guarantees explicit
+in one sentence: "accepted redacted events are durably buffered and archived;
+sampling controls indexing/retention class unless the collector rejects before
+ack." That would remove the main ambiguity across steps.
 
 ## Concept Introduction and Learning Flow
 
-The learning flow is good. Each step solves a problem surfaced by the previous
-one: blocking writes, unstructured data, slow search, hot storage cost,
-late alerts, and reliability under lag.
+The learning flow is strong. Each step solves a pressure point exposed by the
+previous one: blocking writes, unstructured data, expensive search, hot storage
+cost, delayed alerts, and operational reliability.
 
-The main opportunity is to introduce production concepts just in time:
-idempotent ingestion in Step 2, schema evolution and destructive-vs-index
-sampling in Step 3, segment metadata and mapping/cardinality limits in Step 4,
-async cold query jobs in Step 5, alert-rule state in Step 6, and tenant/privacy
-controls across the wrap-up.
+The main sequencing gap is the control plane. The final design now depends on
+control-plane metadata for auth, schemas, quotas, retention, alerts, query
+jobs, and segment catalogs, but learners only see that dependency fully at the
+end. Introduce it lightly when it first matters rather than as a final reveal.
 
 ## Step-to-Final-Design Coherence
 
-The final architecture includes all seven step-level components, which is a
-strength. The `satisfies` mapping also points to the right steps and has no
-unresolved step IDs.
+The final architecture includes all major step-level components. The
+`satisfies` mappings point to real steps, and the high-level links now render
+cleanly in the target-specific checks.
 
-The coherence gap is in invisible state. Several step claims depend on records
-that are not in the final model: retention policies for lifecycle, offsets for
-rebuildability, quotas for fairness, alert-rule state for streaming alerts, and
-query jobs for cold retrieval. Add those records and the design will better
-support its own final claims.
+The coherence gaps are semantic rather than structural:
+
+- Step 3 sampling must line up with the durable-ingest guarantee.
+- The cold-query sequence/flow must line up with the async `query_job` API.
+- The control-plane records should appear in at least one step before the final
+  design.
+- Dedupe/offset records should support the ingest API and rebuildability claim.
 
 ## Realism Compared With Production Systems
 
-Production logging systems spend much of their complexity budget on data
-governance and cost controls. This dataset covers cost at the architecture
-level, but not yet at the policy and operations level.
+This is now realistic enough for a strong interview walkthrough. It covers the
+right themes for a centralized logging platform: write-heavy ingest,
+partitioned streams, query-time pruning, high-cardinality field control,
+hot/cold economics, tenant isolation, RBAC, redaction, quota fairness, and
+stream alerts.
 
-Important missing topics:
+The remaining realism improvements are operational:
 
-- Tenant/project isolation and source authentication.
-- Field redaction, secret detection, and query audit trails.
-- Schema evolution and dynamic field cardinality controls.
-- Backpressure semantics before vs. after acknowledgement.
-- Dead-letter/quarantine handling for malformed records.
-- Indexing lag, segment rebuild status, and query freshness.
-- Async cold-query jobs with cost/time limits.
-- Alert suppression, ownership, notification routing, and delivery failures.
-
-These do not all need to become full steps, but the dataset should cover the
-first four as core requirements or deep dives.
+- clarify accepted-vs-rejected-vs-sampled data;
+- model batch/event identity and dedupe windows;
+- size index shards/nodes more plausibly;
+- show cold query jobs as background work with cancellation/cost caps/result
+  TTL;
+- add alert delivery retry/suppression/escalation;
+- add drills and metrics for lag, saturation, DLQ, lifecycle backlog, and
+  query audit anomalies.
 
 ## Dataset and Renderer-Facing Observations
 
 - `interview.json` parses as valid JSON.
-- Canonical node types used by `highLevelArchitecture.nodes[]` resolve against
+- `_scripts/validate_options.py data/book/logging-platform/interview.json`
+  reports OK.
+- High-level node types used by this dataset resolve against
   `_templates/node-types.json`.
-- `satisfies[*].steps[*]`, pattern steps, and step `probeLinks` resolve.
-- Sequence participant IDs in the API and step flows resolve to canonical
-  high-level node IDs.
-- No `view.nodes` reference unknown high-level nodes.
-- No `view.links` reference unknown high-level links.
-- Two local views include links whose endpoints are absent from the local node
-  set: Step `index` with `processor-indexer`, and Step `reliability` with
-  `raw-cold`.
-- `dataModel` is very small for the claims made by the steps; this is a content
-  gap rather than a JSON/schema failure.
-- This review is repo-only. Rebuilding `docs/` is not needed for `REVIEW.md`.
+- `satisfies[*].steps[*]` and pattern `steps[]` references resolve.
+- Target-specific checks found no step, option, or final-design view links with
+  missing local endpoints.
+- The prior stale findings about Step `index` missing `Processor` and Step
+  `reliability` missing `RawStore` are no longer valid; both local views have
+  been fixed.
+- This review is repo-only. Rebuilding `docs/` is not needed for a `REVIEW.md`
+  update.
 
 ## Recommended Edits, Prioritized
 
-### P1: Make capacity numeric and use it in the design
+### P1: Make ingest semantics explicit
 
-Add concrete scale assumptions and derived sizing: events/sec, bytes/sec,
-burst multiplier, stream partitions, hot-index size, cold retention size,
-search QPS, alert-rule count, and indexing lag target.
+Define exactly where auth, quota, redaction, buffering, acknowledgement,
+destructive shedding, raw archival, and hot-index sampling happen. This is the
+highest-value remaining edit because it protects the central durability and
+privacy claims.
 
-### P1: Expand API and data-model contracts
+### P1: Reconcile capacity math and shard sizing
 
-Add tenant/source/schema identity, ingest dedupe/backpressure behavior,
-search pagination and async cold-query behavior, alert-rule APIs, and records
-for policies, schemas, offsets, segment metadata, alert state, query jobs, and
-usage quotas.
+Resolve the 20M events/sec vs 700K events/sec mismatch, split accepted/raw/
+indexed/cold volumes, and replace the 5 TB/shard shortcut with an explicit
+segment/shard/node sizing model.
 
-### P1: Add tenant/security/privacy requirements
+### P1: Align cold-query flows with async query jobs
 
-Make RBAC, source authentication, redaction, query auditing, encryption, and
-per-tenant retention/fairness first-class concerns.
+Change cold branches in sequences/flows to return a query job, run scan or
+rehydration asynchronously, and expose polling/results/TTL/cost caps.
 
-### P2: Make cold retrieval concrete
+### P2: Introduce the control plane earlier
 
-Describe object layout, catalog lookup, query jobs, rehydration limits,
-temporary result/index TTL, and how users experience old searches.
+Add lightweight control-plane dependencies in Step 2, Step 3, Step 5, or Step
+7 so tenant/source/schema/quota/RBAC metadata is not only visible in the final
+design.
 
-### P2: Tighten ingestion reliability semantics
+### P2: Add dedupe and sampling-weight records
 
-Define acknowledgement, retries, duplicate handling, partial acceptance,
-dead-letter handling, and pre-ack overload behavior.
+Add event or batch identity fields and sample weight/watermark fields to make
+retry dedupe, partial acceptance, weighted aggregations, and rebuildability
+concrete.
 
-### P2: Fix renderer-facing local view mismatches
+### P2: Add alert delivery operations
 
-Add `Processor` to the Step `index` view or remove `processor-indexer`. Add
-`RawStore` to the Step `reliability` view or remove `raw-cold`.
+Cover notification routing, retry, suppression, escalation, alert storms, and
+delivery audit, either in Step 6 or the reliability step.
 
 ### P3: Add focused failure drills
 
-Add drills for buffer saturation, malformed/poison log records, mapping
-explosion from high-cardinality fields, cold-query runaway cost, alert storm
-suppression, and leaked-secret redaction.
-
-### P3: Add optional technology choices
-
-If this is intended as a book flagship case, a `technologyChoices` section would
-be useful: Kafka/Pulsar/Redpanda for the buffer, OpenSearch/Elasticsearch/Loki
-for hot search, ClickHouse/Parquet object storage for analytics, Flink/Kafka
-Streams for processing, and cloud-native logging alternatives.
+Add drills for buffer saturation, index lag, malformed/poison records,
+high-cardinality field explosion, leaked-secret redaction, runaway cold query,
+lifecycle backlog, and alert delivery failures.
 
 ## What Not To Change
 
-- Keep the seven-step structure. It is coherent and maps well to interview
-  pacing.
-- Keep the baseline-first teaching style; it makes each later component feel
+- Keep the seven-step structure. It maps well to interview pacing.
+- Keep the baseline-first narrative; it makes each later component feel
   necessary.
-- Keep stream-based alerting as the default over scheduled index polling.
+- Keep stream-based alerting as the preferred design over scheduled index
+  polling.
 - Keep raw archive plus rebuildable immutable segments as the reliability
   backbone.
-- Keep the cost-vs-searchability tradeoff as the central theme.
+- Keep technology choices as a wrap-up section; they are useful and do not
+  overload the main architecture path.
 
 ## Bottom Line
 
-This is a good conceptual logging-system interview. The core architecture and
-pedagogical arc are sound. To make it book-flagship quality, harden the
-production contracts: numeric capacity, richer API/data model, tenant/security
-controls, explicit cold-query workflows, precise ingestion semantics, and the
-two local diagram fixes.
+The logging-platform interview has moved from a solid conceptual draft to a
+strong production-oriented case. One more consistency pass around ingest
+semantics, capacity sizing, cold-query jobs, control-plane staging, and alert
+operations should make it flagship-ready.

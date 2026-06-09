@@ -1,297 +1,310 @@
-# Review: Spotify - Audio Streaming - System Design
+# Review: Spotify — Audio Streaming — System Design
 
 Reviewed file: `data/book/spotify/interview.json`
 Review date: 2026-06-09
 
 ## Executive Summary
 
-This is a clear, usable first-pass case for audio streaming. The main teaching
-arc is sound: start with naive origin streaming, move to segmented CDN delivery,
-split catalog from user library state, store playlists by track reference,
-handle offline download/sync, and use play-event streams for recommendations and
-royalties.
+The recent dataset pass materially improves the Spotify case. The earlier
+largest gaps — quantitative capacity, entitlement/DRM, regional availability,
+search indexing, richer data contracts, royalty accounting, feature storage,
+hot-content operations, and diagram hygiene — are now addressed in the source
+interview.
 
-The dataset is not yet at the depth of the stronger book cases. It states
-Spotify-scale requirements, but the capacity model, API contracts, data model,
-and final architecture stay too small for that scale. The largest gaps are
-entitlement/DRM/licensing state, search/indexing, richer playlist/offline/play
-event records, royalty accounting consumers, operational SLOs, and a few
-renderer-facing diagram inconsistencies.
+This is now a strong book-style walkthrough. It has a coherent seven-step arc,
+good production vocabulary, concrete capacity numbers, and a final architecture
+that integrates audio delivery, catalog/search, library/playlists, offline
+licenses, play-event streams, recommendations, and royalties. The remaining
+work is mostly second-layer depth: make recommendations/home feed less
+placeholder-like, tighten rights/accounting details, promote some operational
+details into first-class architecture, and fix a few dataset coherence nits.
 
 | Area | Score | Notes |
 | --- | ---: | --- |
-| System design soundness | 3.5/5 | The main split is right, but several required state surfaces are only implied. |
-| Production realism | 3.2/5 | CDN, segmentation, offline sync, and streams are present; licensing, DRM, search, royalty accounting, failure handling, and operations are thin. |
-| Pedagogical flow | 3.8/5 | The seven-step arc is coherent, but many steps need stronger problem statements, failure drills, and concrete trade-offs. |
-| Dataset/rendering fit | 3.7/5 | JSON parses and most references resolve; two step diagrams reference link endpoints outside their node lists. |
-| Overall | 3.5/5 | Good foundation; one substantial content pass would make it book-quality. |
+| System design soundness | 4.3/5 | Core media, catalog, library, offline, event, entitlement, and royalty paths are credible. |
+| Production realism | 4.1/5 | Much stronger than before; fraud/privacy/observability and recommendation serving still need more shape. |
+| Pedagogical flow | 4.2/5 | The step sequence works and now has decision prompts, recaps, traps, and drills; Step 7 is dense and could teach more gradually. |
+| Dataset/rendering fit | 4.4/5 | JSON parses, structured views resolve, and prior link endpoint issues are fixed; a few mapping/pattern details remain. |
+| Overall | 4.2/5 | Book-quality foundation with targeted polish still worthwhile. |
 
 ## What Works Well
 
-- The scope is easy to understand: streaming playback, catalog browsing,
-  personal libraries/playlists, offline use, recommendations, and royalties.
-- The high-level architecture uses the right core boundaries: streaming
-  service, object storage, CDN, catalog service/store, library service/store,
-  ingestion/transcode, play-event log, and recommendation service.
-- Step 2's default option explains segmented audio, signed segment URLs, CDN
-  origin misses, adaptive bitrate, and egress cost.
-- The catalog/library split and reference-by-id playlist pattern are the right
-  lessons for shared media plus per-user mutable state.
-- Offline playback is framed as encrypted local cache plus reconnect
-  reconciliation rather than just "download files."
-- The play-event stream option correctly avoids synchronous analytics writes on
-  the playback path and names idempotent consumers for royalty accuracy.
+- The capacity section now does real work: catalog PB estimate, concurrent
+  stream bandwidth, segment QPS, CDN hit-ratio/origin-miss budget, play-event
+  rate, search read QPS, and ingestion throughput all tie back to design steps.
+- The playback path now models the critical licensed-media decision: per-play
+  entitlement checks across subscription, market, availability, device, signed
+  segment URLs, short TTLs, and DRM licenses.
+- Search is no longer hand-waved as catalog DB reads. The case adds a dedicated
+  search index, indexing path, market filtering, and prefix/typo-tolerant
+  ranked search.
+- The data model has become much more credible: rights policy, subscriptions
+  and devices, playlist items with fractional rank/versioning, offline download
+  state, raw play events, royalty ledger, and feature store.
+- Play-event processing is correctly split between recommendations and a
+  separate idempotent, fraud-filtered royalty ledger.
+- The step extras are much richer than the old review: decision prompts,
+  why-now sections, recaps, traps, failure drills, and scale bottlenecks make
+  the walkthrough easier to teach.
+- Prior diagram issues appear fixed. Step views and string links resolve, and
+  the previous missing endpoint cases for `library` and `scale` no longer show
+  up in the current structured views.
 
 ## Highest-Impact Issues
 
-### 1. Capacity is descriptive, not quantitative enough to drive design choices
+### 1. Recommendation serving is still thinner than the rest of the design
 
-The capacity section names "100M+ tracks", "tens of millions" of concurrent
-streams, "few MB" tracks, sub-second start latency, and "billions/day" of play
-events. Those are useful headlines, but they do not convert into bandwidth,
-storage, request rate, CDN hit ratio, origin miss traffic, ingestion backlog, or
-stream partitions.
+The case now has `FeatureStore` and `RecSvc`, which is a major improvement, but
+the personalized-home requirement still reads mostly as "play events feed
+features, then recs write to library." It does not yet explain candidate
+generation, ranking, online retrieval, home-feed serving, freshness, or why
+generated playlists differ from a real-time recommendation shelf.
 
-Why it matters: the case claims Spotify scale. Readers need enough arithmetic
-to justify CDN-first delivery, object-store layout, play-log partitioning,
-offline cache limits, catalog/search cache behavior, and hot-release prewarming.
+Why it matters: recommendations are one of the named product requirements, and
+the rest of the dataset has become concrete enough that this path now stands
+out as the least developed major subsystem.
 
-Concrete fix: add capacity bullets such as average/peak segment QPS, edge
-bandwidth, origin miss budget at several hit ratios, audio storage multiplier
-for bitrate ladders, play-event events/sec, event retention, ingestion/transcode
-throughput, and catalog/search read QPS. Tie each number to a step.
+Concrete fix: add a small recommendation-serving shape: play log -> stream/batch
+features -> feature store + candidate store/model outputs -> recommendation
+service -> home/feed or generated playlist API. Name the latency expectations
+for home page personalization versus weekly playlist generation, and explain
+fallbacks for cold-start users.
 
-### 2. The API and data model do not support the behavior promised by the prose
+### 2. Rights and royalty modeling is strong at the API level but still compact
 
-The API surface is intentionally small, but it omits fields that later become
-important: user/device/session identity, market/region, entitlement state,
-manifest version, DRM/license response, idempotency/event IDs, offline batch
-sync, playlist item positions, optimistic concurrency, and unavailable-track
-handling. The data model has only `tracks`, `playlists`, and `play_event`.
+`rights_policy`, `isrc`, and `royalty_ledger` are the right primitives. The
+remaining gap is that labels, territories, rights holders, splits, effective
+windows, disputes, corrections, and audit/replay workflows are still compressed
+into one policy row and one ledger row.
 
-Why it matters: offline download, licensing, playlist edits, royalty counts,
-recommendations, and search cannot be made reliable from these records alone.
-The design reads plausible at the component level but underspecified at the
-state level.
+Why it matters: the interview does not need a full music-industry accounting
+system, but it should be honest that "accurate royalties" involves more than
+deduping play events. The current design could make readers underweight rights
+holder splits and replayable accounting periods.
 
-Concrete fix: add or expand records for `artists`/`albums`, `playlist_items`
-with position/version, saved-library rows, offline download/license state,
-playback sessions, deduped play events with event ID and device timestamp,
-royalty aggregation or accounting output, and recommendation feature/history
-storage. Update APIs with idempotency keys, versions, and sync cursors.
+Concrete fix: add one or two sentences or fields for rights-holder splits,
+territorial contracts, ledger period close/replay, and adjustment events. Keep
+it bounded; the goal is to show the boundary, not design a finance platform.
 
-### 3. Entitlements, DRM, takedowns, and region restrictions are only implied
+### 3. Observability is present as prose but not represented in the architecture
 
-The text mentions signed segment URLs, key rotation, encrypted offline cache,
-license revalidation, and tracks becoming unavailable. There is no entitlement
-or license service, no rights/policy store, no DRM license flow, no regional
-availability state, and no takedown invalidation path in the final design.
+Step 7 has useful operating metrics: start latency p99, rebuffer ratio, CDN hit
+ratio, origin miss QPS, manifest/entitlement failures, play-log lag, duplicate
+rate, royalty lag, offline sync conflicts, ingestion backlog, and transcode
+dead-letter rate. However, there is no observability node or flow in the
+high-level architecture/final design.
 
-Why it matters: for a music streaming system, "can this user play/download this
-track in this country on this device right now?" is on the critical path. It
-also affects offline expiration, cached manifests, CDN tokens, playlist
-hydration, and royalty reporting.
+Why it matters: for a media system, quality-of-experience metrics are not
+incidental. They are how operators detect CDN regressions, bad bitrate ladders,
+entitlement outages, fraud spikes, and ingestion backlogs.
 
-Concrete fix: introduce an Entitlement/License service and rights-policy store.
-Show playback checking user subscription, region, track availability, and
-device/offline rules before issuing manifest URLs and DRM keys. Add a flow for
-license/takedown changes invalidating manifests, offline licenses, and playlist
-hydration results.
+Concrete fix: add an `Observability` node of canonical type `observability` to
+the final design or scale view, fed by client playback telemetry, CDN/origin
+metrics, service metrics, and pipeline lag. The text is already good; the
+diagram should make it visible.
 
-### 4. Search and recommendations are requirements but not designed deeply
+### 4. Fraud, privacy, and retention need one more production pass
 
-"Search and browse a large music catalog" is a functional requirement, yet the
-architecture has no search index, indexing pipeline, query path, cache, ranking,
-or typo/prefix strategy. Recommendations are represented by `RecSvc`, but there
-is no feature store, model/batch pipeline, online retrieval path, or separation
-between recommendations and royalty accounting consumers.
+The dataset now says royalties are fraud-filtered and play events retain raw
+data for about 30 days before aggregation. That is directionally correct, but
+the fraud/privacy boundary remains thin. Listening history is sensitive, and
+fraud filtering affects payments.
 
-Why it matters: the dataset risks teaching that catalog DB queries and a single
-recommendation service are enough for a music product. At this scale, search and
-personalized home are their own read paths and data pipelines.
+Why it matters: a senior/staff answer should mention abuse controls and data
+governance when behavior data drives money and personalization.
 
-Concrete fix: add a search/index component fed by catalog ingestion, and add a
-recommendation pipeline split such as play log -> stream/batch processors ->
-feature/history store -> recommendation service. Add a separate royalty
-consumer/ledger so recommendations and accounting do not look like the same
-system.
+Concrete fix: add a fraud/risk consumer or a short fraud-filtering paragraph:
+bot/farm signals, device/account velocity, suspicious repeats, appeal/replay
+path, and separation from recommendation features. Add a retention/privacy note
+for raw play events, user deletion/export, and aggregation/anonymization.
 
-### 5. The walkthrough needs more production failure modes and operations
+### 5. A few dataset coherence details lag behind the content upgrades
 
-The steps teach the broad architecture, but only the naive step has a trap. The
-case would benefit from failure drills around CDN outage/origin overload,
-playlist concurrent edits, offline sync conflicts, duplicate/late play events,
-fraudulent play farming, hot new releases, catalog takedowns, and ingestion
-retries.
+The source requirements list six functional requirements, but
+`satisfies.functional` maps five; licensed playback is represented under
+non-functional instead of matching the functional requirement. The
+`Async ingestion pipeline` pattern points to `playback`, even though Step 7 is
+the main ingestion/hot-content step. Step 7 has no `concepts` despite
+introducing ingestion state machines, origin shields, prewarming, SLOs, and
+derived-state rebuildability.
 
-Why it matters: the current case is good for explaining the happy path. A
-strong senior/staff interview answer should also expose where the design breaks,
-what is retried, what is idempotent, what is eventually consistent, and which
-metrics page an operator would watch.
+Why it matters: these are small, but they affect the rendered wrap-up and the
+reader's ability to trace requirements and patterns back to the right step.
 
-Concrete fix: add traps or failure drills to Steps 2, 4, 5, 6, and 7. Add
-observability/SLO details for start latency, rebuffer ratio, CDN hit ratio,
-origin egress, manifest failures, offline sync conflicts, play-log lag,
-duplicate rate, royalty pipeline lag, and ingestion backlog.
+Concrete fix: add a functional `satisfies` row for licensed playback/download
+or move that requirement category consistently; add `scale` to the async
+ingestion pattern; add one or two Step 7 concepts such as "Ingestion state
+machine" and "Hot-content prewarming/origin shield."
 
 ## System Design Soundness
 
-The core playback architecture is directionally correct. Segmented audio served
-from a CDN with object storage as origin is the right default, and the option
-set in Step 2 compares it against peer-assisted and direct-origin delivery in a
-useful way.
+The core architecture is sound. CDN-served segmented audio is the right default
+for instant start and massive fanout. The design correctly keeps application
+servers off the byte-serving hot path, uses object storage as durable origin,
+and explains the origin-miss budget at a 98-99% edge hit ratio.
 
-The catalog/library split is also sound. Shared catalog metadata and per-user
-mutable library state have different scale, consistency, and caching needs.
-The reference-by-id playlist lesson is appropriate because duplicating track
-metadata across millions of playlists creates storage and takedown problems.
+The catalog/library split is also well handled. Shared catalog state, search
+indexing, and per-user mutable library/playlists are separated, and the
+playlist-item model avoids the earlier track-id-array weakness. The design now
+accounts for unavailable tracks at hydration time instead of assuming every
+reference remains playable forever.
 
-The design becomes thin around state and policy. A music system needs rights,
-availability, user subscription/device authorization, signed URL expiry, DRM key
-issuance, offline license expiry, and takedown propagation. The current model
-has hooks in the prose but no components or records to own those decisions.
+Entitlement and offline playback are credible. Playback and download APIs carry
+device/market/session context, rights are versioned, offline licenses expire
+and revalidate, and takedowns invalidate manifests and offline licenses. That
+is the right shape for licensed media.
 
-The play-event architecture is directionally right but should be more precise.
-It should distinguish raw events, deduped playback sessions, recommendation
-features, royalty/accounting aggregates, fraud/bot filtering, and metrics. A
-single `PlayLog -> RecSvc -> LibrarySvc` path hides the harder accounting and
-consumer-isolation questions.
+The play-event system now separates raw ingestion from recommendation features
+and royalty accounting. The design names idempotency keys, session/sequence
+ordering, client/server timestamps, dedupe windows, stream thresholds, fraud
+filtering, and an auditable ledger. The remaining improvement is to make the
+fraud/accounting boundary a little more explicit.
+
+Search is finally designed as its own path. The dedicated index, market filter,
+and ingestion-fed updates close the old "catalog DB does search" gap.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: Stream the Whole File from the App Server
 
-This is a good baseline. The diagram and trap expose why direct whole-file
-streaming fails: slow start, origin bandwidth pressure, and no adaptive bitrate.
+This remains a good baseline. The decision prompt now asks what happens to
+latency and origin load at tens of millions of streams, which sets up Step 2
+well. The trap is clear and specific.
 
-Improvement: add a short problem statement or recap that tees up Step 2. The
-reader should see that the next design goal is to keep playback traffic off the
-application servers and start audio after the first small segment, not after a
-whole object fetch.
+Improvement: no major change needed. If anything, keep this step short so it
+does not compete with the real design.
 
 ### Step 2: Segmented Audio Delivery via CDN
 
-This is the strongest step. It teaches manifest URLs, edge segment fetches,
-origin misses, bitrate ladders, pre-segmentation, and CDN egress trade-offs.
-The peer-to-peer alternative is useful historical context.
+This is now the strongest step. It combines segmented streaming, bitrate
+ladders, CDN cache behavior, origin miss budgeting, entitlement checks, signed
+URL TTLs, DRM licenses, takedown-driven manifest invalidation, and CDN failure
+drills. The options compare the real default against peer-assisted delivery
+and origin streaming without strawmen.
 
-Improvements: add entitlement/DRM checks to the playback flow, include manifest
-and segment cache keys/TTL at a high level, and add a failure drill for CDN
-miss storms or a massive new release that needs prewarming.
+Improvement: if adding an observability node later, this step should mention
+client playback telemetry and CDN/origin metrics as first-class signals.
 
 ### Step 3: Catalog vs Library Split
 
-The concept is correct and well placed. The step separates shared, mostly
-cacheable metadata from user-owned mutable state before playlists are modeled.
+The search-index addition fixes the prior biggest gap in this step. The lesson
+now covers authoritative catalog metadata, separate ranked search, market
+filtering, and the different scaling axes for catalog and user library.
 
-Improvements: add the search/index read path here or in a nearby sub-step. The
-functional requirement says search and browse a large catalog; a catalog DB
-alone is not the right mental model for prefix search, relevance ranking,
-artist/album browsing, or popularity signals.
+Improvement: add a short note on stale search results after takedown: the
+catalog/rights store is authoritative, and the search index is rebuildable and
+filtered at query/hydration time.
 
 ### Step 4: Playlists and Library (Reference by ID)
 
-The default option is the right one, and the denormalized alternative explains
-the storage and takedown downsides clearly.
+This step is much stronger after the move from a single `track_ids` array to
+playlist item rows with fractional rank and optimistic concurrency. The
+unavailable-track trap is a useful production detail.
 
-Improvements: model playlist items as rows or an ordered CRDT-like list rather
-than one `track_ids` array. Add optimistic concurrency, version/cursor based
-sync, collaborative playlist conflict behavior, deleted/unavailable track
-hydration, and cache strategy for resolving many track IDs.
+Improvement: collaborative playlists are in follow-ups; consider one small
+failure drill here for concurrent offline edits or collaborative reorder
+conflicts, since the data model now has enough detail to support it.
 
 ### Step 5: Offline Download and Sync
 
-The step correctly states encrypted local cache, library edits buffered offline,
-and license revalidation on reconnect.
+This step now has the right primitives: device-bound offline licenses, encrypted
+local cache, license expiry/revalidation, sync cursors, buffered edit
+operations, and conflict handling. The failure drills are practical.
 
-Improvements: make offline a real state machine. Track download intent,
-downloaded segment set, license expiry, device limit, subscription/region
-revalidation, local edit operations, sync cursor, conflict policy, and delete or
-revocation behavior when a track becomes unavailable.
+Improvement: state whether offline play events are uploaded through the same
+`/v1/plays:batch` path and how very late events are accepted, deduped, or
+excluded from a closed royalty period.
 
 ### Step 6: Play Events: Recommendations and Royalties
 
-The default stream option is correct and the synchronous database alternative is
-a useful foil. The flow correctly keeps event ingestion asynchronous so playback
-is not blocked by analytics.
+The asynchronous event log remains the right answer, and the current version
+adds the important split between feature generation and royalty accounting. The
+traps are good: do not count directly from an at-least-once raw log, and do not
+couple recs and royalties.
 
-Improvements: split the consumers. Recommendations, royalty accounting, fraud
-filtering, resume position, metrics, and artist dashboards have different
-latency and correctness requirements. Add event IDs, playback session IDs,
-sequence numbers, client timestamps, server receive timestamps, offline batch
-upload, dedup windows, and threshold semantics for "counts as a stream."
+Improvement: add a bit more recommendation-serving depth and a short fraud
+consumer shape. This would bring the step up to the same quality as playback
+and offline.
 
 ### Step 7: Ingestion, Hot Content, and Scale
 
-This works as a synthesis step, but it is too brief for the title. Ingestion,
-hot content, and scale are each substantial topics.
+This step is now much more substantial. It covers ingestion state, deterministic
+output keys, retry/dead-letter, publish-last semantics, rollback, CDN prewarm,
+origin shield, popularity cache, log backpressure, derived state, and operating
+SLOs.
 
-Improvements: add a concrete ingestion state machine for masters, transcode
-jobs, segment output, catalog publish, retry/dead-letter behavior, and rollback.
-For hot content, add CDN prewarm, origin shield, per-track popularity cache, and
-backpressure. For scale, add SLOs and operator metrics.
+Improvement: split or teach the concepts more explicitly. Step 7 carries many
+advanced ideas but has no `concepts`, and the async ingestion pattern is not
+linked to this step. Add concepts for the ingestion state machine and
+hot-content/origin-shield strategy.
 
 ## Final Design Review
 
-The final design integrates the main components introduced in the steps. It
-does not accidentally put the application server on the segment hot path, and
-it preserves the catalog/library split and play-event stream.
+The final design now integrates the important systems introduced by the steps:
+`StreamSvc`, `EntSvc`, `RightsDB`, `CDN`, `AudioStore`, `CatalogSvc`,
+`CatalogDB`, `SearchIdx`, `LibrarySvc`, `LibraryDB`, `Ingest`, `PlayLog`,
+`FeatureStore`, `RecSvc`, `Royalty`, and `RoyaltyDB`.
 
-The final design should become more explicit about the systems it currently
-implies: entitlement/license checks before playback and offline download,
-search indexing for catalog browsing, recommendation and royalty consumers,
-feature/history storage, fraud filtering, and operational monitoring. Without
-those, the final design is a good audio-delivery diagram but not yet a full
-Spotify-like product design.
+The description is strong. It states which stores are authoritative and which
+stores are rebuildable derived state, explains offline license and sync behavior,
+and separates recommendation features from royalty ledgering.
+
+The main final-design omission is observability. Step 7 names the right SLOs,
+but the final diagram does not show how playback telemetry, CDN/origin metrics,
+service failures, and pipeline lag are collected. Add that if the goal is a
+staff-level final architecture.
 
 ## Concept Introduction and Learning Flow
 
-The concept sequence is logical: naive delivery, segmented CDN delivery,
-catalog/library split, reference-by-id playlists, offline sync, play-event
-streams, then scale. Each concept mostly arrives near the step where it matters.
+The concept sequence is logical and much improved:
 
-The main teaching gap is that several steps state outcomes without exposing the
-pressure that forces the mechanism. Adding `problem`/`decision` style prose,
-traps, and failure drills would make the walkthrough more interview-like. The
-case should let readers practice why a mechanism is needed, not only recognize
-the final mechanism.
+- Step 1 establishes the failed baseline.
+- Step 2 introduces segmented CDN delivery and entitlement.
+- Step 3 separates catalog, library, and search.
+- Step 4 models playlist references and concurrent ordering.
+- Step 5 adds offline cache/license/sync.
+- Step 6 turns playback behavior into durable streams for recs and royalties.
+- Step 7 closes with ingestion, hot-content scaling, and operations.
+
+The new `decisionPrompt`, `whyNow`, and `recap` fields make the case feel more
+like an interview walkthrough than a static architecture note. The remaining
+pedagogical gap is Step 7 density: it introduces several staff-level concepts
+at once without concept cards.
 
 ## Step-to-Final-Design Coherence
 
-The final architecture includes the components introduced by the steps:
-`StreamSvc`, `AudioStore`, `CDN`, `CatalogSvc`, `CatalogDB`, `LibrarySvc`,
-`LibraryDB`, `Ingest`, `PlayLog`, and `RecSvc`. The `satisfies` section maps
-the major requirements to relevant steps and all listed step IDs resolve.
+The final architecture now reflects the step additions. Entitlement/rights,
+search index, feature store, royalty accounting, and ingestion are all present
+in `highLevelArchitecture` and the final design. This closes most of the old
+coherence problems.
 
-The coherence gaps are mostly omissions rather than contradictions. Search is a
-requirement without a designed component. Royalties are named but do not appear
-as a consumer or ledger. Offline license enforcement is mentioned but not owned.
-Catalog availability changes are mentioned in follow-ups but not reflected in
-the data model or final design.
+The remaining mismatches are small:
+
+- Licensed playback/download is listed as a functional requirement but mapped
+  under non-functional satisfaction.
+- `Async ingestion pipeline` points to Step 2 even though Step 7 is the
+  ingestion/scale synthesis step.
+- Step 7's scale concepts are mostly embedded in prose rather than represented
+  as concept cards/pattern tags.
 
 ## Realism Compared With Production Systems
 
-For an interview, this is realistic at the first architectural layer. It knows
-that audio is segmented, cached, and authorized by manifest/URL issuance rather
-than streamed through app servers. It understands that playlists reference
-shared tracks and that play events should flow through a durable log.
+This is now realistic at the level expected for a strong system design
+interview. It does not pretend that app servers stream audio, that catalog DBs
+serve ranked search, that offline is just "download a file," or that raw play
+logs can directly pay royalties.
 
-Production realism needs another layer of detail:
+Production caveats worth adding:
 
-- Entitlement, subscription, rights, market availability, and DRM license
-  issuance.
-- CDN prewarming, origin shield, cache invalidation, signed URL TTLs, and
-  regional edge behavior.
-- Search indexing and ranking separate from the authoritative catalog store.
-- Playlist ordering, concurrent edits, sync cursors, and unavailable-track
-  hydration.
-- Offline license expiry, device limits, subscription checks, conflict
-  resolution, and revocation.
-- Raw play-event deduplication, fraud filtering, stream-count thresholds,
-  royalty ledgering, and delayed/offline event handling.
-- Ingestion/transcode retries, deterministic output keys, publish state, and
-  rollback.
-- Observability and operations for quality of experience and cost.
+- Rights contracts and royalty splits are simplified.
+- Recommendation serving and cold-start behavior are simplified.
+- Fraud filtering is named but not architected.
+- Privacy, deletion/export, and play-history retention are only lightly
+  covered.
+- Observability is described but not shown as an architectural path.
+
+These are acceptable omissions for a bounded case, but they are the right next
+places to deepen the interview.
 
 ## Dataset and Renderer-Facing Observations
 
@@ -299,70 +312,65 @@ Production realism needs another layer of detail:
 - Step view node IDs resolve to `highLevelArchitecture.nodes`.
 - Step and final-design string link references resolve to
   `highLevelArchitecture.links`.
+- The previous `library` view issue with `lb-catalog` is fixed by a local
+  inline `LibrarySvc -> CatalogSvc` link.
+- The previous `scale` view issue with `client-playlog` is fixed; `Client` is
+  now included in that view's nodes.
+- The peer-assisted option's local `Peers` node now has `type: "client"`.
 - `satisfies[*].steps[*]` and `patterns[*].steps[*]` resolve to real step IDs.
 - No raw `diagram` fields appear under structured step or final-design areas.
-- `steps[library].view.links` includes `lb-catalog`, whose source endpoint
-  `LB` is not listed in that view's nodes. The default option uses an inline
-  `LibrarySvc -> CatalogSvc` link that better matches the caption.
-- `steps[scale].view.links` includes `client-playlog`, whose source endpoint
-  `Client` is not listed in that view's nodes. This can cause Mermaid to create
-  an implicit unlabeled node.
-- The peer-assisted delivery option introduces a local `Peers` node without a
-  canonical node type. Add `type: "client"` or another suitable type so styling
-  is intentional.
-- `REVIEW.md` is repo-only; no docs rebuild is needed for this review.
+- `REVIEW.md` is repo-only; no docs rebuild is needed for this review update.
 
 ## Recommended Edits, Prioritized
 
-### P1: Add quantitative capacity and workload math
+### P1: Add recommendation-serving depth
 
-Expand capacity into concrete request, bandwidth, storage, event, and ingestion
-numbers. Use those numbers to justify CDN, object storage, play-log partitions,
-and ingestion worker scale.
+Show how features become personalized home/generated playlists: candidate
+generation, model or batch output, online ranking/retrieval, cold-start
+fallbacks, and freshness expectations.
 
-### P1: Model entitlement, DRM, regional availability, and offline license state
+### P1: Add observability to the architecture
 
-Add an entitlement/license component, policy store, playback authorization flow,
-DRM/offline license fields, and takedown/region-change behavior.
+Represent playback QoE, CDN/origin, entitlement, play-log, royalty, fraud, and
+ingestion metrics with an observability node/path in the final or scale view.
 
-### P1: Strengthen API and data-model contracts
+### P2: Tighten rights, royalty, fraud, and privacy boundaries
 
-Add playlist item/version records, saved-library rows, playback sessions,
-deduped play events, offline download/license state, and royalty/recommendation
-outputs. Add idempotency keys, sync cursors, event IDs, versions, and region or
-device context to APIs.
+Add concise details for rights-holder splits, territorial contracts, accounting
+period replay/adjustments, fraud signals, and retention/deletion handling for
+listening history.
 
-### P2: Add search and recommendation pipeline depth
+### P2: Fix requirement and pattern traceability
 
-Introduce a catalog search index and indexing path. Split recommendations into
-feature/history processing and online retrieval. Add a separate royalty
-accounting consumer or ledger.
+Align the licensed-playback functional requirement with `satisfies.functional`,
+and link `Async ingestion pipeline` to `scale` as well as or instead of
+`playback`.
 
-### P2: Add failure drills and operations
+### P3: Add Step 7 concept cards
 
-Add drills for CDN miss storms, offline sync conflicts, duplicate late play
-events, fraud, ingestion retry/dead-letter, and licensing takedowns. Add SLOs
-and metrics for playback quality, CDN cost, event lag, and ingestion backlog.
+Add concepts for "Ingestion state machine" and "Hot-content prewarming/origin
+shield" so the dense scale step is easier to scan and teach.
 
-### P3: Fix diagram hygiene
+### P3: Add a collaborative/offline playlist conflict drill
 
-For the `library` and `scale` step views, either include the missing endpoint
-nodes or replace the link references with inline links whose endpoints are in
-the view. Give the `Peers` option node a canonical type.
+The playlist data model supports concurrent edits; a short failure drill would
+make that lesson more interview-ready.
 
 ## What Not To Change
 
 - Keep the seven-step arc.
 - Keep the naive baseline as contrast.
 - Keep segmented CDN delivery as the default playback answer.
-- Keep the catalog/library split and reference-by-id playlist lesson.
-- Keep offline as encrypted local cache plus reconnect reconciliation.
-- Keep play-event logging asynchronous and off the playback critical path.
-- Keep peer-assisted delivery as a non-default historical alternative.
+- Keep entitlement/DRM on the playback and offline authorization paths.
+- Keep the catalog/search/library separation.
+- Keep playlist item rows with reference-by-id hydration.
+- Keep play-event ingestion asynchronous and off the playback critical path.
+- Keep recommendation and royalty consumers separated.
+- Keep Step 7 as the capstone, but make its concepts more explicit.
 
 ## Bottom Line
 
-This dataset has the right backbone for a Spotify-style audio streaming
-interview. To become book-quality, it needs more quantitative capacity, stronger
-state models, entitlement/DRM/search/recommendation depth, and a small diagram
-cleanup pass.
+The Spotify dataset has moved from a good first-pass case to a credible
+book-quality system design interview. The remaining work is targeted: deepen
+recommendations, show observability, sharpen rights/accounting/fraud/privacy,
+and clean up a few requirement/pattern mappings.

@@ -1,360 +1,350 @@
-# Review: Fraud Detection - System Design
+# Review: Fraud / Abuse Detection - System Design
 
 Reviewed file: `data/book/fraud-detection/interview.json`
 Review date: 2026-06-09
 
 ## Executive Summary
 
-This is a coherent and useful fraud-risk walkthrough. The step arc is strong:
-start with static rules, add inline rules + ML, introduce fresh velocity
-features, add entity graph signals, split decisions into block/challenge/review,
-close the label/retraining loop, and finish with latency/failure/adversarial
-concerns.
+The recent hardening pass materially improved this interview. The previous
+review's biggest issues are now addressed: capacity is numeric, decision
+identity and idempotency are explicit, the data model names the operational
+state behind the architecture, review/challenge are modeled as workflows, the
+fallback story is per-action rather than a universal "fail open", privacy and
+poisoning are first-class requirements, and the old Step 3 local-view endpoint
+mismatch is fixed.
 
-The main gaps are production depth rather than concept choice. The dataset
-teaches the right components, but several of the contracts and records needed to
-operate those components are still implied: quantitative capacity, idempotent
-decision/event identity, review-case state, challenge outcomes, graph storage,
-rules/model versioning, privacy controls, and per-action fallback policy.
+The dataset is now a strong book-quality fraud-system walkthrough. The core
+architecture is credible, the teaching arc is clear, and the final design
+integrates the concepts introduced by the steps. Remaining work is mostly a
+second-pass polish: align a few stale wrap-up/interviewer phrases with the new
+fallback stance, make challenge/review API contracts a bit more explicit, and
+turn the new capacity assumptions into a few concrete sizing and operating
+decisions.
 
 | Area | Score | Notes |
 | --- | ---: | --- |
-| System design soundness | 3.8/5 | The architecture is directionally right, but capacity, API identity, and data-model backing are too light. |
-| Production realism | 3.4/5 | Good fraud concepts; missing key operational state for idempotency, review workflow, model rollout, privacy, and poisoning resistance. |
-| Pedagogical flow | 4.2/5 | The sequence of steps is clean and interview-friendly, with good prompts and recaps. |
-| Dataset/rendering fit | 3.9/5 | JSON parses and most references resolve; one step view references a link endpoint not included in that view. |
-| Overall | 3.8/5 | Strong draft; one focused production-hardening pass would make it book-quality. |
+| System design soundness | 4.5/5 | Strong real-time risk architecture with numeric load, idempotent decisions, feature snapshots, graph state, review state, and versioned policy/model records. |
+| Production realism | 4.3/5 | Much more operationally grounded; review/challenge contracts, retention policy, and concrete staffing/sizing could be sharper. |
+| Pedagogical flow | 4.6/5 | The progression from static rules to ML, features, graph, review, feedback, and resilience is clean and interview-friendly. |
+| Dataset/rendering fit | 4.7/5 | JSON parses, structured views resolve, local link endpoints resolve, and canonical node types are valid. |
+| Overall | 4.5/5 | Ready as a strong flagship case after a small consistency/polish pass. |
+
+## What Changed Since The Prior Review
+
+- Capacity now has design-driving assumptions: ~5k peak decisions/sec,
+  10-20k events/sec, 50-150k feature reads/sec, hot-key notes, p99 ~50ms,
+  graph edge growth, review arrival rate, label lag, and audit storage.
+- `POST /v1/risk/decision` now includes `actionId`, `idempotencyKey`,
+  `eventTime`, entity IDs, policy context, `decisionId`, policy/model versions,
+  fallback mode, and challenge/review references.
+- Events and labels now have dedupe/join semantics: event IDs, dedupe keys,
+  event time versus ingest time, decision IDs, and label source trust.
+- The data model now backs the system's claims with `decisions`, `events`,
+  `feature_snapshots`, `graph_edges`, `review_cases`, `challenge_attempts`,
+  versioned rules/policies/models, online features, and labels.
+- Step 3 now explains dedupe, late/out-of-order events, hot-key strategy, and
+  decision-time feature snapshots.
+- Step 5 now treats review as a case state machine with evidence snapshots,
+  SLA, analyst assignment, resolution, appeals, RBAC, and audit logging.
+- Step 7 now gives p95/p99 latency slices, feature-staleness and fallback-rate
+  alerting, per-action fallback behavior, reason redaction, probing defense, and
+  poisoning/drift controls.
+- The Step 3 renderer issue from the previous review is resolved: the view now
+  includes `Rules` before using the `rules-features` link.
 
 ## What Works Well
 
-- The requirements name the core fraud-engine tensions: low-latency inline
-  decisions, recall versus false positives, fast adaptation, auditability, and
-  graceful degradation.
-- The high-level architecture uses the right primitives: risk API, rules
-  engine, model serving, online feature store, event stream, streaming
-  aggregator, entity graph, review queue, label store, and trainer.
-- The pedagogical progression is effective. Each step removes a concrete blind
-  spot from the previous step instead of jumping straight to the final design.
-- The options in Steps 2, 3, and 5 compare real choices rather than strawmen:
-  rules-only, model-only, batch features, on-demand features, binary allow/block,
-  and allow-but-flag are all useful interview trade-offs.
-- The dataset introduces point-in-time labeling, online/offline feature parity,
-  tiered thresholds, and adversarial reason leakage, which are the right
-  differentiators for a senior fraud-system answer.
-- The final design integrates the main components introduced by the steps and
-  clearly states the intended steady-state behavior.
+The seven-step arc is strong. The interview starts with understandable static
+rules, then introduces the exact pressures that force a real fraud platform:
+fuzzy ML scoring, fresh velocity features, entity graph signals, tiered
+decisions, human review, label lag, retraining, latency budgets, graceful
+degradation, and adversarial behavior.
+
+The design avoids common fraud-interview mistakes. It does not put graph
+traversal on the inline path, does not rely on batch-only features for
+seconds-fresh abuse, does not collapse every score into a binary allow/block
+decision, and does not pretend chargeback labels are immediate or clean.
+
+The API and data model now give the candidate concrete hooks for senior-level
+discussion: idempotent scoring retries, decision-time feature snapshots,
+event-time processing, source-trusted labels, versioned policy/model rollout,
+and auditability.
+
+The final design is coherent with the steps. Every major component introduced
+in the walkthrough appears in the final architecture, and the final description
+now names state ownership instead of leaving stores implied.
 
 ## Highest-Impact Issues
 
-### 1. Capacity is qualitative, not design-driving
+### 1. A few wrap-up/interviewer phrases still say "fail-open fallback"
 
-The capacity section currently says "very high", "tens of ms", "seconds", and
-"small" without any numeric assumptions. That keeps the design plausible, but it
-does not force the candidate to size the critical paths.
+Most of the dataset now correctly says fallback is per-action and risk-aware:
+login can challenge, small payment can allow-with-flag, high-value payment can
+require step-up/review, and account creation can rate-limit. Two wrap-up areas
+still use the older phrasing:
 
-Why it matters: fraud systems are shaped by derived work units. A design for 500
-decisions/sec, 5,000 decisions/sec, and 100,000 decisions/sec makes different
-choices for feature-store partitioning, event-stream partitions, graph update
-strategy, review sampling, model-serving fleet size, and audit-retention cost.
+- `interviewScript[2].say[]`: "Latency budget, fail-open fallback, adversarial
+  concerns."
+- `levelVariants[2].expectations[]`: "Designs entity-graph features and
+  fail-open fallback."
 
-Concrete fix: add explicit assumptions and derived numbers, for example:
-decision QPS by action type, event write amplification per decision, features
-read per score, feature update rate, hot-key skew by IP/device/card, graph edge
-growth, review queue arrival rate, label lag distribution, audit row size, and
-retention period. Tie those numbers to Step 3 feature serving, Step 4 graph
-updates, Step 5 analyst capacity, and Step 7 latency budget.
+Why it matters: this is exactly the teaching point the hardening pass fixed.
+"Fail open" is a dangerous shorthand for fraud systems because it can imply
+that a risk-engine outage should wave through high-value actions. The main
+content says the opposite; the interviewer scaffolding should not reintroduce
+the old mental model.
 
-### 2. The API lacks stable identity and idempotency for the records used later
+Concrete fix: replace those phrases with "per-action fallback policy" or
+"risk-aware fallback matrix". For Staff level, say the candidate should reason
+about per-action degradation, feature staleness, fallback-rate alerting, and
+audit records for missing model/features.
 
-`POST /v1/risk/decision` accepts action fields and returns a decision, score,
-and reasons. The data model then has `decisions.action_id`, the events endpoint
-emits action/outcome events, and labels refer to `actionId`. The API does not
-show who creates `actionId`, how duplicate scoring requests replay, or which
-decision record a later event/label joins to.
+### 2. Challenge and review are well modeled, but the external contract is still thin
 
-Why it matters: inline callers retry. Without a stable `actionId` or
-idempotency key, the system can double-count attempts, create conflicting
-decisions, poison velocity features, and make labels hard to join to the exact
-decision and feature snapshot.
+Step 5 and the data model now do a good job describing `review_cases` and
+`challenge_attempts`. The API examples expose `challengeId` in the decision
+response, and the prose says review/challenge outcomes feed labels. What is not
+yet as explicit is how callers and downstream systems observe and complete
+those workflows.
 
-Concrete fix: put `actionId`, `idempotencyKey`, `eventTime`, `tenant` or
-business context if scoped, `entityIds`, and `policyContext` in the decision
-request. Return `decisionId`, `decisionVersion` or `policyVersion`,
-`modelVersion`, `fallbackMode`, and a `challengeId` or `reviewCaseId` when
-applicable. State replay semantics: same key and payload returns the original
-decision; same key with different payload is rejected.
+Why it matters: in a real platform, "challenge" and "review" are not just
+decision labels. A caller must know whether to block the action pending a
+challenge, when a challenge expires, how to report challenge completion, how a
+review case is opened, and how final outcomes produce labels/reversals/refunds.
+Without that contract, the architecture is correct but the integration story is
+partly implied.
 
-### 3. The data model is too thin for the architecture it teaches
+Concrete fix: add a concise note or endpoint examples for challenge/review
+state transitions. Examples: decision response returns either `challengeId` or
+`reviewCaseId`; `POST /v1/events` accepts `challenge_passed`,
+`challenge_failed`, `review_resolved`, or `payment_reversed` outcome events; or
+add a small `GET /v1/risk/cases/{caseId}` / callback note if the product flow
+needs async status. Keep it small, but make the lifecycle observable.
 
-The model lists `decisions`, `features (online)`, and `labels`. Those are useful
-but do not back several core mechanisms in the walkthrough: raw event retention,
-feature definitions and point-in-time snapshots, entity graph edges, review
-cases, challenge attempts, rule versions, model registry/deployments, threshold
-policies, and audit access.
+### 3. Capacity is now numeric, but only partly converted into concrete sizing
 
-Why it matters: the prose says the system is auditable, explainable,
-reviewable, retrainable, graph-aware, and fail-safe. Those claims require
-durable records. Otherwise the diagrams teach components whose state ownership
-is unclear.
+The new capacity section is a major improvement. It gives peak QPS, event
+amplification, feature reads/writes, graph edge growth, review arrivals, label
+lag, and audit storage. The step prose uses some of those numbers, especially
+for feature serving and review rate.
 
-Concrete fix: add small data-model sections for:
+Why it matters: the next level of interview value is showing how those
+assumptions drive implementation choices. For example, ~50-150 cases/sec to
+review is too high for manual review unless the band is aggressively sampled,
+batched, or limited by analyst staffing. ~0.5-1 TB/day of audit data forces
+tiered storage and query/index trade-offs. 50-150k feature reads/sec affects
+cache replication and shard count.
 
-- `events` or event log schema with event ID, action ID, event time, ingest time,
-  entity IDs, and dedupe key.
-- `feature_snapshots` or decision-time feature references for training
-  correctness.
-- `graph_edges` / `entity_links` with entity type, confidence, first/last seen,
-  and source event.
-- `review_cases` and `challenge_attempts` with state transitions and outcomes.
-- `rulesets`, `decision_policies`, and `model_versions` with rollout state.
+Concrete fix: add two or three derived decisions, not a full capacity chapter:
+approximate stream partitions/consumer parallelism, feature-store shard/replica
+reasoning, analyst staffing or review-band throttling, and audit hot/cold
+retention tiers. This will make the numeric assumptions visibly shape the
+design rather than sit mostly in the overview.
 
-### 4. Review and challenge are conceptually strong but operationally under-modeled
+### 4. Privacy controls are present but could be made operational by record type
 
-Step 5 and Step 5a correctly teach block/challenge/review tiers. The API and
-data model do not show the lifecycle of a challenge or review case: creation,
-assignment, SLA, analyst decision, customer outcome, reversal/refund/hold, label
-emission, and appeal/dispute handling.
+The dataset now names tokenized identifiers, analyst RBAC, internal-only reason
+codes, rate limiting, dedupe, label trust, drift monitors, and poisoning
+defense. That is the right set of concerns.
 
-Why it matters: "send to review" is not a queue alone. A fraud review workflow
-has state, priority, evidence snapshots, access control, analyst audit trail,
-and label quality concerns. It also determines whether "allow-but-flag" is
-acceptable for payments versus logins versus account creation.
+Why it matters: fraud systems hold sensitive linkage data: user-device-IP-card
+relationships, review evidence, chargebacks, labels, and reason codes. Those
+records often need different retention, access, deletion, and audit rules. A
+single privacy sentence is less teachable than a small operational matrix.
 
-Concrete fix: add a short state machine and fields for `review_cases`: `case_id`,
-`action_id`, `decision_id`, `state`, `priority`, `assigned_to`, `evidence_ref`,
-`due_at`, `resolution`, `resolved_at`, and `label_id`. For challenges, model
-`challenge_id`, method, status, expiry, attempts, and final outcome. Mention how
-review/challenge outcomes feed labels without leaking analyst-only evidence.
-
-### 5. "Fail open to rules-only" needs per-action policy and clearer language
-
-The non-functional requirement says a scoring outage degrades to a safe default.
-The final design says it "fails open to rules-only", and Step 7 says
-"rules-only (or a conservative default)". That is a useful instinct, but it is
-not universally safe.
-
-Why it matters: for low-risk browsing, fail-open may be fine. For high-value
-payments, a model/feature outage may need challenge, lower limits, manual
-review, or temporary throttling. Calling all of those "fail open" can teach the
-wrong operational policy.
-
-Concrete fix: replace the single fallback with a per-action fallback matrix:
-login may challenge, small payment may allow with risk flag, high-value payment
-may require step-up or review, account creation may rate-limit. Log the
-fallback reason, alert on fallback rate, and keep the audit record explicit
-about missing model/features.
-
-### 6. Privacy, abuse, and poisoning controls need first-class treatment
-
-The design uses sensitive identifiers: device, IP, card, user, address, and
-fraud labels. It also exposes a scoring API that attackers can probe and an
-event/label pipeline that can be poisoned.
-
-Why it matters: fraud detection is both security-sensitive and
-privacy-sensitive. A production design needs retention limits, tokenization or
-hashing, analyst access controls, audit logs, reason redaction, sampling or
-rate-limits against probing, and guardrails around labels/features contributed
-by untrusted sources.
-
-Concrete fix: add a security/privacy subsection or late step drill covering PII
-minimization, tokenized identifiers, card data handling, retention by record
-type, analyst RBAC, reason redaction, event dedupe, label-source trust levels,
-and drift/poisoning monitors.
+Concrete fix: add a short drill or table: decisions retained 12-24 months,
+raw events tiered/compacted, graph edges expire by type/confidence, review
+evidence restricted to analyst RBAC, labels retained for model audit, card/IP
+identifiers tokenized or salted, and attacker-facing reason strings separated
+from internal explanations.
 
 ## System Design Soundness
 
-The requirements are well chosen. They avoid a narrow "classify fraud" framing
-and correctly cover synchronous decisioning, hybrid rules + ML, velocity
-features, graph signals, human review, adaptation, auditability, and graceful
-degradation.
+The requirements are now well balanced. They cover synchronous scoring,
+rules-plus-ML, velocity/reputation features, entity graph detection, review and
+learning, latency, false positives, fast adaptation, auditability, fallback
+policy, and privacy/abuse resistance.
 
-Capacity is the weakest foundation. The current labels describe qualitative
-pressure but do not create sizing constraints. Fraud systems need even rough
-numbers for peak QPS, p99 latency budget breakdown, feature-store read QPS,
-stream partitions, per-entity hot-key skew, graph update volume, review backlog,
-and audit storage. Without those, the choices in Step 3 and Step 7 are correct
-but not quantitatively defended.
+The API is credible. The decision endpoint now has the retry semantics a risk
+engine needs: same idempotency key and same payload returns the original
+decision; same key with different payload is rejected. Events are deduped and
+carry event time separately from ingest time. Labels join to the exact decision
+and include source trust. The main missing API detail is lifecycle visibility
+for challenge/review states.
 
-The API is directionally right but too small. `POST /v1/risk/decision`,
-`POST /v1/events`, and `POST /v1/labels` are the right surface areas. They need
-stable identity, idempotency, event time versus ingest time, source trust,
-policy/model versions, and outcome references. The decision response should also
-separate attacker-facing messaging from internal reason codes.
+The data model now supports the architecture. It has durable decision records,
+raw event identity, feature snapshots for point-in-time training joins, graph
+edges, review cases, challenge attempts, versioned policy/model governance,
+online features, and labels. This is a large improvement over the previous
+three-table model.
 
-The data model supports the first layer of the story but not the whole system.
-`decisions` is a good audit anchor and already includes reasons plus
-`model_version`. The online features and labels tables are also appropriate.
-Missing state for event dedupe, graph edges, review cases, challenge attempts,
-rulesets, policies, model deployment, and feature snapshots is the biggest
-soundness gap.
-
-The architecture is credible. It puts heavy aggregation off the inline path,
-keeps the decision API synchronous, and uses a feedback loop for retraining. The
-main architecture improvement is to make state ownership explicit: which store
-owns events, which owns feature definitions, which owns graph links, which owns
-review cases, and which owns model/rules rollout.
+The architecture is technically sound. The inline path is bounded to rules,
+feature reads, model scoring, and precomputed graph features. Heavy streaming
+aggregation, graph maintenance, review, and retraining are outside the critical
+path. The final design correctly states that graph traversal is never done
+inline.
 
 ## Step-by-Step Pedagogical Review
 
-### Step 1: Naive: A Few Static If-Rules Inline in the App (the baseline)
+### Step 1: Naive: A Few Static If-Rules Inline in the App
 
-This is a strong baseline. It makes the limits of static thresholds and
-hard-coded rules obvious, and the trap is well targeted.
+This remains a good baseline. It makes speed and explainability visible while
+exposing the limits of static thresholds, hard-coded deployment, false
+positives, and coordinated abuse.
 
-Improvement: mention idempotency and audit even in the baseline. A naive risk
-system can be fast and explainable but still fail by making the same retried
-action look like multiple actions.
+Small improvement: briefly mention that even the baseline needs audit and retry
+awareness once it becomes a service. That would prepare the reader for why the
+decision endpoint later includes identity and idempotency.
 
 ### Step 2: Inline Decisioning: Rules + ML
 
-The core trade-off is well explained. Rules-only and model-only are useful
-alternatives, and the default hybrid option is the right answer for interviews.
+This step is now much cleaner. It explicitly says the model depends on fresh
+features and that Step 3 will design how those features stay fresh. It also
+adds decision IDs, reasons, and exact rule/model/policy versions for replay and
+disputes.
 
-Improvement: the sequence already includes a feature store before Step 3
-introduces how features are built. That is acceptable if framed as "we will
-design this next"; otherwise, it slightly front-loads a component before the
-reader understands its ownership. Add a sentence saying the model currently
-depends on fresh features and the next step builds the feature path.
-
-Also add policy/version details here: rule version, model version, threshold
-policy version, decision ID, and internal versus external reasons.
+The options are useful: hybrid, rules-only, and ML-only are real alternatives,
+and the default hybrid choice is the right interview answer.
 
 ### Step 3: Streaming Velocity Features
 
-This is one of the strongest steps. It teaches why batch and on-demand feature
-computation both miss the inline freshness/latency target.
+This is one of the strongest steps. It connects event throughput, hot keys,
+dedupe, event time, watermarks, bounded lateness, online/offline parity, and
+feature snapshots into one coherent feature-serving story.
 
-Improvement: add event schema, dedupe, late/out-of-order handling, and hot-key
-strategy. Fraud velocity counters are vulnerable to duplicate events and skewed
-entities such as a shared IP, a popular merchant, or an attack device. A short
-failure drill for duplicate/replayed events would make the step more
-production-real.
-
-Rendering note: this step's main view includes the `rules-features` link but
-does not include the `Rules` node in `view.nodes`. The global link is valid, but
-locally the endpoint is absent. Add `Rules` to the Step 3 view nodes or remove
-that link from this specific view.
+Small improvement: add a concrete partitioning example such as "partition by
+entity type + entity hash; split known hot IP/device keys". That would turn the
+hot-key warning into an implementation decision.
 
 ### Step 4: Entity Graph for Coordinated Abuse
 
-The motivation is excellent. The examples of shared device, IP, card, and known
-fraud cluster make the value of graph features clear.
+The graph step is production-realistic because it avoids live graph traversal on
+the decision path. It says links are maintained from events and graph features
+are materialized into the feature store. Edge confidence and expiry are also
+good details.
 
-Improvement: state what is stored online versus computed offline. Entity graphs
-can be expensive on the decision path, so the interview should distinguish
-precomputed graph features from live traversal. Add a small data-model entry for
-graph edges and a note on edge expiry, confidence, privacy, and feature
-materialization.
+Small improvement: mention how graph features are refreshed and invalidated
+when edges expire, because stale shared-IP/device edges are a common false
+positive source.
 
 ### Step 5: Sync vs Async: Block, Challenge, Review
 
-The tiering trade-off is strong and realistic. The three options are useful
-because they expose the false-positive versus fraud-loss business trade-off.
+This step improved significantly. It now frames review as a state machine with
+evidence snapshots, priority, SLA, analyst ownership, resolution, labels,
+appeals, RBAC, and audit logs.
 
-Improvement: model the lifecycle. The review queue needs priority, ownership,
-case state, evidence snapshot, SLA, analyst decision, label emission, and audit
-trail. Challenge also needs an outcome record. Without those, Step 5 teaches the
-right policy but not enough of the system that runs it.
+Remaining improvement: make the caller-facing lifecycle explicit, especially
+for challenge completion and review resolution. That can be a small contract
+note rather than a new full step.
 
 ### Step 5a: Decision Tiers and Thresholds
 
-This sub-step is valuable. It keeps threshold policy from being buried inside
-Step 5 and correctly ties thresholds to a cost matrix.
+This sub-step is valuable and should stay. It gives candidates a clean way to
+talk about cost matrices, per-action thresholds, canary rollout, rollback, and
+metrics such as approval rate, challenge completion, fraud loss,
+false-positive rate, and review load.
 
-Improvement: connect the cost matrix to a versioned `decision_policies` record
-and to monitoring. Threshold changes should be auditable, rolled out safely, and
-measured by approval rate, challenge completion rate, fraud loss, false-positive
-rate, and review load.
+Small improvement: connect the threshold policy version to the decision
+response and audit record in one sentence so the cross-step link is obvious.
 
 ### Step 6: The Feedback Loop: Labels and Retraining
 
-This step introduces the most important ML-systems correctness idea:
-point-in-time labels. The champion/challenger mention is also good.
+This is strong. It covers label lag, point-in-time correctness, feature
+snapshots, source trust, noisy labels, registry validation metrics, feature-set
+compatibility, shadow/canary/champion rollout, rollback, drift, and emergency
+rules.
 
-Improvement: add a model registry/deployment record and label quality details.
-Labels from chargebacks, analysts, and user reports have different lag and
-trust. The trainer should publish a versioned model with validation metrics,
-rollout state, rollback path, and feature compatibility.
+Small improvement: add one explicit "do not train on analyst-only evidence"
+reminder here as well as in Step 5, because it is a subtle leakage point.
 
 ### Step 7: Latency, Failure Modes, and Adversarial Robustness
 
-This is the right closing step. It reinforces that the risk engine is on the
-critical path and cannot become a single point of checkout failure.
+The final step is now appropriately operational. It gives p95 and p99 latency
+budgets, bounded model/feature work, fallback-rate and feature-staleness
+alerts, per-action fallback behavior, audit fields for degraded scoring,
+reason redaction, probing defense, dedupe, source-trust weighting, drift
+monitors, and fast rules updates.
 
-Improvement: split "fail safe" into concrete modes by action and risk. Add p95
-and p99 latency budget slices, fallback-rate alerts, feature-staleness alerts,
-and explicit "do not reveal internal reason codes" behavior. Include data
-poisoning and probing as failure drills, not only prose.
+Main fix: align `interviewScript` and `levelVariants` with this step by
+removing stale "fail-open fallback" wording.
 
 ## Final Design Review
 
-The final design is coherent with the steps. It includes the inline risk API,
-rules engine, model, feature store, event stream, aggregator, entity graph,
-review queue, label store, and trainer. The description correctly mentions
-feature freshness, graph detection, tiered decisions, point-in-time correctness,
-latency budgets, rules-only fallback, audit, and obscured attacker-facing
-reasons.
+The final design is coherent and well integrated. It includes the inline risk
+API, rules engine, ML model, feature store, event stream, streaming aggregator,
+entity graph, review queue, analyst/review tool, label store, and offline
+trainer. It also names state ownership explicitly: event log for raw events,
+feature store/snapshots for served features, graph for links, `review_cases`
+for review state, and versioned rules/policies/models for rollout.
 
-The missing pieces are mostly state ownership and operational policy. The final
-design should name the durable stores for events, review cases, graph links,
-rulesets, decision policies, and model versions. It should also describe
-fallback behavior as a policy matrix rather than one universal rule.
+The final description now captures the right fraud-system stance: feature
+freshness, online/offline parity, materialized graph features, tiered decisions,
+point-in-time labels, source-trust weighting, p99 latency, per-action fallback,
+audit, tokenized identifiers, and obscured attacker-facing reasons.
+
+The only remaining integration gap is challenge/review observability for
+callers. The final design says the workflows exist; a small API/status note
+would make them fully concrete.
 
 ## Concept Introduction and Learning Flow
 
-The learning flow is strong. Concepts arrive in an intuitive order:
-explainable rules, fuzzy ML scoring, fresh features, graph links, tiered
-outcomes, labels/retraining, and operational robustness.
+The concept order is excellent:
 
-The main flow issue is that features are used in the Step 2 sequence before the
-feature path is introduced. This is minor, but the walkthrough would be cleaner
-if Step 2 explicitly says "assume features exist for now; Step 3 designs how we
-keep them fresh."
+- Static rules expose the baseline.
+- Rules + ML introduces hybrid inline scoring.
+- Streaming features explain freshness and online/offline parity.
+- Entity graph introduces coordinated-abuse detection.
+- Review and challenge introduce false-positive management.
+- Feedback loop introduces labels, lag, and model rollout.
+- Serving robustness closes with latency, degradation, and adversaries.
 
-The concepts list is useful but could include a few missing production concepts:
-decision idempotency, event-time processing, feature snapshot, model registry,
-policy versioning, and label-source trust.
+The previous flow issue, where Step 2 used features before Step 3 explained
+them, is now handled by an explicit "assume they exist for now" sentence. That
+keeps the walkthrough natural.
 
 ## Step-to-Final-Design Coherence
 
-The steps mostly build toward the final design:
+The steps now map cleanly to the final design:
 
-- Step 1 motivates why static rules are insufficient.
-- Step 2 introduces the Risk API, Rules, and Model.
-- Step 3 introduces EventLog, AggSvc, and Features.
-- Step 4 introduces Graph.
-- Step 5 introduces CaseQ, Analyst, and LabelStore.
-- Step 6 introduces Trainer and the model update loop.
-- Step 7 reuses RiskAPI, Rules, Features, and Model to discuss latency and
-  failure behavior.
+- Step 1 motivates moving rules into a risk service.
+- Step 2 introduces RiskAPI, Rules, Model, decision identity, and versioned
+  audit records.
+- Step 3 introduces EventLog, AggSvc, Features, dedupe, event time, snapshots,
+  and online/offline parity.
+- Step 4 introduces Graph and materialized graph features.
+- Step 5 introduces CaseQ, Analyst, LabelStore, review case state, and
+  challenge/review outcomes.
+- Step 5a introduces threshold policy and rollout governance.
+- Step 6 introduces Trainer, source-trusted labels, model registry, and
+  champion/challenger rollout.
+- Step 7 ties the inline path to latency, fallback, observability, and
+  adversarial hardening.
 
-The final design includes all of those components. The coherence gaps are in
-the data contract: the final design depends on action identity, decision audit
-records, review state, graph state, feature snapshots, policy versions, and
-model versions more than the data model currently shows.
+The final design includes all major components and now also includes the state
+records that make them real.
 
 ## Realism Compared With Production Systems
 
-For an interview, the component choices are realistic. The design does not try
-to compute graph traversals inline, it does not rely on batch features for
-seconds-fresh abuse, and it recognizes that hard-blocking all medium-risk users
-is too costly.
+The interview is realistic for an interview-sized design. It captures the key
+operational tensions: low latency versus rich signals, recall versus false
+positives, inline decisioning versus async review, fresh features versus
+expensive computation, graph power versus graph latency, fast rules versus slow
+labels, and attacker-facing opacity versus internal explainability.
 
-Production systems would need more detail on:
+Production systems would still need more detail on:
 
-- Idempotency and dedupe for risk decisions, events, labels, and review actions.
-- Event-time processing, late events, replay, and exactly-once versus
-  effectively-once feature updates.
-- Feature definitions, feature snapshotting, and offline/online parity tests.
-- Review tooling, analyst authorization, evidence snapshots, and audit logs.
-- Model registry, champion/challenger rollout, drift monitoring, and rollback.
-- Ruleset/policy governance, approvals, and emergency rule pushes.
-- Privacy controls, tokenized identifiers, retention windows, and data-subject
-  deletion constraints.
-- Abuse of the risk API itself: probing, traffic spikes, poisoning, and reason
-  leakage.
-- Business metrics: fraud loss, false-positive rate, chargeback rate,
-  challenge completion, approval rate, review backlog age, and fallback rate.
+- Caller-visible challenge/review state transitions.
+- Analyst staffing and queue throttling given the stated 1-3% review rate.
+- Feature-store shard/replica strategy for 50-150k reads/sec and hot entities.
+- Stream partition count, replay strategy, and backfill behavior.
+- Per-record retention/deletion/access rules for events, graph edges, review
+  evidence, labels, and audit records.
+- Model/rules/policy approval workflow and emergency override controls.
+- Metrics dashboards tying fraud loss, approval rate, false positives,
+  challenge completion, review backlog age, drift, fallback rate, and feature
+  freshness together.
+
+Those are good advanced follow-up directions rather than blockers.
 
 ## Dataset and Renderer-Facing Observations
 
@@ -362,86 +352,69 @@ Production systems would need more detail on:
 - Top-level structure is valid for this project: requirements, capacity, API,
   data model, high-level architecture, steps, final design, satisfies,
   interview script, level variants, follow-ups, and probe links are present.
+- `steps[]` contains eight entries, including one valid sub-step:
+  `decision-tiers` has parent `review`.
 - Main step, option, and final-design view node references resolve to
-  `highLevelArchitecture.nodes` when they are string references.
+  `highLevelArchitecture.nodes` when authored as string references.
 - Main step, option, and final-design view link references resolve to
-  `highLevelArchitecture.links` when they are string references.
+  `highLevelArchitecture.links` when authored as string references.
+- Local view endpoint checks pass: every referenced link's `from` and `to`
+  endpoints are present in that view's node list.
 - `satisfies[*].steps[*]` resolves to real step IDs.
 - Dataset `patterns[*].steps[*]` resolves to real step IDs.
-- No raw `diagram` fields appear under structured areas.
+- No raw `diagram` fields appear under structured step/final/API flow areas.
 - Canonical node types used by the dataset are valid for the current template
   set: `actor`, `cache`, `client`, `database`, `model`, `queue`, `service`,
   `stream`, and `worker`.
-- Local view endpoint check found one issue: Step 3 (`features`) uses
-  `rules-features`, whose `Rules` endpoint is not listed in that view's
-  `nodes`.
-- `REVIEW.md` is repo-only; no docs rebuild is needed for this review.
+- API request/response examples are stringified JSON, which matches the current
+  renderer's `<pre>` handling.
+- `REVIEW.md` is repo-only; no docs rebuild is needed for this review update.
 
 ## Recommended Edits, Prioritized
 
-### P1: Make capacity numeric and tie it to design choices
+### P1: Remove stale "fail-open fallback" phrasing from wrap-up helpers
 
-Add concrete assumptions and derived rates for decision QPS, event throughput,
-feature reads/writes, graph updates, review volume, label lag, and audit storage.
-Use those numbers in the Step 3, Step 4, Step 5, and Step 7 explanations.
+Change the `interviewScript` and Staff `levelVariants` language to
+"per-action fallback policy" or "risk-aware fallback matrix" so the wrap-up
+matches Step 7 and the final design.
 
-### P1: Add decision identity, idempotency, and audit versions to the API
+### P2: Make challenge/review lifecycle observable in the API contract
 
-Update `POST /v1/risk/decision` to include stable action identity and retry
-semantics. Return decision IDs and version metadata. Make events and labels join
-unambiguously to the original decision and feature snapshot.
+Add a short note or endpoint examples showing how `challengeId` and
+`reviewCaseId` are created, completed, expired, resolved, and joined back to
+events/labels.
 
-### P1: Expand the data model for the mechanisms already claimed
+### P2: Convert the new capacity numbers into a few sizing decisions
 
-Add concise records for events, feature snapshots, graph edges, review cases,
-challenge attempts, rulesets, decision policies, model versions, and model
-deployments. Keep each small, but show state ownership.
+Add concise derived choices for stream partitions, feature-store sharding,
+review staffing/backlog limits, and hot/cold audit retention.
 
-### P2: Turn review/challenge into a real state machine
+### P2: Add a record-type privacy/retention mini-matrix
 
-Add review-case and challenge lifecycles, including creation, assignment,
-expiry/SLA, outcome, label emission, and audit trail. Tie `reviewCaseId` and
-`challengeId` back to the decision response.
+Show retention, access, tokenization, and expiry rules for decisions, events,
+graph edges, review evidence, labels, and internal reason codes.
 
-### P2: Replace universal fail-open wording with a fallback policy matrix
+### P3: Tighten advanced follow-ups around operations
 
-Define fallback behavior by action type and risk tier. Include alerting and
-audit fields for model timeout, feature-store timeout, stale features, and
-rules-only decisioning.
-
-### P2: Add security, privacy, and poisoning drills
-
-Cover tokenized identifiers, retention, analyst RBAC, internal-only reason
-codes, probing protection, label-source trust, duplicate event defense, and
-poisoning/drift monitors.
-
-### P3: Fix the Step 3 local view endpoint mismatch
-
-Either add `Rules` to `steps[features].view.nodes` or remove `rules-features`
-from that view's links. The global link is valid, but the local view should be
-self-contained.
-
-### P3: Retarget and enrich step-level probe links
-
-The global links are useful. Step-level links could be sharper: Step 3 should
-emphasize stream processing and feature stores, Step 4 graph/entity resolution,
-Step 6 ML lifecycle/model registry, and Step 7 SRE/security monitoring.
+Add or retarget follow-ups for analyst staffing under review spikes, feature
+backfill/replay, graph edge expiry, and emergency policy rollback.
 
 ## What Not To Change
 
 - Keep the seven-step arc and the Step 5a sub-step.
 - Keep the rules + ML hybrid as the default decisioning option.
 - Keep streaming velocity features as the default feature strategy.
-- Keep the entity graph as a distinct coordinated-abuse step.
+- Keep graph features materialized outside the inline path.
 - Keep block/challenge/review as the core policy trade-off.
-- Keep point-in-time labeling and online/offline parity as senior-level learning
-  points.
-- Keep the final step focused on latency, graceful degradation, and adversarial
-  behavior.
+- Keep point-in-time labeling, source-trust weighting, and online/offline
+  parity as senior-level learning points.
+- Keep the final step focused on latency, degradation, observability, and
+  adversarial behavior.
 
 ## Bottom Line
 
-This is a strong conceptual fraud-detection interview. It already teaches the
-right architecture and trade-offs. To make it production-shaped, add the
-quantitative sizing and durable operational state that make retries, reviews,
-labels, graph features, model rollout, privacy, and fallback behavior explicit.
+The fraud-detection interview is now a strong, production-shaped walkthrough.
+The recent changes resolved the prior review's major concerns. A small follow-up
+pass should remove stale fail-open wording, expose challenge/review lifecycle
+semantics a bit more clearly, and connect the new capacity numbers to concrete
+operating choices.

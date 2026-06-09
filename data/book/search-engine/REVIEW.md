@@ -5,402 +5,438 @@ Review date: 2026-06-09
 
 ## Executive Summary
 
-This is a strong teaching walkthrough for the core shape of web search: crawl,
-index, scatter-gather, rank, cache, and refresh. The step ordering is natural,
-the option trade-offs are useful, and the final design integrates most of the
-components introduced along the way.
+This review has been updated against the current dataset. The recent changes
+materially improve the case: the capacity section now includes shard, replica,
+fan-out, deadline, and crawl-rate math; the crawler step covers canonicalization,
+robots caching, host backoff, retries, traps, and recrawl policy; ranking now
+includes spam/quality and freshness signals; caching covers skew, TTLs, and
+stampede control; and freshness now explains immutable segments, tombstones,
+atomic publish, reader refresh, rollback, and cache invalidation.
 
-The main gap is that the dataset currently explains the architecture pattern
-better than it explains production scale. The capacity section names large
-numbers but does not turn them into shard counts, replica counts, crawl
-bandwidth, index write rates, or per-query fan-out budgets. A candidate could
-recite the design and still avoid the hard reasoning behind whether 100K QPS
-and sub-second p99 are achievable.
+The dataset is now a strong book-quality walkthrough of a web search engine. It
+teaches the right backbone - crawl, index, shard, scatter-gather, rank, cache,
+and refresh - and it now exposes many of the production concerns that were
+previously missing.
+
+The remaining gap is not that major mechanisms are absent. It is that the
+serving scale model is still a little too hand-wavy after it reveals a very
+large number: roughly 300M shard requests per second on cache misses. The review
+should now push the dataset to reconcile that fan-out with broker topology,
+per-replica capacity, top-k sizes, partial results, observability, and cost.
 
 | Axis | Rating | Notes |
 | --- | --- | --- |
-| System design soundness | 4 | Correct core architecture, but capacity math, update semantics, and ops need more detail. |
-| Production realism | 3 | Good crawler/index/serving split; missing several real crawler, index deploy, spam, and failure workflows. |
-| Pedagogical flow | 4 | Clear progression from naive scan to final design; a few steps need sharper motivation and concrete numbers. |
-| Dataset/rendering fit | 4 | Mostly valid structured views; a few exact view/type/pattern issues should be fixed. |
-| Overall | 4 | Strong base, but not yet flagship-depth for a book-scale search-engine case. |
+| System design soundness | 4.5 | Correct architecture with much better capacity, crawl, ranking, caching, and freshness detail; serving fan-out economics still need tighter reconciliation. |
+| Production realism | 4 | Strong production coverage now; remaining realism gaps are broker topology, observability, host crawl state, and operational runbooks. |
+| Pedagogical flow | 4.5 | Natural progression and good trade-off choices; Step 4 is now dense enough that one more serving-scale sub-step may help. |
+| Dataset/rendering fit | 4.5 | Structured views and references validate cleanly; only minor renderer-facing polish remains. |
+| Overall | 4.5 | A strong search-engine case, close to flagship depth with a few scale and operations refinements. |
 
 ## What Works Well
 
-- The walkthrough starts from an intentionally bad linear scan and uses it to
-  motivate the inverted index, sharding, scatter-gather, ranking, caching, and
-  freshness.
-- The `serve` and `partitioning-scheme` steps teach a real senior-level fork:
-  document partitioning versus term partitioning.
-- The `rank` step correctly introduces two-phase ranking and separates cheap
-  recall from more expensive re-ranking.
-- The final design is concise and includes the major components introduced in
+- The case now has a credible quantitative spine: documents, index size, shard
+  count, replicas, cache-miss QPS, fan-out, top-k work, deadline budget, and
+  crawl throughput.
+- The crawler step now feels domain-specific instead of generic queue-worker
+  material. Canonicalization, robots caching, retries, host backoff, traps,
+  duplicate clusters, sitemaps, and recrawl frequency are all present.
+- The inverted-index step explains term dictionaries, compressed postings,
+  positions, skip lists/block-max metadata, immutable segments, and merge
+  policy at an appropriate interview depth.
+- The serving steps correctly teach document partitioning first, then use the
+  sub-step to compare document and term partitioning with useful nuance.
+- Ranking now goes beyond BM25 and PageRank by naming freshness, spam/quality,
+  suppressions, and explicit out-of-scope areas.
+- Caching now ties directly to the capacity plan and includes TTLs, invalidation,
+  single-flight, TTL jitter, and cache warming.
+- Freshness now has proper update semantics: new document versions, tombstones,
+  segment generations, publish markers, reader refresh, rollback, and merge
+  compaction.
+- The final design is concise but integrates the mechanisms introduced across
   the steps.
-- The dataset uses structured `view` and `sequence` fields consistently instead
-  of raw Mermaid for architecture steps.
 
 ## Highest-Impact Issues
 
-### 1. Capacity is named but not reasoned through
+### 1. The 300M shard-requests/s plan needs a clearer serving topology
 
-The capacity section lists `100B+` documents, `~100,000` QPS, PB-scale index
-size, and billions of crawls per day, but it does not derive any operational
-numbers from them.
+The capacity section now does the right thing by exposing the cost of
+document-sharded scatter-gather: roughly `30K cache-miss QPS x 10K shards =
+300M shard-requests/s`. That is useful, but it creates a new teaching problem:
+the dataset does not yet show how the query-serving fleet actually absorbs that
+load.
 
-Why it matters: search-system interviews turn on fan-out and work budgeting. If
-every cache miss scatters to every shard, then QPS multiplied by shard fan-out
-can explode into millions or billions of shard requests per second. The dataset
-mentions shard replication and caching, but it does not force the candidate to
-show what cache hit rate, shard count, replica count, top-k size, and timeout
-budget make the target plausible.
-
-Concrete fix:
-
-- Add rough document/index sizing: average fetched page bytes, parsed content
-  bytes, postings bytes per term occurrence, metadata bytes, and total index
-  multiplier.
-- Add shard sizing: target GB/TB per shard, number of primary shards, number of
-  replicas, and why that keeps per-shard working sets manageable.
-- Add serving math: cache hit-rate assumption, cache-miss QPS, fan-out per
-  query, per-shard QPS, per-shard top-k, merge cost, timeout budget, and
-  expected partial-result behavior.
-- Add crawl math: pages/day to fetches/sec, average page size to bandwidth, and
-  how per-host politeness changes throughput.
-
-### 2. The crawler pipeline is too simple for production web crawling
-
-The `crawl` step covers frontier, robots/politeness, dedupe, and discovered
-links, which is the right center of gravity. But production crawling also needs
-URL canonicalization, robots caching, DNS/fetch isolation, fetch retries,
-redirect handling, sitemap/seeding, host-level backoff, duplicate clusters,
-content extraction failures, malware/adult/spam filtering, and a recrawl policy
-based on observed change frequency.
-
-Why it matters: without these details, the crawl stage looks like a generic
-queue-worker problem. For web search, crawl quality determines index quality,
-freshness, cost, and whether the crawler gets blocked.
+Why it matters: once the review says 300M shard requests per second and about
+10MB gathered per cache-miss query, the candidate should be expected to reason
+about broker fan-out trees, per-replica request rates, network egress,
+connection management, queueing, and top-k limits. Otherwise the capacity math
+names a huge number without proving the design can survive it.
 
 Concrete fix:
 
-- Extend `url_frontier` with canonical URL, crawl status, fetch attempts,
-  robots policy/cache key, next retry time, and change-frequency/freshness
-  priority.
-- Add a short crawl failure drill: host starts returning 429/5xx, robots changes,
-  duplicate-content storm, or crawler trap.
-- Add a parser/extractor or fetch-result queue between `Crawler`, `DocStore`,
-  and `Indexer` so retries, backpressure, and poison documents are explicit.
-- Use the existing Nutch and Heritrix probe links on the crawl step; they are
-  better crawl references than the current generic storage/index links.
+- Add a short "broker topology" note: many stateless query frontends hand off to
+  broker workers or a two-level fan-out tree, rather than one `QuerySvc` box
+  opening 10K shard calls.
+- Reconcile the per-replica load. The current math implies about 10K shard
+  requests/s per shard replica at 3x replication; state whether that is
+  acceptable, requires more replicas, or assumes each "shard" is a logical
+  partition spread over multiple serving nodes.
+- Tighten top-k numbers. `top-k ~100-1000 per shard` across 10K shards means
+  one million to ten million candidates before merge; clarify the default
+  target and when a larger top-k is used.
+- Mention hierarchical merge or early pruning so the broker does not gather and
+  sort an unnecessarily large candidate set for every miss.
+- Add a cost caveat: a 60-70% result-cache hit rate helps, but a real 100K-QPS
+  web search service probably needs tiering, hot-query precomputation, query
+  classification, and aggressive overload controls.
 
-### 3. Serving topology needs a more believable 100K-QPS plan
+### 2. Step 4 now carries too much of the hardest material
 
-The `serve` step says every query is scattered to all document-partitioned
-shards and that shards are replicated for QPS and availability. That is a good
-first explanation, but not enough for the stated load.
+Step 4 has to teach document partitioning, scatter-gather, replication, broker
+responsibility, deadline propagation, hedging, top-k limits, partial results,
+tail latency, and fan-out amplification. That is all relevant, but it is a lot
+for one step.
 
-Why it matters: at large shard counts, the query broker, replica selection,
-timeouts, hedging, and partial-result policy are first-class design elements.
-The dataset currently treats `QuerySvc` as one box and `IndexShards` as one box,
-so the hardest production problem is compressed into one arrow.
-
-Concrete fix:
-
-- Split the serving path conceptually into query parsing/rewrite, broker/fanout,
-  shard replicas, merge, rank, and hydration.
-- Add a short note on replica selection, request hedging, deadline propagation,
-  per-shard top-k limits, and graceful degradation when a shard times out.
-- Clarify whether "all shards" means all primary partitions, a tiered subset, or
-  all replicas. The current text can be read as broadcasting to every replica.
-- Add a bottleneck or failure drill for slow shard, hot shard, bad replica, or
-  result-cache stampede.
-
-### 4. Freshness and update semantics need more than segment append
-
-The `freshness` step correctly introduces immutable segments and background
-merge, but changed/deleted pages and deploy consistency are under-specified.
-
-Why it matters: web search must remove pages, update changed content, handle
-redirects/canonical IDs, hide spam/takedowns, and keep serving indexes
-consistent during segment rollout. Appending fresh segments alone does not
-explain deletion tombstones, version visibility, rollback, or cache invalidation.
+Why it matters: pedagogically, this is the core senior/staff part of the case.
+If it is too compressed, readers may memorize the answer without understanding
+which part solves which bottleneck.
 
 Concrete fix:
 
-- Add data-model entities for `index_segments`, `doc_versions`, and deletion or
-  suppression tombstones.
-- Explain the serving visibility contract: segment generation, publish marker,
-  atomic reader refresh, rollback, and merge compaction.
-- Tie result-cache invalidation to term/doc updates more concretely than
-  "materially".
-- Add a failure drill for a bad segment rollout or stale cache after a high-news
-  crawl.
+- Keep Step 4 focused on partitioning and the basic scatter-gather path.
+- Add a child step such as `4b. Make Scatter-Gather Survive 100K QPS` for
+  broker topology, deadlines, hedging, top-k, partial results, cache-miss math,
+  and overload behavior.
+- Move the existing slow-replica and cache-stampede failure drills into that
+  child step so each drill lands near the mechanism it tests.
+- In the decision-tree overview, this would make the flow clearer: choose
+  document partitioning, then harden the serving path.
 
-### 5. Ranking quality and abuse are mostly pushed to follow-ups
+### 3. Observability and operations are still underdeveloped
 
-The `rank` step is good for BM25 plus PageRank, but spam/quality, safe search,
-freshness scoring, language/locale, and personalization are only lightly
-mentioned or left as follow-ups.
+The dataset now includes several failure drills, but it does not yet define what
+the system measures or alerts on.
 
-Why it matters: a web search engine that returns "ranked relevant documents"
-must defend ranking quality from spam and low-quality pages. Even if
-personalization is out of scope, spam/quality should not be purely optional.
+Why it matters: search engines are operated through freshness, quality, and tail
+latency metrics. Without observability, the design cannot explain how operators
+detect crawl stalls, bad segment publishes, ranking regressions, cache
+stampedes, or shard tail latency.
 
 Concrete fix:
 
-- Add a quality/spam signal to the ranking description and data model.
-- Add a component or derived dataset for spam/quality scores if the final design
-  wants to claim production realism.
-- State which ranking features are intentionally out of scope: ads,
-  personalization, semantic/vector retrieval, query understanding, and safe
-  search.
+- Add an observability paragraph or a small data-model/control-plane entity for
+  metrics.
+- Include crawl metrics: frontier backlog by host/priority, fetch success rate,
+  robots/blocked rate, 429/5xx rate, duplicate rate, crawl lag, and recrawl
+  freshness.
+- Include indexing metrics: segment build lag, validation failures, publish
+  generation, merge backlog, tombstone ratio, and rollback count.
+- Include serving metrics: result-cache hit rate, doc-cache hit rate,
+  cache-miss QPS, shard p95/p99, hedge rate, partial-result rate, timeout rate,
+  candidate count, and merge/rank latency.
+- Include quality metrics: spam demotion rate, suppression count, ranker model
+  version, click/feedback quality indicators if in scope.
+
+### 4. Crawl state deserves one more explicit model boundary
+
+The `url_frontier` model now includes canonical URL, host, status, attempts,
+robots policy, change frequency, and `next_fetch_at`. That is much better than
+before. The remaining ambiguity is that host-level politeness and robots state
+are modeled only as fields on URL-level entries.
+
+Why it matters: the crawler's hardest invariant is per-host behavior. A
+production crawler usually needs host/domain buckets with their own next-fetch
+time, rate limits, robots cache, backoff state, and error budget. If this is
+buried in each URL row, readers may miss that the frontier is really scheduling
+hosts as well as URLs.
+
+Concrete fix:
+
+- Add a `host_crawl_state` or `robots_cache` data-model entity with host,
+  crawl-delay/rate limit, robots version/TTL, next host fetch time, recent
+  errors, and backoff state.
+- In the crawl flow, show that the frontier selects an eligible host bucket and
+  then a URL within that bucket.
+- Keep the current `url_frontier` fields, but make `robots_policy` a reference
+  to the host-level cache rather than the only place that policy lives.
+
+### 5. API and response semantics need a few search-specific caveats
+
+The `/search` API now supports quoted phrases, boolean operators, locale, cursor
+pagination, freshness bias, titles, URLs, snippets, and `nextCursor`. That is a
+good improvement. A few production search details should still be made explicit.
+
+Why it matters: the external API sets user-visible expectations. Exact counts,
+deep pagination, partial results, and freshness controls can conflict with the
+serving plan if they are not scoped carefully.
+
+Concrete fix:
+
+- Change `total` to `approxTotal` or note that exact totals are approximate or
+  capped at web scale.
+- Add response fields such as `partialResults`, `timedOutShards`, or
+  `servedFromCache` if the design intentionally returns partial results under
+  deadline pressure.
+- State cursor limits and expiry, since deep pagination over a changing index is
+  expensive and unstable.
+- Clarify the freshness parameter as a ranking bias or filter, because the
+  system does not guarantee all new pages are visible instantly.
 
 ## System Design Soundness
 
-The core architecture is sound. A crawler frontier feeds fetched documents into
-a durable document store, an indexer builds an inverted index and link graph,
-query serving scatters to document-partitioned shards, and a ranking stage
-reorders candidates. That is the right backbone for an interview.
+The core design is sound. A politeness-aware frontier feeds a crawler fleet; raw
+pages and parsed content land in the document store; the indexer builds
+document-partitioned inverted-index segments and link-graph/page-quality
+signals; the query path checks a result cache, scatters cache misses to one
+replica per primary partition, merges per-shard candidates, re-ranks, hydrates
+snippets from a doc cache, and returns partial results if shards miss deadlines.
 
-The weakest part is quantitative design. The dataset should turn `100B+`
-documents and `100K QPS` into the concrete work units the candidate must manage:
-documents per shard, postings size, query fan-out, per-shard QPS, network bytes
-per query, top-k merge cost, and cache hit-rate assumptions.
+The data model now supports more of the promised behavior. `documents` includes
+canonical URL, content hash, page score, quality score, current version,
+suppression, and last crawl time. `doc_versions` and `index_segments` cover
+content lifecycle and segment publish state. `url_frontier` covers crawl
+priority, attempts, robots policy, change frequency, and next fetch time.
 
-The API is intentionally minimal, but it does not yet support the stated
-"multi-term queries and basic operators" requirement beyond a plain `q`
-parameter. Add examples or fields for phrases, boolean operators, pagination
-cursor/offset limits, language/locale, freshness controls, and safe-search or
-adult-content mode if those are in scope.
+The biggest remaining soundness question is serving economics. The dataset
+correctly admits that document partitioning trades term-local lookups for large
+fan-out. Now it should go one level deeper: how many broker workers, how many
+connections, how much network, what per-shard top-k, and what overload mode keep
+300M shard requests/s from dominating the design.
 
-The data model covers the most important artifacts: postings, documents, and the
-frontier. It should add segment metadata, document-version lifecycle, canonical
-URL mapping, tombstones/suppression records, and ranking/quality signals.
+The API is much better aligned with the requirements than before. The remaining
+API polish is mostly about honesty: approximate totals, partial-result flags,
+cursor limits, and freshness semantics.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: Scan Every Document for the Query Terms
 
-This is a useful baseline. It clearly explains why linear scanning fails over
-100B documents and motivates the inverted index.
+This remains a useful baseline. The view now includes both `QuerySvc` and
+`DocStore` with an inline "scan every document" edge, so the diagram matches the
+text. The trap is clear and motivates the inverted index.
 
-Improve the diagram: the view includes `User`, `QuerySvc`, and `DocStore`, but
-only renders `user-query`. Add an inline edge or high-level link from
-`QuerySvc` to `DocStore` so the diagram matches the caption's "scans every
-document" behavior.
+Keep it short. It does its job as the intentionally bad starting point.
 
 ### Step 2: Crawl the Web with a URL Frontier
 
-This step introduces the right central concept: a prioritized,
-politeness-aware URL frontier. The flow is also helpful.
+This step is now substantially stronger. It covers the important web-crawling
+concerns: canonicalization, robots caching, DNS/fetch timeouts, retry/backoff,
+429/5xx host backoff, duplicate clusters, crawler traps, per-host caps,
+sitemaps, and recrawl policy.
 
-Deepen it with production crawler concerns: canonicalization, per-host queues,
-robots caching, retry/backoff, redirects, content extraction, duplicate
-clusters, crawl traps, and recrawl scheduling. Add crawler-specific probe links
-to Nutch and Heritrix here.
+The failure drills are good and domain-specific. The remaining improvement is
+to make host-level state explicit in the data model or flow so politeness is
+visibly enforced per host, not just implied by URL rows.
 
 ### Step 3: Build the Inverted Index
 
-The inverted-index explanation is clear and correctly ties postings, positions,
-term frequency, and link extraction together.
+The step now teaches enough of the real index internals: term dictionary,
+postings with positions/frequency, compact docIDs, normalization, gap
+compression, skip lists/block-max metadata, immutable segments, and merges.
 
-The next improvement is to make index construction more concrete: term
-dictionary, immutable segment files, compression, skip lists/block-max metadata,
-docID assignment, and merge policy. Not all of those need full treatment, but a
-book case should expose enough that the candidate can answer a follow-up about
-why posting-list lookup is fast.
+This is a good balance for an interview dataset. Avoid adding too much Lucene
+implementation detail unless it supports a later trade-off.
 
 ### Step 4: Shard the Index and Scatter-Gather Queries
 
-This is one of the strongest steps. The document versus term partitioning option
-comparison is realistic and useful.
+This is still the most important step and now contains the right concepts:
+document partitioning, one chosen replica per primary partition, query parsing,
+broker fan-out, per-shard top-k, deadlines, hedging, and partial results.
 
-The serving path needs more operational detail. Add query brokers, replica
-choice, fan-out limits, hedged requests, shard timeouts, and partial-result
-behavior. The current statement that every query fans out to all shards is fine
-as a conceptual model, but the production plan needs the numbers and guardrails
-that keep it from collapsing under 100K QPS.
+The issue is density. Consider splitting operational scatter-gather hardening
+into a child step. That would preserve the clean partitioning lesson while
+giving the 100K-QPS plan room to breathe.
 
 ### Step 4a: Document vs Term Partitioning
 
-This sub-step is worth keeping. It reinforces a real design fork and helps
-interviewers probe the trade-off more deeply.
+This sub-step is worth keeping. It now avoids the earlier overclaim by saying
+document partitioning is the right starting point while leaving room for tiered,
+hybrid, and hot/common-term treatment.
 
-Avoid overclaiming that web search "overwhelmingly uses" document partitioning
-without caveat. It is the right default for this walkthrough, but hybrid
-partitioning, tiered indexes, and special treatment for hot/common terms are
-common enough that the text should leave room for nuance.
+The one small caution: the example line saying "Google/Elasticsearch use
+document partitioning + scatter-gather" is useful, but phrase it as a broad
+pattern rather than a proof that all web-search retrieval tiers work this way.
 
 ### Step 5: Rank Results
 
-Two-phase ranking is the right teaching choice. The options are strong:
-full scoring is correctly rejected as too expensive, and PageRank-only ranking
-is correctly rejected as query-insensitive.
+This step is much better now. Two-phase ranking is the right default, and the
+dataset now names authority, freshness, spam/quality, suppressions, and scoped
+exclusions.
 
-Add spam/quality and freshness signals to the default path, and say where those
-features are computed. The `LinkGraph` alone is not enough to explain modern
-result quality or abuse resistance.
+One remaining nuance: the "PageRank only" option says link authority is strong
+against spam/low-quality pages. Link authority helps, but link farms and SEO
+abuse are exactly why explicit spam/quality signals are needed. Consider softening
+that pro or adding a con that PageRank-only ranking is vulnerable to link
+manipulation.
 
 ### Step 6: Caching for QPS and Latency
 
-The result-cache/doc-cache split is good, and the staleness trade-off is
-introduced at the right time.
+The step now connects directly to capacity: 60-70% result-cache hit rate reduces
+100K QPS to 30-40K scatter QPS. It also includes doc-cache hydration, staleness
+TTLs, segment-publish invalidation, single-flight, TTL jitter, and warming.
 
-This step should quantify the cache assumption. For example, define a hot-query
-hit-rate target, cache TTL policy, invalidation triggers, and stampede
-protection. Also fix the pattern metadata: the dataset-level `Result + doc
-caching` pattern declares `steps: ["serve"]`, but the actual step using that
-pattern is `cache`.
+The next improvement is operational: add metrics and alerts for result-cache hit
+rate, stampede prevention, stale-hit rate, and invalidation lag.
 
 ### Step 7: Freshness and Continuous Indexing
 
-The immutable-segment model is the right answer for incremental freshness.
+This step now addresses the major lifecycle gaps. It explains immutable
+segments, new versions, tombstones for updates/deletes/suppressions, publish
+markers, reader refresh, rollback, cache invalidation, and merge compaction.
 
-Strengthen this step with deletion/update semantics, segment versioning, atomic
-publish, reader refresh, rollback, and bad-segment failure handling. Also fix
-the step view: it includes the `doc-indexer` link, whose source is `DocStore`,
-but `DocStore` is not listed in this view's nodes. Add `DocStore` to
-`freshness.view.nodes` or remove the `doc-indexer` link from that view.
+That is the right model. Add a metric or control-plane note for segment build
+lag, publish generation, validation failure, merge backlog, and rollback rate.
 
 ## Final Design Review
 
-The final design integrates the major components introduced in the steps:
-frontier, crawler, seen store, document store, indexer, index shards, link
-graph, query service, ranker, result cache, and document cache.
+The final design now integrates the important mechanisms introduced in the
+steps:
 
-What is missing is mostly operational rather than conceptual:
+- Crawler fleet, URL frontier, seen/dedup store, and document store.
+- Indexing pipeline, immutable index segments, index shards, and link graph.
+- Query service/broker, result cache, index shard replicas, ranker, and doc
+  cache.
+- Ranking signals: text relevance, page authority, freshness, quality, and
+  suppressions.
+- Operational behaviors: deadline propagation, hedging, partial results,
+  single-flight caching, TTL jitter, generation-based publish, and rollback.
 
-- No explicit fetch-result or indexing queue/log for backpressure and retry.
-- No index segment/version metadata in the final design.
-- No clear query-broker/replica-selection responsibility inside `QuerySvc`.
-- No bad-index rollout, shard loss, or cache-stampede operational path.
-- No quality/spam/takedown path.
-
-The final design description should also state the major scoped exclusions so
-readers do not mistake omissions for oversights: ads, personalized ranking,
-semantic/vector retrieval, query suggestions, image/video search, and legal
-takedown workflow.
+The final design description is dense but effective. The diagram stays concise,
+which is good, but it may now under-represent important logical components named
+in the text: query broker/fan-out tree, segment metadata/publish control, and
+host crawl state. These do not necessarily need to be top-level diagram nodes,
+but the dataset should decide whether they are first-class components or
+implementation details.
 
 ## Concept Introduction and Learning Flow
 
-The concept flow is mostly excellent:
+The concept flow is strong:
 
 1. Linear scan creates the pain.
 2. The crawler creates the corpus.
 3. The inverted index makes lookup fast.
 4. Sharding and scatter-gather make the index serve at scale.
-5. Ranking makes results useful.
-6. Caching makes the target affordable.
-7. Incremental indexing keeps the system fresh.
+5. The partitioning sub-step teaches the key sharding trade-off.
+6. Ranking makes results useful.
+7. Caching makes the target load economically plausible.
+8. Incremental segment indexing keeps the system fresh.
 
-The main pedagogical improvement is to introduce more numbers exactly where a
-candidate would be expected to reason. The `serve`, `cache`, and `freshness`
-steps are the best places to add quick calculations and deadline budgets.
+The best improvement would be one additional serving-scale child step between
+partitioning and ranking. It would let the candidate reason about the cost of
+scatter-gather before moving on to ranking.
 
 ## Step-to-Final-Design Coherence
 
-Most steps map cleanly to final-design components:
+The coherence is now strong:
 
-- `crawl` introduces `Frontier`, `Crawler`, `SeenStore`, and `DocStore`.
-- `index` introduces `Indexer`, `IndexShards`, and `LinkGraph`.
-- `serve` introduces `QuerySvc`, `IndexShards`, and `ResultCache`.
-- `rank` introduces `Ranker` and `LinkGraph` usage at query time.
-- `cache` introduces `ResultCache` and `DocCache`.
-- `freshness` closes the loop on continuous crawl and segment-based indexing.
+- `crawl` introduces `Frontier`, `Crawler`, `SeenStore`, `DocStore`, crawl
+  failures, and crawler-specific probe links.
+- `index` introduces `Indexer`, `IndexShards`, `LinkGraph`, and index internals.
+- `serve` introduces `QuerySvc`, `ResultCache`, `IndexShards`, broker behavior,
+  hedging, deadlines, and partial results.
+- `partitioning-scheme` explains why the final design chooses document
+  partitioning.
+- `rank` introduces `Ranker`, `LinkGraph` usage, quality signals, and ranking
+  exclusions.
+- `cache` introduces `ResultCache`, `DocCache`, cache hit-rate assumptions, TTLs,
+  invalidation, warming, and stampede protection.
+- `freshness` closes the loop with segment publish, tombstones, reader refresh,
+  rollback, and score recomputation lag.
 
-The weaker links are:
-
-- The baseline `naive` step uses `DocStore` before the crawl step has introduced
-  how pages arrive there. This is acceptable as a baseline, but the text should
-  explicitly say "assuming pages have been fetched somehow" or move the crawl
-  before the naive serving baseline.
-- The `freshness` step depends on `DocStore -> Indexer`, but the view omits
-  `DocStore`.
-- The cache pattern metadata points to the wrong step.
+The older coherence problems have been fixed: the naive scan view includes the
+scan edge, `freshness.view.nodes` includes `DocStore`, the cache pattern points
+to `cache`, `User` is typed as an `actor`, and the multi-term requirement is
+mapped in `satisfies.functional`.
 
 ## Realism Compared With Production Systems
 
-The dataset captures the standard high-level production shape. To feel more
-like a production design, add coverage for:
+The dataset is now realistic at the architecture-pattern level and reasonably
+realistic at the operational level. It names the web-search-specific problems
+that matter: politeness, duplicate pages, crawler traps, index compression,
+segment merges, ranking quality, spam suppression, cache skew, and freshness.
 
-- URL canonicalization, robots caching, host backoff, and crawl traps.
-- Fetch, parse, and index queues with retries, dead-lettering, and backpressure.
-- Index segment lifecycle: build, validate, publish, refresh, merge, rollback.
-- Deletions, redirects, duplicate clusters, takedowns, and spam suppression.
-- Query broker deadlines, hedging, replica selection, partial results, and
-  overload behavior.
-- Cache stampede protection, cache warming, and freshness-aware invalidation.
-- Observability: crawl lag, index freshness, shard p99, timeout rate, cache hit
-  rate, bad segment rollbacks, and ranking-quality metrics.
+To reach the next level, add:
+
+- Broker/fan-out topology and per-replica capacity reasoning.
+- Host/domain crawl-state modeling.
+- Observability and alerting across crawl, index, serving, cache, and ranking.
+- A clearer overload policy for cache-miss bursts beyond "partial results".
+- Explicit approximate-total and partial-result semantics in the public API.
+- One or two runbook-style drills: bad ranker model rollout, publish generation
+  stuck, frontier backlog explosion, or a cache hit-rate collapse.
 
 ## Dataset and Renderer-Facing Observations
 
 - JSON validation passed.
-- `satisfies[*].steps[*]` references resolve to real step IDs.
-- `probeLinks` references resolve to `toProbeFurther.links`.
+- Step `view.nodes` all resolve to high-level architecture nodes or inline view
+  nodes.
+- Step and option `view.links` references resolve to high-level link IDs when
+  they are string references.
 - `view.highlight` IDs resolve within their step views.
-- Step and option `view.links` references resolve to high-level link IDs.
-- `freshness.view.links` includes `doc-indexer`, but `freshness.view.nodes`
-  omits `DocStore`, the source endpoint of that link. This can produce a
-  misleading generated diagram.
-- `highLevelArchitecture.nodes[]` defines `User` as type `client`; repo
-  conventions reserve `actor` for human or organization roles and `client` for
-  software outside the backend boundary. `User`/`Searcher` should be `actor`.
-- Dataset-level pattern `Result + doc caching` declares `steps: ["serve"]`, but
-  the actual step using the pattern is `cache`.
-- `satisfies.functional` does not explicitly map the requirement "Support
-  multi-term queries and basic operators." It is partially covered by inverted
-  index/scatter-gather, but basic operators need an explicit mapping or
-  requirement adjustment.
+- `satisfies[*].steps[*]` references resolve to real step IDs.
+- Dataset-level `patterns[*].steps[*]` references resolve to real step IDs.
+- Step `probeLinks` references resolve to `toProbeFurther.links`.
+- `step.parent` references resolve.
+- `User` is now correctly typed as `actor`.
+- `freshness.view.nodes` now includes `DocStore`, so the `doc-indexer` link is
+  valid in that view.
+- Dataset-level `Result + doc caching` now points to `cache`.
+- `satisfies.functional` now explicitly maps "Multi-term queries and basic
+  operators."
+- Minor polish: the inline `TermShards` option node could declare `type:
+  "index"` for visual consistency with `IndexShards`.
 
 ## Recommended Edits, Prioritized
 
-### P1: Add capacity math and serving budgets
+### P1: Reconcile the serving scale model
 
-Add document/index sizing, shard counts, replica counts, cache hit-rate
-assumptions, fan-out math, per-shard QPS, per-query top-k, merge cost, and
-deadline/timeout behavior.
+Add broker topology, per-replica load assumptions, connection/network budget,
+top-k defaults, hierarchical merge/early pruning, and explicit overload
+behavior for the 300M shard-requests/s cache-miss plan.
 
-### P1: Strengthen crawl and freshness lifecycle
+### P1: Split scatter-gather hardening into a child step
 
-Add canonicalization, robots cache, retry/backoff, crawl traps, recrawl policy,
-segment publish/versioning, deletion/tombstone handling, and bad-segment
-rollback.
+Move the 100K-QPS operational details into a `4b` sub-step so Step 4 remains the
+partitioning lesson and the new sub-step becomes the tail-latency/fan-out lesson.
 
-### P1: Make 100K-QPS scatter-gather operationally credible
+### P2: Add observability and runbook coverage
 
-Split the query path into parsing/rewrite, broker/fanout, shard replicas,
-merge/rank, and hydration. Add hedging, partial results, and cache stampede
-behavior.
+Add metrics and alerts for crawl lag, frontier backlog, robots/fetch errors,
+segment publish lag, merge backlog, rollback count, cache hit rate, hedge rate,
+partial-result rate, shard p99, ranker version, and quality regressions.
 
-### P2: Add quality/spam and ranking-signal coverage
+### P2: Add host-level crawl state
 
-Add spam/quality/freshness signals to ranking, plus where they are computed and
-stored. Explicitly scope out ads, personalization, and semantic retrieval if
-they are not part of this case.
+Represent host politeness and robots state as a first-class data model entity or
+control-plane concept, and show how the frontier schedules eligible host buckets.
 
-### P2: Expand API and data model for promised features
+### P2: Tighten API semantics
 
-Represent basic operators, pagination limits/cursors, language/locale, snippet
-requirements, segment metadata, doc versions, canonical URLs, and suppression
-tombstones.
+Use approximate totals, expose partial-result/timed-out-shard information, state
+cursor limits/expiry, and clarify freshness as a ranking bias or filter.
 
-### P3: Fix dataset metadata and diagrams
+### P3: Polish ranking and renderer details
 
-Fix `freshness.view.nodes`, the `User` node type, the cache pattern step, and
-the naive scan diagram edge. Add crawl-specific probe links to the crawl step.
+Soften the PageRank-only spam-resistance claim, add `type: "index"` to the
+inline `TermShards` option node, and consider one more failure drill for a bad
+ranker or quality-score rollout.
 
 ## What Not To Change
 
-- Keep the main sequence: naive scan -> crawl -> index -> shard/serve -> rank
-  -> cache -> freshness. It teaches the system in a good order.
-- Keep the document-versus-term partitioning sub-step. It is one of the most
-  valuable parts of the dataset.
-- Keep two-phase ranking as the default ranking option.
-- Keep the final design concise, but add supporting mechanics in the relevant
-  steps so the final diagram does not become overloaded.
+- Keep the main sequence: naive scan -> crawl -> index -> shard/serve ->
+  partitioning trade-off -> rank -> cache -> freshness.
+- Keep document partitioning as the default and term partitioning as the
+  contrast option.
+- Keep two-phase ranking as the default ranking path.
+- Keep the final design concise; add detail in steps and notes rather than
+  overloading the final diagram with every internal control-plane object.
+- Keep the explicit scoped exclusions. They prevent the case from ballooning
+  into ads, personalization, semantic search, query suggestions, and takedown
+  workflow.
 
 ## Bottom Line
 
-This is already a good search-engine interview walkthrough. To make it
-flagship-quality, add the quantitative reasoning and operational lifecycle that
-turn the correct high-level architecture into a credible production design.
+The search-engine dataset is now strong. The recent updates fixed the biggest
+previous gaps in capacity, crawler realism, freshness semantics, ranking quality,
+and dataset references. The main remaining work is to make the 100K-QPS
+scatter-gather plan operationally explicit and observable, so the case teaches
+not just the right architecture but the mechanics that keep it alive at scale.

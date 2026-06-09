@@ -5,484 +5,411 @@ Review date: 2026-06-09
 
 ## Executive Summary
 
-This is a strong teaching skeleton for a metrics platform interview. It starts
-from the right baseline, makes cardinality a first-class theme, introduces
-chunked TSDB storage, downsampling, push-vs-pull collection, query caching,
-alert debouncing, and series sharding in a coherent order.
+This dataset has been materially strengthened since the previous review. The
+core gaps called out earlier are now mostly addressed: the capacity section
+derives bandwidth/storage/index/shard estimates, ingestion has a partial
+acceptance contract, percentiles are modeled with histograms/sketches, the data
+model includes control-plane and alerting state, collection has service
+discovery plus push-gateway behavior, and the final design now includes the
+control plane and both TSDB shards feeding rollups.
 
-The main gap is production precision. The current dataset teaches the broad
-architecture well, but it does not yet define the operator contracts that make a
-metrics system trustworthy at large scale: derived capacity math, ingestion
-acknowledgement and overload semantics, tenant/source metadata, query limits,
-alert rule state, notification delivery, histogram/percentile support, and shard
-replication/rebalancing details.
+The remaining work is not about making the design plausible; it is about making
+the stronger design easier to defend in an interview. The main risks are
+precision around "point" sizing and histogram expansion, a slightly muddy
+collector/scraper model, alerting state being clearer in prose than in the
+diagram, and wrap-up sections that lag behind the richer main content.
 
 | Area | Rating | Notes |
 | --- | --- | --- |
-| System design soundness | 3.8/5 | The architecture is plausible, but capacity, percentiles, API contracts, and alert reliability need more rigor. |
-| Production realism | 3.5/5 | Good concepts, but missing tenant/source controls, durable acceptance semantics, alert HA, and operational workflows. |
-| Pedagogical flow | 4.2/5 | The eight-step progression is clear and teachable; collection/control-plane details should be introduced earlier. |
-| Dataset/rendering fit | 4.7/5 | JSON and renderer references check cleanly; issues are mostly content-level, not schema-level. |
-| Overall | 4.0/5 | Useful book-grade draft; one focused hardening pass would make it much stronger. |
+| System design soundness | 4.5/5 | Strong architecture with realistic contracts; tighten capacity definitions and alert/state diagrams. |
+| Production realism | 4.4/5 | Good handling of cardinality, tenant limits, partial accepts, rollups, and alert HA; collection and replay semantics need a little more exactness. |
+| Pedagogical flow | 4.6/5 | The eight-step progression is coherent and teaches one pressure at a time. |
+| Dataset/rendering fit | 4.8/5 | JSON and renderer references check cleanly; icons resolve; no docs rebuild needed for review-only edits. |
+| Overall | 4.5/5 | A strong book-grade metrics case with a few remaining precision and polish issues. |
 
 ## What Works Well
 
-- The scope is clear: ingest time-series samples, store them efficiently, query
-  dashboards, evaluate alerts, and retain older data at lower resolution.
-- The naive row-per-sample baseline exposes the right forces: write volume,
-  range queries, and cardinality.
-- Cardinality is treated as a central failure mode, not as an afterthought. The
-  traps around `user_id`/`request_id` labels are realistic and valuable.
-- The storage step teaches the right mental model: per-series compressed chunks
-  plus a label-to-series index.
-- The rollup step correctly warns against averaging away spikes and keeps
-  min/max/sum/count, which is much better than a vague "downsample old data"
-  explanation.
-- The option sets are generally honest tradeoffs: buffered ingest vs synchronous
-  writes, TSDB vs wide-column vs relational extension, precomputed rollups vs
-  query-time aggregation, pull/scrape vs push-only.
-- The wrap-up fields are useful: `satisfies`, `interviewScript`,
-  `levelVariants`, `followUps`, and `patterns` all line up with the main step
-  sequence.
-- Renderer-facing checks are clean: step/final-design nodes and links resolve,
-  sequence participants resolve, `satisfies[*].steps[*]` and pattern step links
-  resolve, and node types are canonical.
+- The capacity section now connects 10M points/sec to peak write rate,
+  compressed volume, hot-store size, index memory, shards, query envelope, and
+  alert evaluation load.
+- The ingest API is much more credible: tenant identity, `Idempotency-Key`,
+  histogram payloads, partial acceptance, dropped reasons, and retry hints are
+  all explicit.
+- Percentile support is no longer hand-waved. Requirements, API, data model,
+  storage deep dives, rollup notes, and traps all call out histogram/sketch
+  preservation and the "do not average p95s" trap.
+- The data model now carries the production contracts: `metric_descriptor`,
+  `scrape_target`, `alert_instance`, `notification_attempt`, and `silence`
+  records make the control plane and alerting state visible.
+- The step sequence is strong: naive rows -> buffered ingest -> TSDB chunks ->
+  rollups -> collection -> cardinality -> query/alerting -> sharding.
+- The final design now matches the steps much better. It includes service
+  discovery, push gateway, control plane, cardinality guard, router, replicated
+  shards, rollup worker, query/cache, dashboards, alert rules, and notification
+  provider.
+- `technologyChoices` has been added and is useful for this domain: Prometheus,
+  managed Prometheus, Kafka/Pulsar/Kinesis, object storage, Grafana/query
+  frontends, and Alertmanager-style routing are the right comparison families.
+- Renderer-facing checks are clean: nested view nodes/links resolve, final
+  design references resolve, sequence participants resolve, step cross-links
+  resolve, probe links resolve, canonical node types are valid, and icon paths
+  exist.
 
 ## Highest-Impact Issues
 
-### 1. Capacity is a set of headlines, not an architecture-sizing ladder
+### 1. Capacity math should define "point" more precisely
 
-The capacity section gives useful anchors: about 10M points/sec, tens to
-hundreds of millions of active series, sub-second recent queries, full-res days,
-rollups for months, and alert evaluation every 10-60 seconds. It does not yet
-convert those numbers into the design decisions that follow.
+The sizing ladder is now useful, but the "Sample-on-wire size" entry mixes
+in-chunk compression with ingestion bandwidth. A compressed scalar sample can be
+tiny inside a TSDB chunk, but remote-write payloads also carry labels, metadata,
+protobuf/framing overhead, WAL cost, and replication. Histogram metrics also
+expand one logical observation into many bucket series.
 
-Why it matters: metrics systems are data-intensive. A candidate should be able
-to show how points/sec become network bandwidth, queue partitions, TSDB shard
-count, chunk sizes, label-index memory, retention cost, rollup throughput, query
-fan-out, and alert evaluation load.
-
-Concrete fix:
-
-- Add an assumed sample/event size after encoding and compression.
-- Derive ingest bandwidth from 10M points/sec and a peak multiplier.
-- Estimate raw data/day, compressed hot storage/day, and retained rollup
-  storage/month.
-- Estimate active-series index memory, because cardinality pressure is mostly
-  memory/index pressure.
-- Tie those estimates to queue partitions, ingestion workers, TSDB shard count,
-  replication factor, and rollup worker throughput.
-- Add a query/alert envelope: dashboard query QPS, max returned series, maximum
-  lookback, rule count, and rule evaluation concurrency.
-
-### 2. Ingestion acceptance and reliability semantics are ambiguous
-
-Step 2 says ingestion is fire-and-forget, buffered, best-effort, and may lose
-recent samples on buffer failure. The API returns only `202 Accepted`. The
-requirements also say reliable alerting should not miss real alerts, and the
-final design describes a buffered ingestion path without defining whether the
-buffer is durable, replicated, memory-only, or replayable.
-
-Why it matters: "metrics are best-effort" is often true, but alert-critical
-metrics still need a clear contract. The system needs to say what happens before
-acknowledgement, what can be dropped, what is retried, and which classes of data
-are protected during overload.
+Why it matters: a candidate may overstate how little bandwidth/storage the
+system needs if they read "1-2 B compressed" as the end-to-end ingest unit.
+Metrics platforms are often constrained by labels, active series, and
+histogram bucket fan-out before raw scalar point bytes.
 
 Concrete fix:
 
-- Define the acceptance boundary: for example, acknowledge only after append to
-  a bounded replicated buffer/WAL, or explicitly say the API acknowledges after
-  in-memory admission and can lose recent samples.
-- Return partial acceptance details from ingest: accepted count, rejected count,
-  dropped labels/series, retry-after, and error categories.
-- Separate durable/replayable remote-write queues from ephemeral agent buffers.
-- Add overload policy by priority: keep alert-critical metrics, shed debug or
-  high-cardinality metrics, and emit owner-facing warnings.
-- Clarify whether duplicates are acceptable and how idempotency is handled for
-  retried batches.
+- Define whether "10M points/sec" means scalar samples, bucket samples, or
+  logical measurements before bucket expansion.
+- Split capacity into "wire/WAL bytes before TSDB compression" and
+  "compressed chunk bytes after TSDB encoding."
+- Add a short histogram example: one latency histogram with N buckets creates N
+  bucket series plus count/sum, so percentiles increase active-series and
+  ingest work.
+- Mention label/index overhead explicitly in the ingest bandwidth estimate, not
+  only in the active-series memory estimate.
 
-### 3. The API and data model are too thin for the behavior being promised
+### 2. The collector/scraper model is still a little ambiguous
 
-The API has three compact endpoints: ingest, query range, and create rule. The
-data model has `series`, `samples`, `rollups`, and `alert_rules`. That is a good
-teaching minimum, but it does not support several claims in the requirements and
-steps: collection topology, cardinality policy, tenant isolation, query limits,
-retention tiers, alert state, notification routing, and operational ownership.
+Step 5 and the final design now include service discovery, target registry,
+scrape health, and push gateway behavior, which is the right fix. The remaining
+ambiguity is the role of `Agent`: it is called "Collector Agent", receives
+targets from discovery, scrapes the app, forwards to ingest, and also appears
+as an app-adjacent component. Its generated node description still says it is a
+"synchronous application component that owns request-time business logic,"
+which is not accurate for a collector.
 
-Why it matters: without these fields, important behavior remains prose-only. A
-candidate can describe "cardinality guard" or "routed notifications", but the
-reader does not see what state the system stores to enforce those contracts.
-
-Concrete fix:
-
-- Add tenant/source metadata: `tenant`, `service`, `collector`, `scrape_target`,
-  `metric_descriptor`, and `retention_policy`.
-- Expand `series` with owner, created/last-seen timestamps, status, label
-  fingerprint, per-tenant/per-metric cardinality policy, and dropped/relabel
-  counters.
-- Add chunk/index metadata: `chunk`, `block`, `label_index_entry`, compaction
-  level, min/max time, and storage tier.
-- Add query governance: max lookback, max series, timeout, cache key, result
-  freshness, and query cost/bytes scanned.
-- Add alerting records: `alert_rule`, `rule_eval_state`, `alert_instance`,
-  `silence`, `notification_route`, and `notification_attempt`.
-
-### 4. Percentiles are promised but not supported by the model
-
-The requirements and API mention percentiles, but the data model stores scalar
-samples and rollups with only `min,max,sum,count`. That supports gauges,
-counters, rates, sums, and means, but it does not support request-latency
-percentiles across many observations unless the system stores histogram buckets,
-summaries, sketches, or treats each request latency as an individual sample.
-
-Why it matters: percentiles are a common interview trap in monitoring systems.
-You cannot average p95s across hosts and get a correct global p95, and rollups
-that preserve only sum/count cannot answer percentile queries later.
+Why it matters: push-vs-pull collection is a control-plane topic. Candidates
+should be clear whether the system runs central scrapers, node agents,
+sidecars, or library exporters, because that changes auth, liveness, rate
+control, network reachability, and label ownership.
 
 Concrete fix:
 
-- Add histogram metrics as first-class input: bucket series, explicit bounds,
-  count, sum, and bucket counters.
-- Or add sketch support, such as t-digest/HDR-style rollups, with mergeability
-  caveats.
-- Update `rollups.agg` to preserve histogram buckets or sketches where
-  percentile queries are required.
-- Add a trap: "averaging per-host p95s" and the correct replacement: merge
-  histograms/sketches or compute from raw observations while available.
+- Rename or describe the component as `Scraper` / `Collector` / `OpenTelemetry
+  Collector` rather than generic `Agent`, or explicitly state it may be a
+  node-local collector managed by the platform.
+- Add a one-line distinction between instrumentation library, scrape target,
+  collector/scraper, and push gateway.
+- Update the high-level node description for `Agent` so generated tooltips do
+  not call it request-time business logic.
+- Consider showing `Discovery -> Collector -> App` and `Collector -> Ingest`
+  as the main pull path, with `App -> PushGW -> Ingest` as the ephemeral-job
+  branch.
 
-### 5. Alerting reliability is under-modeled
+### 3. Alerting is well described but underrepresented in the architecture view
 
-Step 7 covers query caching, debounced rules, grouping, and routed
-notifications. That is the right direction, but a reliable alerting platform
-needs more: rule scheduling, evaluation state, HA/failover behavior, missed
-evaluation handling, dedupe, silences, inhibition, escalation, notification
-retries, and evidence of delivery.
+Step 7 now includes the right alerting concepts: rule ownership, persisted
+inactive/pending/firing/resolved state, silences, inhibition, dedup, delivery
+retries, escalation, and missing-data behavior. The data model also includes
+`alert_instance`, `notification_attempt`, and `silence`.
 
-Why it matters: alerting is not just another query client. During incidents, the
-monitoring system may be overloaded, the TSDB may be partially unavailable, and
-notification providers may fail. The design should say how it avoids both missed
-critical alerts and alert storms.
-
-Concrete fix:
-
-- Add an alert-evaluator flow: load rules, evaluate recent raw/fine-resolution
-  data, persist `pending/firing/resolved` state, and send notification jobs.
-- Model HA rule ownership: shard rules across evaluators with leader election
-  or deterministic ownership, and avoid duplicate pages after failover.
-- Add silence/inhibition/dedup state and notification retry/escalation records.
-- Define stale-data behavior: whether an alert fires, suppresses, or emits
-  "monitoring data missing" when the input series disappears.
-
-### 6. Collection is introduced, but the collection control plane is missing
-
-The default collection option says pull/scrape with a push gateway for ephemeral
-jobs. The final design shows `App -> Agent -> Ingest`, but it does not include
-service discovery, scrape target metadata, scrape scheduling, target health,
-push gateway state, or collector authentication.
-
-Why it matters: push vs pull is not just an edge preference. It changes how the
-system discovers services, detects liveness, controls scrape interval, handles
-NAT/private networks, authenticates producers, and prevents a bad target from
-overloading ingestion.
+The diagram still compresses this into `Alert`, `Rules`, and `Notify`. That is
+acceptable for a compact view, but the visual underplays the most important
+production point: alerting is not just a query client; it owns durable state and
+a notification delivery pipeline.
 
 Concrete fix:
 
-- Introduce `ServiceDiscovery`/`TargetRegistry` and optionally `PushGateway` in
-  Step 5 and the final design.
-- Add data-model records for targets, scrape intervals, labels injected by
-  discovery, last scrape status, and owner/team.
-- Show failed scrape as a liveness signal and distinguish it from "metric value
-  is zero."
-- Add auth/tenant identity for push ingestion so arbitrary clients cannot mint
-  unlimited labels.
+- Add either `Alert State Store` and `Notification Queue` nodes, or add a
+  final-design caption sentence that explicitly maps those records to durable
+  storage/queueing.
+- In Step 7, show the persisted state and delivery queue in the flow
+  participants if the diagram should teach the operational path.
+- Keep the current query and alerting content in one step only if the UI stays
+  compact; otherwise split into "Querying" and "Alerting" sub-steps.
 
-### 7. Sharding and final-design replication need sharper mechanics
+### 4. Wrap-up sections lag behind the richer main content
 
-Step 8 correctly chooses shard-by-series and warns against sharding by time.
-The final design, however, has two shard nodes but no explicit replica model,
-membership/ring metadata, write quorum, anti-entropy, or rebalancing path. It
-also shows rollup from `ShardA` only, which can read as if only one shard feeds
-retention.
+The main walkthrough now mentions histograms, control plane, partial
+acceptance, query admission, alert HA, and multi-tenant budgets in detail. Some
+wrap-up fields are still shorter and older in tone. For example,
+`satisfies.functional[0].how` says "Buffered, batched, fire-and-forget
+ingestion" but does not mention partial acceptance, tenant auth, or histogram
+input; the interview script and level variants also underplay the new control
+contracts.
 
-Why it matters: at 10M points/sec and hundreds of millions of active series, the
-hard parts are shard ownership, hot-shard mitigation, rebalancing, partial query
-failure, and preserving recent data when a node dies.
+Why it matters: the wrap-up is what readers use to rehearse the answer. If it
+summarizes the earlier, simpler version, readers may miss the higher-level
+production lessons that now exist in the steps.
 
 Concrete fix:
 
-- Add a concise shard-ring concept: series fingerprint -> shard owner(s), with
-  replication factor and membership changes.
-- Say whether writes go to a primary plus replicas, quorum, or async replicas.
-- Show rollup workers consuming all shards or use a generalized `TSDB Shards`
-  node instead of a single `ShardA -> Roll` edge.
-- Add query behavior for partial shard failure: timeout, partial response flag,
-  retry, or fail closed for alerting.
-- Add hot-series/hot-shard mitigation: split hot metrics, virtual shards, or
-  adaptive routing.
+- Update `satisfies[*].how` to mention the newer mechanisms where relevant:
+  histograms/sketches, partial acceptance, query admission, persisted alert
+  state, and control-plane budgets.
+- Expand the "Estimate & API" script phase with the point-vs-series distinction
+  and histogram payload.
+- Add staff-level expectations around acceptance boundaries, alert state, and
+  collection control-plane ownership.
+
+### 5. Technology choices are useful but many chips fall back to generic icons
+
+The `technologyChoices` content is good and all icon paths resolve. Many
+high-value options still use `assets/tech-icons/tech.png`, including Thanos,
+Cortex/Mimir, M3DB, VictoriaMetrics, InfluxDB, Amazon Timestream, GCP Pub/Sub,
+Azure Event Hubs, and several managed Grafana/cloud options.
+
+Why it matters: this is polish, not correctness. But the book group uses tech
+chips as visual anchors, and generic icons make the technology section look
+less finished than the content deserves.
+
+Concrete fix:
+
+- Add mappings in `_media/index.yaml` for the most common observability and
+  cloud-service terms, then re-run `_scripts/assign_tech_icons.py` for this
+  dataset.
+- Prioritize Mimir/Thanos/M3/VictoriaMetrics/InfluxDB and the managed cloud
+  services that appear in multiple interviews.
 
 ## System Design Soundness
 
-The core design is sound as a learning path. It uses the right architecture
-families: buffered ingestion, TSDB storage, label index, hot/cold retention,
-rollup workers, query service, alerting engine, cardinality guard, and series
-sharding.
+The design is now sound for a senior-level system design interview. It covers
+the important data-plane path (samples -> buffer/WAL -> cardinality guard ->
+series shards -> chunks/rollups -> queries/alerts) and the important
+control-plane concerns (tenant identity, descriptors, budgets, scrape targets,
+retention policies, query limits, routes, silences).
 
-The weak point is that several correctness and reliability contracts are
-implicit. The system needs to define what "accepted" means, what data can be
-dropped, how alert-critical data is protected, how query limits protect the
-cluster, how alert state survives evaluator restarts, and how percentiles remain
-valid after rollup.
+The strongest content is the treatment of cardinality and percentile-safe
+rollups. Those are exactly the areas where generic "ingest lots of events"
+answers usually fail. The dataset also correctly distinguishes dashboard
+partial results from alerting fail-closed behavior on shard timeouts.
 
-The data model should also carry more of the design. Four entities are enough
-for a simple illustration, but a book-grade system design should expose the
-state that lets the platform enforce source ownership, cardinality budgets,
-retention, alerting state, and notification delivery.
+The remaining soundness work is precision. Define bytes and points in capacity,
+make replay/idempotency semantics exact enough for counters and histograms, and
+make the durable alerting state visible enough that a reader cannot mistake
+alerting for a stateless polling loop.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive Metrics Table (the baseline)
 
-This is an effective baseline. It explains why row-per-sample relational
-storage fails and introduces series/cardinality early. Keep this step.
-
-The improvement is to add one numerical failure example: at 10M points/sec, a
-row-per-sample table receives hundreds of billions of rows/day before indexes
-and retention. That would connect the capacity section to the baseline more
-forcefully.
+This baseline now lands well because it has the 0.86 trillion rows/day failure
+example. It quickly motivates why row-per-sample OLTP storage is the wrong
+shape without spending too long on a strawman.
 
 ### Step 2: Ingestion Pipeline
 
-The buffer-plus-batch default is the right first move. The traps correctly warn
-against blocking producers and having no overload behavior.
+This step has improved substantially. It now explains the acceptance boundary,
+partial acceptance, priority shedding, retries, and idempotency. The flow also
+shows the `202 {accepted, rejected, droppedReasons}` response, which is a good
+teaching detail.
 
-Clarify the queue semantics. "In-memory buffer/queue" and `202 Accepted` are
-too loose for a system that also promises reliable alerting. This step should
-state whether the buffer is durable and replicated, whether agents retry, how
-partial acceptance is reported, and which samples are sacrificed first during
-overload.
+The nuance to add is counter/histogram replay semantics. State whether a retry
+dedupes by batch id, by series+timestamp, or by both, and what happens to
+out-of-order histogram bucket samples.
 
 ### Step 3: Time-Series Storage
 
-This is one of the strongest steps. It explains compressed per-series chunks and
-the inverted label index clearly. The TSDB, wide-column, and relational-extension
-options are realistic.
+This is one of the strongest steps. It names compressed chunks,
+delta-of-delta/XOR encoding, WAL/head chunks, compaction, label indexes,
+out-of-order windows, and histogram/sketch storage. Keep the three option
+families: purpose-built TSDB, wide-column/LSM, and relational extension.
 
-Add the missing storage mechanics: WAL or commit log, chunk/block metadata,
-compaction, index memory sizing, out-of-order sample handling, and histogram or
-sketch storage for percentile support.
+Tighten the capacity connection by linking index memory and histogram bucket
+series back to the Step 1/Step 2 estimates.
 
 ### Step 4: Downsampling & Retention
 
-The step teaches the right concept and correctly warns that averages hide
-spikes. The raw -> 1m -> 1h progression is easy to understand.
+The rollup step now handles the earlier correctness gap. It preserves
+min/max/sum/count for scalar metrics, sums histogram buckets for percentiles,
+mentions sketches, and models late/backfilled data with versioned dirty
+buckets.
 
-The production gap is late and corrected data. Rollups need versioning or
-recompute behavior for late-arriving samples, backfills, and retention-policy
-changes. If percentiles are in scope, rollups also need histogram/sketch
-preservation, not only min/max/sum/count.
+This is production-realistic and should stay as-is except for maybe noting that
+rollup recomputation must invalidate query cache entries.
 
 ### Step 5: Collection: Push vs Pull
 
-The push-vs-pull tradeoff is well presented, and the default hybrid choice is
-credible. Pull for long-lived services plus push for ephemeral jobs is a good
-interview answer.
+The new control-plane deep dive is valuable: discovery labels, scrape health,
+push gateway expiry, and push auth are exactly the right concepts.
 
-This step needs a visible control-plane component. Add service discovery, target
-registry, scrape status, and push gateway behavior. Also consider placing this
-step earlier or cross-linking it back to ingestion, because collection identity
-and labels strongly affect cardinality and tenant limits.
+The diagram and naming need a small cleanup. Make it unmistakable whether the
+collector is a scraper service, a node agent, or a sidecar, and update the
+`Agent` node description accordingly.
 
 ### Step 6: Cardinality Control
 
-This is the conceptual center of the interview and it works well. The traps are
-specific and realistic, and the agent-side vs ingestion-side options are useful.
+This remains the conceptual center of the case and it works. The step now goes
+beyond "drop labels" into budgets, descriptors, owner reporting, emergency
+overrides, and redirecting high-cardinality exploration to logs/traces or
+exemplars.
 
-The next improvement is operator workflow. A cardinality guard should not only
-drop or relabel samples; it should report the offending metric, owner, tenant,
-label name, estimated series growth, and policy action. Add per-tenant and
-per-metric budgets, allowlists, emergency overrides, and links to logs/traces or
-exemplars for high-cardinality exploration.
+No major content change is needed. A useful small addition would be an example
+before/after relabeling rule for `path="/users/123"` -> `path="/users/:id"`.
 
 ### Step 7: Querying & Alerting
 
-The dashboard/query path and alert debounce concept are both necessary. The
-flow for recent raw vs long-range rollups is clear.
+The content is strong and realistic. Query admission, cache, raw-vs-rollup
+selection, rule scheduling, persisted alert state, silences, inhibition, dedup,
+notification retries, escalation, and missing-data behavior are all covered.
 
-The issue is scope compression. Querying and alerting are different enough that
-the alert path deserves its own state and flow: rule scheduler, evaluator
-ownership, persisted pending/firing state, silences, notification queue, retries,
-and delivery evidence. The query path should also include guardrails: max
-series, max lookback, timeout, query cost, partial results, and cache freshness.
+The issue is density. This step carries two major subsystems. It is still
+usable as one step, but the architecture view should make alert state/delivery
+more visible, or the prose should explicitly say those are represented by the
+data-model records rather than separate nodes.
 
 ### Step 8: Scaling by Sharding
 
-Series sharding is the right default and the traps identify the important
-mistakes. Keeping a series co-located is the correct teaching point.
+This step now has the missing mechanics: shard ring, replica set, membership
+registry, low write quorum vs async replication, consistent-hash rebalancing,
+virtual nodes, hot-shard mitigation, partial dashboard results, and fail-closed
+alerting.
 
-Add mechanics: shard ring, virtual shards, replication factor, write/read
-quorum or primary-replica behavior, rebalancing, hot-shard handling, and partial
-query failure. The step says replicas exist, but the view does not show or
-describe enough of the replication contract.
+The final design caption correctly explains that two shard nodes are
+illustrative for about 16-32 replicated shards. Keep that clarification.
 
 ## Final Design Review
 
-The final design integrates the main components from the walkthrough: app,
-agent, ingest, queue, cardinality guard, router, TSDB shards, rollup worker,
-cold store, query/cache/dashboard path, alert rules, alerting engine, and
-notification provider.
+The final design is coherent and now reflects the current walkthrough. It shows
+collection, push gateway, control plane, buffered ingest, cardinality guard,
+metric router, two illustrative TSDB shards, rollups, cold storage,
+query/cache/dashboard, alert rules, alerting engine, and notification provider.
 
-It would become more production-realistic with a small set of additions:
+The best part is the caption: it states that the diagram's two shards are only
+illustrative and that the real ring has about 16-32 shards with RF=3. It also
+states that both shards feed the rollup worker, fixing the earlier single-shard
+rollup ambiguity.
 
-- `TargetRegistry` or `ServiceDiscovery` for scrape/pull collection.
-- `PushGateway` for ephemeral jobs if the default collection choice keeps
-  mentioning it.
-- `ControlPlane` for tenant/source auth, metric descriptors, cardinality
-  budgets, retention policies, query limits, and alert routes.
-- Alert state and notification delivery components, or at least records in the
-  data model.
-- A clearer `TSDB Shards`/replica representation so rollups, queries, and shard
-  failure behavior are not tied to one illustrated shard.
+The main improvement would be adding or naming durable alert state and
+notification delivery state. The data model already has those records; the
+diagram should either show them or explicitly map them in the caption.
 
 ## Concept Introduction and Learning Flow
 
-The concept staging is mostly strong: time series and cardinality first, then
-buffered ingestion, compressed chunks, rollups, collection models, cardinality
-guarding, query/alerting, and finally sharding.
+Concept staging is strong. The reader meets time series and cardinality first,
+then ingestion, then storage, then retention, then collection identity, then
+cardinality enforcement, then query/alerting, then horizontal scale. That order
+lets each step solve a visible problem from the previous one.
 
-Two concepts should be introduced explicitly:
-
-- Histogram/sketch metrics for percentile queries. This belongs near Step 3 or
-  Step 4.
-- Alert state machines. This belongs in Step 7 and should cover
-  `inactive -> pending -> firing -> resolved`, plus silence/inhibition/dedup.
-
-The dataset should also distinguish telemetry data from observability workflows:
-samples, series, chunks, and rollups are the data plane; targets, descriptors,
-policies, quotas, rules, silences, and routes are the control plane.
+The only sequencing question is whether collection should come before storage.
+The current placement is defensible: first teach the data-store shape, then
+teach how samples arrive. If a reader is focused on tenant identity and labels,
+Step 5 could be introduced earlier, but the current eight-step order is still
+clear.
 
 ## Step-to-Final-Design Coherence
 
-Most steps map cleanly to final-design components:
+The step-to-final mapping is now strong:
 
-- Step 2 adds `Queue`.
-- Step 3 motivates `TSDB`/hot store.
-- Step 4 adds `Roll` and `Cold`.
-- Step 6 adds `Cardinality`.
-- Step 7 adds `Query`, `Cache`, `Alert`, `Rules`, and `Notify`.
-- Step 8 adds `Router`, `ShardA`, and `ShardB`.
+- Step 2 contributes `Queue` and the partial-acceptance ingest path.
+- Step 3 contributes `TSDB`/hot store concepts that become `ShardA`/`ShardB`.
+- Step 4 contributes `Roll` and `Cold`.
+- Step 5 contributes `Discovery`, `Agent`, and `PushGW`.
+- Step 6 contributes `Cardinality` and the `Control -> Cardinality` policy
+  link.
+- Step 7 contributes `Query`, `Cache`, `Dash`, `Alert`, `Rules`, `Notify`, and
+  control-plane query/route links.
+- Step 8 contributes `Router`, replicated shard semantics, fan-out, and partial
+  failure behavior.
 
-The weaker connections are collection and replication. Step 5's default hybrid
-collection design is not fully visible in the final design, and Step 8's
-replication claim is not represented beyond two shard nodes. The final design
-should show either explicit replica/shard ownership or prose that explains the
-diagram is simplified.
+The remaining mismatch is alerting state: Step 7 and the data model teach it,
+but the final visual compresses it.
 
 ## Realism Compared With Production Systems
 
-The dataset captures the broad shape of Prometheus/M3-style metric systems, but
-it should add the operational surfaces that make those systems survivable:
+The dataset now captures the shape of production Prometheus/Mimir/Thanos/M3 or
+managed-monitoring systems: remote-write buffering, compressed TSDB chunks,
+label indexes, cardinality limits, service discovery, push gateway handling,
+histograms, tiered retention, query frontends, alert routing, and sharded
+storage.
 
-- tenant/source authentication and quotas;
-- metric descriptors, ownership, and label policies;
-- service discovery and scrape health;
-- per-tenant cardinality budgets and owner notifications;
-- query admission control and expensive-query protection;
-- histogram/sketch support for percentiles;
-- alert evaluator HA and persisted state;
-- silences, inhibition, dedupe, escalation, and notification retries;
-- shard membership, rebalancing, replication, and repair;
-- self-monitoring of the monitoring system itself.
+Remaining realism caveats:
 
-These additions do not require changing the main eight-step order. They can be
-added as compact API/model fields, traps, failure drills, one or two extra
-flows, and final-design notes.
+- Be explicit that histogram support multiplies series and must be budgeted.
+- Make the collector/scraper deployment model concrete.
+- Clarify replay/dedup behavior for retried batches and out-of-order samples.
+- Show alert state/delivery durability more directly.
+- Keep self-monitoring of the monitoring system as a follow-up or trap: ingest
+  lag, dropped samples, queue depth, rule-eval lag, shard health, and query
+  saturation.
 
 ## Dataset and Renderer-Facing Observations
 
 - `interview.json` parses successfully.
-- The `dataModel` array shape is valid for this renderer.
-- Step and final-design `view.nodes` references resolve to
-  `highLevelArchitecture.nodes`.
-- Step and final-design string `view.links` references resolve to
+- Top-level content is rich: requirements, capacity, API, data model, eight
+  steps, final design, satisfies, technology choices, interview script, level
+  variants, follow-ups, and probe links are present.
+- Nested `view.nodes` references resolve to `highLevelArchitecture.nodes`.
+- Nested string `view.links` references resolve to
   `highLevelArchitecture.links`.
-- `satisfies.functional[*].steps`, `satisfies.nonFunctional[*].steps`, and
-  `patterns[*].steps` all resolve to existing steps.
+- `finalDesign.view.nodes` and `finalDesign.view.links` resolve.
+- Sequence participants and message endpoints resolve.
+- `satisfies[*].steps`, `patterns[*].steps`, and
+  `technologyChoices[*].steps` resolve to existing step IDs.
 - Step `probeLinks` resolve to top-level `toProbeFurther.links`.
-- Sequence participants and top-level sequence message endpoints resolve.
 - Canonical node types in use are valid: `cache`, `database`, `external`,
   `gateway`, `observability`, `queue`, `service`, and `worker`.
+- Icon paths referenced from `assets` and `technologyChoices` exist.
+- Optional AI visuals and `explainerComic` are absent. That is acceptable, but
+  this case would benefit from generated visuals later.
 - No generated `docs/` rebuild is needed for this `REVIEW.md`-only change.
-- Optional book extras are absent: `technologyChoices`, `aiVisuals`, per-step
-  `aiVisual`, and `explainerComic`. That is not a rendering problem, but
-  `technologyChoices` would be useful for this domain.
 
 ## Recommended Edits, Prioritized
 
-### P1: Add derived capacity math
+### P1: Tighten capacity terminology
 
-Turn the current capacity bullets into a sizing ladder for bandwidth, storage,
-index memory, queue partitions, shards, replication, rollup work, query fan-out,
-and alert evaluation load.
+Separate scalar sample, histogram bucket sample, logical measurement, wire/WAL
+bytes, compressed chunk bytes, label/index overhead, and replication overhead.
 
-### P1: Define ingestion acceptance and overload contracts
+### P1: Clarify collector/scraper semantics
 
-Make `202 Accepted` mean something precise. Add partial acceptance, rejected
-series/labels, retry/backpressure behavior, priority shedding, and durable vs
-best-effort buffer semantics.
+Rename or define `Agent`, update its node description, and make the pull path
+visually distinct from the push-gateway branch.
 
-### P1: Expand API and data model to support the promised operations
+### P1: Make alert durability visible
 
-Add tenant/source/target records, metric descriptors, cardinality policy,
-retention policy, chunk/index metadata, query guardrails, alert state, silences,
-routes, and notification attempts.
+Add alert state and notification delivery queue/store to the diagram or caption
+so the visual matches the strong Step 7 prose and data model.
 
-### P1: Fix percentile support
+### P2: Refresh wrap-up fields
 
-Add histograms or mergeable sketches and preserve them through rollups. Add a
-trap for averaging p95s across hosts.
+Bring `satisfies`, `interviewScript`, and `levelVariants` up to the same level
+as the updated main walkthrough: histograms, partial acceptance, tenant budgets,
+query admission, and persisted alert state.
 
-### P2: Make alerting a real subsystem
+### P2: Add replay/idempotency nuance
 
-Add a rule-evaluation flow and records for pending/firing/resolved state,
-evaluator ownership, dedupe, inhibition, silences, escalation, and notification
-delivery retries.
+State how retried batches, duplicate samples, out-of-order samples, and
+histogram buckets are identified and reconciled.
 
-### P2: Add collection control-plane details
+### P3: Improve technology icons
 
-Introduce service discovery/target registry, scrape status, push gateway,
-collector auth, and target ownership.
+Add icon mappings for the observability and managed cloud technologies that
+currently fall back to `tech.png`.
 
-### P2: Sharpen sharding and replication
+### P3: Add generated learning visuals
 
-Define shard ring ownership, replication factor, write/read behavior,
-rebalancing, hot-shard handling, and partial query failure behavior.
-
-### P3: Add technology choices
-
-For a book dataset, `technologyChoices` would be valuable: Prometheus/Mimir/M3,
-VictoriaMetrics, Kafka/Pulsar buffers, object storage tiers, Cortex-style
-querying, Alertmanager-style notification routing, and managed cloud monitoring
-options.
-
-### P3: Add a few generated learning assets when convenient
-
-AI visuals/comic are optional, but this case would benefit from one visual for
-the write path, one for cardinality explosion, and one for query/alerting.
+Optional but valuable: one visual each for cardinality explosion, histogram
+rollups, and alert state/delivery.
 
 ## What Not To Change
 
-- Keep the naive baseline. It is short and does useful teaching work.
-- Keep cardinality as a central theme. It is the most important differentiator
-  from generic data-ingestion interviews.
-- Keep the hybrid pull/push collection default.
-- Keep precomputed rollups as the default for long-range dashboards.
-- Keep sharding by series as the scaling default.
-- Keep the existing traps; they are concrete and interview-relevant.
+- Keep the naive baseline and the 0.86 trillion rows/day failure anchor.
+- Keep cardinality as the central recurring theme.
+- Keep histogram/sketch support in requirements, API, storage, and rollups.
+- Keep the hybrid pull/scrape plus push-gateway collection choice.
+- Keep precomputed rollups as the default long-range query strategy.
+- Keep series sharding with replicas as the scaling default.
+- Keep `technologyChoices`; it adds useful book-level implementation context.
 
 ## Bottom Line
 
-This is a good metrics-monitoring walkthrough with strong conceptual coverage.
-The next pass should make it operationally explicit: derive the numbers, define
-ingestion and alerting contracts, model the control-plane state, preserve
-percentiles correctly, and make sharding/replication mechanics visible enough
-for a senior candidate to defend.
+The recent changes moved this from a good conceptual draft to a strong
+production-minded metrics interview. The next pass should be narrow: tighten the
+capacity unit definitions, clarify collector deployment semantics, make alert
+durability visible, and refresh the wrap-up summaries so they reflect the now
+much richer design.

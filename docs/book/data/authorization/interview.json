@@ -249,7 +249,9 @@
       "Support roles (RBAC) and attribute/relationship-based rules (ABAC / ReBAC).",
       "Grant and revoke permissions and relationships.",
       "List the objects a subject can access (and the subjects who can access an object).",
-      "Centralized policy used by many applications."
+      "Centralized policy used by many applications.",
+      "Author, test, roll out, and roll back policy/schema changes; explain and audit decisions.",
+      "Isolate tenants across tuples, policies, caches, and list indexes."
     ],
     "nonFunctional": [
       "Very low latency: checks are on every request's critical path (sub-10ms p99).",
@@ -284,15 +286,40 @@
       "label": "Consistency",
       "value": "tunable",
       "note": "Default cached/fast; opt-in consistent for sensitive ops."
+    },
+    {
+      "label": "Cache hit rate / slow path",
+      "value": "~99% hit → ~10k checks/s",
+      "note": "At 99% SDK+decision-cache hits, only ~1% (≈10k/s of 1M) reaches the policy engine; design the slow path for that, not for 1M/s."
+    },
+    {
+      "label": "Graph depth / fan-out",
+      "value": "≤ ~6 hops, capped fan-out",
+      "note": "Bound the reachability walk (depth + per-node fan-out budget) so one check is a few tuple-page reads, not an unbounded traversal; cycle-detect."
+    },
+    {
+      "label": "Latency budget (p99)",
+      "value": "SDK ~0 + net 1–2 + cache 1–2 + eval 3–5 ms",
+      "note": "Hot path is an in-process SDK hit (~0); on a miss the ≈10ms budget splits across network, decision-cache probe, and a bounded engine eval over tuple-store pages."
+    },
+    {
+      "label": "Tuple-store partitioning",
+      "value": "by (tenant, object namespace/id)",
+      "note": "Billions of tuples shard by object for forward checks; a secondary subject-keyed access pattern (and the reverse index) serves membership/listing."
+    },
+    {
+      "label": "Change log / audit",
+      "value": "writes/s × consumers; log every decision",
+      "note": "Partition the change log for materializer parallelism on group fan-out; if every decision is audited, ~1M records/s drives a tiered (hot→cold) retention budget."
     }
   ],
   "api": [
     {
       "method": "POST",
       "path": "/v1/check",
-      "description": "Evaluate a single permission check.",
-      "request": "{ \"subject\": \"user:42\", \"relation\": \"edit\", \"object\": \"doc:9\", \"consistency\": \"min_token:t_77\" }",
-      "response": "{ \"allowed\": true }",
+      "description": "Evaluate a single permission check. consistency selects the serving path: minimize_latency (any fresh-enough cache) or min_token (at least as fresh as a prior write).",
+      "request": "{ \"tenant\": \"acme\", \"subject\": \"user:42\", \"relation\": \"edit\", \"object\": \"doc:9\", \"consistency\": { \"min_token\": \"t_77\" }, \"explain\": false }",
+      "response": "{ \"allowed\": true, \"decisionId\": \"d_5f2\", \"checkedAtToken\": \"t_81\", \"policyVersion\": 14, \"explain\": null }",
       "sequence": {
         "participants": [
           {
@@ -374,24 +401,35 @@
     },
     {
       "method": "POST",
-      "path": "/v1/relationships",
-      "description": "Write (grant) or delete (revoke) a relationship tuple; returns a consistency token.",
-      "request": "{ \"object\": \"doc:9\", \"relation\": \"viewer\", \"subject\": \"group:eng#member\" }",
-      "response": "{ \"token\": \"t_78\" }"
+      "path": "/v1/relationships:write",
+      "description": "Idempotent, conditionally-applied grant/revoke of relationship tuples. idempotencyKey dedupes retries; precondition makes it a compare-and-set so concurrent edits don't clobber each other; actor/reason/requestId become the audit record.",
+      "request": "{ \"tenant\": \"acme\", \"idempotencyKey\": \"req-9c1\", \"actor\": \"admin:7\", \"reason\": \"offboard\", \"requestId\": \"r_22\", \"updates\": [ { \"operation\": \"delete\", \"object\": \"doc:9\", \"relation\": \"viewer\", \"subject\": \"group:eng#member\", \"precondition\": { \"mustExist\": true, \"atVersion\": 1207 } } ] }",
+      "response": "{ \"token\": \"t_78\", \"tupleVersion\": 1208, \"changeId\": \"c_4a9\", \"applied\": [ { \"object\": \"doc:9\", \"relation\": \"viewer\", \"subject\": \"group:eng#member\", \"operation\": \"delete\" } ] }"
     },
     {
       "method": "POST",
       "path": "/v1/list-objects",
-      "description": "List objects a subject can access for a relation (uses the expanded-set index).",
-      "request": "{ \"subject\": \"user:42\", \"relation\": \"view\", \"type\": \"doc\" }",
-      "response": "{ \"objects\": [\"doc:9\", \"doc:13\"] }"
+      "description": "List objects a subject can access for a relation, scoped by type/tenant and paginated (the result set may be millions). Served from the expanded-set index; min_token requires the index to be at least that fresh.",
+      "request": "{ \"tenant\": \"acme\", \"subject\": \"user:42\", \"relation\": \"view\", \"type\": \"doc\", \"pageToken\": null, \"pageSize\": 100, \"consistency\": { \"min_token\": \"t_77\" } }",
+      "response": "{ \"objects\": [\"doc:9\", \"doc:13\"], \"nextPageToken\": \"p_eyJ...\", \"servedAtToken\": \"t_81\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/schema:write",
+      "description": "Publish a namespace/relation-rewrite schema or policy version. Versions are staged (draft → shadow → active) and can be rolled back; a write returns the new version and its rollout status so a bad schema is reversible.",
+      "request": "{ \"tenant\": \"acme\", \"namespace\": \"document\", \"rewrites\": [ \"viewer = self | folder.viewer | group.member\", \"editor implies viewer\" ], \"rollout\": \"shadow\", \"actor\": \"admin:7\" }",
+      "response": "{ \"policyVersion\": 15, \"status\": \"shadow\", \"previousVersion\": 14 }"
     }
   ],
   "dataModel": [
     {
       "name": "relation_tuples",
-      "note": "Authoritative relationships (Zanzibar-style). The core of ReBAC.",
+      "note": "Authoritative relationships (Zanzibar-style). The core of ReBAC. Partitioned by (tenant, object).",
       "fields": [
+        {
+          "name": "tenant",
+          "type": "string (isolation boundary; part of every key)"
+        },
         {
           "name": "object",
           "type": "string (e.g. doc:9)"
@@ -405,44 +443,112 @@
           "type": "string (user:42 or set ref like group:eng#member)"
         },
         {
+          "name": "caveat",
+          "type": "optional predicate (ABAC condition on subject/object/env attrs)"
+        },
+        {
           "name": "version",
           "type": "bigint (from change log; for consistency)"
         }
       ]
     },
     {
-      "name": "roles_policies",
-      "note": "RBAC role->permission and ABAC attribute rules.",
+      "name": "policy_versions",
+      "note": "Namespace/relation-rewrite schemas and ABAC policies, versioned for safe rollout and rollback.",
       "fields": [
         {
-          "name": "role",
+          "name": "tenant",
           "type": "string"
         },
         {
-          "name": "permissions",
-          "type": "set<action>"
+          "name": "policy_version",
+          "type": "bigint"
         },
         {
-          "name": "abac_rule",
-          "type": "predicate over subject/object/env attributes"
+          "name": "namespace",
+          "type": "string (e.g. document)"
+        },
+        {
+          "name": "rewrites",
+          "type": "list (relation rewrite rules; e.g. editor implies viewer)"
+        },
+        {
+          "name": "permissions",
+          "type": "set<action> (RBAC role->permission)"
+        },
+        {
+          "name": "status",
+          "type": "enum (draft | shadow | active | rolled_back)"
         }
       ]
     },
     {
-      "name": "expanded_sets",
-      "note": "Derived reverse index: subject -> accessible objects per relation.",
+      "name": "expanded_set_chunks",
+      "note": "Derived reverse index, chunked for scale: a subject's accessible objects per (relation, objectType) split into paginated shards (not one giant set).",
       "fields": [
         {
-          "name": "subject",
-          "type": "string"
-        },
-        {
-          "name": "relation",
-          "type": "string"
+          "name": "key",
+          "type": "(tenant, subject, relation, object_type, shard)"
         },
         {
           "name": "object_ids",
-          "type": "set<string> (materialized)"
+          "type": "ordered list<string> (one bounded shard; pageToken walks shards)"
+        },
+        {
+          "name": "applied_version",
+          "type": "bigint (change-log watermark this chunk reflects)"
+        }
+      ]
+    },
+    {
+      "name": "relationship_changes",
+      "note": "The ordered change log as records: drives materialization and doubles as the grant/revoke audit trail.",
+      "fields": [
+        {
+          "name": "change_id",
+          "type": "string"
+        },
+        {
+          "name": "version",
+          "type": "bigint (log position; basis for consistency tokens)"
+        },
+        {
+          "name": "operation",
+          "type": "enum (create | delete)"
+        },
+        {
+          "name": "old_tuple / new_tuple",
+          "type": "tuple (before/after)"
+        },
+        {
+          "name": "actor / reason / requestId",
+          "type": "string (who changed access and why)"
+        }
+      ]
+    },
+    {
+      "name": "decision_audit_log",
+      "note": "Optional per-decision record for compliance, support, and incident review.",
+      "fields": [
+        {
+          "name": "decision_id",
+          "type": "string"
+        },
+        {
+          "name": "subject / object / relation",
+          "type": "string (what was asked)"
+        },
+        {
+          "name": "result / reason_code",
+          "type": "enum + string (allow/deny and why)"
+        },
+        {
+          "name": "policy_version / checked_at_token",
+          "type": "bigint / token (provenance of the decision)"
+        },
+        {
+          "name": "caller / request_id / latency_ms",
+          "type": "string / string / int"
         }
       ]
     }
@@ -511,7 +617,7 @@
       "title": "1. Naive: Hardcode Permission Checks in Each Service",
       "description": [
         "Start with the simplest thing that works. Each application embeds its own permission logic inline — `if user.role == 'admin'` (or a handful of such checks) scattered through the code, reading whatever role/attribute data it has handy. There is no central authority; every service decides for itself.",
-        "This is the path of least resistance — and it exposes the problems the rest of the design solves. First, every team reimplements checks slightly differently, so the same question gets different answers across services (inconsistent and bug-prone). Second, there's no central place to see or change who-can-do-what: a policy change means editing and redeploying many services, and there's no audit trail of decisions. Third, hardcoded roles can't express real product sharing like 'people who can edit THIS specific document'.",
+        "This is the path of least resistance — and it exposes the problems the rest of the design solves. First, every team reimplements checks slightly differently, so the same question gets different answers across services (inconsistent and bug-prone). Second, there's no central place to see or change who-can-do-what: a policy change means editing and redeploying many services, and — with each decision made inline and unlogged — there's no audit trail of who was allowed to do what and why. (Auditability becomes a recurring design goal from here on, not an afterthought.) Third, hardcoded roles can't express real product sharing like 'people who can edit THIS specific document'.",
         "So the baseline motivates everything that follows: centralize authorization behind one model and one check API, so policy is defined, evaluated, and audited in a single place."
       ],
       "view": {
@@ -555,7 +661,8 @@
       "description": [
         "Centralize authz so apps just ask 'can S do A on O?' and never embed policy. The first decision is the model. RBAC (roles -> permissions) is simple but coarse — it can't express 'editors of THIS document'. ABAC adds attribute rules (department, time, resource tags). ReBAC models permissions as a relationship graph of (object, relation, subject) tuples.",
         "ReBAC (the Zanzibar approach) is the most expressive for real product sharing: a check becomes graph reachability — is there a path from the subject to the object via relations (ownership, group membership, folder inheritance)?",
-        "Store relation tuples as the source of truth; layer RBAC roles and ABAC predicates on top where they fit. Deny by default."
+        "ReBAC needs more than raw tuples: each object type has a namespace schema defining its valid relations and relation rewrites — `document#viewer includes group#member`, `folder#editor implies document#editor` for contained docs. Rewrites are what make group/folder inheritance composable, and they're where you set depth/cycle limits so reachability stays bounded.",
+        "Store relation tuples as the source of truth; layer RBAC roles and ABAC predicates (as caveats on tuples) on top where they fit. Deny by default."
       ],
       "view": {
         "nodes": [
@@ -710,6 +817,13 @@
           "whyItMatters": "The model determines expressiveness, performance, and how grants are reasoned about.",
           "example": "ReBAC tuple: (doc:9, editor, user:42); group membership and folder inheritance chain via tuples.",
           "group": "Choose the Authorization Model"
+        },
+        {
+          "term": "Namespace schema & relation rewrites",
+          "definition": "Per-object-type definitions of valid relations and how they derive (inheritance/implication) from others.",
+          "whyItMatters": "Rewrites make group/folder inheritance composable and are where depth/cycle limits live, keeping reachability bounded.",
+          "example": "document#viewer includes group#member; folder#editor implies document#editor for contained docs.",
+          "group": "Choose the Authorization Model"
         }
       ],
       "patterns": [
@@ -731,8 +845,8 @@
       "title": "3. The Low-Latency Check Path",
       "description": [
         "A check is on every request, so it must be single-digit-ms. A check evaluates the policy: for ReBAC, walk the relationship graph from object to subject (doc:9 editor? -> doc:9 is in folder:3 which user:42 owns?), short-circuiting on the first allow.",
-        "Bound the walk: cache intermediate set memberships and the final decision. Most checks are repeats (same user, same object) so a decision cache absorbs the bulk of load.",
-        "Keep the check API stateless and horizontally scaled; ship an SDK that caches recent decisions in-process to cut even the network hop for hot checks."
+        "Bound the walk: cap depth and per-node fan-out, detect cycles, and cache intermediate set memberships, not just final decisions. Cache key shape is `(tenant, subject, relation, object, policyVersion)` with the entry's applied change-log version stored for freshness; cache denies too (negative caching) so repeated denied probes stay cheap. Besides final verdicts, cache the expensive sub-results — group membership, resolved relation rewrites, and compiled policies.",
+        "Most checks are repeats (same user, same object), so the decision cache absorbs the bulk of load. Keep the check API stateless and horizontally scaled; ship an SDK that caches recent decisions in-process to cut even the network hop for hot checks."
       ],
       "view": {
         "nodes": [
@@ -763,7 +877,7 @@
           "description": "A decision cache keyed by a consistency version sits ahead of the policy engine, returning prior (subject, relation, object) verdicts on a hit and walking the graph only on a miss.",
           "pros": [
             "Cache hits return (subject, relation, object) decisions in well under 10ms, skipping the graph walk entirely.",
-            "Keyed by a consistency version, so a stale entry is invalidated the moment the underlying tuples change.",
+            "Each entry carries the change-log version it was computed at, so a check can tell whether the entry is fresh enough for its min_token.",
             "Absorbs hot, repeated checks (the same user opening the same docs) cheaply."
           ],
           "cons": [
@@ -1012,22 +1126,25 @@
       "description": [
         "Caching introduces the central authz hazard: after a revoke, a stale cached 'allow' could leak access (Zanzibar calls the inverse the 'new enemy' problem). You need a consistency knob.",
         "Each write to the relationship store goes through an ordered change log and returns a consistency token (a 'zookie'). A caller can pass a token to a check meaning 'evaluate at least as fresh as this change' — so right after revoking, the app demands a consistent check.",
-        "Default checks use the (fast, slightly stale) cache; sensitive operations opt into consistency tokens. This makes the staleness-vs-latency tradeoff explicit and per-call."
+        "Make the guarantee precise via watermarks: every cache entry, index shard, and region carries the change-log version it has applied. A default check may use any cached decision within a bounded staleness window. A `min_token` check may use the cache only if that entry's (and the serving region's) applied version is ≥ the token; otherwise the check does NOT serve the stale entry — it re-evaluates fresh against the policy engine / tuple store, waits briefly for the watermark to catch up, routes to a fresher region, or returns a retryable consistency error. It never serves a stale allow. Async invalidation (next step) is an optimization that raises the hit rate; the watermark check is the actual safety property.",
+        "So default checks are fast and slightly stale; sensitive operations opt into a token. This makes the staleness-vs-latency tradeoff explicit and per-call."
       ],
       "view": {
         "nodes": [
           "Admin",
           "RelStore",
           "ChangeLog",
+          "Indexer",
           "CheckAPI",
           "DecisionCache"
         ],
-        "caption": "An admin's grant/revoke appends to the change log via the relationship/tuple store, and the check API compares its cached decision against that log's version token.",
+        "caption": "An admin's grant/revoke appends to the change log via the relationship/tuple store; the materializer advances the cache's applied-version watermark, and the check API compares its cached decision against the caller's min_token.",
         "links": [
           "admin-rel",
           "rel-changelog",
-          "check-cache",
-          "indexer-cache"
+          "changelog-indexer",
+          "indexer-cache",
+          "check-cache"
         ],
         "highlight": [
           "ChangeLog"
@@ -1164,7 +1281,7 @@
       ],
       "probeLinks": [
         "zanzibar-paper",
-        "oauth-rfc",
+        "spicedb-docs",
         "sre-monitoring"
       ],
       "patterns": [
@@ -1212,6 +1329,10 @@
               {
                 "id": "DecisionCache",
                 "label": "Decision Cache"
+              },
+              {
+                "id": "PolicyEng",
+                "label": "Policy Engine"
               }
             ],
             "messages": [
@@ -1240,20 +1361,38 @@
                 "label": "check (min_token: t_78)"
               },
               {
+                "from": "CheckAPI",
+                "to": "DecisionCache",
+                "arrow": "->>",
+                "label": "entry applied_version ≥ t_78?"
+              },
+              {
                 "type": "alt",
-                "label": "cache older than t_78",
+                "label": "cache watermark below t_78 (stale)",
                 "messages": [
                   {
                     "from": "CheckAPI",
-                    "to": "DecisionCache",
+                    "to": "PolicyEng",
                     "arrow": "->>",
-                    "label": "stale → bypass"
+                    "label": "evaluate fresh (or wait/route)"
+                  },
+                  {
+                    "from": "PolicyEng",
+                    "to": "RelStore",
+                    "arrow": "->>",
+                    "label": "walk current relations"
+                  },
+                  {
+                    "from": "PolicyEng",
+                    "to": "CheckAPI",
+                    "arrow": "-->>",
+                    "label": "decision @ ≥ t_78 (recache)"
                   },
                   {
                     "from": "CheckAPI",
                     "to": "App",
                     "arrow": "-->>",
-                    "label": "deny (fresh eval)"
+                    "label": "deny (revoke honored)"
                   }
                 ],
                 "else": {
@@ -1282,7 +1421,8 @@
       "title": "5. Listing Accessible Objects (Reverse Index)",
       "description": [
         "Apps need 'list the docs user:42 can view' to render and filter UIs. Doing a per-object check across millions of objects is infeasible. Precompute the reverse: a materialized expanded-set index mapping subject -> accessible objects per relation.",
-        "The index is derived from the relationship graph (expanding group/folder/ownership relations). 'List objects' becomes a lookup; 'list subjects with access to O' is the symmetric query.",
+        "The index is derived from the relationship graph (expanding group/folder/ownership relations). 'List objects' becomes a lookup; 'list subjects with access to O' is the symmetric query. List answers are almost always scoped — by object type, relation, tenant, folder/collection, or an upstream search query — so store the index chunked by `(tenant, subject, relation, objectType, shard)` and return results paginated with a stable page token rather than as one unbounded set.",
+        "Two cases the pure index doesn't cover: when the caller already has a small candidate set (the 50 docs on a page), it's cheaper to batch-filter those with checks than to read a giant index; and ABAC caveats (department, time) can't be fully materialized, so caveated tuples are post-filtered at read time against current attributes. List with a `min_token` only serves shards whose applied version is fresh enough.",
         "Because it's derived, it can be rebuilt from the tuple store and must be kept in sync as relations change."
       ],
       "view": {
@@ -1429,6 +1569,117 @@
           "data-plane"
         ]
       },
+      "options": [
+        {
+          "name": "Eager fan-out invalidation/materialization (default)",
+          "description": "On each change the materializer immediately recomputes the affected reverse-index shards and evicts the affected cached decisions, so reads stay correct without per-read work.",
+          "pros": [
+            "Reads are cheap and correct: the index and cache are already updated when the next check arrives.",
+            "Simple mental model — derived state always reflects the latest applied change-log version.",
+            "Pairs naturally with consistency tokens: the watermark advances as fan-out completes."
+          ],
+          "cons": [
+            "A widely-shared group/folder change fans out to many subjects/objects — a write spike becomes an invalidation storm.",
+            "Materializer must be partitioned and parallelized to keep fan-out latency bounded.",
+            "Briefly amplifies load right when a large change lands."
+          ],
+          "view": {
+            "nodes": [
+              "RelStore",
+              "ChangeLog",
+              "Indexer",
+              "ExpandIdx",
+              "DecisionCache"
+            ],
+            "caption": "The materializer consumes each change and eagerly updates the affected expanded-set shards and evicts the affected cached decisions.",
+            "links": [
+              "rel-changelog",
+              "changelog-indexer",
+              "indexer-expand",
+              "indexer-cache"
+            ],
+            "highlight": [
+              "Indexer",
+              "ExpandIdx"
+            ],
+            "groups": [
+              "data-plane"
+            ]
+          }
+        },
+        {
+          "name": "Lazy versioned revalidation",
+          "description": "The materializer only advances version watermarks; the index/cache aren't eagerly rewritten. A read compares its entry's version to the latest and re-evaluates on demand if stale.",
+          "pros": [
+            "A huge group change is cheap to record — no immediate fan-out work.",
+            "Work is paid only for entries actually read again, not for every affected subject.",
+            "Naturally bounds the invalidation storm by deferring it."
+          ],
+          "cons": [
+            "Shifts cost onto the read path: the first read after a change pays a re-evaluation.",
+            "Cold/rarely-read entries can stay logically stale for a long time (still safe via the watermark check).",
+            "Listing can be slow right after a big change as shards lazily rebuild."
+          ],
+          "view": {
+            "nodes": [
+              "ChangeLog",
+              "Indexer",
+              "DecisionCache",
+              "CheckAPI",
+              "PolicyEng"
+            ],
+            "caption": "The materializer advances watermarks only; a stale read at the check API re-evaluates through the policy engine on demand rather than being pushed an update.",
+            "links": [
+              "changelog-indexer",
+              "indexer-cache",
+              "check-cache",
+              "check-policy"
+            ],
+            "highlight": [
+              "CheckAPI",
+              "PolicyEng"
+            ],
+            "groups": [
+              "data-plane",
+              "check-path"
+            ]
+          }
+        },
+        {
+          "name": "Hybrid priority-based materialization",
+          "description": "Eagerly materialize hot/high-value entries (recently-read subjects, sensitive relations) and defer the long tail to lazy revalidation, prioritizing the change-log consumer queue.",
+          "pros": [
+            "Keeps hot reads fast and fresh while capping the fan-out cost of giant low-traffic groups.",
+            "Lets you bound materializer load with a priority budget rather than processing fan-out blindly.",
+            "Sensitive relations can be forced eager regardless of traffic."
+          ],
+          "cons": [
+            "More complex: needs hotness/priority signals and two propagation paths to operate.",
+            "Misclassifying hotness can leave an important entry on the slow lazy path.",
+            "Harder to reason about worst-case freshness across the two paths."
+          ],
+          "view": {
+            "nodes": [
+              "ChangeLog",
+              "Indexer",
+              "ExpandIdx",
+              "DecisionCache"
+            ],
+            "caption": "The materializer splits the change stream by priority — eagerly rebuilding hot shards and evicting hot cache entries, while deferring the long tail to lazy revalidation.",
+            "links": [
+              "changelog-indexer",
+              "indexer-expand",
+              "indexer-cache"
+            ],
+            "highlight": [
+              "Indexer"
+            ],
+            "groups": [
+              "data-plane"
+            ]
+          }
+        }
+      ],
       "decisionPrompt": "Removing a user from a group should revoke access to thousands of documents. How does that propagate?",
       "patterns": [
         "Materialized reverse index",
@@ -1436,7 +1687,7 @@
       ],
       "probeLinks": [
         "zanzibar-paper",
-        "oauth-rfc"
+        "spicedb-docs"
       ],
       "whyNow": [
         "Change propagation is what keeps derived state correct; tying it to the change log + tokens closes the consistency story."
@@ -1528,8 +1779,9 @@
       "title": "7. Availability, Auditing, and Multi-Region",
       "description": [
         "Authz is on every request, so its outage cascades to every app. Run it highly available: stateless check tiers, replicated tuple/role stores, and SDK-side caches so brief authz blips don't hard-fail apps (with a safe deny-by-default fallback for sensitive actions).",
-        "Replicate read paths regionally for latency; the change log keeps regions' caches/indexes converging, and tokens let a caller demand its own write is visible even across regions.",
-        "Every decision and grant/revoke is auditable — log who-can-do-what-and-why for compliance and incident review."
+        "Replicate read paths regionally for latency; each region's caches/indexes carry their own applied-version watermark, so a min_token check that lands in a lagging region waits, routes to a fresher region, or fails retryably rather than serving a stale allow. The change log keeps regions converging.",
+        "Treat the service as a control plane too: schema/policy versions roll out draft→shadow→active and can be rolled back, so a bad rewrite is reversible; tenant IDs partition tuples, policies, cache keys, and list indexes for isolation.",
+        "Every decision and grant/revoke is auditable. The change log doubles as the grant/revoke record (actor, reason, old/new tuple), and each check can emit a decision record (decisionId, result, reason code, policy/tuple version, caller) — enough to explain why any allow/deny happened for compliance and incident review."
       ],
       "view": {
         "nodes": [
@@ -1537,13 +1789,15 @@
           "SDK",
           "CheckAPI",
           "DecisionCache",
+          "PolicyEng",
           "RoleStore"
         ],
-        "caption": "The application's check travels through the authz client SDK to the check API, which serves verdicts from the decision cache backed by the role/policy store.",
+        "caption": "The application's check travels through the authz client SDK to the check API, which serves verdicts from the decision cache and, on a miss, evaluates via the policy engine over the role/policy store.",
         "links": [
           "app-sdk",
           "sdk-check",
           "check-cache",
+          "check-policy",
           "policy-role"
         ],
         "highlight": [
@@ -1678,7 +1932,24 @@
         "Closing on availability/audit/multi-region addresses the 'don't take down every app' requirement and the compliance angle."
       ],
       "probeLinks": [
-        "oauth-rfc"
+        "opa-docs",
+        "sre-monitoring"
+      ],
+      "concepts": [
+        {
+          "term": "Decision audit & explainability",
+          "definition": "A per-decision record (id, result, reason code, policy/tuple version, caller) plus the change log as a grant/revoke trail.",
+          "whyItMatters": "A shared authz service must prove who could do what and explain any allow/deny for compliance and incident review.",
+          "example": "decision d_5f2: deny, reason no_path, policyVersion 14, caller svc:docs.",
+          "group": "Availability, Auditing, and Multi-Region"
+        },
+        {
+          "term": "Policy lifecycle (rollout & rollback)",
+          "definition": "Schema/policy versions staged draft→shadow→active with a rollback path, evaluated against tenant boundaries.",
+          "whyItMatters": "A central control plane must test and roll out policy safely and reverse a bad change without re-granting.",
+          "example": "Publish rewrite as shadow, compare decisions, promote to active or roll back to version 14.",
+          "group": "Availability, Auditing, and Multi-Region"
+        }
       ],
       "recap": {
         "before": "Single-region, SPOF authz.",
@@ -1695,7 +1966,7 @@
   ],
   "finalDesign": {
     "title": "Final Design — Centralized ReBAC Authorization",
-    "description": "Apps call a stateless check API (via an SDK with in-process decision caching) asking 'can S do A on O?'. The policy engine evaluates relationship tuples (ReBAC) plus RBAC roles / ABAC predicates as a bounded, cached, short-circuiting graph walk. Writes to the tuple store flow through an ordered change log that returns consistency tokens, so callers can demand revokes are honored (no new-enemy bug) while default checks stay fast. A materializer maintains expanded-set reverse indexes for 'list accessible objects' and invalidates affected cached decisions on change. The service is stateless, regionally replicated, auditable, and deny-by-default on failure.",
+    "description": "Apps call a stateless check API (via an SDK with in-process decision caching) asking 'can S do A on O?'. The policy engine evaluates versioned relationship tuples (ReBAC) plus RBAC roles / ABAC caveats as a bounded, cached, short-circuiting graph walk. Writes to the tuple store are idempotent and conditional and flow through an ordered change log that both returns consistency tokens — so callers can demand revokes are honored (no new-enemy bug) while default checks stay fast — and serves as the grant/revoke audit trail. Caches, index shards, and regions carry applied-version watermarks so a min_token check never serves a stale allow. A materializer maintains chunked expanded-set reverse indexes for 'list accessible objects' and invalidates affected cached decisions on change. Schema/policy versions roll out (draft→shadow→active) and roll back; every decision can be logged for audit. The service is stateless, regionally replicated, tenant-isolated, and deny-by-default on failure.",
     "view": {
       "nodes": [
         "App",
@@ -1763,6 +2034,22 @@
         "steps": [
           "listing"
         ]
+      },
+      {
+        "requirement": "Centralized policy used by many applications",
+        "how": "One stateless check API + policy engine over shared tuple/role/policy stores; apps embed only a thin caching SDK, never policy logic.",
+        "steps": [
+          "model",
+          "availability"
+        ]
+      },
+      {
+        "requirement": "Policy lifecycle, audit & tenant isolation",
+        "how": "Versioned policy/schema (draft→shadow→active→rolled_back), change-log + decision audit records, and tenant IDs threaded through tuples, caches, and indexes.",
+        "steps": [
+          "model",
+          "availability"
+        ]
       }
     ],
     "nonFunctional": [
@@ -1771,6 +2058,14 @@
         "how": "Decision cache + SDK cache + bounded graph walk.",
         "steps": [
           "check"
+        ]
+      },
+      {
+        "requirement": "High throughput (1M+ checks/sec)",
+        "how": "Stateless check tier scaled horizontally; SDK + decision caches absorb ~99% of load so only ~1% reaches the policy engine/tuple store.",
+        "steps": [
+          "check",
+          "availability"
         ]
       },
       {
@@ -1911,17 +2206,6 @@
         "source": "Authzed",
         "type": "Docs",
         "why": "Open-source Zanzibar-inspired authorization system reference."
-      },
-      {
-        "id": "oauth-rfc",
-        "group": "Security and Identity",
-        "groupDescription": "Authentication, authorization, policy, abuse, and identity standards.",
-        "title": "OAuth 2.0 Authorization Framework",
-        "url": "https://www.rfc-editor.org/rfc/rfc6749",
-        "source": "IETF",
-        "type": "RFC",
-        "why": "The core standard behind delegated authorization and OAuth flows.",
-        "year": "2012"
       },
       {
         "id": "sre-monitoring",

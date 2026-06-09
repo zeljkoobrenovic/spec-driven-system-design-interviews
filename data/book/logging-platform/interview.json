@@ -320,11 +320,13 @@
   ],
   "capacityDiagram": [
     "graph LR",
-    "  Vol[~10 TB/day raw, ~2M events/sec peak]",
-    "  Hot[7 days hot + indexed: ~70 TB raw, ~100 TB index]",
-    "  Cold[365 days cold compressed: ~365 TB]",
-    "  Vol --> Hot",
-    "  Hot --> Cold"
+    "  Fire[Accepted firehose: ~700K evt/sec avg, ~2M peak, ~30 TB/day]",
+    "  Kept[Kept after sampling: ~10 TB/day archived raw]",
+    "  Hot[7 days hot-indexed: ~10 TB/day x 7 -> ~70 TB raw, ~80 TB index]",
+    "  Cold[365 days cold (compressed ~10x): ~365 TB]",
+    "  Fire --> Kept",
+    "  Kept --> Hot",
+    "  Kept --> Cold"
   ],
   "requirements": {
     "functional": [
@@ -337,8 +339,8 @@
       "Redact secrets/PII at collection and audit every search query."
     ],
     "nonFunctional": [
-      "Very high ingest throughput (~10 TB/day after sampling, ~2M events/sec peak), bursty.",
-      "Durable ingestion: don't drop accepted logs (at-least-once until deduped).",
+      "Very high ingest throughput (~30 TB/day firehose, ~10 TB/day kept after sampling; ~700K events/sec avg, ~2M peak), bursty.",
+      "Durable ingestion: don't drop accepted logs (at-least-once until deduped); accepted events are archived raw even when sampled out of the hot index.",
       "Fast search over recent (hot) data (seconds); slower acceptable for old (cold) data (async).",
       "Cost-efficient retention — most logs are written and never read.",
       "Resilient: a slow consumer or indexer must not drop ingestion.",
@@ -348,14 +350,14 @@
   },
   "capacity": [
     {
-      "label": "Ingest volume",
-      "value": "~10 TB/day",
-      "note": "Assume ~5,000 services, ~20M events/sec is the headline; we size to ~700K events/sec average at ~500 B/event -> ~350 MB/sec -> ~30 TB/day before sampling, ~10 TB/day kept after sampling debug noise."
+      "label": "Accepted firehose",
+      "value": "~700K evt/sec avg, ~2M peak",
+      "note": "~5,000 services at ~500 B/event -> ~350 MB/sec avg -> ~30 TB/day of raw events accepted at the edge. Incident bursts run ~3x average (~2M evt/sec, ~1 GB/sec), the surge that stresses consumers and indexers. This is the firehose all sizing starts from."
     },
     {
-      "label": "Events/sec",
-      "value": "~700K avg, ~2M peak",
-      "note": "Burst multiplier ~3x during incidents (the surge that stresses indexers). Drives stream partition count and collector fleet size."
+      "label": "Kept after sampling",
+      "value": "~10 TB/day",
+      "note": "Sampling drops most healthy debug noise from the indexed/retained set, keeping ~1/3 of the firehose. Every accepted (post-redaction) event is still archived raw; sampling controls hot-index inclusion and aggregation weight, not whether the event is persisted."
     },
     {
       "label": "Write:read",
@@ -365,17 +367,22 @@
     {
       "label": "Stream partitions",
       "value": "~256",
-      "note": "At ~350 MB/sec and ~5-10 MB/sec per partition consumer, ~256 partitions gives parallelism + burst headroom; partition by tenant/service."
+      "note": "At ~350 MB/sec firehose and ~5-10 MB/sec drained per partition by one consumer, ~256 partitions gives parallelism (a consumer group of ~256 processor tasks) plus burst headroom for the 3x incident surge; partition by tenant/service. The partition count is the ceiling on consumer parallelism and bounds indexing lag during bursts."
     },
     {
-      "label": "Hot window",
-      "value": "7 days indexed",
-      "note": "~10 TB/day x 7 = ~70 TB raw; inverted index runs ~1-1.5x raw, so ~100 TB hot index. With ~5 TB/shard that is ~20-30 hot shards."
+      "label": "Hot window + indexing",
+      "value": "7 days, ~70 TB raw / ~80 TB index",
+      "note": "~10 TB/day kept x 7 days = ~70 TB raw; inverted index over message + allowlisted fields runs ~1-1.2x raw, so ~80 TB hot index."
+    },
+    {
+      "label": "Shard / segment / node sizing",
+      "value": "~1,200 segments, ~50 nodes",
+      "note": "Segment per tenant-shard per hourly bucket; aim for ~30-50 GB sealed segments so rebuild/move is cheap. ~70 TB / ~50 GB ~= 1,400 live hot segments. Group into ~256 primary shards (one per stream partition lineage) x replica; pack ~1.5-2 TB index/node -> ~50 hot index nodes. Small segments keep recovery, rebalancing, and parallel query fan-out fast."
     },
     {
       "label": "Cold retention",
       "value": "365 days, ~365 TB",
-      "note": "~10 TB/day compressed ~10x in columnar object storage -> ~1 TB/day stored -> ~365 TB/year. Cheap object storage, searched on demand."
+      "note": "~10 TB/day kept, compressed ~10x in columnar object storage -> ~1 TB/day stored -> ~365 TB/year. Cheap object storage, searched on demand via async jobs."
     },
     {
       "label": "Search latency",
@@ -385,7 +392,7 @@
     {
       "label": "Indexing lag target",
       "value": "< 30 sec p99",
-      "note": "Recent logs searchable within ~30s of ingest under normal load; bounded by scaling consumers off the buffer during bursts."
+      "note": "Recent logs searchable within ~30s of ingest under normal load; bounded by scaling consumers (up to the ~256-partition ceiling) off the buffer during bursts."
     }
   ],
   "api": [
@@ -457,8 +464,8 @@
             "label": "Hot Index"
           },
           {
-            "id": "ColdStore",
-            "label": "Cold Store"
+            "id": "ControlPlane",
+            "label": "Control Plane"
           }
         ],
         "messages": [
@@ -477,25 +484,31 @@
                 "to": "HotIndex",
                 "arrow": "->>",
                 "label": "indexed search"
+              },
+              {
+                "from": "QuerySvc",
+                "to": "User",
+                "arrow": "-->>",
+                "label": "200 hits (seconds)"
               }
             ],
             "else": {
-              "label": "old range",
+              "label": "old range (beyond hot window)",
               "messages": [
                 {
                   "from": "QuerySvc",
-                  "to": "ColdStore",
+                  "to": "ControlPlane",
                   "arrow": "->>",
-                  "label": "scan / rehydrate"
+                  "label": "create query_job (filters required, cost cap)"
+                },
+                {
+                  "from": "QuerySvc",
+                  "to": "User",
+                  "arrow": "-->>",
+                  "label": "202 query_job_id (poll /v1/query-jobs)"
                 }
               ]
             }
-          },
-          {
-            "from": "QuerySvc",
-            "to": "User",
-            "arrow": "-->>",
-            "label": "hits"
           }
         ]
       }
@@ -518,8 +531,12 @@
   "dataModel": [
     {
       "name": "log_event",
-      "note": "A structured log record (parsed from the raw line).",
+      "note": "A structured log record (parsed from the raw line). Carries durable identity (source/batch/seq/offset) for dedupe + rebuild and a sample_weight for weighted aggregations.",
       "fields": [
+        {
+          "name": "event_id",
+          "type": "string (pk; derived from source_id+batch_id+seq, stable across retries)"
+        },
         {
           "name": "ts",
           "type": "timestamp (partition by time)"
@@ -527,6 +544,34 @@
         {
           "name": "tenant_id",
           "type": "string (index, isolation key)"
+        },
+        {
+          "name": "source_id",
+          "type": "string (fk -> log_source)"
+        },
+        {
+          "name": "batch_id",
+          "type": "string (ingest batch; dedupe key)"
+        },
+        {
+          "name": "seq",
+          "type": "int (per-source sequence within batch)"
+        },
+        {
+          "name": "partition",
+          "type": "int (buffer partition)"
+        },
+        {
+          "name": "offset",
+          "type": "long (buffer offset; rebuild watermark)"
+        },
+        {
+          "name": "accepted_at",
+          "type": "timestamp (when the collector acked)"
+        },
+        {
+          "name": "sample_weight",
+          "type": "int (1/keep-rate; multiply for true counts)"
         },
         {
           "name": "service",
@@ -620,6 +665,19 @@
       ]
     },
     {
+      "name": "ingest_batch",
+      "note": "Short-lived dedupe record for at-least-once ingest. A retry whose batch_id is still present is idempotent; once dedupe_expires_at passes, a re-send may duplicate.",
+      "fields": [
+        { "name": "batch_id", "type": "string (pk)" },
+        { "name": "source_id", "type": "string (fk)" },
+        { "name": "partition", "type": "int" },
+        { "name": "base_offset", "type": "long (first appended offset)" },
+        { "name": "accepted", "type": "int (events accepted)" },
+        { "name": "accepted_at", "type": "timestamp" },
+        { "name": "dedupe_expires_at", "type": "timestamp (TTL, e.g. ack + 10m)" }
+      ]
+    },
+    {
       "name": "retention_policy",
       "note": "Per-tenant/service retention + tiering rules the lifecycle worker enforces.",
       "fields": [
@@ -667,13 +725,16 @@
     },
     {
       "name": "alert_event",
-      "note": "A fired alert (for history, audit, and delivery retry).",
+      "note": "A fired alert (for history, audit, and delivery retry). Detection writes it pending; the notification worker drives delivery.",
       "fields": [
         { "name": "alert_id", "type": "string (pk)" },
         { "name": "rule_id", "type": "string (fk)" },
         { "name": "fired_at", "type": "timestamp" },
         { "name": "value", "type": "number (observed)" },
-        { "name": "delivery_status", "type": "enum(pending, sent, failed)" }
+        { "name": "delivery_status", "type": "enum(pending, sent, failed, suppressed)" },
+        { "name": "delivery_attempts", "type": "int (retry count)" },
+        { "name": "escalation_level", "type": "int (0 = primary, n = escalated)" },
+        { "name": "acknowledged_at", "type": "timestamp (stops escalation)" }
       ]
     },
     {
@@ -759,11 +820,11 @@
   "steps": [
     {
       "id": "naive",
-      "title": "1. Naive: Write Logs Straight to a Database and Scan It (the baseline)",
+      "title": "1. Naive: Write Logs Straight to One Store and Scan It (the baseline)",
       "description": [
-        "Start with the simplest thing that works. Each service writes its log lines straight into a single shared store — one big table or one growing set of files — and when an engineer needs to investigate, they run a query that scans the whole store, effectively grep over everything.",
-        "This works for one small service and immediately exposes three problems the rest of the design exists to solve. First, synchronous writes can't absorb a ~10 TB/day firehose — a burst or a slow store backs up and stalls the applications doing the logging. Second, searching means scanning the whole store, which gets unusably slow as it grows. Third, it grows without bound; nothing ages old data out, so cost and size explode.",
-        "So the baseline motivates everything that follows: put a durable buffer in front so ingestion never blocks, build a time-bucketed index so search prunes instead of scans, and tier old data to cheap storage with a retention policy."
+        "Start with the simplest thing that works. Each service writes its log lines straight into a single shared store — one big table or one growing set of files — and when an engineer needs to investigate, they run a query that scans the whole store, effectively a grep over everything.",
+        "This works for one small service, and it immediately exposes the three problems the rest of the design exists to solve. First, synchronous writes can't absorb a ~10 TB/day firehose — a burst or a slow store backs up and stalls the very applications doing the logging. Second, searching means scanning the whole store, which gets unusably slow as it grows. Third, it grows without bound: nothing ages old data out, so cost and size explode.",
+        "So the baseline motivates everything that follows: put a durable buffer in front so ingestion never blocks, build a time-bucketed index so search prunes instead of scanning, and tier old data to cheap storage under a retention policy."
       ],
       "view": {
         "nodes": [
@@ -812,27 +873,31 @@
       "title": "2. Durable High-Throughput Ingestion",
       "description": [
         "Agents on each host batch log lines and ship them to a collector that parses/enriches lightly and appends to a durable, partitioned buffer (Kafka-style). The collector does minimal work so it can absorb TBs/day.",
-        "The buffer decouples ingestion from indexing: a slow or down indexer doesn't drop logs — they queue durably and consumers catch up. Partition by tenant/service for parallelism.",
-        "Accept fast and acknowledge only after the batch is durably appended; never block the application's logging on downstream processing. This makes ingestion at-least-once: an agent that times out before the ack will retry, so batches carry a batch_id (and events a source seq number) to dedupe duplicates downstream.",
-        "Be explicit about overload: if a source exceeds its quota or the buffer approaches saturation, reject or sample before acknowledging (429 + Retry-After) — drop low-value logs at the edge, never silently lose a log you already acknowledged. Malformed or poison records that can't be parsed are routed to a dead-letter/quarantine path rather than failing the whole batch."
+        "The buffer decouples ingestion from indexing: a slow or down indexer doesn't drop logs — they queue durably and consumers catch up when they recover. Partition by tenant/service for parallelism.",
+        "Make the ingest contract explicit, because it defines the platform's durability and privacy guarantees. Per batch, the collector, in order: (1) authenticates the source and checks the per-tenant quota against the control plane; (2) redacts secrets/PII at the edge — before anything is persisted, so a leaked token never lands in the durable buffer; (3) compresses and appends to the partitioned buffer; (4) acknowledges only after the durable append succeeds. Everything that survives to the buffer is durable and at-least-once until deduped.",
+        "Shedding is allowed only before the acknowledgement: if a source exceeds its quota or the buffer approaches saturation, reject or down-sample at the edge and return 429 + Retry-After (or 207 partial acceptance with the rejected events listed). Once a batch is acked it is never silently dropped — destructive shedding after the ack would violate 'don't drop accepted logs'. (Hot-index sampling in Step 3 is non-destructive: the event is still archived raw.)",
+        "Ingestion is at-least-once, so an agent that times out before the ack retries. Batches carry a batch_id and events a source seq; the control plane keeps a short dedupe window (e.g. 10 min of seen batch_ids) so retries inside the window are idempotent. A retry that arrives after the window expires may produce a duplicate — acceptable for logs, and visible because events carry stable identity. Malformed or poison records that can't be parsed are routed to a dead-letter/quarantine path rather than failing the whole batch."
       ],
       "view": {
         "nodes": [
           "App",
           "Collector",
-          "Buffer"
+          "Buffer",
+          "ControlPlane"
         ],
-        "caption": "Host agents batch log lines to the collector, which appends them to a durable partitioned ingestion buffer.",
+        "caption": "Host agents batch log lines to the collector, which authenticates and quota-checks the source against the control plane, redacts at the edge, then appends to the durable partitioned buffer.",
         "links": [
           "app-collector",
-          "collector-buffer"
+          "collector-buffer",
+          "collector-control"
         ],
         "highlight": [
           "Collector",
           "Buffer"
         ],
         "groups": [
-          "ingest"
+          "ingest",
+          "control"
         ]
       },
       "decisionPrompt": "Why put a durable buffer between collection and indexing instead of indexing inline?",
@@ -859,13 +924,13 @@
       ],
       "recap": {
         "before": "Nothing.",
-        "after": "Logs durably accepted (at-least-once, deduped by batch_id) and buffered, decoupled from indexing; overload sheds before the ack.",
+        "after": "Logs authenticated, quota-checked, redacted at the edge, then durably buffered (at-least-once, deduped by batch_id), decoupled from indexing; overload sheds before the ack.",
         "newRisk": "Raw lines aren't searchable or structured yet, and volume may exceed what's worth indexing."
       },
       "flows": [
         {
-          "name": "Ship -> buffer -> ack (never block the app)",
-          "note": "The collector accepts and durably buffers a batch fast; indexing happens later off the buffer, so a slow indexer never blocks logging.",
+          "name": "Ship -> auth/quota -> redact -> buffer -> ack (never block the app)",
+          "note": "The collector authenticates and quota-checks the source, redacts secrets at the edge, then durably buffers the batch and acks only after the append; a too-fast source or saturated buffer is shed with 429 before any ack.",
           "sequence": {
             "participants": [
               {
@@ -877,6 +942,10 @@
                 "label": "Collector"
               },
               {
+                "id": "ControlPlane",
+                "label": "Control Plane"
+              },
+              {
                 "id": "Buffer",
                 "label": "Ingest Buffer"
               }
@@ -886,31 +955,54 @@
                 "from": "App",
                 "to": "Collector",
                 "arrow": "->>",
-                "label": "ship log batch"
+                "label": "ship log batch (batch_id, seq)"
               },
               {
                 "from": "Collector",
-                "to": "Collector",
+                "to": "ControlPlane",
                 "arrow": "->>",
-                "label": "parse + enrich (light)"
+                "label": "auth source + check quota/dedupe"
               },
               {
-                "from": "Collector",
-                "to": "Buffer",
-                "arrow": "->>",
-                "label": "append (partition by service)"
-              },
-              {
-                "from": "Buffer",
-                "to": "Collector",
-                "arrow": "-->>",
-                "label": "durably persisted"
-              },
-              {
-                "from": "Collector",
-                "to": "App",
-                "arrow": "-->>",
-                "label": "202 accepted"
+                "type": "alt",
+                "label": "authorized + within quota",
+                "messages": [
+                  {
+                    "from": "Collector",
+                    "to": "Collector",
+                    "arrow": "->>",
+                    "label": "redact secrets/PII + parse/enrich (light)"
+                  },
+                  {
+                    "from": "Collector",
+                    "to": "Buffer",
+                    "arrow": "->>",
+                    "label": "append (partition by service)"
+                  },
+                  {
+                    "from": "Buffer",
+                    "to": "Collector",
+                    "arrow": "-->>",
+                    "label": "durably persisted"
+                  },
+                  {
+                    "from": "Collector",
+                    "to": "App",
+                    "arrow": "-->>",
+                    "label": "202 accepted (offset)"
+                  }
+                ],
+                "else": {
+                  "label": "over quota / buffer saturated",
+                  "messages": [
+                    {
+                      "from": "Collector",
+                      "to": "App",
+                      "arrow": "-->>",
+                      "label": "429 Retry-After (shed before ack)"
+                    }
+                  ]
+                }
               }
             ]
           },
@@ -925,37 +1017,43 @@
       "id": "process",
       "title": "3. Parse, Structure, and Sample",
       "description": [
-        "Consumers read the buffer and turn raw lines into structured events: extract level, timestamp, service, and key fields (and a trace id for correlation). Structured fields enable precise queries; the message stays full-text-searchable.",
-        "Volume often outpaces value, so control cost here. Be precise about what 'drop' means: dropping from hot indexing (the event still lands in the raw archive, just isn't searchable in the index) is cheap and reversible; dropping before acceptance (never archived) is destructive and should be reserved for clearly low-value classes like healthy debug noise. Enforce per-tenant/service quotas and route different log types to different retention.",
-        "Schema evolution is handled here too: parser_schema is versioned, and events carry a schema_version so field mappings can change without breaking old data. Always archive the raw event cheaply (object store) before/while structuring, so nothing is permanently lost even if parsing is lossy."
+        "Consumers read the buffer and turn raw lines into structured events: extract level, timestamp, service, and key fields (and a trace id for correlation). Structured fields enable precise queries; the message stays full-text-searchable. (Secrets/PII were already redacted at the collector in Step 2 — by the time the processor sees an event it is safe to archive and index.)",
+        "Volume often outpaces value, so this is where you control cost — but be precise about three different operations, because they carry different guarantees:",
+        "1. Drop before acceptance: this is the only destructive drop, and it happens at the collector before the ack (Step 2), never here after the event is already durable. Reserve it for clearly low-value classes the API marks droppable (e.g. healthy debug noise) and surface it as 429/207, not a silent loss.",
+        "2. Archive accepted raw, sample the hot index: every accepted event is written to the raw store; sampling here decides only what enters the inverted index. A sampled-out event is fully retrievable from raw/cold — it just isn't in the fast index. This is reversible: you can re-index a window later.",
+        "3. Store sample weights for aggregations: when the processor keeps 1-in-N of a class, it stamps a sample_weight on the kept events so dashboard counts and rates can be reconstructed (multiply by the weight) instead of under-reporting.",
+        "Enforce per-tenant/service quotas and route different log types to different retention. Schema evolution is handled here too: parser_schema is versioned and each event carries a schema_version, so field mappings can change without breaking old data. Raw archival happens before (or alongside) structuring, so nothing is permanently lost even when parsing is lossy."
       ],
       "view": {
         "nodes": [
           "Buffer",
           "Processor",
           "RawStore",
-          "Indexer"
+          "Indexer",
+          "ControlPlane"
         ],
-        "caption": "The processing pipeline consumes the buffer, archives raw lines to object storage, and sends structured events to the indexer.",
+        "caption": "The processing pipeline consumes the buffer, reads versioned parser schemas from the control plane, archives raw lines to object storage, and sends structured events to the indexer.",
         "links": [
           "buffer-processor",
           "processor-raw",
-          "processor-indexer"
+          "processor-indexer",
+          "processor-control"
         ],
         "highlight": [
           "Processor"
         ],
         "groups": [
           "ingest",
-          "storage"
+          "storage",
+          "control"
         ]
       },
       "options": [
         {
           "name": "Tail-based sampling (decide after seeing the trace) (default)",
-          "description": "The processor buffers a request's logs until its outcome is known, then keeps everything for errors/slow requests and drops most healthy debug noise.",
+          "description": "The processor buffers a request's logs until its outcome is known, then indexes everything for errors/slow requests and keeps most healthy debug noise out of the hot index (still archived raw).",
           "pros": [
-            "Keep all logs for errors/slow requests and drop most healthy debug noise, so you cut volume without losing the logs you actually read.",
+            "Index all logs for errors/slow requests and sample healthy debug noise out of the hot index, so you cut index cost without losing the logs you actually read (raw stays archived).",
             "Decisions use the whole request outcome, so an error's surrounding debug lines are retained.",
             "Targets the real cost driver (high-volume debug logs nobody reads)."
           ],
@@ -1088,7 +1186,7 @@
       ],
       "recap": {
         "before": "Raw lines.",
-        "after": "Structured, cost-controlled events + archived raw.",
+        "after": "Structured events: all accepted raw archived, hot index sampled (with sample weights for aggregations), schema-versioned.",
         "newRisk": "Searching all events directly is too slow — recent data needs an index."
       }
     },
@@ -1097,9 +1195,9 @@
       "title": "4. Time-Bucketed Indexing for Search",
       "description": [
         "Logs are time-ordered and queries almost always include a time range, so index in immutable time-bucketed segments (e.g. per hour). The indexer builds an inverted index over the message and structured fields per bucket.",
-        "Search prunes by time first — only segments overlapping the query range are touched — then matches terms within them. Shard segments by tenant/service within each time bucket so a noisy tenant doesn't bloat everyone's index and queries scope to one tenant. Segments are immutable and independently retire-able, which is what makes tiering clean; each segment tracks a build status and the source offsets it covers, so a crashed indexer can rebuild exactly the buckets it lost.",
-        "Guard cardinality: full-text-index the message but only index an allowlist of structured fields (parser_schema.indexed_fields). High-cardinality fields like request_id or user_id explode the inverted index, so keep them queryable via the raw/columnar path rather than the hot index. Expose indexing lag (ingest-to-searchable) as a first-class metric.",
-        "Index only the hot window (recent days); older buckets age out of the index even though their raw data persists."
+        "Search prunes by time first — only segments overlapping the query range are touched — then matches terms within them. The unit is one segment per (tenant-shard, hourly bucket): shard by tenant/service within each time bucket so a noisy tenant doesn't bloat everyone's index and queries scope to one tenant. Aim for ~30-50 GB sealed segments so ~70 TB of hot data is ~1,400 live segments packed onto ~50 index nodes (see Capacity) — small enough that rebuild, rebalance, and parallel query fan-out stay fast. Segments are immutable and independently retire-able, which is what makes tiering clean; each segment tracks a build status and the source offsets it covers, so a crashed indexer can rebuild exactly the buckets it lost.",
+        "Guard cardinality: full-text-index the message but only index an allowlist of structured fields (parser_schema.indexed_fields). High-cardinality fields like request_id or user_id explode the inverted index, so keep them queryable via the raw/columnar path rather than the hot index; the allowlist (and a dynamic-mapping limit) is the hard cap. Expose indexing lag (ingest-to-searchable) as a first-class metric and alert when it approaches the 30-second p99 target — under a burst the indexer is the component that falls behind, and the lever is scaling consumers up to the ~256-partition parallelism ceiling.",
+        "Index only the hot window (recent days); older buckets age out of the index even though their raw data persists in cheap storage."
       ],
       "view": {
         "nodes": [
@@ -1234,7 +1332,7 @@
       "description": [
         "Most logs are written and never read, and reads skew heavily to recent data. Keep a short hot window indexed on fast storage; age older data to cheaper tiers — warm (compressed, slower index) then cold (archive, searchable only on rehydrate).",
         "Make the cold path concrete. Cold data lives in object storage as compressed columnar files (e.g. Parquet) partitioned by tenant/service/date/hour; a catalog maps each time bucket to its objects. A query whose range falls beyond the hot window doesn't run synchronously — it creates a query_job. Large jobs require time/service filters and run under a cost cap (bounded scanned_bytes); the job either scans the columnar files directly or rehydrates a temporary index, and its result (or temp index) expires after a TTL. So the user experience is: recent search returns in seconds; an old search returns a job id to poll, and a too-broad cold query is rejected until narrowed.",
-        "The raw store backs both — you can always re-derive an index for an old window if needed. This tiering is the cost story: it keeps the expensive indexed footprint small while retaining everything cheaply."
+        "The raw store backs both tiers — you can always re-derive an index for an old window if needed. This tiering is the whole cost story: it keeps the expensive indexed footprint small while still retaining everything cheaply."
       ],
       "view": {
         "nodes": [
@@ -1242,22 +1340,25 @@
           "HotIndex",
           "ColdStore",
           "RawStore",
-          "Lifecycle"
+          "Lifecycle",
+          "ControlPlane"
         ],
-        "caption": "The query service routes recent searches to the hot index and old ones to the cold tier or raw store, while a lifecycle worker ages data out.",
+        "caption": "The query service routes recent searches to the hot index and creates async jobs (tracked in the control plane) for old ranges against the cold tier or raw store, while a lifecycle worker ages data out.",
         "links": [
           "query-hot",
           "query-cold",
           "query-raw",
           "raw-cold",
-          "lifecycle-cold"
+          "lifecycle-cold",
+          "query-control"
         ],
         "highlight": [
           "ColdStore"
         ],
         "groups": [
           "storage",
-          "consume"
+          "consume",
+          "control"
         ]
       },
       "options": [
@@ -1365,8 +1466,8 @@
       },
       "flows": [
         {
-          "name": "Search routes by time range (hot vs cold)",
-          "note": "Recent ranges hit the indexed hot store and return in seconds; old ranges rehydrate from cold storage and are slower but acceptable.",
+          "name": "Search routes by time range (hot sync vs cold async job)",
+          "note": "Recent ranges hit the indexed hot store and return in seconds. Old ranges become an async query_job: the query service returns a 202 job id immediately, a worker scans/rehydrates from cold storage under a cost cap, and the user polls until results are ready (and until they expire).",
           "sequence": {
             "participants": [
               {
@@ -1408,31 +1509,55 @@
                     "to": "QuerySvc",
                     "arrow": "-->>",
                     "label": "hits (seconds)"
+                  },
+                  {
+                    "from": "QuerySvc",
+                    "to": "User",
+                    "arrow": "-->>",
+                    "label": "200 results"
                   }
                 ],
                 "else": {
-                  "label": "old range (beyond hot window)",
+                  "label": "old range (beyond hot window) -> async job",
                   "messages": [
+                    {
+                      "from": "QuerySvc",
+                      "to": "QuerySvc",
+                      "arrow": "->>",
+                      "label": "create query_job (require filters, cost cap)"
+                    },
+                    {
+                      "from": "QuerySvc",
+                      "to": "User",
+                      "arrow": "-->>",
+                      "label": "202 query_job_id"
+                    },
                     {
                       "from": "QuerySvc",
                       "to": "ColdStore",
                       "arrow": "->>",
-                      "label": "rehydrate + scan"
+                      "label": "worker scans / rehydrates (bounded scanned_bytes)"
                     },
                     {
                       "from": "ColdStore",
                       "to": "QuerySvc",
                       "arrow": "-->>",
-                      "label": "hits (slower)"
+                      "label": "temp results / temp index"
+                    },
+                    {
+                      "from": "User",
+                      "to": "QuerySvc",
+                      "arrow": "->>",
+                      "label": "poll /v1/query-jobs/{id}"
+                    },
+                    {
+                      "from": "QuerySvc",
+                      "to": "User",
+                      "arrow": "-->>",
+                      "label": "done: result_url (until expires_at)"
                     }
                   ]
                 }
-              },
-              {
-                "from": "QuerySvc",
-                "to": "User",
-                "arrow": "-->>",
-                "label": "results"
               }
             ]
           },
@@ -1449,28 +1574,32 @@
       "title": "6. Streaming Alerts",
       "description": [
         "Alerting on logs ('error rate spiking', 'this exception appeared') shouldn't poll the index — that's slow and load-heavy. Evaluate alert rules on the ingest stream as events flow, so detection is near-real-time.",
-        "Rules match patterns or compute windowed aggregates (counts/thresholds) over the stream; matches fire alerts. This reuses the same buffer the indexer consumes — alerting is just another consumer.",
-        "Behind the stream sits a small control plane: alert_rules (query, window, threshold, owner, notification routing) with CRUD and a test path, alert_window state that must survive restarts so a crash doesn't miss firings, and alert_events for history and delivery retry. Keep window state and dedup/suppression (one page per incident, not per matching log) in the alert service; route to pager/Slack/webhook by rule and handle delivery failures. The index remains for ad-hoc investigation after an alert."
+        "Rules match patterns or compute windowed aggregates (counts/thresholds) over the stream, and matches fire alerts. This reuses the same buffer the indexer consumes — alerting is just another consumer of it.",
+        "Behind the stream sits a small control plane: alert_rules (query, window, threshold, owner, notification routing) with CRUD and a test path, alert_window state that must survive restarts so a crash doesn't miss firings, and alert_events for history and delivery retry. Keep window state and dedup/suppression (one page per incident, not per matching log) in the alert service; route to pager/Slack/webhook by rule and handle delivery failures. The index remains for ad-hoc investigation after an alert.",
+        "Window state is checkpointed: the alert service periodically snapshots each alert_window (start, running count, last_fired_at) alongside the consumed stream offset, so a restart resumes from the checkpoint and replays only the tail rather than missing or double-firing. Detection (rule evaluation) is deliberately separated from delivery (getting the page to a human): an evaluation that crosses a threshold writes an alert_event with delivery_status=pending; a notification worker then routes and retries it, so a flaky webhook can't block or drop a detected alert."
       ],
       "view": {
         "nodes": [
           "Processor",
           "AlertSvc",
           "User",
-          "Buffer"
+          "Buffer",
+          "ControlPlane"
         ],
-        "caption": "The processor streams structured events to the alerting service, which evaluates rules on the live buffer feed and fires alerts to engineers.",
+        "caption": "The processor streams structured events to the alerting service, which loads rules and checkpoints window state in the control plane, evaluates on the live buffer feed, and fires alerts to engineers.",
         "links": [
           "processor-alert",
           "alert-user",
-          "buffer-processor"
+          "buffer-processor",
+          "alert-control"
         ],
         "highlight": [
           "AlertSvc"
         ],
         "groups": [
           "ingest",
-          "consume"
+          "consume",
+          "control"
         ]
       },
       "options": [
@@ -1571,9 +1700,22 @@
       ],
       "recap": {
         "before": "Alerting by polling search.",
-        "after": "Real-time alerts evaluated on the ingest stream.",
+        "after": "Real-time alerts evaluated on the ingest stream, with checkpointed window state and a separate retrying delivery path.",
         "newRisk": "Indexer lag under bursts and retention enforcement must be handled operationally."
       },
+      "deepDives": [
+        {
+          "title": "Notification delivery: routing, retries, suppression, escalation, and alert storms",
+          "points": [
+            "Detection vs delivery: rule evaluation writes an alert_event (delivery_status=pending); a separate notification worker owns getting it to a human, so a slow PagerDuty/Slack/webhook never stalls evaluation or drops a firing.",
+            "Routing + ownership: each alert_rule carries a route list (pager/Slack/webhook) and an owner team; ownership/route changes take effect on the next firing without restarting evaluation.",
+            "Retries + evidence: failed deliveries retry with backoff and flip delivery_status pending->sent/failed; every attempt is recorded on the alert_event so there's an audit trail of what fired and whether the page landed.",
+            "Suppression + escalation: a per-rule dedup_window collapses repeat firings into one page per incident; if it isn't acknowledged within an escalation interval, escalate to the next contact rather than re-paging the same person.",
+            "Alert storms: during a broad outage thousands of rules can fire at once. Bound it with per-rule and per-tenant notification rate caps and grouping (one summarized page per service/incident), so on-call isn't buried and the notification path itself doesn't melt down.",
+            "Self-protection: the alert path reads off the buffer (not the laggy index), so it keeps detecting during the same incident that stresses indexing; delivery backpressure (queue + caps) keeps a downstream pager outage from blocking the consumer."
+          ]
+        }
+      ],
       "flows": [
         {
           "name": "Streaming alert evaluation (not index polling)",
@@ -1654,7 +1796,7 @@
         "A lifecycle worker enforces retention: age hot segments to warm/cold, then delete past the policy — per service/tenant. This is what keeps storage bounded and compliant.",
         "Handle bursts and slow consumers with backpressure: the durable buffer absorbs ingestion spikes while indexers fall behind, then catch up. If truly overwhelmed, shed or sample at the collector before the ack (return 429) — this drops low-value logs at the edge, which is fundamentally different from losing logs you already acknowledged. Per-tenant quotas stop one noisy service from starving others.",
         "Operate it with metrics and drills: buffer saturation / consumer lag, collector rejection (429) rate, processor and indexer lag, dead-letter volume, hot-index health, cold-query cost, lifecycle backlog, and alert-rule evaluation lag.",
-        "Because raw events are archived and segments are immutable/rebuildable, an indexer crash or corrupt segment is recovered by reprocessing from the buffer/raw store — no data loss."
+        "Because raw events are archived and segments are immutable and rebuildable, an indexer crash or a corrupt segment is recovered by reprocessing from the buffer/raw store — with no data loss."
       ],
       "view": {
         "nodes": [
@@ -1663,21 +1805,24 @@
           "ColdStore",
           "RawStore",
           "Buffer",
-          "Processor"
+          "Processor",
+          "ControlPlane"
         ],
-        "caption": "The lifecycle worker expires old hot segments and ages the raw archive to the cold tier, while the buffer absorbs bursts as the processor catches up.",
+        "caption": "The lifecycle worker reads retention policies from the control plane, expires old hot segments, and ages the raw archive to the cold tier, while the buffer absorbs bursts as the processor catches up.",
         "links": [
           "lifecycle-hot",
           "lifecycle-cold",
           "buffer-processor",
-          "raw-cold"
+          "raw-cold",
+          "lifecycle-control"
         ],
         "highlight": [
           "Lifecycle"
         ],
         "groups": [
           "consume",
-          "storage"
+          "storage",
+          "control"
         ]
       },
       "decisionPrompt": "An indexer falls hours behind during an incident's log surge. What happens to ingestion and search?",
@@ -1741,13 +1886,23 @@
           "scenario": "A service logs a secret/token in plaintext.",
           "expectedBehavior": "The value is redacted at collection before it is buffered or indexed; query access is audited.",
           "mitigation": "Field redaction + secret/PII detection at the collector; RBAC + audit on search."
+        },
+        {
+          "scenario": "The lifecycle worker falls behind and old hot segments aren't aging out.",
+          "expectedBehavior": "Hot storage grows past budget but nothing is lost; ingestion/search keep working while the backlog drains.",
+          "mitigation": "Alert on lifecycle backlog (segments overdue for tiering/deletion); idempotent, resumable tiering jobs; cap hot capacity with headroom so a transient backlog doesn't fill disks."
+        },
+        {
+          "scenario": "Notification delivery fails (webhook/pager outage) during an incident.",
+          "expectedBehavior": "Detection keeps firing alert_events; deliveries retry and escalate, and no detected alert is silently lost.",
+          "mitigation": "Separate notification worker with retry/backoff + escalation; alert_events persist delivery_status as evidence; per-tenant notification rate caps prevent storm amplification."
         }
       ]
     }
   ],
   "finalDesign": {
     "title": "Final Design — Centralized Logging Platform",
-    "description": "Host agents batch logs to authenticated collectors that append to a durable partitioned buffer. Processors parse/structure events, redact secrets, sample/quota for cost, archive raw to object storage, and feed an indexer that builds immutable time-bucketed inverted-index segments for the hot window. A query service routes searches by time range — hot index for recent (seconds), async cold query jobs for old (rehydrate from compressed columnar object storage under a cost cap). Alert rules evaluate on the ingest stream for near-real-time detection. A lifecycle worker tiers hot->cold->delete per retention. A control-plane/metadata store holds tenants, sources, parser schemas, retention policies, alert rules, the segment catalog, query jobs, and quotas — giving the data plane its tenant isolation, RBAC, and rebuildability. The durable buffer + raw archive + immutable segments (with source offsets) make ingestion lossless and indexes rebuildable under bursts and failures.",
+    "description": "Host agents batch logs to authenticated collectors that authenticate the source, check per-tenant quota, redact secrets at the edge, then append to a durable partitioned buffer and ack only after the durable write. The core data guarantee: accepted (redacted) events are durably buffered and archived raw; sampling controls hot-index inclusion and retention class, never whether an accepted event is persisted — destructive drops happen only before the ack (429/partial). Processors parse/structure events (schema-versioned), stamp sample weights, sample/quota for cost, archive raw to object storage, and feed an indexer that builds immutable ~30-50 GB time-bucketed inverted-index segments for the hot window. A query service routes searches by time range — hot index for recent (seconds), async cold query jobs for old (rehydrate from compressed columnar object storage under a cost cap, results expiring on a TTL). Alert rules evaluate on the ingest stream for near-real-time detection, with checkpointed window state and a separate retrying/escalating notification path. A lifecycle worker tiers hot->cold->delete per retention. A control-plane/metadata store holds tenants, sources, parser schemas, retention policies, alert rules, the segment catalog, query jobs, dedupe state, and quotas — giving the data plane its tenant isolation, RBAC, and rebuildability. The durable buffer + raw archive + immutable segments (with source offsets) make ingestion lossless and indexes rebuildable under bursts and failures.",
     "view": {
       "nodes": [
         "App",
@@ -1844,9 +1999,9 @@
       },
       {
         "requirement": "Redact secrets/PII + audit search",
-        "how": "Redaction at the collector before buffering; query audit + RBAC.",
+        "how": "Redaction at the collector before buffering (Step 2); query audit + RBAC.",
         "steps": [
-          "process",
+          "ingest",
           "reliability"
         ]
       }

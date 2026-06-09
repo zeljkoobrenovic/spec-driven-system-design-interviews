@@ -5,229 +5,207 @@ Review date: 2026-06-09
 
 ## Executive Summary
 
-This is a strong method-oriented walkthrough rather than a normal system design case. It teaches a clear nine-phase interview arc, has useful traps and interviewer signals, and fits the book's role as a reusable framework. The main weakness is that the dataset explains what to do but does not yet show enough concrete artifacts for each phase: sample outputs, time boxes, decision templates, and branch handling when the interview goes off the happy path.
+This is now a strong method-oriented chapter, not a conventional single-system case. The recent changes materially improved the dataset: it now has per-step time boxes, concrete board-artifact concepts, cross-cutting operations prompts in earlier phases, branch options for several common mistakes, and a `finalDesign` synthesis that shows what a strong candidate leaves behind.
+
+The main remaining weakness is not correctness; it is expressiveness. Several phases still have no branch choices, the board artifacts are described in prose rather than shown as compact templates, and the diagrams still mostly render the same P1-P9 pipeline with a different highlight. The method is credible and useful, but it can become more operational by showing exactly what a candidate writes, says, and chooses when the interview diverges from the happy path.
 
 | Area | Rating | Notes |
 | --- | ---: | --- |
-| Method soundness | 4/5 | Covers the right phases in a defensible order. |
-| Production realism | 3/5 | Names reliability, security, cost, and operations, but keeps them late and broad. |
-| Pedagogical flow | 4/5 | Clear progression with good traps/signals; needs more examples and branches. |
-| Candidate usability | 3/5 | Memorable framework, but not enough "what do I write on the board?" detail. |
-| Dataset/rendering fit | 3/5 | JSON references are clean, but the repeated diagrams and service-typed phase nodes are weak. |
+| Method soundness | 4/5 | The nine-phase order is defensible and now includes time pressure, artifacts, and closure. |
+| Production realism | 4/5 | Reliability, security, cost, privacy, deletion, overload, and DR are now introduced earlier, though still mostly as prompts. |
+| Pedagogical flow | 4/5 | Clear progression with good traps, signals, options, and final synthesis; needs more concrete examples. |
+| Candidate usability | 4/5 | Much more reusable after the artifact and time-box additions; templates would make it easier to practice. |
+| Dataset/rendering fit | 4/5 | References are clean and `finalDesign` is present; phase nodes and repeated views remain semantically limited. |
 
 ## What Works Well
 
-- The nine phases are ordered well: clarify, estimate, API, data model, architecture, deep dives, bottlenecks, operations, communication.
-- Each step has practical `talkingPoints`, common traps, and strong/weak interviewer signals. Those are high-value teaching details.
-- The `recap` and `whyNow` fields make most step transitions explicit, especially from estimation through operations.
-- The requirements and `satisfies` sections align: each stated method goal maps to one or more steps.
-- The `interviewScript` is a useful compact runbook for a 45-minute session.
-- Structurally, the dataset parses as JSON and the view/link/highlight references resolve.
+- The core sequence is coherent: clarify, estimate, API, data model, architecture, deep dives, bottlenecks, operations, communication.
+- Recent edits fixed several earlier gaps: time boxes are now encoded per phase, operations concerns are woven into Steps 1-6, and `finalDesign` now provides closure.
+- Each phase has useful `talkingPoints`, `concepts`, traps, and interviewer signals.
+- The new "Board artifact" concepts are valuable because they translate abstract advice into candidate outputs.
+- Options on clarify, estimate, architecture, and communication model real interview choices rather than pure architecture alternatives.
+- `satisfies`, `patterns`, `interviewScript`, `levelVariants`, and `followUps` align well with the method.
+- Structurally, JSON parses cleanly and view/link/highlight/probe references resolve.
 
 ## Highest-Impact Issues
 
-### 1. The method needs concrete output artifacts for each phase
+### 1. Branch coverage is still uneven
 
-The dataset tells candidates to clarify scope, estimate scale, define APIs, model data, and sketch architecture, but it rarely shows the actual artifact they should produce. A reusable method chapter should include compact examples such as:
+The dataset now has useful branch options in four phases: clarify, estimate, architecture, and communicate. That is a strong improvement, but the middle and late phases are still linear: API, data model, deep dives, bottlenecks, and operations have no `options`.
 
-- A requirements/out-of-scope table.
-- A back-of-envelope estimation template with example formulas.
-- A minimal API contract sketch.
-- An entity/access-pattern table.
-- A component-to-requirement mapping.
-- A bottleneck and mitigation matrix.
-- A final 60-second summary template.
+Why it matters: the method is explicitly about judgment under ambiguity. The most teachable failures often happen in those missing phases: over-designing an API, choosing a database too early, deep-diving the wrong component, presenting trade-offs as absolutes, or spending the operations recap on generic checklists.
 
-Concrete fix: add one small "board artifact" or "candidate output" block to each step, either as additional `talkingPoints`, `concepts`, or focused `deepDives`. Keep the examples generic, or thread one simple running prompt such as URL shortener through every phase.
+Concrete fix: add one or two method-level options to the remaining phases:
 
-### 2. Time management is central but not encoded per step
+- API: "minimal contract with idempotency/auth marked" vs "full REST spec too early".
+- Data model: "access-pattern table first" vs "pick database by familiarity".
+- Deep dives: "choose the highest-risk component" vs "deep-dive the familiar component".
+- Bottlenecks: "name first failure mode and mitigation" vs "claim the design scales horizontally".
+- Operations: "prioritize system-specific risks" vs "recite generic monitoring/security".
 
-The non-functional requirements say the method is time-boxed to about 45 minutes, and `interviewScript` gives broad phase ranges. Individual steps do not show target durations, skip rules, or pivot criteria. That weakens the most practical promise of the method.
+### 2. Board artifacts are described, but not yet shown as templates
 
-Concrete fix: add explicit phase budgets:
+The artifact concepts are a major upgrade, but they are still mostly paragraph examples. A candidate using this as a practice tool would benefit from exact mini-templates they can reproduce on a whiteboard.
 
-- Clarify and estimate: about 10 minutes total.
-- API and data model: about 10 minutes.
-- Architecture and deep dives: about 20 minutes.
-- Bottlenecks, operations, and wrap: about 5 minutes.
+Concrete fix: add compact artifacts to each phase, either in `concepts`, `deepDives`, or a new repeated content pattern:
 
-Then add per-step guidance such as "if the interviewer pushes back, move to X", "if time is short, say Y and continue", and "minimum acceptable output before moving on".
+- Scope table: functional, non-functional, out-of-scope, assumptions, open questions.
+- Estimate table: input, assumption, rough math, design implication.
+- API sketch: endpoint, caller, idempotency, auth, pagination/status.
+- Data table: entity, access pattern, store, index/partition key, retention.
+- Architecture map: component, requirement/number that justifies it.
+- Deep-dive decision: option, optimizes, sacrifices, failure mode.
+- Risk register: bottleneck, symptom, mitigation, revisit trigger.
+- Operations checklist: SLO, alerts, DR, rollout, cost driver.
+- Closing summary: scope, design, trade-off, bottleneck, next step.
 
-### 3. Operations are treated as a late phase, even though the text says they should be woven in
+### 3. The final synthesis is useful in prose but visually underpowered
 
-Step 8 correctly covers reliability, security, cost, and operations, but those concerns appear mostly near the end. In real interviews, many of them must influence earlier choices:
+`finalDesign` now exists and its description is exactly the kind of closure this dataset needed. The diagram, however, still shows the same phase pipeline instead of the deliverables the prose lists. That makes the final view less memorable than it could be.
 
-- API design needs auth, authorization, rate limiting, idempotency, and pagination.
-- Data modeling needs retention, deletion, tenancy, privacy, and consistency constraints.
-- Architecture needs failure domains, backpressure, overload handling, and observability hooks.
-- Deep dives need explicit correctness, latency, and cost trade-offs.
+Concrete fix: make the final view a deliverables map. Keep the P1-P9 method spine, but add or replace nodes for the artifacts: scope table, estimates, API contract, entity/access-pattern table, architecture diagram, deep-dive choice, risk register, ops checklist, and closing summary. That would make the final design visibly different from the step views.
 
-Concrete fix: keep Step 8 as the recap phase, but add cross-cutting prompts to Steps 3-7 so operations are not only a final checklist.
+### 4. Interview-pressure recovery is present, but mostly in follow-ups
 
-### 4. The visual walkthrough is too repetitive
+The dataset now mentions recovery from a wrong assumption and includes strong follow-up questions. The core steps still do not model enough interruption and recovery behavior: what to do when the interviewer rejects a scope, challenges a number, asks for a different deep dive, or says there are five minutes left.
 
-Every architecture step uses the same P1-P9 pipeline and highlights one node. That is readable, but it does not use the explorer's strongest teaching affordances: options, deep dives, decision branches, and final synthesis. The generated Steps Overview will also be a straight line because there are no `options`.
+Concrete fix: add small "recovery script" bullets to the relevant steps. Examples:
 
-Concrete fix: add a few branch points as step `options`, such as:
-
-- Clarify: "accept broad prompt" vs "negotiate scope".
-- Estimate: "skip math" vs "derive design-driving magnitudes".
-- Architecture: "deep-dive early" vs "breadth first".
-- Communicate: "continue drilling" vs "summarize and wrap".
-
-This would turn the method into a navigable decision map instead of only a checklist.
-
-### 5. The dataset lacks a final synthesis entry
-
-`finalDesign` is optional and the dataset is valid without it, but this method would benefit from a final integrated artifact. Right now the walkthrough ends at communication without a final "what a good complete answer leaves behind" view.
-
-Concrete fix: add `finalDesign` as a final method summary, not a literal production architecture. It could show the deliverables produced by the candidate: agreed scope, estimates, API contract, data model, high-level diagram, deep-dive decision, risk register, ops checklist, and summary.
+- Clarify: "If they reject your scope, ask which axis to expand: features, scale, or correctness."
+- Estimate: "If a number is challenged, recompute with their assumption and state what changes."
+- Data model: "If the access pattern changes, revisit store/index/shard key before drawing."
+- Deep dives: "If steered elsewhere, summarize your current choice and pivot."
+- Communicate: "If out of time, stop adding boxes and give the 60-second summary."
 
 ## System Design Soundness
 
-The method itself is sound. It avoids the common failure of memorized architectures by making requirements and numbers drive the rest of the design. It also teaches candidates to tie API, data model, components, bottlenecks, and operations back to the agreed scope.
+The method is sound. It teaches the right dependency chain: requirements and constraints drive estimates; estimates and access patterns drive API/data choices; those choices shape the architecture; architecture exposes the hard parts; hard parts expose bottlenecks and operational risks.
 
-The strongest design advice is in these areas:
+The recent cross-cutting prompts improved the production angle. API now calls out authorization, rate limiting, and idempotency. Data modeling now names retention/deletion, tenancy, consistency, and hot partitions. Architecture now asks for failure domains, backpressure, load shedding, metrics, and traces. Operations now includes DR and rough RPO/RTO.
 
-- Clarify requirements before drawing.
-- Use rough numbers to justify components.
-- Define API and data model before internals.
-- Build breadth before depth.
-- Proactively name bottlenecks and trade-offs.
-- Include failure handling, security, observability, and cost.
-
-The main system-design gap is not order; it is depth. Reliability, security, privacy, tenancy, data retention, overload handling, disaster recovery, and operational ownership are all named, but they are not connected to earlier artifacts. A candidate following this exactly could still produce a tidy happy-path design and then bolt on operations in the final minutes.
+The remaining soundness gap is depth calibration. Because this is a method chapter, it should not become a full design for one system. But it should teach how to decide which operational concerns matter for the current prompt. Right now the guidance names the right concerns; the next improvement is to make prioritization more explicit.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: 1. Clarify Requirements
 
-Strong start. The step correctly tells candidates not to design the prompt as given and gives useful traps around over-scoping and jumping to diagrams. Add a concrete scoping template: functional, non-functional, out-of-scope, assumptions, and open questions.
+Strong start. The step now includes a target time, minimum output, privacy/compliance/deletion prompts, and a good option pair: negotiate scope vs accept the prompt as-is. The board artifact concept is specific and useful. Add a short recovery script for interviewer pushback on scope.
 
 ### Step 2: 2. Estimate Scale
 
-This is correctly placed before API/data/architecture. The step explains why QPS, storage, bandwidth, and read/write ratio matter. It would be stronger with an example calculation and a "design implication" column, such as QPS -> cache/replicas, writes -> partitioning/queues, storage growth -> retention/tiering.
+This is correctly placed before API and data modeling. The estimate-to-implication artifact is the right teaching device, and the option pair catches a common weak-candidate behavior. Add one concrete reusable calculation row so candidates can see the expected level of arithmetic.
 
 ### Step 3: 3. Define the API
 
-Good contract-first advice. It calls out auth, pagination, and idempotency, which are exactly the right hidden requirements. Add a minimal example endpoint set and include failure/status semantics where relevant, since system design APIs often need idempotency keys, async operation IDs, cursor pagination, and authorization boundaries.
+The step now calls out auth, pagination, rate limiting, and idempotency at the right time. It would be stronger with an option pair that contrasts a minimal contract against over-specifying every endpoint and field. Add a tiny endpoint sketch to make the "contract-first" advice visible.
 
 ### Step 4: 4. Model the Data
 
-The step correctly frames the data model around access patterns and sharding. Add a concrete artifact: entities, primary access patterns, write path, read path, indexing needs, retention/deletion rules, and chosen partition key. This would prevent candidates from reducing the phase to "pick Postgres or DynamoDB".
+Good framing around access patterns, store choice, shard key, retention/deletion, tenancy, consistency, and hot partitions. The main opportunity is to add a branch for "access-pattern first" vs "database first", because that is one of the most common interview mistakes.
 
 ### Step 5: 5. High-Level Architecture
 
-The breadth-before-depth message is strong. The step should more explicitly require mapping each component to either a requirement, estimate, API behavior, or access pattern. That mapping is the difference between a justified diagram and a pile of familiar boxes.
+This is one of the strongest steps. The breadth-first option is well chosen, and the step now requires mapping boxes back to requirements or estimates. Add a compact component-to-justification example so candidates learn to avoid decorative architecture boxes.
 
 ### Step 6: 6. Deep Dives
 
-The instruction to deep-dive the genuinely hard part is right. The step would benefit from a decision heuristic: choose the component with the highest product risk, correctness risk, scale risk, or operational blast radius. Add examples of good deep-dive targets for common systems.
+The target-selection heuristic is good: highest-risk, highest-scale, correctness-critical, or largest blast radius. The step also handles not knowing a component honestly. Add options that show "follow the risk/interviewer signal" vs "deep-dive the familiar component", and consider a sample deep-dive decision matrix.
 
 ### Step 7: 7. Bottlenecks & Trade-offs
 
-This is one of the strongest steps. It teaches candidates to name weaknesses before being asked. Add a compact trade-off matrix format: choice, optimizes, sacrifices, failure mode, mitigation, and when to revisit.
+The step is strong and now supported by the fixed pattern metadata (`Trade-off framing` maps to both bottlenecks and operations). Add a branch for proactive bottleneck ownership vs claiming the design scales. This is also a good place for the exact risk-register template.
 
 ### Step 8: 8. Reliability, Security, Cost & Operations
 
-The content is correct but too compressed. This step is carrying several senior-level topics at once. Keep it as the operations recap, but cross-link its concerns into earlier steps so security, observability, reliability, and cost are designed in rather than appended.
+The content is more credible after the recent changes because this step is explicitly a recap of earlier decisions, not a late bolt-on. Add prioritization guidance: for example, user-facing read paths prioritize latency/SLOs, payment-like systems prioritize correctness/idempotency/auditability, and multi-tenant systems prioritize isolation and abuse controls.
 
 ### Step 9: 9. Communicate Under Time Pressure
 
-The step is important and well written. The one pedagogical issue is placement: communication is presented as a final phase even though the text says it runs through all others. Consider adding "communication checkpoint" prompts to each earlier step, and use Step 9 for recovery, summarization, and time management.
+The communication checkpoint language is strong, and the new option pair captures a real end-of-interview choice. This step should remain a through-line rather than only a final phase. The 60-second closing summary artifact is the right close; make it a reproducible template.
 
 ## Final Design Review
 
-There is no `finalDesign` entry. That is schema-valid and defensible for a method chapter, but the absence weakens closure. A final synthesis would help readers see the finished interview answer as a set of artifacts, not just a sequence of behaviors.
+The new `finalDesign` is a clear improvement. It correctly says this is not a production architecture and defines the final artifact as the reusable interview answer structure. It also lists the right deliverables: scope, estimates, API contract, data model, architecture diagram, deep-dive decision, risk register, operations checklist, and summary.
 
-A good final design for this dataset could be titled "Reusable Interview Answer Structure" and show:
-
-- Problem statement and scoped requirements.
-- Capacity numbers and assumptions.
-- API contract.
-- Data model and access patterns.
-- High-level architecture.
-- Selected deep dive and rejected alternatives.
-- Bottlenecks, mitigations, and operational plan.
-- Final summary tied back to requirements.
+The only gap is visual. The final design view uses the same method spine as the step views, so the visual does not communicate the artifact bundle as strongly as the prose does. A deliverables-focused final view would make the wrap-up entry more useful.
 
 ## Concept Introduction and Learning Flow
 
-Concepts are introduced just in time and are scoped appropriately. The dataset does not overload the reader with distributed systems theory before the phase where it matters. The `patterns` list also reinforces the intended mental model.
+The learning flow is now stronger than the earlier version. Each step introduces concepts just in time, and most steps include one artifact concept that tells candidates what to produce. The traps and interviewer signals add practical coaching beyond generic system-design advice.
 
-The main learning-flow issue is that the method currently reads as a linear checklist. Real interviews are interactive: interviewers interrupt, change constraints, ask for deeper justification, or expose a wrong assumption. The `followUps` section asks some of those questions, but the core steps do not yet model recovery paths.
+The biggest remaining opportunity is to thread a tiny running example through the artifacts. A URL shortener, notification system, or rate limiter example would let each phase show one concrete row without turning the method chapter into a full case study.
 
 ## Step-to-Final-Design Coherence
 
-The step-to-step coherence is strong: each phase creates an input for the next one. Requirements feed estimates; estimates feed API/data choices; API/data feed architecture; architecture feeds deep dives; deep dives expose bottlenecks; bottlenecks motivate operations; communication makes the reasoning visible.
+The coherence is strong. Requirements feed estimates; estimates feed API/data; API/data feed architecture; architecture determines the deep dive; the deep dive exposes bottlenecks; bottlenecks motivate operations; communication keeps the reasoning visible. The final design now reinforces that each phase produces an artifact the interviewer can score.
 
-The missing piece is the integrated final artifact. Without `finalDesign`, the dataset has no canonical place to show how the nine phase outputs combine into a complete interview answer.
+The step options also improve the decision-tree map. Still, because only four steps have options, the map remains mostly linear. More branches in the middle phases would better demonstrate that the method is a decision process, not just a checklist.
 
 ## Realism Compared With Production Systems
 
-The method is realistic as interview guidance. It correctly values trade-offs, assumptions, failure modes, and operational concerns. It also avoids pretending there is one universal design for a prompt.
+As interview guidance, the dataset is realistic. It values assumptions, numbers, access patterns, failure modes, security, observability, cost, and explicit trade-offs. It also avoids pretending that memorizing a canonical architecture is enough.
 
-The realism gaps are mostly about pressure and ambiguity:
+The remaining realism gaps are about interviewer dynamics and prioritization under pressure:
 
-- Add recovery guidance for wrong early assumptions.
-- Add guidance for interviewer steering and interruptions.
-- Add examples of negotiating scope when a prompt is too broad.
-- Add branch handling for "I do not know this component well".
-- Add explicit treatment of privacy, compliance, tenancy, and data deletion when relevant.
-- Add cost/blast-radius reasoning earlier than the operations wrap-up.
+- More guidance for when the interviewer rejects an assumption or steers the discussion.
+- More examples of choosing one operational risk over another.
+- More concrete treatment of multi-tenancy, privacy/deletion, abuse/rate limiting, and rollout when those concerns dominate.
+- More explicit "minimum viable answer" guidance for each phase when time collapses.
 
 ## Dataset and Renderer-Facing Observations
 
 - JSON parsing succeeds.
-- Step view nodes all resolve to `highLevelArchitecture.nodes`.
-- Step view links all resolve to `highLevelArchitecture.links`.
+- Step view nodes, option view nodes, and final-design view nodes all resolve to `highLevelArchitecture.nodes`.
+- Step view links, option view links, and final-design view links all resolve to `highLevelArchitecture.links`.
 - Step highlights resolve.
 - `satisfies.functional[*].steps` and `satisfies.nonFunctional[*].steps` resolve.
 - Step `probeLinks` resolve against `toProbeFurther.links`.
-- `finalDesign` is absent, which is allowed by the schema.
-- There are no step `options`, `flows`, or `deepDives`, so the decision-tree and diagram experience is intentionally simple but not very expressive.
-- The dataset-level `Trade-off framing` pattern lists only `bottlenecks`, while the `operations` step also uses `Trade-off framing`. Add `operations` to that pattern's `steps`.
-- The phase nodes P1-P9 are typed as `service`, so the renderer can present method phases as synchronous application components. For a meta-method dataset, that annotation is misleading. Either add more accurate custom descriptions and accept the imperfect type, or consider a repo-level process/concept node type if more method/catalog datasets need it.
-- Several high-level architecture nodes (`Cand`, `Method`, `Signal`) are only used by the raw requirements diagram, not by the structured step views. That is not broken, but a final synthesis view could use them.
+- `finalDesign` is present and schema-valid.
+- Four steps have `options`; the remaining five steps are linear.
+- There are no `flows` or `deepDives`. That is acceptable for a method dataset, but it limits the explorer's richer teaching affordances.
+- `capacity`, top-level `api`, and top-level `dataModel` are absent/null, which is defensible for a meta-method chapter. If the overview feels thin, a "45-minute time budget" capacity-style section could be added deliberately.
+- The P1-P9 phase nodes are typed as `service`. Their descriptions make the intent clear, but the renderer still visually presents method phases as application components. A future `process` or `concept` node type would fit this dataset better.
+- The repeated step and option views are valid but visually similar. More artifact-specific nodes would make the visual walkthrough less repetitive.
 
 ## Recommended Edits, Prioritized
 
-### P1: Add phase artifacts and time boxes
+### P1: Add option branches to the remaining linear phases
 
-Add a compact artifact/template to every step and include minimum output plus target duration. This is the highest leverage improvement because it makes the method directly reusable under interview pressure.
+Add branch pairs for API, data model, deep dives, bottlenecks, and operations. Use them to teach judgment failures and recovery paths, not just "good vs bad" phrasing.
 
-### P1: Add a final synthesis entry
+### P1: Turn artifact concepts into reusable templates
 
-Create `finalDesign` as a method-summary diagram that shows the complete answer structure and the deliverables produced by the nine phases.
+Keep the prose, but add compact table-like examples candidates can practice reproducing under time pressure.
 
-### P1: Add branch/options for common interview failure modes
+### P1: Make `finalDesign.view` a deliverables map
 
-Use step `options` for choices like "scope first vs draw immediately", "derive estimates vs skip math", and "breadth first vs premature deep dive". This would make the Steps Overview valuable.
+The final prose is strong. Update the visual to show the artifacts the method produces, not only the phase pipeline.
 
-### P2: Weave operations into earlier steps
+### P2: Add interviewer-recovery scripts per phase
 
-Keep Step 8, but add reliability/security/observability/cost prompts to API, data model, architecture, and deep-dive steps.
+Include short language for challenged assumptions, changed requirements, time collapse, and interviewer steering.
 
-### P2: Fix pattern metadata
+### P2: Add prioritization heuristics for operations
 
-Update the `Trade-off framing` dataset pattern to include `operations` in `steps`, matching the step-level `patterns` usage.
+Teach how to pick the two or three operational concerns that matter for the current prompt instead of listing every possible concern.
 
-### P2: Improve renderer semantics for phase nodes
+### P3: Consider a process/concept node type
 
-The current `service` type is mechanically valid but semantically odd. At minimum, replace auto-generated service descriptions with method-specific descriptions. If this pattern appears in more datasets, add an explicit process/concept node type to the template system.
+If method and catalog datasets become common, add a canonical node type that renders phases/concepts without implying backend services.
 
-### P3: Tune probe links
+### P3: Tune probe links toward method practice
 
-The probe links are credible but broad and repeated. Consider adding one or two interview-method-specific resources, and reserve Kafka/Dynamo-style references for phases where they directly support a concrete example.
+The current links are credible foundations. Add one or two resources specifically about interview execution, estimation practice, or architecture communication if this chapter needs more method-focused reading.
 
 ## What Not To Change
 
-- Keep the nine-phase order. It is coherent and easy to remember.
-- Keep the traps and interviewer signals. They are some of the most useful content in the dataset.
-- Keep the emphasis on requirements and numbers before architecture.
-- Keep communication as a major theme, but make it a through-line across all steps.
-- Keep this as a method walkthrough, not a disguised single-system case.
+- Keep the nine-phase order.
+- Keep this as a reusable method chapter, not a disguised single-system case.
+- Keep requirements and estimates before architecture.
+- Keep communication as a through-line across all phases.
+- Keep traps and interviewer signals; they are among the most useful teaching details.
+- Keep operations as a recap phase, while continuing to weave its concerns earlier.
 
 ## Bottom Line
 
-This dataset is a solid framework chapter with clean structure and good teaching instincts. To make it excellent, turn the checklist into a practical interview operating manual: show the artifacts, encode time pressure, add branch handling, and finish with a final synthesis of what a strong candidate produces.
+The recent changes moved this from a solid checklist to a credible interview operating manual. The next step is to make it more practiced and visual: add branches for every phase, show exact board templates, and make the final design diagram display the artifact bundle a strong candidate produces.

@@ -5,11 +5,11 @@
     "nodes": [
       {
         "id": "Agent",
-        "label": "Collector Agent",
+        "label": "Collector / Scraper",
         "type": "service",
         "category": "compute",
         "traits": [],
-        "description": "Collector Agent: Synchronous application component that owns request-time business logic."
+        "description": "Collector / Scraper: a node-local or platform-managed collector (e.g. an OpenTelemetry Collector or scraper service) that takes targets + labels from service discovery, scrapes exposed /metrics endpoints, and forwards batches to ingestion. It is collection infrastructure, not request-time business logic."
       },
       {
         "id": "Alert",
@@ -157,6 +157,27 @@
         "category": "ops",
         "traits": [],
         "description": "Alert Rules: Telemetry, monitoring, alerting, logging, dashboard, or audit component."
+      },
+      {
+        "id": "AlertState",
+        "label": "Alert State Store",
+        "type": "database",
+        "category": "state",
+        "traits": [
+          "stateful",
+          "authoritative"
+        ],
+        "description": "Alert State Store: durable home of the inactive->pending->firing->resolved state machine per rule+labelset (plus silences), so an evaluator restart or failover resumes the 'for' window instead of re-paging or forgetting firing alerts."
+      },
+      {
+        "id": "NotifyQ",
+        "label": "Notification Queue",
+        "type": "queue",
+        "category": "async",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Notification Queue: durable delivery queue for pages/emails with per-attempt records, retries, and escalation on no-ack, so a failed provider does not silently drop a critical page."
       },
       {
         "id": "ShardA",
@@ -346,6 +367,24 @@
         "to": "Notify"
       },
       {
+        "id": "alert-alertstate",
+        "from": "Alert",
+        "to": "AlertState",
+        "label": "persist state machine"
+      },
+      {
+        "id": "alert-notifyq",
+        "from": "Alert",
+        "to": "NotifyQ",
+        "label": "enqueue page"
+      },
+      {
+        "id": "notifyq-notify",
+        "from": "NotifyQ",
+        "to": "Notify",
+        "label": "deliver (retry/escalate)"
+      },
+      {
         "id": "router-sharda",
         "from": "Router",
         "to": "ShardA"
@@ -488,8 +527,8 @@
     "  Cold[(Cold Store — rollups)]",
     "  App -->|~10M points/s| Ingest",
     "  Ingest --> TSDB",
-    "  Roll -->|downsample| TSDB",
-    "  Roll --> Cold"
+    "  TSDB -->|read raw| Roll",
+    "  Roll -->|downsample| Cold"
   ],
   "requirements": {
     "functional": [
@@ -511,19 +550,29 @@
   },
   "capacity": [
     {
-      "label": "Ingest rate",
-      "value": "~10M points/s avg, ~30M peak",
-      "note": "Thousands of hosts x many metrics x labels, every few seconds. Assume a 3x peak multiplier for deploys/incidents."
+      "label": "Ingest rate (what '10M points/s' means)",
+      "value": "~10M stored samples/s avg, ~30M peak",
+      "note": "Count stored time-series samples, not logical measurements: a scalar gauge is 1 sample, but one latency histogram with N buckets fans out to N bucket samples + count + sum. So 10M samples/s might be far fewer logical observations once histograms are subtracted. Thousands of hosts x many metrics x labels every few seconds; 3x peak for deploys/incidents."
     },
     {
-      "label": "Sample-on-wire size",
-      "value": "~1–2 B compressed",
-      "note": "Delta-of-delta ts + XOR value compress a steady-interval sample to ~1.5 B in-chunk; ~12–16 B raw before compression."
+      "label": "Compressed chunk bytes (after TSDB encoding)",
+      "value": "~1–2 B / sample in-chunk",
+      "note": "Delta-of-delta ts + XOR value compress a steady-interval sample to ~1.5 B once it is inside an immutable TSDB chunk. This is the on-disk storage unit, NOT the cost to get the sample there."
+    },
+    {
+      "label": "Wire + WAL bytes (before TSDB compression)",
+      "value": "~varies; labels dominate",
+      "note": "Remote-write/scrape payloads carry the full label set, metric name, and metadata per series (protobuf/framing overhead), plus a WAL append before chunk compression. A new/low-density series can cost tens of bytes per sample on the wire even though it compresses to ~1.5 B at rest. Don't read '1-2 B compressed' as the end-to-end ingest unit."
     },
     {
       "label": "Ingest bandwidth",
-      "value": "~15–45 MB/s post-compression",
-      "note": "10M x ~1.5 B = ~15 MB/s steady, ~45 MB/s at peak (before replication). Pre-compression remote-write is ~10x that."
+      "value": "~15–45 MB/s at rest; ~10x on the wire",
+      "note": "10M x ~1.5 B = ~15 MB/s steady, ~45 MB/s at peak measured as compressed chunk bytes (before replication). Pre-compression remote-write/WAL bandwidth — labels + metadata + framing — is roughly an order of magnitude larger, and is the figure that sizes the ingest network/WAL tier."
+    },
+    {
+      "label": "Histogram fan-out",
+      "value": "1 histogram -> N+2 series",
+      "note": "One latency histogram with N bucket bounds produces N bucket series plus _count and _sum series. Enabling percentiles on a hot metric multiplies its active series (and ingest samples) by ~N+2, so histograms must be budgeted against the cardinality/index ceiling, not treated as one cheap series."
     },
     {
       "label": "Raw write volume",
@@ -1028,7 +1077,7 @@
       "title": "1. Naive Metrics Table (the baseline)",
       "description": "Start by writing every metric sample as a row in a relational table and querying with GROUP BY. It works for one service; at 10M points/sec a row-per-sample table takes ~0.86 trillion rows/day before indexes and retention — so it falls over, motivating a purpose-built time-series store.",
       "patterns": [
-        "Synchronous request/response"
+        "Time-series storage (chunked, compressed)"
       ],
       "probeLinks": [
         "m3-uber",
@@ -1075,6 +1124,11 @@
         "weak": [
           "Treats metrics like ordinary OLTP rows."
         ]
+      },
+      "recap": {
+        "before": "No system yet — just the instinct to reach for a relational table.",
+        "after": "A row-per-sample baseline that visibly collapses at ~0.86 trillion rows/day.",
+        "newRisk": "Everything downstream — storage, ingestion, cardinality — exists to escape this baseline."
       },
       "whyNow": [
         "The baseline exposes why time-series storage and cardinality control are needed."
@@ -1144,7 +1198,9 @@
             "Acknowledge after appending to a bounded, replicated remote-write buffer/WAL so an in-flight batch survives a single ingestion-node crash; ephemeral agent-side buffers are explicitly best-effort and replay on reconnect.",
             "Return partial acceptance: accepted/rejected counts, dropped series and reasons (cardinality_limit, out_of_order, bad_labels), and a retry-after when backpressured — so producers learn what was lost instead of assuming success.",
             "Shed by priority under overload: keep alert-critical metrics flowing, drop debug/high-cardinality series first, and emit an owner-facing warning rather than OOMing the pipeline.",
-            "Make retried batches idempotent via an Idempotency-Key per batch so a producer retry after a slow `202` doesn't double-count counters; duplicates within a series+ts are de-duplicated."
+            "Make retried batches idempotent via an Idempotency-Key per batch so a producer retry after a slow `202` doesn't double-count counters; a duplicate (series_id, ts) is de-duplicated last-write-wins, and an exact key replay is acknowledged without re-applying.",
+            "Define replay semantics by metric kind: counters are cumulative, so a duplicate sample is safe to drop and a gap is recovered by the next scrape's higher count; gauges last-write-win; histograms dedupe per (bucket series, ts) — a retried histogram re-sends all N bucket series at the same ts and each is reconciled independently, never summed twice.",
+            "Bound out-of-order arrivals to an acceptance window: samples (including histogram buckets) older than the window are rejected and counted in droppedReasons or routed to a backfill path that recomputes affected rollups, rather than silently corrupting an already-compacted chunk."
           ]
         }
       ],
@@ -1372,7 +1428,7 @@
             "Background compaction merges small blocks into larger ones, drops expired chunks, and builds block-level index/min-max-time metadata so queries skip irrelevant blocks.",
             "Bound out-of-order samples to an acceptance window (e.g. last hour); older arrivals are rejected (counted in droppedReasons) or routed to a separate backfill path that recomputes affected rollups.",
             "Index memory is the real ceiling: ~1–3 KB of postings per active series means 100M series ≈ 100–300 GB RAM — size the head/index before the disk.",
-            "Store histograms as bucket series (one series per `le` bound) so percentiles are computed by merging bucket counts across hosts; t-digest/HDR sketches are an alternative when bucket bounds aren't known ahead of time (mergeable, with bounded error)."
+            "Store histograms as bucket series (one series per `le` bound) so percentiles are computed by merging bucket counts across hosts; t-digest/HDR sketches are an alternative when bucket bounds aren't known ahead of time (mergeable, with bounded error). Budget the fan-out: a histogram with N buckets is N+2 series (buckets + count + sum), so enabling percentiles on a high-traffic metric is a real charge against the active-series/index ceiling from the capacity estimate, not a free add-on."
           ]
         }
       ],
@@ -1583,7 +1639,7 @@
         {
           "title": "Late data, backfills, and percentile-safe rollups",
           "points": [
-            "A rollup bucket carries a version; when a late/backfilled sample lands in an already-rolled window, mark the bucket dirty and recompute it, bumping the version so caches invalidate.",
+            "A rollup bucket carries a version; when a late/backfilled sample lands in an already-rolled window, mark the bucket dirty and recompute it, bumping the version so any query-cache entry keyed on that bucket's (series, range, version) is invalidated rather than serving stale rolled-up points.",
             "Roll up histograms by summing bucket counts per bucket (mergeable) rather than averaging — that preserves the distribution so `histogram_quantile` stays correct at 1m/1h resolution.",
             "min/max/sum/count survive spikes for scalar metrics; sketches (t-digest) are the rollup unit when you need approximate percentiles without pre-declared bucket bounds.",
             "Retention-policy changes (extend/shorten a tier) trigger a recompute or re-tiering job rather than silently leaving inconsistent history."
@@ -1824,6 +1880,7 @@
         {
           "title": "The collection control plane",
           "points": [
+            "Name the four roles so the deployment model is unambiguous: the instrumentation library exposes counters/histograms inside the app process; the scrape target is the `/metrics` endpoint it exposes; the collector/scraper (a node-local agent, sidecar, or central scraper service) pulls those targets and forwards batches to ingestion; the push gateway accepts pushes from jobs that can't be scraped. This system runs a platform-managed node-local collector for long-lived services and a push gateway for ephemeral ones.",
             "Service discovery enumerates targets and injects labels (job, instance, team) the producer never sets — these become part of the series identity, so discovery directly shapes cardinality and per-tenant budgets.",
             "Each scrape records up/down/timeout; treat a failed scrape as a distinct liveness signal (an `up == 0` series) rather than letting the metric silently go to zero or absent.",
             "A push gateway covers ephemeral jobs that finish before a scrape and targets behind NAT/firewalls; it must expire stale pushed series so a finished job doesn't linger forever.",
@@ -1984,7 +2041,8 @@
             "Enforce budgets at two levels: a per-tenant series budget and a per-metric budget from the metric descriptor, with allowlisted labels so only sanctioned dimensions create series.",
             "When the guard acts, emit a structured report — offending metric, owner/team, tenant, the label name driving growth, estimated series added, and the policy action taken (dropped/relabeled/aggregated) — and notify the owner instead of silently dropping.",
             "Support emergency overrides: a temporary budget bump for a legitimate new high-cardinality metric, and an allowlist entry so it isn't re-dropped on the next deploy.",
-            "Point owners at logs/traces/exemplars for the per-entity detail metrics shouldn't carry, so cardinality control redirects the need rather than just denying it."
+            "Point owners at logs/traces/exemplars for the per-entity detail metrics shouldn't carry, so cardinality control redirects the need rather than just denying it.",
+            "Concrete relabel rule: collapse unbounded path/id segments before they become series — `path=\"/users/123\"`, `/users/456`, ... all relabel to `path=\"/users/:id\"`, turning millions of per-id series into one templated series while keeping the route-level signal."
           ]
         }
       ],
@@ -2233,22 +2291,24 @@
           "TSDB",
           "Alert",
           "Rules",
+          "AlertState",
+          "NotifyQ",
           "Notify"
         ],
-        "caption": "The query service answers range expressions over the TSDB with a query cache, while the alerting engine evaluates alert rules against the TSDB and fires notifications.",
+        "caption": "The query service answers range expressions over the TSDB with a query cache. The alerting engine evaluates alert rules against the TSDB, persists each rule's inactive->pending->firing->resolved state in the alert state store (surviving failover), and enqueues pages to a durable notification queue that delivers with retries and escalation.",
         "links": [
           "query-cache",
           "query-tsdb",
           "alert-rules",
           "alert-tsdb",
-          "alert-notify"
+          "alert-alertstate",
+          "alert-notifyq",
+          "notifyq-notify"
         ],
         "highlight": [
-          "Query",
-          "Cache",
           "Alert",
-          "Rules",
-          "Notify"
+          "AlertState",
+          "NotifyQ"
         ]
       },
       "flows": [
@@ -2342,8 +2402,8 @@
           ]
         },
         {
-          "name": "Alert evaluation: schedule -> state machine -> notify",
-          "note": "The owning evaluator runs a rule on its interval against fine data, advances the persisted inactive->pending->firing state machine, applies silences/dedup, and hands a notification job to a delivery queue that retries and escalates.",
+          "name": "Alert evaluation: schedule -> persisted state machine -> queued delivery",
+          "note": "The owning evaluator runs a rule on its interval against fine data, advances the inactive->pending->firing state machine persisted in the alert state store (so failover resumes mid-'for'), applies silences/dedup, and hands a notification job to a durable delivery queue that retries and escalates.",
           "sequence": {
             "participants": [
               {
@@ -2357,6 +2417,14 @@
               {
                 "id": "Recent",
                 "label": "Hot Store (fine)"
+              },
+              {
+                "id": "AlertState",
+                "label": "Alert State Store"
+              },
+              {
+                "id": "NotifyQ",
+                "label": "Notification Queue"
               },
               {
                 "id": "Notify",
@@ -2384,9 +2452,9 @@
               },
               {
                 "from": "Alert",
-                "to": "Alert",
+                "to": "AlertState",
                 "arrow": "->>",
-                "label": "advance state: inactive->pending->firing ('for')"
+                "label": "advance + persist: inactive->pending->firing ('for')"
               },
               {
                 "type": "alt",
@@ -2394,13 +2462,19 @@
                 "messages": [
                   {
                     "from": "Alert",
+                    "to": "NotifyQ",
+                    "arrow": "->>",
+                    "label": "enqueue page (deduped, grouped)"
+                  },
+                  {
+                    "from": "NotifyQ",
                     "to": "Notify",
                     "arrow": "->>",
-                    "label": "page (deduped, grouped); retry+escalate on no-ack"
+                    "label": "deliver; retry+escalate on no-ack"
                   },
                   {
                     "from": "Notify",
-                    "to": "Alert",
+                    "to": "NotifyQ",
                     "arrow": "-->>",
                     "label": "delivery attempt recorded"
                   }
@@ -2410,7 +2484,7 @@
                   "messages": [
                     {
                       "from": "Alert",
-                      "to": "Alert",
+                      "to": "AlertState",
                       "arrow": "->>",
                       "label": "suppress / mark resolved, no page"
                     }
@@ -2421,8 +2495,8 @@
           },
           "highlight": [
             "Alert",
-            "Rules",
-            "Notify"
+            "AlertState",
+            "NotifyQ"
           ]
         }
       ]
@@ -2586,7 +2660,7 @@
   ],
   "finalDesign": {
     "title": "Final Design",
-    "description": "End-to-end: service discovery hands agents their targets (push gateway for ephemeral jobs); samples enter a buffered ingestion path that acks after replicated-buffer admission and is guarded for cardinality against per-tenant/per-metric budgets from a control plane; series are hash-sharded across a replicated time-series ring storing compressed chunks (with histogram buckets) and a label index; a rollup worker downsamples all shards into tiered, percentile-preserving retention; a cached query service answers dashboards (raw for recent, rollups for long ranges) under admission control; and an alerting subsystem evaluates debounced rules through a persisted state machine and routes notifications with retries. The diagram shows two illustrative shards; in reality the ring holds ~16–32 shards each replicated (RF=3), and both shards (all of them) feed the rollup worker.",
+    "description": "End-to-end: service discovery hands the collector/scraper its targets (push gateway for ephemeral jobs); samples enter a buffered ingestion path that acks after replicated-buffer admission and is guarded for cardinality against per-tenant/per-metric budgets from a control plane; series are hash-sharded across a replicated time-series ring storing compressed chunks (with histogram buckets) and a label index; a rollup worker downsamples all shards into tiered, percentile-preserving retention; a cached query service answers dashboards (raw for recent, rollups for long ranges) under admission control; and an alerting subsystem evaluates debounced rules, persists each alert's inactive->pending->firing->resolved state in a durable alert state store (so failover doesn't re-page or forget), and routes pages through a durable notification queue with retries and escalation. The diagram shows two illustrative shards; in reality the ring holds ~16–32 shards each replicated (RF=3), and both shards (all of them) feed the rollup worker.",
     "view": {
       "nodes": [
         "Discovery",
@@ -2607,9 +2681,11 @@
         "Dash",
         "Alert",
         "Rules",
+        "AlertState",
+        "NotifyQ",
         "Notify"
       ],
-      "caption": "Service discovery + push gateway feed a buffered, cardinality-guarded ingestion path governed by a control plane (budgets, retention, query limits, routes); the metric router hash-shards series across a replicated TSDB ring; a rollup worker tiers all shards into cold storage; a cached query service serves dashboards under admission control and the alerting engine pages on rule breaches via a persisted state machine.",
+      "caption": "Service discovery + push gateway feed a buffered, cardinality-guarded ingestion path governed by a control plane (budgets, retention, query limits, routes); the metric router hash-shards series across a replicated TSDB ring; a rollup worker tiers all shards into cold storage; a cached query service serves dashboards under admission control; the alerting engine pages on rule breaches via a state machine persisted in the alert state store and a durable notification queue that retries and escalates.",
       "links": [
         "discovery-agent-targets",
         "app-agent",
@@ -2632,7 +2708,9 @@
         "dash-query",
         "alert-rules",
         "alert-router",
-        "alert-notify",
+        "alert-alertstate",
+        "alert-notifyq",
+        "notifyq-notify",
         "control-alert-routes"
       ]
     }
@@ -2667,7 +2745,7 @@
         },
         {
           "name": "InfluxDB",
-          "icon": "assets/tech-icons/tech.png"
+          "icon": "assets/tech-icons/influxdb.png"
         },
         {
           "name": "TimescaleDB (Postgres extension)",
@@ -2678,17 +2756,17 @@
         "aws": [
           {
             "name": "Amazon Managed Service for Prometheus",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Service-for-Prometheus_64.png"
           },
           {
             "name": "Amazon Timestream",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/Arch_Amazon-Timestream_64.png"
           }
         ],
         "gcp": [
           {
             "name": "Google Cloud Managed Service for Prometheus",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/Operations-512-color.png"
           },
           {
             "name": "Cloud Monitoring (Monarch)",
@@ -2752,13 +2830,13 @@
         "gcp": [
           {
             "name": "Google Cloud Pub/Sub",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
           }
         ],
         "azure": [
           {
             "name": "Azure Event Hubs",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
           }
         ]
       },
@@ -2787,7 +2865,7 @@
         },
         {
           "name": "Telegraf",
-          "icon": "assets/tech-icons/tech.png"
+          "icon": "assets/tech-icons/telegraf.png"
         },
         {
           "name": "Grafana Agent / Alloy",
@@ -2850,7 +2928,7 @@
         "aws": [
           {
             "name": "Amazon S3",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Storage-Service_64.png"
           },
           {
             "name": "S3 Glacier",
@@ -2860,13 +2938,13 @@
         "gcp": [
           {
             "name": "Google Cloud Storage (Nearline/Coldline)",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/Storage-512-color.png"
           }
         ],
         "azure": [
           {
             "name": "Azure Blob Storage (Cool/Archive)",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/10781-icon-service-Blob-Page.svg"
           }
         ]
       },
@@ -2898,7 +2976,7 @@
         "aws": [
           {
             "name": "Amazon Managed Grafana",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Grafana_64.png"
           },
           {
             "name": "CloudWatch dashboards",
@@ -2958,7 +3036,7 @@
           },
           {
             "name": "Amazon SNS",
-            "icon": "assets/tech-icons/tech.png"
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Notification-Service_64.png"
           }
         ],
         "gcp": [
@@ -2992,7 +3070,7 @@
     "functional": [
       {
         "requirement": "Ingest time-series metrics",
-        "how": "Buffered, batched, fire-and-forget ingestion.",
+        "how": "Buffered, batched, fire-and-forget ingestion with per-tenant auth, histogram payloads, an idempotency-keyed acceptance boundary, and partial acceptance (accepted/rejected + dropped reasons) so producers learn what was lost.",
         "steps": [
           "ingest",
           "collection"
@@ -3000,7 +3078,7 @@
       },
       {
         "requirement": "Query with aggregation over ranges",
-        "how": "Query service over label index + chunks, cached.",
+        "how": "Query service over label index + chunks, cached, under admission control (max series, max full-res lookback, timeout, bytes scanned); percentiles computed by merging histogram buckets/sketches, never by averaging per-host p95s.",
         "steps": [
           "query",
           "tsdb"
@@ -3008,7 +3086,7 @@
       },
       {
         "requirement": "Dashboards",
-        "how": "Cached/pre-aggregated query results, resolution-aware.",
+        "how": "Cached/pre-aggregated query results, resolution-aware (raw for recent, percentile-preserving rollups for long ranges); partial results flagged when a shard times out.",
         "steps": [
           "query",
           "rollups"
@@ -3016,14 +3094,14 @@
       },
       {
         "requirement": "Alerting",
-        "how": "Rule engine with 'for' debounce and routed notifications.",
+        "how": "Rule engine with 'for' debounce, a persisted inactive->pending->firing->resolved state machine in a durable alert state store, silences/inhibition/dedup, and routed notifications through a delivery queue with per-attempt records, retries, and escalation.",
         "steps": [
           "query"
         ]
       },
       {
         "requirement": "Tiered retention",
-        "how": "Downsample raw -> 1m -> 1h with expiry.",
+        "how": "Downsample raw -> 1m -> 1h with expiry; histogram buckets summed (not averaged) and versioned rollup buckets recomputed for late/backfilled data so percentiles survive coarsening.",
         "steps": [
           "rollups"
         ]
@@ -3032,7 +3110,7 @@
     "nonFunctional": [
       {
         "requirement": "Absorb huge write volume",
-        "how": "Buffered async batch writes; series sharding.",
+        "how": "Buffered async batch writes acked after replicated-buffer/WAL admission, with partial acceptance and priority shedding; series sharding (~16-32 shards, RF=3) for horizontal headroom.",
         "steps": [
           "ingest",
           "scale"
@@ -3100,8 +3178,9 @@
       "phase": "Estimate & API",
       "time": "5–15 min",
       "say": [
-        "Size points/sec, active series, retention tiers, and alert cadence.",
-        "Sketch ingest, query_range, and rule creation."
+        "Define your unit: '10M points/s' is stored samples, not logical measurements — one histogram with N buckets is N+2 series, so percentiles multiply both active series and ingest.",
+        "Separate wire/WAL bytes (labels + metadata dominate) from compressed chunk bytes (~1.5 B/sample at rest), and size active-series/index memory as the real cardinality ceiling.",
+        "Sketch ingest (tenant auth, idempotency key, histogram payload, partial-acceptance response), query_range under admission control, and rule creation with missing-data behavior."
       ]
     },
     {
@@ -3141,9 +3220,11 @@
     {
       "level": "Staff+",
       "expectations": [
-        "Makes cardinality control a first-class concern at the ingest edge.",
-        "Shards by series with fan-out aggregation and replication.",
-        "Quantifies storage/query/cardinality tradeoffs and degradation behavior."
+        "Makes cardinality control a first-class concern at the ingest edge, with per-tenant/per-metric budgets and histogram fan-out budgeted explicitly.",
+        "Pins down the acceptance boundary: what '202' promises, partial acceptance, idempotency/replay for retried counters and out-of-order histogram buckets.",
+        "Owns the collection control plane: scraper-vs-collector-vs-push-gateway deployment, service discovery as label/cardinality source, scrape failure as liveness.",
+        "Treats alerting as a stateful subsystem: persisted state machine, deterministic evaluator ownership across failover, durable notification delivery — not a stateless polling loop.",
+        "Shards by series with fan-out aggregation and replication; quantifies storage/query/cardinality tradeoffs and degradation behavior (partial dashboards vs fail-closed alerts)."
       ]
     }
   ],
@@ -3153,7 +3234,8 @@
     "How would you implement long-term storage in object storage with a query layer on top?",
     "How do you handle late-arriving or out-of-order samples?",
     "How would you support multi-tenancy with per-tenant cardinality and query limits?",
-    "How do you backfill historical data and recompute rollups after a schema change?"
+    "How do you backfill historical data and recompute rollups after a schema change?",
+    "How does the monitoring system monitor itself — ingest lag, dropped samples, queue depth, rule-eval lag, shard health, query saturation — without a circular dependency on the system that's down?"
   ],
   "toProbeFurther": {
     "links": [

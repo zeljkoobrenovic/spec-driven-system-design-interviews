@@ -126,6 +126,16 @@
         "description": "Caches recent recommendation lists by user, surface, context, model arm, and freshness window."
       },
       {
+        "id": "EventIngest",
+        "label": "Event Ingest API",
+        "type": "gateway",
+        "category": "async",
+        "traits": [
+          "stateless"
+        ],
+        "description": "Authenticated client-event endpoint: validates schema, enforces auth, deduplicates by event id, applies abuse/rate controls, and buffers with retry before the durable stream."
+      },
+      {
         "id": "EventLog",
         "label": "Impression & Interaction Stream",
         "type": "stream",
@@ -133,7 +143,7 @@
         "traits": [
           "stateful"
         ],
-        "description": "Durable stream of impressions, clicks, hides, dwell time, conversions, and request context."
+        "description": "Durable stream of impressions, clicks, hides, dwell time, conversions, and request context, written through the ingest API."
       },
       {
         "id": "RealtimeFeatures",
@@ -282,10 +292,16 @@
         "label": "eligibility / availability"
       },
       {
-        "id": "client-eventlog",
+        "id": "client-eventingest",
         "from": "Client",
-        "to": "EventLog",
+        "to": "EventIngest",
         "label": "clicks, hides, dwell"
+      },
+      {
+        "id": "eventingest-eventlog",
+        "from": "EventIngest",
+        "to": "EventLog",
+        "label": "validated, deduped events"
       },
       {
         "id": "recapi-eventlog",
@@ -394,6 +410,7 @@
         "id": "offline",
         "label": "Offline / Feedback",
         "nodes": [
+          "EventIngest",
           "EventLog",
           "RealtimeFeatures",
           "DataLake",
@@ -475,7 +492,7 @@
     },
     {
       "label": "Feature reads",
-      "value": "~500 candidates x ~50 features, batched -> ~10k feature values/request, ~200M values/sec at peak",
+      "value": "~500 candidates x ~50 features, batched -> ~25k feature values/request, ~500M values/sec at 20k RPS",
       "note": "Feature fetch is a batched key-value read, not per-candidate round trips; it dominates the ranking stage budget."
     },
     {
@@ -645,15 +662,20 @@
     {
       "method": "POST",
       "path": "/v1/events",
-      "description": "Log an impression or interaction event for training, online features, monitoring, and evaluation. Events are appended asynchronously; an idempotency/event id deduplicates client retries and a client timestamp lets late events be ordered.",
-      "request": "{ \"eventId\": \"e_55\", \"requestId\": \"r_123\", \"userId\": \"u_42\", \"itemId\": \"i_9\", \"type\": \"click\", \"position\": 3, \"dwellMs\": 4200, \"clientTs\": \"2026-06-09T10:00:01Z\" }",
-      "response": "{ \"ok\": true }",
+      "description": "Log a rendered impression or interaction event for training, online features, monitoring, and evaluation. The request hits the authenticated event-ingest API, which validates schema, checks auth, deduplicates by event id, applies abuse/rate controls, and only then appends to the durable stream — clients never write the stream directly. A client timestamp lets late events be ordered, and viewportVisible/renderedAt confirm the item was actually shown.",
+      "request": "{ \"eventId\": \"e_55\", \"requestId\": \"r_123\", \"userId\": \"u_42\", \"itemId\": \"i_9\", \"type\": \"click\", \"position\": 3, \"dwellMs\": 4200, \"viewportVisible\": true, \"renderedAt\": \"2026-06-09T10:00:00Z\", \"clientTs\": \"2026-06-09T10:00:01Z\" }",
+      "response": "{ \"ok\": true, \"eventId\": \"e_55\", \"deduped\": false }",
       "sequence": {
         "participants": [
           {
             "id": "Client",
             "label": "Client / App",
             "alias": "C"
+          },
+          {
+            "id": "EventIngest",
+            "label": "Event Ingest API",
+            "alias": "G"
           },
           {
             "id": "EventLog",
@@ -684,9 +706,27 @@
         "messages": [
           {
             "from": "Client",
+            "to": "EventIngest",
+            "arrow": "->>",
+            "label": "POST click/hide/dwell event"
+          },
+          {
+            "from": "EventIngest",
+            "to": "EventIngest",
+            "arrow": "->>",
+            "label": "auth, validate schema, dedup by eventId"
+          },
+          {
+            "from": "EventIngest",
             "to": "EventLog",
             "arrow": "->>",
-            "label": "append click/hide/dwell event"
+            "label": "append validated event"
+          },
+          {
+            "from": "EventIngest",
+            "to": "Client",
+            "arrow": "-->>",
+            "label": "accepted (or deduped)"
           },
           {
             "from": "EventLog",
@@ -711,12 +751,6 @@
             "to": "Observability",
             "arrow": "->>",
             "label": "quality and guardrail metrics"
-          },
-          {
-            "from": "EventLog",
-            "to": "Client",
-            "arrow": "-->>",
-            "label": "accepted"
           }
         ]
       }
@@ -771,7 +805,7 @@
     },
     {
       "name": "recommendation_exposure",
-      "note": "One row per shown item, keyed by (request_id, item_id). This is the exposure log; without per-item rank, score, source, version, and propensity, learning from logged recommendations (counterfactual / off-policy evaluation, contextual bandits) is impossible. Replaces the lossy served_item_ids array.",
+      "note": "One row per item in the served list, keyed by (request_id, item_id), written server-side the moment the API returns. This is the served-exposure log (what the system decided to show), distinct from a client-confirmed rendered impression in interaction_event. Without per-item rank, score, source, version, and propensity, learning from logged recommendations (counterfactual / off-policy evaluation, contextual bandits) is impossible. Replaces the lossy served_item_ids array.",
       "fields": [
         {
           "name": "request_id",
@@ -825,7 +859,7 @@
     },
     {
       "name": "interaction_event",
-      "note": "The feedback signal. Include impressions, not just clicks, so training data is not positive-only. event_id is the idempotency key for client retries; client_ts orders late-arriving events against shown_at.",
+      "note": "The client-confirmed feedback signal, ingested through the event-ingest API. A type=impression row is a rendered impression (the item was actually visible), which is stronger than the server-side served exposure; clicks/hides/dwell are the interactions. Log impressions, not just clicks, so training data is not positive-only. event_id is the idempotency key for client retries; client_ts orders late-arriving events against the exposure's shown_at; viewport_visible/rendered_at distinguish 'served but never seen' from 'seen and ignored'.",
       "fields": [
         {
           "name": "event_id",
@@ -854,6 +888,14 @@
         {
           "name": "dwell_ms",
           "type": "int"
+        },
+        {
+          "name": "viewport_visible",
+          "type": "bool"
+        },
+        {
+          "name": "rendered_at",
+          "type": "timestamp"
         },
         {
           "name": "context",
@@ -1063,6 +1105,15 @@
       ],
       "icon": "assets/icons/patterns/post-ranking-filters-diversity-dedup.png",
       "group": "Post-Ranking Filters and Diversity"
+    },
+    {
+      "name": "Graceful degradation / fallback serving",
+      "what": "Keep a usable response under dependency failure by degrading per component — partial recall, feature/ranker fallbacks, and cached or popularity lists — instead of erroring.",
+      "whenToUse": "Latency-critical paths with many dependencies where some answer beats no answer.",
+      "steps": [
+        "serving"
+      ],
+      "group": "Serving: Latency, Cold Start, and Resilience"
     }
   ],
   "steps": [
@@ -1071,8 +1122,8 @@
       "title": "1. Start with Simple Candidate Generation",
       "description": [
         "Do not start by scoring the whole catalog. First build a simple recall layer that cheaply returns a few hundred plausible items from sources that already exist: recent popularity, trending by surface/locale, the user's history, followed categories, and catalog metadata.",
-        "This version is deliberately understandable and debuggable. It can serve cold-start users with popularity/contextual lists and can personalize lightly from user profile/history without needing embeddings yet.",
-        "The candidate generation service fans out to these sources in parallel, merges and dedups item ids, and caps the set before ranking. It establishes the recall stage before adding more sophisticated retrieval."
+        "This version is deliberately understandable and debuggable. It can serve cold-start users with popularity/contextual lists and can personalize lightly from the user profile/history without needing embeddings yet.",
+        "The candidate generation service fans out to these sources in parallel, merges and dedups item ids, and caps the set before ranking. This establishes the recall stage before any more sophisticated retrieval is added."
       ],
       "view": {
         "nodes": [
@@ -1233,9 +1284,9 @@
       "id": "ann-recall",
       "title": "2. Refine Recall with Embeddings and ANN",
       "description": [
-        "The simple recall layer is useful, but it misses items that are behaviorally or semantically similar but not captured by popularity, category, or direct history rules. Add an embedding-based recall source as a refinement.",
+        "The simple recall layer is useful, but it misses items that are behaviorally or semantically similar yet not captured by popularity, category, or direct history rules. Add an embedding-based recall source as a refinement.",
         "Represent users, sessions, and items as vectors. Candidate generation queries an ANN index to retrieve nearest item vectors quickly, then merges those ids with the simple sources from step 1.",
-        "ANN is not the whole recommender. It is one recall source inside the candidate-generation fan-out, and it is useful because it improves recall quality while still keeping the candidate set bounded before ranking."
+        "ANN is not the whole recommender — it is one recall source inside the candidate-generation fan-out. It earns its place because it improves recall quality while still keeping the candidate set bounded before ranking."
       ],
       "view": {
         "nodes": [
@@ -1429,6 +1480,18 @@
         "after": "A richer candidate set that includes semantic and behavioral nearest-neighbor items.",
         "newRisk": "Candidates are still unordered by predicted engagement and need ranking."
       },
+      "deepDives": [
+        {
+          "title": "Evaluating an ANN index and refreshing it safely",
+          "points": [
+            "ANN is approximate, so its quality metric is recall@K against exact nearest-neighbor search on a sampled query set — what fraction of the true top-K does the index return. An index can be fast and low-recall at once, so always track recall@K next to p99 latency, query throughput, index memory, and build/rebuild time.",
+            "Tune to a recall target, not to latency alone: HNSW's ef and IVF-PQ's nprobe both trade recall against speed. Pick the operating point that meets a recall floor within the candidate-generation budget, and re-check it whenever the embedding model changes.",
+            "Fresh and fast-changing items are the failure mode: if the index only rebuilds nightly, new items have no vector and ANN silently stops surfacing them. Support incremental inserts for fresh items and rebuild on a cadence the catalog churn justifies.",
+            "Refresh is a rollout, not a file copy. Build the new index from refreshed, versioned embeddings, benchmark recall@K on it, and swap atomically so requests never read a half-built index. Keep the previous index version hot for instant rollback if the new one regresses.",
+            "Version embeddings and the index together with the ranking model: a ranker trained against one embedding space scoring candidates from another is train/serve skew at the recall layer. Promote the index only after the recall@K benchmark passes."
+          ]
+        }
+      ],
       "traps": [
         {
           "trap": "Treating ANN as a black box and only watching latency.",
@@ -1527,9 +1590,9 @@
       "id": "ranking",
       "title": "3. Ranking the Candidates",
       "description": [
-        "The candidate set is small enough to score with an expensive ML model. The ranker predicts engagement (e.g. probability of click/like) for each (user, item, context) and orders them — this is where personalization quality lives.",
-        "Two-stage design: cheap recall, including simple sources plus ANN refinement, then a heavy ranking model over hundreds of items. The model uses features about the user, item, and context (next step). The ranker loads a versioned model from the registry so models can be updated/rolled back.",
-        "Only the top-N after ranking are returned, so the costly scoring runs on a bounded candidate set, keeping serving within the latency budget."
+        "The candidate set is now small enough to score with an expensive ML model. The ranker predicts engagement (e.g. probability of click/like) for each (user, item, context) and orders them — this is where personalization quality lives.",
+        "Two-stage design: cheap recall (simple sources plus ANN refinement), then a heavy ranking model over hundreds of items. The model uses features about the user, item, and context (next step), and loads a versioned artifact from the registry so models can be updated or rolled back.",
+        "Only the top-N after ranking are returned, so the costly scoring runs on a bounded candidate set and serving stays within the latency budget."
       ],
       "view": {
         "nodes": [
@@ -1732,7 +1795,7 @@
       ],
       "recap": {
         "before": "Bounded but unordered candidates from simple and ANN recall.",
-        "after": "Model-ranked candidates by predicted engagement.",
+        "after": "Candidates ranked by predicted engagement.",
         "newRisk": "The model needs features at serving time — fast, and consistent with how it was trained."
       },
       "traps": [
@@ -1842,9 +1905,9 @@
       "id": "features",
       "title": "4. Features and the Feature Store",
       "description": [
-        "The ranking model needs features: user attributes/history, item attributes/popularity, and context — fetched within the latency budget at serving time. A feature store provides low-latency online reads of these features keyed by user/item.",
+        "The ranking model needs features: user attributes/history, item attributes/popularity, and context — all fetched within the latency budget at serving time. A feature store provides low-latency online reads of these features keyed by user/item.",
         "The critical correctness issue is train/serve parity: the features used to train the model offline must match those served online, or the model sees different inputs than it learned on (train/serve skew). The feature store enforces shared feature definitions across both.",
-        "Features come from two pipelines: offline batch (computed periodically, materialized to the store) and real-time (updated from the event stream for recency, e.g. 'items viewed in this session')."
+        "Features come from two pipelines: offline batch (computed periodically and materialized to the store) and real-time (updated from the event stream for recency, e.g. 'items viewed in this session')."
       ],
       "view": {
         "nodes": [
@@ -2040,9 +2103,9 @@
         "Features make ranking work, and train/serve parity is the subtle ML-systems correctness point that separates a strong answer."
       ],
       "recap": {
-        "before": "Model with no consistent inputs.",
-        "after": "Low-latency, parity-guaranteed features online + offline.",
-        "newRisk": "Raw model scores still aren't the final list — business rules, dedup, diversity apply."
+        "before": "A model with no consistent inputs.",
+        "after": "Low-latency, parity-guaranteed features shared across online serving and offline training.",
+        "newRisk": "Raw model scores still aren't the final list — business rules, dedup, and diversity must apply."
       },
       "traps": [
         {
@@ -2156,10 +2219,10 @@
       "id": "filters",
       "title": "5. Post-Ranking Filters and Diversity",
       "description": [
-        "The model's top scores aren't the final list. Apply post-ranking rules: remove ineligible items (out of stock, region-blocked, policy), drop already-seen/recently-shown items, and enforce freshness.",
+        "The model's top scores aren't the final list. Apply post-ranking rules: remove ineligible items (out of stock, region-blocked, policy), drop already-seen or recently-shown items, and enforce freshness.",
         "This stage is also where privacy and policy land: suppress sensitive categories, honor regional eligibility, and respect user controls (hides, blocks, opt-outs) before anything is shown. The item catalog's policy_status, sensitive_category, and region_eligibility drive these checks.",
-        "Add diversity: a pure score sort can return ten near-identical items; re-rank for variety (category/author spread) so the list feels good, not repetitive. Business boosts/demotes (promotions, quality) also apply here.",
-        "These filters run on the small ranked set, cheaply, and produce the final ordered top-N returned to the user."
+        "Add diversity: a pure score sort can return ten near-identical items, so re-rank for variety (category/author spread) and the list feels good rather than repetitive. Business boosts and demotes (promotions, quality) also apply here.",
+        "These filters run cheaply on the small ranked set and produce the final ordered top-N returned to the user."
       ],
       "view": {
         "nodes": [
@@ -2436,15 +2499,17 @@
       "id": "feedback",
       "title": "6. The Feedback Loop: Events, Training, Models",
       "description": [
-        "Recommendations should improve from behavior. Log every interaction (impression, click, view, like) to an event stream — this is both the training label source and the input to fresh features.",
+        "Recommendations should improve from behavior. Log every interaction (impression, click, hide, dwell, conversion) to an event stream — this is both the training-label source and the input to fresh features.",
         "Offline pipelines consume the events to retrain the ranking model and rebuild embeddings periodically, publishing new versions to the model registry; the ANN index is rebuilt from refreshed embeddings. Real-time features (session behavior) update continuously from the same stream.",
-        "Close the loop carefully: log impressions (what was shown), not just clicks, so training isn't biased by only seeing positives — and to enable counterfactual evaluation. The exposure log keeps per-item rank, score, candidate source, and model/feature/experiment versions; when exploration or a contextual bandit is in scope, also log the selection propensity so off-policy / counterfactual evaluation is sound.",
+        "Close the loop carefully: log impressions (what was shown), not just clicks, so training isn't biased by only seeing positives — and to enable counterfactual evaluation. Keep two facts distinct: the API records a server-side served exposure (rank, score, candidate source, model/feature/experiment versions) the moment it returns the list, and the client later confirms a rendered impression (was the item actually visible, and when) plus interactions. When exploration or a contextual bandit is in scope, also log the selection propensity so off-policy / counterfactual evaluation is sound.",
+        "Client events do not write the durable stream directly. They pass through an authenticated event-ingest API that validates schema, enforces auth, deduplicates by event id, applies abuse/rate controls, and buffers with retry — so the log stays clean even under client retries, clock skew, and bursty traffic.",
         "Governance closes the loop too: consent flags gate which signals may train models, retention windows bound how long raw events live, and right-to-delete requests must propagate into the event log and training data, not just the serving stores."
       ],
       "view": {
         "nodes": [
           "Client",
           "RecAPI",
+          "EventIngest",
           "EventLog",
           "RealtimeFeatures",
           "DataLake",
@@ -2454,9 +2519,10 @@
           "OfflineFeat",
           "Observability"
         ],
-        "caption": "Client and API events flow into the interaction stream, which feeds the data lake for the training pipeline, the real-time feature updater, and quality monitoring, closing the loop back to models and embeddings.",
+        "caption": "Client events go through the event-ingest API into the interaction stream, while the API writes server-side exposures; the stream feeds the data lake for the training pipeline, the real-time feature updater, and quality monitoring, closing the loop back to models and embeddings.",
         "links": [
-          "client-eventlog",
+          "client-eventingest",
+          "eventingest-eventlog",
           "recapi-eventlog",
           "eventlog-realtime",
           "eventlog-datalake",
@@ -2467,6 +2533,7 @@
           "eventlog-observability"
         ],
         "highlight": [
+          "EventIngest",
           "EventLog",
           "DataLake",
           "Trainer",
@@ -2495,6 +2562,7 @@
             "nodes": [
               "Client",
               "RecAPI",
+              "EventIngest",
               "EventLog",
               "RealtimeFeatures",
               "DataLake",
@@ -2505,7 +2573,8 @@
             ],
             "caption": "The interaction stream lands raw logs in the data lake, where a periodic training pipeline builds models, publishes them to the registry, and refreshes ANN embeddings.",
             "links": [
-              "client-eventlog",
+              "client-eventingest",
+              "eventingest-eventlog",
               "recapi-eventlog",
               "eventlog-realtime",
               "eventlog-datalake",
@@ -2542,6 +2611,7 @@
             "nodes": [
               "Client",
               "RecAPI",
+              "EventIngest",
               "EventLog",
               "RealtimeFeatures",
               {
@@ -2552,7 +2622,8 @@
             ],
             "caption": "An online/incremental trainer consumes the interaction stream directly and publishes model increments to the registry, skipping the batch data lake.",
             "links": [
-              "client-eventlog",
+              "client-eventingest",
+              "eventingest-eventlog",
               "recapi-eventlog",
               "eventlog-realtime",
               {
@@ -2592,6 +2663,7 @@
             "nodes": [
               "Client",
               "RecAPI",
+              "EventIngest",
               "EventLog",
               {
                 "id": "Bandit",
@@ -2601,7 +2673,8 @@
             ],
             "caption": "A contextual bandit policy reads click/dwell rewards off the interaction stream and updates its policy in the model registry to balance exploration and exploitation.",
             "links": [
-              "client-eventlog",
+              "client-eventingest",
+              "eventingest-eventlog",
               "recapi-eventlog",
               {
                 "from": "EventLog",
@@ -2653,6 +2726,18 @@
         "after": "Models + features + embeddings continuously refreshed from feedback.",
         "newRisk": "New users/items have no history (cold start); serving must stay fast and resilient."
       },
+      "deepDives": [
+        {
+          "title": "Exposure logging for unbiased training and off-policy evaluation",
+          "points": [
+            "The logs the system produces are not a random sample of the world: items only get feedback if the current policy showed them, at the rank it chose. Train naively on that and the model learns to agree with its own past decisions (a feedback loop), and offline metrics flatter the incumbent.",
+            "Log the full served exposure per request — every item shown, with rank, score, candidate sources, and the model/feature/experiment versions that produced it — not just the clicked items. Shown-not-clicked is a real negative signal; positive-only logs make calibration and ranking-loss training impossible.",
+            "When any randomness selected the item (exploration slot, bandit arm, tie-break, traffic split), log the selection propensity P(item shown | context). Inverse-propensity-scoring (IPS) and doubly-robust estimators need it to reweight logged rewards into an unbiased estimate of a new policy's value.",
+            "This is what lets you evaluate a candidate model counterfactually — 'what would CTR have been under ranker_v8?' — from logs alone, before spending live traffic on an A/B test. Position-bias models or rank features then correct training for where an item was shown.",
+            "Practical traps: propensities near zero blow up IPS variance (clip or use doubly-robust); exposure and interaction must join on a stable request_id; and the exposure log itself must respect consent and retention like any other event."
+          ]
+        }
+      ],
       "traps": [
         {
           "trap": "Logging only clicks (positive-only) instead of impressions too.",
@@ -2673,7 +2758,7 @@
       "flows": [
         {
           "name": "Impressions to retraining",
-          "note": "The system logs what was shown as well as what users clicked, so labels and evaluation are not positive-only.",
+          "note": "The API records a server-side served exposure and the client confirms rendered impressions/interactions through the ingest API, so labels and evaluation are not positive-only.",
           "sequence": {
             "participants": [
               {
@@ -2685,6 +2770,11 @@
                 "id": "Client",
                 "label": "Client / App",
                 "alias": "C"
+              },
+              {
+                "id": "EventIngest",
+                "label": "Event Ingest API",
+                "alias": "G"
               },
               {
                 "id": "EventLog",
@@ -2727,13 +2817,19 @@
                 "from": "RecAPI",
                 "to": "EventLog",
                 "arrow": "->>",
-                "label": "log impression list + model arm"
+                "label": "server-side served exposure + model arm"
               },
               {
                 "from": "Client",
+                "to": "EventIngest",
+                "arrow": "->>",
+                "label": "rendered impressions, clicks, hides, dwell"
+              },
+              {
+                "from": "EventIngest",
                 "to": "EventLog",
                 "arrow": "->>",
-                "label": "clicks, hides, dwell, conversions"
+                "label": "validated, deduped events"
               },
               {
                 "from": "EventLog",
@@ -2786,7 +2882,7 @@
       "id": "serving",
       "title": "7. Serving: Latency, Cold Start, and Resilience",
       "description": [
-        "The whole funnel (recall -> rank -> filter) must fit a tight latency budget (p99 ~150 ms): give each stage its own deadline, parallelize candidate generators, bound candidate count, batch feature reads, and cache recent recommendations per user/context for repeat requests. The cache key must include the model arm and a feature-freshness bucket so an experiment or a refresh doesn't serve stale lists.",
+        "The whole funnel (recall -> rank -> filter) must fit a tight latency budget (p99 ~150 ms): give each stage its own deadline, parallelize candidate generators, bound the candidate count, batch feature reads, and cache recent recommendations per user/context for repeat requests. The cache key must include the model arm and a feature-freshness bucket so an experiment or a refresh doesn't serve stale lists.",
         "Degrade per dependency, not all-or-nothing. If one recall source is slow, proceed with partial recall from the sources that answered. If the feature store times out, score with last-known/default features or a lighter fallback model. If the ranker is down, serve cached or popularity lists. Isolate dependencies (separate pools/circuit breakers) so one slow component can't exhaust the request budget, and apply backpressure / load-shed to the cheapest path under overload.",
         "Cold start: new users get popularity/contextual recs until they have history; new items get content-based features and exploration (surface them to gather feedback) so they're not invisible until they have interactions.",
         "Version compatibility is a serving concern: the model version, feature-set version, and embedding/ANN version selected for a request must be compatible, or a rollout scores against mismatched features/embeddings. The experiment router pins a consistent (model, feature-set, embedding) tuple per arm, and rollout is gradual (shadow/A-B) with rollback via the registry."
@@ -2828,6 +2924,171 @@
           "ops"
         ]
       },
+      "options": [
+        {
+          "name": "Full online serving with fallbacks (default)",
+          "description": "Run the whole funnel — recall, rank, filter — live per request, with per-stage deadlines and cache/popularity fallbacks when a dependency is slow or down.",
+          "pros": [
+            "Freshest, most personalized result: every request reflects current context, features, and the live model.",
+            "One code path to reason about; experiments and new models take effect immediately.",
+            "Graceful degradation is built in — partial recall, feature/ranker fallbacks, and cached/popularity lists keep a response coming."
+          ],
+          "cons": [
+            "Most expensive per request and the tightest latency budget to defend.",
+            "Quality depends on several live dependencies staying within their deadlines.",
+            "Needs careful isolation and load-shedding so one slow component can't sink the path."
+          ],
+          "view": {
+            "nodes": [
+              "Client",
+              "RecAPI",
+              "Cache",
+              "ExperimentSvc",
+              "CandGen",
+              "PopularityStore",
+              "Ranker",
+              "FeatureStore",
+              "Filters",
+              "Observability"
+            ],
+            "caption": "The recommendation API runs the full live funnel per request — experiment routing, candidate generation, ranking with online features, and filtering — falling back to cache or popularity on dependency failure.",
+            "links": [
+              "client-recapi",
+              "recapi-cache",
+              "recapi-experiments",
+              "recapi-candgen",
+              "candgen-popularity",
+              "recapi-ranker",
+              "ranker-feature",
+              "recapi-filters",
+              "recapi-observability",
+              "ranker-observability"
+            ],
+            "highlight": [
+              "RecAPI",
+              "Ranker",
+              "Filters"
+            ],
+            "groups": [
+              "serving",
+              "ops"
+            ]
+          }
+        },
+        {
+          "name": "Precomputed recommendation lists",
+          "description": "A batch/streaming job ranks items per user ahead of time and writes the top-N to a store; serving is a single fast key lookup.",
+          "pros": [
+            "Lowest, most predictable serving latency — a single key-value read, no live ranking.",
+            "Cheap and resilient at request time: no ranker/feature dependencies on the hot path.",
+            "Trivial to scale reads and to cap tail latency."
+          ],
+          "cons": [
+            "Stale between precompute runs: can't react to in-session intent or fresh context.",
+            "Wasteful for low-DAU surfaces — you precompute lists most users never see.",
+            "Hard to apply per-request context (device, current query, A/B arm) without recomputing."
+          ],
+          "view": {
+            "nodes": [
+              "Client",
+              "RecAPI",
+              {
+                "id": "PrecompStore",
+                "label": "Precomputed List Store"
+              },
+              {
+                "id": "PrecompJob",
+                "label": "Offline Ranking Job"
+              },
+              "DataLake",
+              "Observability"
+            ],
+            "caption": "An offline job ranks items per user from logged data and writes top-N lists to a store; the API serves them with a single lookup.",
+            "links": [
+              "client-recapi",
+              {
+                "from": "RecAPI",
+                "to": "PrecompStore",
+                "label": "read precomputed top-N"
+              },
+              {
+                "from": "PrecompJob",
+                "to": "PrecompStore",
+                "label": "write ranked lists"
+              },
+              {
+                "from": "DataLake",
+                "to": "PrecompJob",
+                "label": "behavior + features"
+              },
+              "recapi-observability"
+            ],
+            "highlight": [
+              "PrecompStore",
+              "PrecompJob"
+            ],
+            "groups": [
+              "serving",
+              "offline"
+            ]
+          }
+        },
+        {
+          "name": "Hybrid: online funnel with precomputed/cache fallback",
+          "description": "Serve the live funnel when dependencies are healthy, but fall back to a per-user precomputed list (and the result cache) under deadline pressure or outage.",
+          "pros": [
+            "Combines online freshness with a guaranteed-fast, dependency-light fallback list.",
+            "The fallback is far better than generic popularity — it is the user's own precomputed recs.",
+            "Smooths tail latency and rides out partial outages without a blank surface."
+          ],
+          "cons": [
+            "Two serving paths and a precompute pipeline to build, keep consistent, and monitor.",
+            "Fallback lists still go stale and must be refreshed and version-tagged.",
+            "Switchover logic and cache-key correctness add operational complexity."
+          ],
+          "view": {
+            "nodes": [
+              "Client",
+              "RecAPI",
+              "Cache",
+              "CandGen",
+              "Ranker",
+              "Filters",
+              {
+                "id": "PrecompStore",
+                "label": "Precomputed Fallback Store"
+              },
+              "Observability"
+            ],
+            "caption": "The API runs the live funnel by default but reads a per-user precomputed list (and the result cache) as a fast fallback under deadline pressure or dependency failure.",
+            "links": [
+              "client-recapi",
+              "recapi-cache",
+              "recapi-candgen",
+              "recapi-ranker",
+              "recapi-filters",
+              {
+                "from": "RecAPI",
+                "to": "PrecompStore",
+                "label": "fallback precomputed list"
+              },
+              "recapi-observability"
+            ],
+            "highlight": [
+              "RecAPI",
+              "PrecompStore",
+              "Cache"
+            ],
+            "groups": [
+              "serving",
+              "ops"
+            ]
+          }
+        }
+      ],
+      "patterns": [
+        "Graceful degradation / fallback serving"
+      ],
       "decisionPrompt": "The ranking model service times out. What should the user see instead of an error?",
       "whyNow": [
         "Closing on latency budget, cold start, and graceful degradation makes the funnel actually servable and robust in production."
@@ -2837,6 +3098,39 @@
         "after": "Budgeted, cached, cold-start-aware, gracefully-degrading serving.",
         "newRisk": "Feedback bias and A/B rollout risk — bounded by impression logging, exploration, and gradual rollout."
       },
+      "deepDives": [
+        {
+          "title": "Latency budget and overload shedding across the funnel",
+          "points": [
+            "Give the request a hard p99 budget (~150 ms) and split it across stages: cache lookup, routing, parallel recall, batch feature fetch, scoring, filters, serialize — each with its own deadline, not a single overall timeout. A stage that blows its deadline returns its best partial result rather than failing the request.",
+            "Parallelize what you can (recall sources fan out concurrently; feature reads are one batched call) and bound what you can't (cap candidate count so scoring cost is predictable). Async impression logging sits off the critical path so it never spends the budget.",
+            "Under overload, shed toward the cheapest path on purpose rather than letting every request degrade. Concretely: raise the cache TTL/serve-stale window, drop the slowest recall source, fall back to the feature-light or popularity ranker, and shrink top-N. Decide the shedding order up front so behavior under load is intentional.",
+            "Isolate dependencies with separate connection pools, per-dependency circuit breakers, and concurrency limits so one slow component (a GC-pausing feature store) can't exhaust threads and take down the whole request path. Load-shed at admission when queues build, returning a fast fallback instead of a slow timeout.",
+            "Measure the budget you actually spend: p99 per stage, deadline-exceeded rate per stage, and fallback rate. A rising fallback rate is the early warning that the funnel is silently degrading before users see errors."
+          ]
+        },
+        {
+          "title": "Version-compatible rollout across model, feature set, embedding, and ANN index",
+          "points": [
+            "A recommendation request touches four versioned artifacts that must agree: the ranking model, the feature-set schema it was trained on, the embedding space, and the ANN index built from those embeddings. Mismatch any pair and you get silent quality loss, not an error — a new ranker scored on an old feature set, or a model reading embeddings from an index it never saw.",
+            "Treat them as one immutable bundle. The experiment router pins a compatible (model version, feature-set version, embedding/ANN version) tuple per arm; a request resolves the whole tuple at once, never mixing a v8 model with a v7 feature set.",
+            "Roll out gradually: shadow the new bundle (score in parallel, compare distributions, serve the old result), then ramp an A/B arm behind guardrails (engagement plus tail-exposure, calibration, latency). Keep the previous bundle hot so rollback is an instant pointer flip in the registry, not a redeploy.",
+            "Embedding and ANN refresh is the subtle case: rebuild the index from the new embeddings and swap it atomically; never let the ranker read one version of an item's vector while recall used another. Version the embeddings so the index and the model stay in lockstep.",
+            "Validate compatibility before promotion (schema and version checks in the registry) and emit a metric for requests served on each bundle, so a botched rollout is visible immediately and attributable to the right arm."
+          ]
+        },
+        {
+          "title": "What to monitor: a recommender metric catalog",
+          "points": [
+            "Serving SLOs: p50/p99 end-to-end latency and p99 per stage (cache, route, recall, feature fetch, scoring, filters, serialize); request error rate and per-stage deadline-exceeded rate; cache hit ratio and serve-stale rate; RPS and saturation (queue depth, pool utilization).",
+            "Recall / ANN quality: recall@K vs an exact-search baseline on a sampled query set; per-source timeout / partial-recall rate; candidate-count distribution after dedup (watch for collapse); ANN index age, rebuild success, and fresh-item insertion lag.",
+            "Model quality — the silent failures that HTTP health misses: online CTR/dwell/conversion per arm; score-distribution and calibration drift vs training; feature drift and null-rate per feature; guardrail metrics per experiment arm.",
+            "Freshness & feedback: online feature freshness and TTL-miss rate; exposure-log lag and event-ingest dedup rate; real-time feature consumer lag; training-data and embedding refresh recency.",
+            "Coverage & governance: fallback rate (cache/popularity/feature-light) as the early warning of silent degradation; catalog coverage and tail-exposure share (popularity feedback loop); exploration impression share vs target; right-to-delete propagation backlog and retention-expiry job health.",
+            "Alert and runbook expectations: page on SLO and fallback-rate breaches; alert (not page) on drift, freshness, and recall@K regressions; every alert maps to a degrade/rollback action — shed to the cheapest path, roll back the bundle, or pause an arm."
+          ]
+        }
+      ],
       "probeLinks": [
         "linkedin-fishdb",
         "twitter-algorithm",
@@ -3033,7 +3327,7 @@
   ],
   "finalDesign": {
     "title": "Final Design — Recommendation Funnel",
-    "description": "A recommendation request first checks a context-aware result cache (keyed by user/context, model arm, and feature freshness) and model/experiment routing. Candidate generation starts with simple bounded sources such as popularity, user profile/history, and catalog/content metadata, then refines recall with an embedding ANN source for semantic and behavioral similarity. The ranker scores the merged candidate batch with the selected model version and online features, while eligibility and diversity re-ranking use catalog metadata (including policy and sensitive-category controls) to produce the final top-N. The API logs both impressions and request context as a per-item exposure log (rank, score, source, versions, propensity), while the client logs interactions; those events feed a real-time feature updater, the training data lake, offline feature jobs, model training, embedding refresh, model registry rollout, and quality monitoring. The experiment router and model registry pin a compatible (model version, feature-set version, embedding/ANN version) tuple per arm so a rollout never scores against mismatched features or embeddings, with guardrail-driven rollback. This closes the feedback loop while keeping the serving path fast, observable, experimentable, cold-start-aware, governance-aware, and able to degrade to cache or popularity fallbacks.",
+    "description": "A recommendation request first checks a context-aware result cache (keyed by user/context, model arm, and feature freshness) and model/experiment routing. Candidate generation starts with simple bounded sources such as popularity, user profile/history, and catalog/content metadata, then refines recall with an embedding ANN source for semantic and behavioral similarity. The ranker scores the merged candidate batch with the selected model version and online features, while eligibility and diversity re-ranking use catalog metadata (including policy and sensitive-category controls) to produce the final top-N. The API writes a server-side per-item served-exposure log (rank, score, source, versions, propensity) the moment it returns, while the client confirms rendered impressions and interactions through an authenticated event-ingest API (auth, schema validation, dedup by event id, abuse controls, buffered retry) before the durable stream; those events feed a real-time feature updater, the training data lake, offline feature jobs, model training, embedding refresh, model registry rollout, and quality monitoring. The experiment router and model registry pin a compatible (model version, feature-set version, embedding/ANN version) tuple per arm so a rollout never scores against mismatched features or embeddings, with guardrail-driven rollback. This closes the feedback loop while keeping the serving path fast, observable, experimentable, cold-start-aware, governance-aware, and able to degrade to cache or popularity fallbacks.",
     "view": {
       "nodes": [
         "Client",
@@ -3048,6 +3342,7 @@
         "FeatureStore",
         "Filters",
         "Cache",
+        "EventIngest",
         "EventLog",
         "RealtimeFeatures",
         "DataLake",
@@ -3056,7 +3351,7 @@
         "ModelReg",
         "Observability"
       ],
-      "caption": "The recommendation API serves from cache or runs the full funnel (experiment router, candidate generation with ANN/trending/history/catalog recall, ranking with the feature store, and diversity re-ranking), while the interaction stream feeds training, feature, and monitoring pipelines that refresh models and embeddings.",
+      "caption": "The recommendation API serves from cache or runs the full funnel (experiment router, candidate generation with ANN/trending/history/catalog recall, ranking with the feature store, and diversity re-ranking), while client events pass through the event-ingest API into the interaction stream that feeds training, feature, and monitoring pipelines refreshing models and embeddings.",
       "links": [
         "client-recapi",
         "recapi-cache",
@@ -3072,7 +3367,8 @@
         "ranker-modelreg",
         "recapi-filters",
         "filters-catalog",
-        "client-eventlog",
+        "client-eventingest",
+        "eventingest-eventlog",
         "recapi-eventlog",
         "eventlog-realtime",
         "realtime-feature",
@@ -3245,6 +3541,11 @@
               "alias": "A"
             },
             {
+              "id": "EventIngest",
+              "label": "Event Ingest API",
+              "alias": "G"
+            },
+            {
               "id": "EventLog",
               "label": "Event Stream",
               "alias": "L"
@@ -3295,13 +3596,19 @@
               "from": "RecAPI",
               "to": "EventLog",
               "arrow": "->>",
-              "label": "impression events"
+              "label": "server-side served exposures"
             },
             {
               "from": "Client",
+              "to": "EventIngest",
+              "arrow": "->>",
+              "label": "rendered impressions + click/hide/dwell"
+            },
+            {
+              "from": "EventIngest",
               "to": "EventLog",
               "arrow": "->>",
-              "label": "click/hide/dwell events"
+              "label": "validated, deduped events"
             },
             {
               "from": "EventLog",
@@ -3454,6 +3761,480 @@
       }
     ]
   },
+  "technologyChoices": [
+    {
+      "concern": "Vector / ANN retrieval",
+      "steps": [
+        "ann-recall"
+      ],
+      "selfHosted": [
+        {
+          "name": "FAISS",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "HNSWlib",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "ScaNN",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Milvus",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Qdrant",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Weaviate",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Vespa",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "OpenSearch k-NN",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Aurora pgvector",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Vertex AI Vector Search",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          },
+          {
+            "name": "AlloyDB pgvector",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "AI Search vector",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Self-hosted libraries (FAISS/HNSWlib/ScaNN) give the most control over index type, recall/latency tuning, and memory layout, but you operate sharding, replication, and refresh yourself.",
+        "Managed vector search removes index operations and scales reads, but constrains index choice and parameter tuning and can be costlier at very large catalogs."
+      ],
+      "makesIrrelevant": "A managed vector search with built-in replication and refresh removes most custom ANN serving, sharding, and atomic-swap machinery."
+    },
+    {
+      "concern": "Online + offline feature store",
+      "steps": [
+        "features"
+      ],
+      "selfHosted": [
+        {
+          "name": "Feast",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Cassandra",
+          "icon": "assets/tech-icons/cassandra.png"
+        },
+        {
+          "name": "Aerospike",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SageMaker Feature Store",
+            "icon": "assets/tech-icons/Arch_Amazon-SageMaker-AI_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Vertex AI Feature Store",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure ML feature store",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A dedicated feature store (Feast or a managed one) enforces shared definitions and point-in-time correctness across training and serving, at the cost of running a platform.",
+        "A bare low-latency KV store (Redis/DynamoDB/Bigtable) is simpler to operate but pushes train/serve parity and materialization logic back onto your pipelines."
+      ],
+      "makesIrrelevant": "A managed feature store with built-in point-in-time joins and online/offline materialization removes most hand-built parity and backfill plumbing."
+    },
+    {
+      "concern": "Event ingest + streaming log",
+      "steps": [
+        "feedback",
+        "serving"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Apache Pulsar",
+          "icon": "assets/tech-icons/pulsar.png"
+        },
+        {
+          "name": "Redpanda",
+          "icon": "assets/tech-icons/redpanda.png"
+        },
+        {
+          "name": "Apache Flink",
+          "icon": "assets/tech-icons/flink.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Kinesis Data Streams",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "MSK",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Streaming-for-Apache-Kafka_64.png"
+          },
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          },
+          {
+            "name": "Stream Analytics",
+            "icon": "assets/tech-icons/00042-icon-service-Stream-Analytics-Jobs.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Self-hosted Kafka/Pulsar gives high throughput, long retention, and replay control for impression/interaction volume, but you run brokers, partitions, and consumer lag monitoring.",
+        "Managed streaming removes broker ops and scales elastically, but caps retention/throughput knobs and can cost more at billions of events/day."
+      ],
+      "makesIrrelevant": "A managed stream plus a managed ingest/API gateway removes most broker operations and custom auth/validation/dedup glue on the event path."
+    },
+    {
+      "concern": "Offline training storage (data lake / table format)",
+      "steps": [
+        "feedback",
+        "features"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Iceberg",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Delta Lake",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Apache Hudi",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Apache Spark",
+          "icon": "assets/tech-icons/spark.png"
+        },
+        {
+          "name": "Trino",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "S3",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Storage-Service_64.png"
+          },
+          {
+            "name": "Glue",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "EMR",
+            "icon": "assets/tech-icons/Arch_Amazon-EMR_64.png"
+          },
+          {
+            "name": "Athena",
+            "icon": "assets/tech-icons/Arch_Amazon-Athena_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Storage",
+            "icon": "assets/tech-icons/Storage-512-color.png"
+          },
+          {
+            "name": "BigQuery",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Dataproc",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "ADLS Gen2",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Synapse",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Databricks",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Open table formats (Iceberg/Delta/Hudi) over object storage give schema evolution, time travel, and engine choice for training-set reproducibility.",
+        "A managed warehouse (BigQuery/Synapse) is simpler for analytics and label aggregation but can be costly for full-fidelity raw-event retention."
+      ],
+      "makesIrrelevant": "A lakehouse with time-travel snapshots removes bespoke point-in-time training-set versioning and reproducibility scaffolding."
+    },
+    {
+      "concern": "Model serving + registry",
+      "steps": [
+        "ranking",
+        "serving"
+      ],
+      "selfHosted": [
+        {
+          "name": "NVIDIA Triton",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "TensorFlow Serving",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "TorchServe",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "MLflow",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "KServe",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SageMaker Endpoints",
+            "icon": "assets/tech-icons/Arch_Amazon-SageMaker-AI_64.png"
+          },
+          {
+            "name": "SageMaker Model Registry",
+            "icon": "assets/tech-icons/Arch_Amazon-SageMaker-AI_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Vertex AI Prediction",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          },
+          {
+            "name": "Vertex AI Model Registry",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure ML Endpoints",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Azure ML Registry",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Self-hosted servers (Triton/TF Serving) maximize throughput and let you co-locate scoring with feature fetch, but you own autoscaling, batching, and GPU packing.",
+        "Managed endpoints handle autoscaling and versioned rollout, at less control over batching/latency and higher per-inference cost."
+      ],
+      "makesIrrelevant": "A managed serving + registry with built-in versioned rollout and rollback removes most custom artifact-store and canary plumbing."
+    },
+    {
+      "concern": "Experimentation / rollout platform",
+      "steps": [
+        "ranking",
+        "serving"
+      ],
+      "selfHosted": [
+        {
+          "name": "GrowthBook",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Unleash",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Flagsmith",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudWatch Evidently",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Firebase A/B Testing",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "App Configuration",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A dedicated experiment platform gives overlapping experiments, guardrail enforcement, and statistically sound readouts, but is one more system to integrate with the model router.",
+        "A simple feature-flag service is quick to adopt but leaves bucketing, guardrails, and analysis to you."
+      ],
+      "makesIrrelevant": "An experiment platform with overlapping-domain bucketing and guardrail automation removes hand-rolled traffic splitting and rollback wiring."
+    },
+    {
+      "concern": "Metrics, quality & drift monitoring",
+      "steps": [
+        "serving",
+        "feedback"
+      ],
+      "selfHosted": [
+        {
+          "name": "Prometheus",
+          "icon": "assets/tech-icons/prometheus.png"
+        },
+        {
+          "name": "Grafana",
+          "icon": "assets/tech-icons/grafana.png"
+        },
+        {
+          "name": "OpenTelemetry",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Evidently",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Great Expectations",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "SageMaker Model Monitor",
+            "icon": "assets/tech-icons/Arch_Amazon-SageMaker-AI_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Vertex AI Model Monitoring",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Azure ML Data Drift",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ]
+      },
+      "tradeoff": [
+        "System metrics (Prometheus/Grafana) cover latency/errors, but recommender failures are often silent — you also need model-quality and data-drift monitors (Evidently / Model Monitor) on score distribution, freshness, and guardrails.",
+        "Managed monitoring integrates drift/quality with serving, at less flexibility in custom recsys metrics like recall@K and tail exposure."
+      ],
+      "makesIrrelevant": "A managed model-monitoring service with built-in drift and data-quality checks removes much custom score-distribution and freshness alerting."
+    }
+  ],
   "interviewScript": [
     {
       "phase": "Scope & requirements",

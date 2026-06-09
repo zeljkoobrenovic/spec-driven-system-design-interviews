@@ -5,375 +5,351 @@ Review date: 2026-06-09
 
 ## Executive Summary
 
-This is a strong, compact walkthrough for the core product-catalog pattern:
-normalized writes, read-optimized projections, faceted search, denormalized
-product views, and a consistency split for volatile stock/price. The sequence
-is easy to teach and the default options are mostly the right interview answer.
+This review reflects the current `interview.json`, which is materially stronger
+than the prior review described. The recent dataset now includes concrete
+capacity numbers, a pricing store and live price read path, an edge/CDN cache,
+seller write safety fields, category/facet schema modeling, projection
+checkpointing, a projection-mechanics deep dive, and explicit bottleneck and
+failure drills.
 
-The current dataset is not yet at the depth of the strongest book cases. It
-states several production claims without enough model or workflow support:
-fresh price is promised but not drawn as a live dependency, capacity is mostly
-qualitative, the seller/update path lacks versioning/idempotency/moderation
-details, and projection/rebuild operations are described but not deeply taught.
-There are also two narrow renderer-facing view issues where a step uses a
-gateway link without including the gateway node.
+The result is a strong book-ready product-catalog walkthrough. The core answer
+is coherent: normalized write model, projected search index, denormalized
+product read model, live reads for volatile inventory/price, and rebuildable
+derived stores. Remaining gaps are no longer foundational architecture breaks;
+they are precision gaps around how stale price participates in search
+filtering/sorting, where the purchase/checkout boundary starts, how multi-seller
+offers and buy-box prices are scoped, and one small wrap-up mapping mismatch.
 
 | Area | Score | Notes |
 | --- | ---: | --- |
-| System design soundness | 4.0/5 | The CQRS/search/read-model architecture is sound; price, seller, rating/image, and projection invariants need more explicit modeling. |
-| Production realism | 3.7/5 | Good high-level trade-offs, but capacity math, price/inventory authority, CDC failure handling, and operational controls are thin. |
-| Pedagogical flow | 4.2/5 | The seven-step progression is clear and builds well; it needs deeper drills around projection lag, rebuilds, and purchase-time freshness. |
-| Dataset/rendering fit | 4.0/5 | JSON parses and cross-links mostly resolve; two step views omit `LB` while using `lb-*` links, and the price live-read path is not represented. |
-| Overall | 4.0/5 | Usable and coherent; one focused expansion pass would make it a polished commerce/catalog chapter. |
+| System design soundness | 4.5/5 | The CQRS/search/read-model design is sound and now has concrete scale assumptions; price/search semantics and offer modeling need one more clarification pass. |
+| Production realism | 4.4/5 | Projection, seller writes, live stock/price, and recovery are realistic; purchase quote semantics and multi-seller offers are still mostly named rather than modeled. |
+| Pedagogical flow | 4.6/5 | The seven-step progression is clear, motivated, and now has useful drills/deep dives. |
+| Dataset/rendering fit | 4.6/5 | JSON parses, links and sequences resolve, and old LB/link issues are fixed; `satisfies.nonFunctional` misses one requirement mapping. |
+| Overall | 4.5/5 | A polished and credible catalog case with a few targeted refinements left. |
 
 ## What Works Well
 
-- The core scope is clear: read-heavy browse/search, seller writes, low-latency
-  product pages, and special treatment for volatile price and stock.
-- Step 1 is a useful baseline. It exposes why a normalized write table is the
-  wrong serving shape for search, facets, and product-page rendering.
-- The CQRS progression is coherent: split writes from reads, add search/facets,
-  add a denormalized read model, then keep derived stores fresh with a stream.
-- The options are real trade-offs rather than strawmen. The rejected choices
-  are plausible for smaller systems and explain why catalog scale changes the
-  decision.
-- The final design integrates the main read path, write path, projection path,
-  search index, read model, inventory service, and pricing service.
-- The wrap-up sections map requirements back to steps cleanly, and the
-  interview script is short enough to be usable.
+- The capacity section now gives useful orders of magnitude: 300M products,
+  100M DAU, 500k peak search QPS, 1M peak detail QPS, 50-100k/sec peak
+  price/stock events, p99 < 5 s projection lag, and rebuild expectations.
+- The CQRS arc is clean: Step 1 exposes the normalized-table failure, Step 2
+  creates source-of-truth separation, Step 3 adds search/facets, Step 4 adds
+  the denormalized read model, and Step 5 explains projection.
+- The data model now supports the story. It includes seller ownership,
+  optimistic-concurrency versioning, moderation status, category facet schema,
+  rating summary, price/offers, inventory, and projection checkpoints.
+- The prior live-price mismatch is fixed. `PriceSvc`, `PriceDB`, `detail-price`,
+  the product-detail API sequence, Step 6, and final design now all align.
+- Projection operations are no longer hand-wavy. The deep dive covers outbox/CDC,
+  event IDs, per-product ordering, idempotent upserts, checkpoints, lag alarms,
+  DLQ handling, replay, partial reindex, and full reproject fallback.
+- Step 7 now teaches operations, not just scale words. Viral product reads, hot
+  search/category queries, projection floods, corrupted shards, lag breaches,
+  and poison events all have expected behavior and mitigations.
+- The structured diagrams fit the renderer conventions. The previously noted
+  Step 3/Step 4 `LB` omissions are fixed.
 
 ## Highest-Impact Issues
 
-### 1. Fresh price is promised but not modeled or diagrammed as a live read
+### 1. Price filtering and sorting need explicit staleness semantics
 
-The requirements, product-detail API description, Step 6, final design, and
-`satisfies` section all say price and availability are read live from their
-owners at purchase-decision time. Inventory is represented by `InvSvc`,
-`InvDB`, and the `detail-inv` link. Pricing has only `PriceSvc` and
-`price-stream`; there is no price store, no `CatalogSvc -> PriceSvc` live-read
-link in the high-level architecture, and the product-detail API sequence calls
-only `InvSvc`.
+The requirements and API include price facets/filtering/sorting, while Step 6
+correctly says authoritative price is read live from Pricing Service and not
+trusted from the projected view. The dataset now includes a trap that says price
+facets should be bucketed with explicit acceptable staleness, but that rule is
+not yet visible in the API, data model, search step, or requirement mapping.
 
-Why it matters: the dataset teaches "consistency by data type" as the main
-senior-level insight, but the rendered diagrams show a concrete live inventory
-path and only an event-emission pricing path. Readers can leave thinking price
-freshness is solved by projection, which is the opposite of the stated default.
+Why it matters: at 50-100k/sec peak price/stock events, indexing every price
+change as a precise search/sort field can churn the index and still serve stale
+results. But if price in search is only approximate, the candidate must explain
+what the shopper sees when a filtered/sorted result is re-priced by the live
+Pricing Service on detail/add-to-cart.
 
-Concrete fix: add a pricing store or explicitly state that the Pricing Service
-owns its own external/hidden store. Add a canonical `detail-price` or
-`decision-price` link from `CatalogSvc` or the checkout/order boundary to
-`PriceSvc`, include it in Step 6 and `finalDesign.view.links`, and update the
-product-detail sequence to call both `InvSvc` and `PriceSvc` when the response
-claims live price. If live price only happens outside the catalog at checkout,
-make that boundary explicit.
+Concrete fix: make the search semantics explicit. Add fields such as
+`indexed_price_bucket`, `display_price`, `price_last_projected_at`, or
+`winning_offer_snapshot` to the search/read model discussion; state that price
+filters/sorts operate on a projected or bucketed snapshot; and say the product
+detail/cart path refreshes the top result's current price from Pricing Service.
 
-### 2. Capacity is too qualitative for the design decisions it justifies
+### 2. The purchase boundary is named, but quote/reservation semantics are thin
 
-The capacity section says "100s of millions", "reads >> writes", "very
-frequent", and "< 200 ms p99", but it never converts that into query QPS,
-product-view working set, index size, projection throughput, write burst size,
-price/stock update rates, cache hit assumptions, or rebuild duration.
+Step 6 and `satisfies` now say checkout re-verifies an authoritative price
+quote, and this is the right boundary for a catalog case. However, there is no
+small explanation of what "price quote" means: quote TTL, quote ID, failed quote
+refresh, inventory reservation/hold handoff, or which adjacent service owns the
+final purchase decision.
 
-Why it matters: the architecture is justified by scale. Without concrete
-orders of magnitude, choices like sharded search, edge caching, stream
-buffering, and read-model rebuildability feel asserted rather than derived.
+Why it matters: the dataset says price and availability are trustworthy at the
+purchase decision. Without a precise boundary, readers can blur "catalog detail
+page is fresh" with "checkout correctness is solved by catalog."
 
-Concrete fix: add approximate numbers, even if rough: daily active shoppers,
-search/detail QPS, seller update QPS, peak price/stock event rate, product-view
-size, index size, search shard count, cache TTL/hit-rate target, projection lag
-SLO, and maximum acceptable full/partial rebuild time. Then tie Step 7 to those
-numbers.
+Concrete fix: keep checkout out of scope, but add a compact boundary note in
+Step 6 or final design: catalog/detail can refresh live display values; cart or
+checkout requests an authoritative price quote and inventory reservation/hold;
+the quote has a TTL and is revalidated before order placement.
 
-### 3. The seller write path lacks production safety details
+### 3. Multi-seller offers and buy-box behavior are under-scoped
 
-The API has `PUT /v1/products/{id}` with a simple `{title, attrs}` request and
-`{version}` response. The write model has `product_id`, `category_id`, `brand`,
-`attributes`, and `version`, but no `seller_id`, ownership/authorization,
-idempotency key, optimistic concurrency condition, moderation state, audit log,
-or validation workflow for category-specific attributes.
+The data model now has `price / offers` with `seller_id`, and follow-ups ask
+about many sellers and buy-box behavior. That is good. The main walkthrough,
+however, still mostly talks as if each product has one current price.
 
-Why it matters: seller updates are one of the stated functional requirements.
-At marketplace scale, bad write semantics create overwritten edits, unauthorized
-changes, invalid facets, abusive content, and projection churn. These are not
-edge cases for a product catalog.
+Why it matters: for an Amazon-style catalog, product identity, seller offers,
+display price, price sorting, availability, and buy-box selection are tightly
+connected. Treating price as a single product field can mislead candidates when
+they later discuss marketplace offers.
 
-Concrete fix: add seller ownership and write-safety fields: `seller_id` or
-owner relation, `status`/moderation state, `updated_at`, `version`, maybe
-`attribute_schema_version`, and a write API that uses `If-Match` or an explicit
-expected version plus idempotency for create/import operations. Mention
-validation of category-specific attributes before they enter search facets.
+Concrete fix: either explicitly scope the default design to "one winning offer
+per product is projected/displayed" or add a short offer summary model:
+`offer_id`, `seller_id`, `condition`, `fulfillment_channel`, `price`,
+`availability`, and `is_buy_box_winner`. Then tie search result price to the
+winning-offer snapshot and live checkout to the selected offer.
 
-### 4. Projection and rebuild operations need more failure semantics
+### 4. `satisfies.nonFunctional` misses one stated non-functional requirement
 
-Step 5 says the stream is durable and projectors are idempotent, and Step 7 says
-derived stores are rebuildable. The data model only has `source_version` on
-`product_view`; there is no event ID, outbox/CDC position, projector checkpoint,
-dedupe key, lag metric, dead-letter workflow, poison-event behavior, or partial
-reindex strategy.
+`requirements.nonFunctional` has five bullets, but `satisfies.nonFunctional`
+has four entries. The omitted one is the read-heavy nature of browse/search
+traffic, which is central to the case even though it is indirectly covered by
+low latency and scale.
 
-Why it matters: the projection pipeline is the mechanism that keeps two user
-visible read stores correct. A production answer should explain how duplicate
-events, out-of-order events, projector crashes, bulk imports, and corrupted
-index shards are detected and recovered.
-
-Concrete fix: add a deep dive or failure drill for projection mechanics:
-transactional outbox/CDC source, event IDs, per-product version ordering,
-idempotent upserts, projector checkpoints, DLQ/retry policy, lag SLOs, and
-partial rebuild by product/category/shard before full reindex.
-
-### 5. Product-page data is under-modeled for the fields the requirements show
-
-The requirements mention images, rating/reviews summary, categories, brand,
-price, availability, facets, and sorting by rating/price. The data model only
-has `products`, `product_view`, and `inventory`. Images, review/rating summary,
-category hierarchy, price/offers, and search facet normalization are either
-buried inside JSON or not represented.
-
-Why it matters: denormalization works only if the reader understands which
-source owns each field and which freshness guarantee applies. Hiding all of
-that inside `rendered json` makes the read model look simpler than the real
-projection problem.
-
-Concrete fix: keep the model compact, but add source ownership rows or notes:
-`product_images` or media service, `category` hierarchy, `rating_summary`,
-`price/offers`, and `facet_attributes` with normalized values. State which are
-projected into `product_view` and/or `SearchIdx`, and which are live at
-purchase time.
+Concrete fix: add a `satisfies.nonFunctional` item such as "Extremely
+read-heavy browse/search" mapped to `cqrs`, `readmodel`, `search`, and `scale`.
 
 ## System Design Soundness
 
-The main architecture is correct for the stated problem. A normalized product
-write model should not serve massive search and product-detail traffic
-directly. A search index plus a denormalized read model is the right default,
-and a change stream feeding both derived stores is a defensible way to handle
-seller edits, category/rating changes, and bulk imports.
+The current architecture is sound for a large e-commerce product catalog. The
+write path is normalized and owner-controlled, while browse/search reads use
+two derived serving shapes: a search/facet index for discovery and a
+denormalized read model for result-card and detail hydration. A durable change
+stream and projector complete the CQRS story.
 
-The most important soundness gap is the price boundary. The prose says price is
-fresh and authoritative, but the graph does not show how. Either the catalog
-detail endpoint must synchronously call Pricing Service for display price, or
-the catalog should show an approximate/display price while the cart/checkout
-system verifies an authoritative price quote. Both are valid, but the dataset
-currently mixes them.
+The capacity math now supports the design choices instead of merely asserting
+them. The read:write ratio, search/detail QPS, price/stock event rate, cache hit
+target, lag SLO, and rebuild bounds explain why one normalized database cannot
+serve the whole workload.
 
-Inventory is more concrete than pricing because it has an owner service and
-store. It still stops short of purchase semantics: there is no reservation,
-hold, or checkout integration. That may be acceptable for a catalog case, but
-then the language should say "fresh enough to shop/display" and "verified by
-checkout" instead of implying the product catalog itself solves purchase
-correctness.
+Inventory and pricing ownership is now much better modeled. `InvSvc`/`InvDB`
+and `PriceSvc`/`PriceDB` own volatile data, emit changes, and are read live
+when the product page needs trustworthy values. The remaining design precision
+is not "add Pricing Service"; that is already done. The precision needed is
+"what does price mean inside search and result ordering if authoritative price
+lives elsewhere?"
 
-Search and faceting are well scoped. The dataset should add one sentence on
-facet normalization and index freshness: category-specific attributes need
-controlled schemas, normalized values, and rules for fields that are searchable
-versus filterable. Otherwise `attributes json (facetable)` makes the hard part
-look automatic.
+The write API and data model are credible: seller ownership, `If-Match`,
+idempotency key, moderation status, category-scoped attributes, schema version,
+and per-product version are the right controls. A future pass could add audit
+log and bulk-import job IDs, but the dataset already teaches the important
+write-safety concepts.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: Query the Normalized Products Table Directly
 
-This is a good baseline. It names the two failures that motivate the rest:
-LIKE/facet scans do not meet search latency, and per-request joins do not meet
-product-page latency under read-heavy traffic.
-
-The step could be stronger if it included one concrete failure number, such as
-an example search QPS or product count that makes SQL faceting untenable.
+This is a strong baseline. It now uses concrete scale numbers to make the
+failure visible: SQL-like search, facet aggregation, and per-request joins do
+not survive hundreds of millions of products and heavy read traffic.
 
 ### Step 2: Split Reads from Writes (CQRS)
 
-This step introduces the central pattern at the right time. The default option
-is the right answer, and the read-replica alternative is fairly explained.
-
-The step's current view is still write-path heavy; it does not yet show the
-read model or search index even though the text says those stores are derived.
-That is acceptable as an incremental reveal, but the caption should make clear
-that this step is establishing the source of truth before the read stores are
-drawn in later steps.
+This step introduces the central pattern at the right moment. The options are
+well framed: derived stores are the right default, while read replicas/caching
+are plausible but insufficient because they do not change the read shape.
 
 ### Step 3: Search and Faceting
 
-This is one of the strongest steps. It distinguishes product search from plain
-keyword search by calling out facet counts, ranking, filters, and result-card
+This is the e-commerce-specific teaching step and it mostly works well. It
+names inverted indexing, facet counts, ranking, shard/replica needs, and result
 hydration from the read model.
 
-Add more operational depth around index layout: shard key, replicas, hot
-queries/categories, refresh interval, and how price/rating facets stay fresh
-when those values change often. If price is live-only at purchase, be careful
-about using price as a search facet without explaining acceptable staleness.
+The main improvement is price semantics. If search supports `maxPrice` and sort
+by price, the step should state whether that price is a projected snapshot, a
+bucketed range, or refreshed for the top N results. This is especially important
+because Step 6 later says price is authoritative only when read live.
 
 ### Step 4: Denormalized Product Read Model
 
-The step teaches the right latency mechanism: turn multi-source fan-out into a
-single render-ready lookup and keep a source version for verification.
+This step is now coherent. It teaches the single-lookup product page and includes
+a flow that gets content from the read model while reading inventory and price
+live. The `product_view` model also clearly labels display price and stock badge
+as non-authoritative.
 
-The read-model schema is too compressed. It would help to show which fields are
-projected content, which are derived summaries, and which are deliberately not
-trusted for purchase decisions. The flow calls only inventory live even though
-the note says stock and price are volatile.
+Consider adding one sentence on review/rating and media ownership: those are
+projected content summaries, not data owned by Catalog Service.
 
 ### Step 5: Keep Read Stores Fresh via Change Streams
 
-This step completes the CQRS story and correctly rejects synchronous dual-write
-and periodic full reindex as defaults.
+This is substantially improved. The projection mechanics deep dive is concrete
+and production-realistic: transactional outbox/CDC, event IDs, version guards,
+partition ordering, checkpoints, lag alarms, DLQ, partial reindex, and replay.
 
-For book-level polish, add a projection mechanics deep dive. The dataset should
-teach idempotent event application, per-product version ordering, checkpointing,
-lag monitoring, retry/DLQ behavior, and partial rebuild. Those are the real
-production details behind "durable stream + projector".
+One small clarity point: the high-level diagram shows catalog, price, and
+inventory events in the same `ChangeStream`. That is fine for a conceptual event
+bus, but the text should say whether this is one physical stream or a shared
+eventing abstraction with owner-specific topics.
 
 ### Step 6: Inventory and Price: Freshness Where It Matters
 
-This is the most important conceptual step. The split between eventually
-consistent catalog content and authoritative volatile values is exactly the
-right senior interview point.
+This is the key senior-level step and the recent changes fixed its largest
+problem. The live price path is now present in prose, API sequence, links,
+nodes, and final design.
 
-The diagrams and model need to catch up. Add the live pricing link/store, and
-clarify whether the catalog endpoint itself verifies price or whether cart/order
-does. Also consider a short trap about over-projecting price because it makes
-search/detail fast but breaks purchase trust.
+The remaining improvement is boundary precision. Say exactly which value is
+fresh on the catalog detail page, which value is only a display snapshot in
+search/read model, and which adjacent cart/checkout service gets the final
+quote/reservation.
 
 ### Step 7: Scaling Reads, Hotspots, and Rebuilds
 
-The closing themes are right: sharding, replication, edge caching, projection
-burst buffering, and derived-store rebuilds.
+This is now much stronger. The bottlenecks and failure drills make the derived
+read stores operationally believable. Viral product reads, hot queries, bulk
+imports, corrupted shards, lag breaches, and poison events are the right drills.
 
-The step is currently too high-level. Add one or two concrete drills: hot
-category/search query, viral product detail page, projector lag during a bulk
-import, and corrupted index shard. For each, name the expected behavior and the
-operational signal that tells the team it is working.
+Add one optional drill for CDN/query-cache invalidation or stale cached product
+content after moderation suppression, since the design now includes an
+`EdgeCache`.
 
 ## Final Design Review
 
-The final design is coherent and includes all major components introduced by
-the steps. It is a good summary of the intended architecture.
+The final design now integrates the steps well. It contains the client/gateway,
+edge cache, catalog service/store, read model, search service/index, change
+stream, projector, inventory service/store, and pricing service/store. It also
+states the crucial consistency split: projected catalog content, live volatile
+stock/price, and rebuildable derived stores.
 
-The main defect is the same price-path mismatch: `PriceSvc` appears only through
-`price-stream`, while the final description says volatile stock/price are read
-live. Add the live price edge or explicitly move price verification out to an
-adjacent checkout/order system.
+The most important final-design refinement is to avoid ambiguity around price
+in browse/search versus price in purchase. The final design can stay compact,
+but it should mention "search uses a projected/bucketed price snapshot; detail
+and checkout refresh/verify live price."
 
-The final design also says reads are edge-cached, but there is no cache/CDN node
-in the high-level architecture. Either add an edge cache/read-through cache node
-for Step 7/final design or soften the claim to "can be edge-cached".
+The edge cache is semantically useful, though the graph link `LB -> EdgeCache`
+can read backwards. A CDN usually fronts the gateway (`Client -> EdgeCache ->
+LB`) or sits in front of static/rendered catalog content. This is a diagram
+polish issue rather than a design blocker.
 
 ## Concept Introduction and Learning Flow
 
-The concepts are introduced in a clean order: CQRS, faceted search,
-denormalized read model, projection, consistency by data type, and bounded
-service ownership. That is the right sequence for this problem.
+The concept order is strong: CQRS first, then search/faceting, denormalized read
+model, projection, consistency by data type, and finally scale/recovery. Each
+step exposes the next problem naturally.
 
-The missing teaching pieces are mostly operational concepts: transactional
-outbox or CDC, projector idempotency, projection lag SLO, partial reindex,
-facet normalization, and price quote/verification boundaries. These should be
-introduced only where needed rather than as a separate theory block.
+The dataset also does a good job introducing concepts only when they are needed.
+Projection mechanics appear after read stores exist; live volatile reads appear
+after projection exposes staleness; failure drills appear after the final
+architecture is assembled.
+
+The one concept that needs tighter placement is "price snapshot versus price
+authority." It should appear in Step 3 or Step 4, before Step 6, because price
+filtering/sorting is already part of search.
 
 ## Step-to-Final-Design Coherence
 
-The final design mostly reflects the steps: search/read model from Steps 3-4,
-change stream/indexer from Step 5, inventory/pricing services from Step 6, and
-sharded/replicated/cached reads from Step 7.
+Coherence is now high:
 
-The coherence gaps are narrow but important:
+- Step 2 establishes Catalog Service and Catalog Store as source of truth.
+- Step 3 introduces Search Service, Search Index, and read-model hydration.
+- Step 4 introduces the Product Read Model and product-detail flow.
+- Step 5 introduces Change Stream and Indexer/Projector.
+- Step 6 introduces Inventory and Pricing services with owned stores and live
+  reads.
+- Step 7 introduces EdgeCache, hotspot handling, and rebuild drills.
+- Final design includes the components and links introduced across the steps.
 
-- Step 6 says live pricing; final design does not show a live price edge.
-- Step 7 says edge caching; final design does not show an edge cache/CDN node.
-- Step 4 and Step 6 mention live volatile values; the API sequence only calls
-  inventory.
-- The write path says seller updates, but final design has no seller/admin
-  client distinction, auth, moderation, or write conflict handling.
+The old review findings about missing `PriceDB`, missing live price edge,
+missing product-detail price sequence, missing EdgeCache, and missing `LB` nodes
+in Step 3/Step 4 are no longer valid for the current JSON.
 
 ## Realism Compared With Production Systems
 
-The dataset is realistic at the architecture-pattern level. It captures the
-big idea used by large e-commerce catalogs: separate product authoring from
-browse serving, use a dedicated search system, denormalize product pages, and
-treat fast-changing commercial data differently from descriptive content.
+The current dataset is realistic at the pattern and operational level. It
+captures the production shape of a large catalog: source-of-truth writes,
+derived search/read stores, CDC/outbox projection, shard/replica/cache scaling,
+lag monitoring, and selective live reads for correctness-sensitive values.
 
-It is less realistic at the operational and domain-boundary level. A production
-catalog has marketplace ownership, offer/price authority, media, category
-taxonomy, facet schema management, review/rating summaries, moderation, bulk
-imports, abuse controls, and explicit checkout handoff. The dataset does not
-need to cover all of these, but it should name the ones intentionally out of
-scope and model the ones it relies on for correctness.
+The remaining realism gaps are marketplace-specific rather than general
+architecture gaps. Real product catalogs need richer offer/buy-box semantics,
+media pipelines, category taxonomy governance, abuse/moderation workflows,
+ranking experimentation, personalized retrieval/ranking, review-summary
+ownership, and checkout handoff. The dataset does not need to fully design all
+of these, but it should name the most important boundaries so the candidate does
+not accidentally claim catalog owns them all.
 
 ## Dataset and Renderer-Facing Observations
 
 - `interview.json` parses successfully.
+- Step, option, and final-design link IDs resolve to
+  `highLevelArchitecture.links`.
+- View link endpoints are present in each view's `nodes` list; the previous
+  Step 3/Step 4 `LB` omission is fixed.
+- API and step-flow sequence messages reference declared participants.
 - `satisfies[*].steps[*]` and `patterns[*].steps[*]` resolve to existing step
   IDs.
-- Step/option/final-design string link IDs resolve to
-  `highLevelArchitecture.links`.
-- Sequence message participants resolve within their sequence, and sequence
-  participants map to canonical high-level node IDs.
-- Main Step 3 uses `lb-search` but `view.nodes` omits `LB`; Main Step 4 uses
-  `lb-detail` but `view.nodes` omits `LB`. Add `LB` to those views or replace
-  the links with local `Client -> SearchSvc` / `Client -> CatalogSvc` links.
-- Canonical node types used by the high-level architecture are supported:
-  `cache`, `client`, `database`, `edge`, `index`, `service`, `stream`, and
-  `worker`.
-- `ReadModel` is typed as `cache`. That renders, but semantically it is a
-  persistent derived read store. Consider whether `database` better matches the
-  teaching intent, or keep `cache` and explicitly say it is rebuildable derived
-  state rather than a simple volatile cache.
+- High-level architecture node types are supported: `cache`, `client`,
+  `database`, `edge`, `index`, `service`, `stream`, and `worker`.
+- `satisfies.nonFunctional` has four entries while `requirements.nonFunctional`
+  has five; add a mapping for the read-heavy requirement.
+- `ReadModel` is typed as `cache`. This renders correctly, but semantically it
+  is a persistent derived serving store. Consider `database`, or keep `cache`
+  and preserve the current explicit language that it is rebuildable derived
+  state rather than a volatile cache.
+- The `edge-cache` link points from `LB` to `EdgeCache`. If the intended model
+  is a fronting CDN, consider drawing `Client -> EdgeCache -> LB` with a local
+  link in the Step 7/final-design views.
+- `toProbeFurther.links` has a useful set of seven references covering
+  Elasticsearch, Lucene, Bigtable, Dynamo, Debezium outbox, Kafka, and
+  Percolator.
 
 ## Recommended Edits, Prioritized
 
-### P1: Fix the live price path
+### P1: Clarify price in search, facets, and sorting
 
-Add pricing storage/ownership, a live price link, and a product-detail or
-purchase-decision sequence that calls Pricing Service when the text promises
-fresh price. Clarify whether price verification belongs to catalog or checkout.
+State whether search price is a projected snapshot, bucketed range, winning
+offer snapshot, or refreshed top-N value. Tie this to the high price/stock event
+rate and to the live Pricing Service read.
 
-### P1: Add concrete capacity and lag numbers
+### P1: Add a compact purchase-boundary note
 
-Turn qualitative capacity bullets into rough operating estimates and use them
-to justify shard counts, cache strategy, projection throughput, and rebuild
-strategy.
+Do not design checkout in full. Add two or three sentences explaining that cart
+or checkout owns the final price quote and inventory reservation/hold, including
+quote TTL and revalidation before order placement.
 
-### P1: Expand projection failure handling
+### P2: Scope multi-seller offers and buy-box behavior
 
-Add a Step 5 deep dive or failure drills for event IDs, idempotent upserts,
-checkpoints, lag SLOs, DLQ behavior, bulk imports, and partial reindex.
+Either declare the main walkthrough assumes one winning offer per product, or
+add a compact offer summary model and describe how search/display price relates
+to the selected offer.
 
-### P2: Strengthen the seller write model
+### P2: Add the missing non-functional `satisfies` mapping
 
-Add seller ownership, expected-version writes, idempotent create/import, status
-or moderation fields, audit metadata, and category-specific attribute
-validation.
+Map "Extremely read-heavy" to the CQRS, search/read model, and scaling steps.
 
-### P2: Make product-page source ownership visible
+### P2: Polish edge/cache semantics
 
-Add compact model notes for media/images, category hierarchy, rating summary,
-price/offers, and facet attributes. Do not bury every important source inside
-`rendered json`.
+Consider drawing the edge cache as a fronting CDN and add one failure drill for
+stale cached content after moderation or a product suppression.
 
-### P2: Fix the two main view endpoint omissions
+### P3: Add technology choices when this case gets a tech pass
 
-Add `LB` to the Step 3 and Step 4 main `view.nodes`, or switch those views to
-local client-service links.
-
-### P3: Add Step 7 operational drills
-
-Add drills for viral product reads, hot category/search queries, projector lag
-during import, and corrupted index shards. Keep them concise and tied to the
-existing architecture.
+This dataset has no `technologyChoices` section. That is optional, but a future
+book polish pass could compare Elasticsearch/OpenSearch/Solr, Kafka/Pulsar,
+Bigtable/Cassandra/DynamoDB, Redis/CDN cache choices, and managed cloud
+equivalents.
 
 ## What Not To Change
 
-- Keep the seven-step CQRS progression. It is the dataset's main strength.
-- Keep faceted search as a dedicated step; it is the e-commerce-specific
+- Keep the seven-step structure. It now teaches the system in the right order.
+- Keep search/faceting as its own step; it is the product-catalog-specific
   teaching point.
-- Keep the denormalized read model separate from the search index. The
-  distinction between candidate retrieval and result hydration is useful.
-- Keep consistency-by-data-type as the senior-level insight. Fix the diagrams
-  and model around it rather than replacing it.
-- Do not turn this into a full checkout/order-management case. Name the
-  boundary and handoff instead.
+- Keep the read model separate from the search index. Candidate answers often
+  blur retrieval and hydration, and this dataset correctly separates them.
+- Keep consistency-by-data-type as the senior insight. The current architecture
+  supports it now.
+- Keep checkout/order management out of scope; just define the handoff precisely.
 
 ## Bottom Line
 
-This is a good product-catalog interview dataset with the right core answer and
-a clear teaching arc. To make it book-polished, focus on concrete capacity,
-explicit price/purchase boundaries, projection operations, seller-write safety,
-and the two small view fixes. The architecture does not need a rewrite; it needs
-the production details to support the claims it already makes.
+The recent changes moved this dataset from "good but missing important
+production support" to a strong product-catalog interview. The remaining work is
+targeted: clarify how projected price participates in search, define the
+purchase quote/reservation boundary, scope multi-seller offers, and fix the
+small `satisfies.nonFunctional` mapping gap.

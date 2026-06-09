@@ -545,7 +545,7 @@
     {
       "label": "Segment GETs/sec",
       "value": "~12M req/sec",
-      "note": "4s segments × 60M viewers = ~15M segment fetches every 4s ≈ 12–15M GET/sec across the edge fleet (Step 4 ABR is the request driver)."
+      "note": "Each viewer fetches one 4s segment every 4s, so 60M viewers ≈ 15M GET/sec (call it 12–15M) across the edge fleet (Step 4 ABR is the request driver)."
     },
     {
       "label": "Origin egress after offload",
@@ -573,6 +573,16 @@
       "note": "New content/day × ~8–12 renditions (resolution × codec) ≈ a ~10× storage multiplier per title; bursty worker-fleet compute, time-to-ready target hours not days (Step 2)."
     },
     {
+      "label": "Catalog storage",
+      "value": "~hundreds of PB",
+      "note": "Derive it: catalog ~1M hrs of content × ~8–12 renditions (resolutions × codecs h264/av1) ≈ a ~10× multiplier over a single encode. At a rough ~1–3 GB/hr averaged across the ladder, that is ~tens of PB of renditions per copy; cross-region replication (×2–3 for a region loss not losing the catalog) pushes the durable footprint to ~hundreds of PB. Source masters add more but are cold. This is why renditions live in cheap object storage, not a database."
+    },
+    {
+      "label": "Worker pool / time-to-ready",
+      "value": "bursty; size to backlog",
+      "note": "A 2-hr 4K title × ~10 renditions of chunked encoding is thousands of chunk-jobs; per-shot/per-title encoding is CPU-heavy. Size the fleet to hit a time-to-ready target (hours, not days) at peak ingest backlog — bursty and elastic, not steady-state — since ingest is rare relative to playback (Step 2)."
+    },
+    {
       "label": "Startup latency",
       "value": "target < ~2s",
       "note": "Time-to-first-frame drives abandonment; modest-start ABR + edge cache hits keep it low (Steps 3–4)."
@@ -587,9 +597,9 @@
     {
       "method": "GET",
       "path": "/v1/titles/{id}/manifest",
-      "description": "Return the streaming manifest (HLS/DASH) listing available bitrate renditions and segment URLs.",
-      "request": "GET /v1/titles/t_9/manifest?device=tv",
-      "response": "200 OK { \"type\": \"HLS\", \"variants\": [ { \"bitrate\": 1000000, \"url\": \"...\" }, { \"bitrate\": 4000000, \"url\": \"...\" } ] }"
+      "description": "Return the streaming manifest (HLS/DASH): the list of bitrate renditions and (encrypted) segment URLs. Device/region-filtered, not secret — it returns only variants this device can decode (codec/HDR/DRM scheme) and only if the title's rights window is open for the region. Segments are cacheable encrypted assets shared across viewers; authorization happens at /v1/playback/start via the DRM license, not here. A blacked-out or unsupported title returns no playable variants (403/empty).",
+      "request": "GET /v1/titles/t_9/manifest?device=tv&codecs=h264,av1&region=US",
+      "response": "200 OK { \"type\": \"HLS\", \"variants\": [ { \"bitrate\": 1000000, \"url\": \"https://cdn/.../seg_{n}.m4s\" }, { \"bitrate\": 4000000, \"url\": \"...\" } ] } | 403 { \"error\": \"region_blackout\" }"
     },
     {
       "method": "POST",
@@ -1377,8 +1387,8 @@
       },
       "flows": [
         {
-          "name": "Upload -> transcode ladder -> package",
-          "note": "Ingest stores the source, then an async pipeline transcodes a bitrate ladder and packages segmented HLS/DASH with manifests — all off the playback path.",
+          "name": "Upload -> job fan-out -> publish-gated package",
+          "note": "Ingest stores the source and creates per-chunk jobs; workers claim jobs under a lease and write rendition outputs; the packager runs and the title publishes only once every rendition's jobs are 'done' — all off the playback path.",
           "sequence": {
             "participants": [
               {
@@ -1390,8 +1400,12 @@
                 "label": "Origin Store"
               },
               {
+                "id": "Jobs",
+                "label": "Job Store"
+              },
+              {
                 "id": "Transcode",
-                "label": "Transcoding Pipeline"
+                "label": "Transcode Workers"
               },
               {
                 "id": "Renditions",
@@ -1414,34 +1428,69 @@
                 "label": "store source master"
               },
               {
-                "from": "Origin",
-                "to": "Transcode",
+                "from": "Upload",
+                "to": "Jobs",
                 "arrow": "->>",
-                "label": "trigger transcode"
+                "label": "create per-chunk/per-rendition jobs (queued)"
               },
               {
-                "from": "Transcode",
-                "to": "Renditions",
-                "arrow": "->>",
-                "label": "encode ladder (parallel chunks)"
+                "type": "loop",
+                "label": "per chunk, parallel workers",
+                "messages": [
+                  {
+                    "from": "Transcode",
+                    "to": "Jobs",
+                    "arrow": "->>",
+                    "label": "claim job under lease (running)"
+                  },
+                  {
+                    "from": "Transcode",
+                    "to": "Renditions",
+                    "arrow": "->>",
+                    "label": "encode chunk, write output"
+                  },
+                  {
+                    "from": "Transcode",
+                    "to": "Jobs",
+                    "arrow": "->>",
+                    "label": "mark done (or retry on crash; alert on poison)"
+                  }
+                ]
               },
               {
-                "from": "Renditions",
-                "to": "Packager",
-                "arrow": "->>",
-                "label": "package segments"
-              },
-              {
-                "from": "Packager",
-                "to": "Manifest",
-                "arrow": "->>",
-                "label": "write HLS/DASH manifest"
+                "type": "alt",
+                "label": "all renditions' jobs done",
+                "messages": [
+                  {
+                    "from": "Jobs",
+                    "to": "Packager",
+                    "arrow": "->>",
+                    "label": "publish: package segments"
+                  },
+                  {
+                    "from": "Packager",
+                    "to": "Manifest",
+                    "arrow": "->>",
+                    "label": "write HLS/DASH manifest, title -> published"
+                  }
+                ],
+                "else": {
+                  "label": "jobs still running / failed",
+                  "messages": [
+                    {
+                      "from": "Jobs",
+                      "to": "Jobs",
+                      "arrow": "->>",
+                      "label": "hold publish — no partial ladder exposed"
+                    }
+                  ]
+                }
               }
             ]
           },
           "highlight": [
+            "Jobs",
             "Transcode",
-            "Renditions",
             "Packager"
           ]
         }
@@ -1667,8 +1716,8 @@
       ],
       "flows": [
         {
-          "name": "Segment fetch: edge hit vs origin miss",
-          "note": "The client reads the manifest, then fetches segments from the CDN edge; only a miss reaches origin, which then fills the edge for the next viewer.",
+          "name": "Segment fetch: edge hit vs shielded origin miss",
+          "note": "The client reads the manifest, then fetches segments from the CDN edge; an edge miss goes to the regional origin shield, which collapses correlated misses into a single origin fetch and fans the segment back out — origin is rarely touched directly.",
           "sequence": {
             "participants": [
               {
@@ -1682,6 +1731,10 @@
               {
                 "id": "CDN",
                 "label": "CDN Edge"
+              },
+              {
+                "id": "Shield",
+                "label": "Origin Shield"
               },
               {
                 "id": "Origin",
@@ -1717,15 +1770,27 @@
                   "messages": [
                     {
                       "from": "CDN",
+                      "to": "Shield",
+                      "arrow": "->>",
+                      "label": "miss -> regional shield"
+                    },
+                    {
+                      "from": "Shield",
                       "to": "Origin",
                       "arrow": "->>",
-                      "label": "fetch immutable segment"
+                      "label": "single fill fetch (coalesced)"
                     },
                     {
                       "from": "Origin",
+                      "to": "Shield",
+                      "arrow": "-->>",
+                      "label": "immutable segment"
+                    },
+                    {
+                      "from": "Shield",
                       "to": "CDN",
                       "arrow": "-->>",
-                      "label": "segment (cache, long TTL)"
+                      "label": "segment (cache, long TTL); fan out"
                     },
                     {
                       "from": "CDN",
@@ -1740,6 +1805,7 @@
           },
           "highlight": [
             "CDN",
+            "Shield",
             "Origin"
           ]
         }
@@ -1779,8 +1845,7 @@
           "title": "Smooth adaptation",
           "points": [
             "Start at a modest bitrate for fast startup, then ramp up as the buffer fills.",
-            "Switch down quickly under buffer pressure; switch up cautiously to avoid oscillation.",
-            "Segments must align across renditions so the player can switch at chunk boundaries."
+            "Switch down quickly under buffer pressure; switch up cautiously to avoid oscillation."
           ]
         },
         {
@@ -2037,11 +2102,39 @@
       ],
       "deepDives": [
         {
+          "title": "The playback authorization contract (manifest, segments, license)",
+          "points": [
+            "Default model (used here): segments are cacheable immutable encrypted assets fetched by a shared CDN URL, and authorization lives entirely in the DRM license — only an entitled session gets a license, so segment URLs being broadly fetchable is harmless because the bytes are useless without the key.",
+            "This keeps the CDN object key identical for every viewer (maximizing cache hit ratio); per-user authorization never varies the cached object, so it stays cache-safe.",
+            "The manifest is device- and region-filtered, not a secret: /v1/titles/{id}/manifest returns only the variants this device can decode (codec/HDR/DRM scheme) and only if the title's content_rights window is open for the region — a blacked-out or unsupported title returns no playable variants.",
+            "Optional hardening for higher-value content: playback/start can return a session-scoped or short-lived signed CDN URL (token validated at the edge) instead of a bare manifest URL; the trick is to validate the token without varying the cache key, so segments stay shared and cacheable while casual scraping is curbed.",
+            "Either way the boundary is explicit: manifest = device/region-filtered catalog of encrypted segment URLs; license = the per-session authorization that actually unlocks playback; CDN = dumb cacheable byte delivery that does no per-user access control."
+          ]
+        },
+        {
           "title": "QoE telemetry vs. resume heartbeats",
           "points": [
             "Keep two paths: tiny resume heartbeats (last-write-wins into the session store) and richer QoE events (startup time, rebuffers, bitrate switches, errors, CDN edge, ISP, player version) batched to a QoE event stream — never write QoE on the segment hot path.",
             "The QoE stream feeds observability dashboards (startup p95, rebuffer minutes/hour, license-start failures, per-ISP/per-edge breakdown) and, in turn, CDN steering (Step 7).",
             "HTTP 200s are not enough: a silent quality failure (rebuffer ratio spikes for one ISP while requests still succeed) is only visible through QoE metrics."
+          ]
+        },
+        {
+          "title": "Heartbeat path under 2M writes/sec",
+          "points": [
+            "Partition the session store by session_id (or user_id) so the ~2M writes/sec spread evenly across shards with no hot key; each session touches one partition.",
+            "Coalesce writes: a player ticks every ~30s, the write is last-write-wins on position, so an in-memory/edge buffer can drop intermediate ticks and persist the newest — losing a heartbeat just means resume is a few seconds stale, which is acceptable.",
+            "Fire-and-forget with bounded client-side retry (a couple of attempts, then drop) — a heartbeat must never block or delay playback.",
+            "Reap stale sessions via a TTL on device_sessions (e.g. expire after a few missed heartbeats) so abandoned streams free a concurrent-stream slot."
+          ]
+        },
+        {
+          "title": "QoE stream: dedupe, retention, backpressure",
+          "points": [
+            "Events carry an event_id so the stream/consumer can dedupe at-least-once delivery; late events are tolerated by windowed aggregation (watermarks) rather than dropped outright.",
+            "Distinguish the stores rather than treating them as one DB: a low-latency keyed session/resume store, an append-only QoE event log (Kafka/Kinesis), real-time aggregates (startup p95, rebuffer ratio by edge/ISP) for alerting/steering, and a columnar warehouse (ClickHouse/BigQuery) for longer-term fleet analysis with a bounded retention window (raw events days–weeks, aggregates much longer).",
+            "Sample/minimize: high-volume event types can be sampled, and PII is minimized (coarse geo/ISP, not raw IP) to keep retention cheap and privacy-safe.",
+            "Backpressure rule: QoE is best-effort. If the pipeline is degraded, playback continues and the client drops or summarizes low-priority telemetry (keep startup/error, shed verbose switch events) before it ever risks the playback hot path."
           ]
         }
       ],
@@ -2099,20 +2192,26 @@
           "Entitlement",
           "Rights",
           "Sessions",
-          "License"
+          "License",
+          "QoE",
+          "Obs"
         ],
-        "caption": "On start the playback service authorizes the request via the entitlement service (subscription, regional rights, device, concurrent-stream limit) before issuing a DRM token; it records progress in the sessions store and ingests fire-and-forget heartbeats.",
+        "caption": "On start the playback service authorizes the request via the entitlement service (subscription, regional rights, device, concurrent-stream limit) before issuing a DRM token; it records progress in the sessions store, ingests fire-and-forget heartbeats, and the player streams batched QoE events to the QoE stream and observability (which Step 7 steering later consumes).",
         "links": [
           "client-playback-start-heartbeat",
           "playback-entitlement-authorize",
           "entitlement-rights",
           "playback-sessions",
-          "playback-license-issue-token"
+          "playback-license-issue-token",
+          "client-qoe-events",
+          "playback-qoe",
+          "qoe-obs"
         ],
         "highlight": [
           "Playback",
           "Entitlement",
-          "License"
+          "License",
+          "QoE"
         ]
       },
       "options": [
@@ -2246,8 +2345,8 @@
       ],
       "flows": [
         {
-          "name": "Playback start: authorize, then license",
-          "note": "Start authorizes the request (subscription, regional rights, device, concurrent-stream limit) before issuing a short-lived DRM license and returning the resume position. Entitlement failures are explicit (not-entitled / stream-limit) rather than silent.",
+          "name": "Playback start: authorize, license, then stream QoE",
+          "note": "Start authorizes the request (subscription, regional rights, device, concurrent-stream limit) before issuing a short-lived DRM license and returning the resume position. Entitlement failures are explicit (not-entitled / stream-limit) rather than silent. Once playing, the player batches fire-and-forget QoE events off the hot path.",
           "sequence": {
             "participants": [
               {
@@ -2269,6 +2368,10 @@
               {
                 "id": "License",
                 "label": "DRM License"
+              },
+              {
+                "id": "QoE",
+                "label": "QoE Stream"
               }
             ],
             "messages": [
@@ -2305,6 +2408,12 @@
                     "to": "Client",
                     "arrow": "-->>",
                     "label": "session + resume + license"
+                  },
+                  {
+                    "from": "Client",
+                    "to": "QoE",
+                    "arrow": "->>",
+                    "label": "batched QoE events (startup, rebuffer, switch) — fire-and-forget"
                   }
                 ],
                 "else": {
@@ -2323,7 +2432,8 @@
           },
           "highlight": [
             "Entitlement",
-            "License"
+            "License",
+            "QoE"
           ]
         }
       ]
@@ -2523,6 +2633,107 @@
             ]
           }
         }
+      ],
+      "deepDives": [
+        {
+          "title": "Freshness tiers without recomputing on every load",
+          "points": [
+            "Offline tier: a batch pipeline computes per-user candidate rows from viewing history and refreshes them periodically (hours) — most of the page is served straight from this precomputed read.",
+            "Online tier (optional): only the top few items are lightly reranked at request time with fresh in-session signals (just-watched, time of day), so the page stays fast while reflecting immediate context.",
+            "Catalog/artwork are immutable-ish reads cached at the CDN; a catalog change (new title, updated artwork) versions the asset URL so a precompute lag never serves a broken card.",
+            "The right boundary for a streaming interview: keep this read-fast and degradation-tolerant — it is not a full recommendation-system design."
+          ]
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The recommendation pipeline is stale or unavailable.",
+          "expectedBehavior": "The homepage still renders and playback is unaffected; rows fall back to generic/popular/editorial content.",
+          "mitigation": "Serve the last good precomputed rows; if those are missing, fall back to popular/trending or editorial rows. Browse is a read-only convenience path — it never blocks playback, which depends only on the manifest/CDN/playback path."
+        }
+      ],
+      "flows": [
+        {
+          "name": "Homepage load: precomputed rows + cached catalog",
+          "note": "Browsing is a fast read: the homepage service reads precomputed personalized rows and hydrates them with catalog metadata/artwork served from cache/CDN. If recommendations are stale/unavailable it degrades to popular rows — playback is never on this path.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Client",
+                "label": "Player"
+              },
+              {
+                "id": "Home",
+                "label": "Homepage Service"
+              },
+              {
+                "id": "Reco",
+                "label": "Precomputed Rows"
+              },
+              {
+                "id": "Meta",
+                "label": "Catalog Metadata"
+              },
+              {
+                "id": "CDN",
+                "label": "CDN (artwork)"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Client",
+                "to": "Home",
+                "arrow": "->>",
+                "label": "GET homepage"
+              },
+              {
+                "type": "alt",
+                "label": "recommendations fresh",
+                "messages": [
+                  {
+                    "from": "Home",
+                    "to": "Reco",
+                    "arrow": "->>",
+                    "label": "read precomputed personalized rows"
+                  }
+                ],
+                "else": {
+                  "label": "reco stale / unavailable",
+                  "messages": [
+                    {
+                      "from": "Home",
+                      "to": "Reco",
+                      "arrow": "->>",
+                      "label": "fall back to popular / editorial rows"
+                    }
+                  ]
+                }
+              },
+              {
+                "from": "Home",
+                "to": "Meta",
+                "arrow": "->>",
+                "label": "hydrate titles (metadata)"
+              },
+              {
+                "from": "Home",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "rows + artwork URLs"
+              },
+              {
+                "from": "Client",
+                "to": "CDN",
+                "arrow": "->>",
+                "label": "fetch artwork (cached)"
+              }
+            ]
+          },
+          "highlight": [
+            "Home",
+            "Reco"
+          ]
+        }
       ]
     },
     {
@@ -2679,7 +2890,7 @@
       "flows": [
         {
           "name": "Edge selection with fallback",
-          "note": "The player asks steering where to fetch; steering combines geo, real-time health/QoE, and cost into a prioritized endpoint list. The player tries the best edge and falls back down the list on error — degrading quality (via ABR) rather than failing.",
+          "note": "This flow owns endpoint selection only — the player asks steering where to fetch and steering combines geo, real-time health/QoE, and cost into a prioritized endpoint list; the player tries the best edge and falls back down the list on error, degrading quality (via ABR) rather than failing. The fill path behind a chosen edge (edge -> regional shield -> origin) is owned by Step 3 and the step view shows it; on a cold miss the chosen edge fills via the shield exactly as in Step 3 before returning bytes.",
           "sequence": {
             "participants": [
               {
@@ -2873,7 +3084,7 @@
       },
       {
         "requirement": "Protect content",
-        "how": "An entitlement check (subscription, regional rights, device, concurrent-stream limit) gates a short-lived DRM license per session; license expiry forces re-authorization.",
+        "how": "Segments are cacheable encrypted assets; an entitlement check (subscription, regional rights, device, concurrent-stream limit) gates a short-lived DRM license per session, and the manifest is device/region-filtered. Authorization lives in the license, not the CDN, so segments stay cache-safe; license expiry forces re-authorization.",
         "steps": [
           "playback"
         ]

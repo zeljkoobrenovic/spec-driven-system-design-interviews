@@ -5,359 +5,310 @@ Review date: 2026-06-09
 
 ## Executive Summary
 
-This is a strong, compact CI/CD delivery-platform walkthrough. The spine is
-right for a book interview: naive build box, DAG orchestration, ephemeral
-runners, affected-only builds, content-keyed cache, immutable signed artifacts,
-progressive delivery, observability-gated rollback, and the separate mobile
-release path. The case is easy to teach because every step exposes the next
-problem before solving it.
+The recent hardening pass materially improved this dataset. The interview is
+now much closer to a production-grade CI/CD control-plane design, not just a
+high-level delivery-platform story. The earlier major gaps around stage/job
+state, approvals, idempotency, environment history, mobile release state,
+deploy-time admission, capacity sizing, rollout state, migration safety, and
+supply-chain checks are now represented directly in the API, data model, step
+prose, deep dives, traps, and final design.
 
-The main issue is that the dataset is still more of a high-level delivery
-platform narrative than a production-grade control-plane design. It names the
-right components, but the API and data model do not yet encode job/stage
-state, approvals, deployment environments, async mobile release state, audit
-history, policy gates, or idempotent retry behavior. Capacity also needs enough
-math to size runner pools, cache, logs, artifact storage, and especially scarce
-macOS capacity.
+The seven-step spine remains strong: build-box baseline, DAG orchestration,
+affected-only feedback, immutable signed artifacts, progressive deployment,
+automated gates/rollback, then mobile release. Each step exposes a realistic
+new constraint before adding the next component. The dataset is now suitable as
+a strong book case.
+
+The remaining work is narrower: add more end-to-end sequences for the stateful
+workflows, expand trade-off options beyond orchestration and rollout strategy,
+make flaky-test/merge-queue operations first-class, clarify capacity at burst
+and p95 cases, and make the external feature-flag dependency concrete enough
+for mobile and cross-client releases.
 
 | Area | Rating | Notes |
 | --- | --- | --- |
-| System design soundness | 4.05/5 | Correct architecture and release-safety principles; control-plane contracts and state machines need more precision. |
-| Production realism | 3.65/5 | Good on runners, artifacts, canaries, rollback, and mobile differences; thin on approvals, retries, migrations, policy, audit, and async store workflows. |
-| Pedagogical flow | 4.25/5 | Clear progression and strong "why now" recaps; lack of options/deep dives reduces trade-off teaching. |
-| Dataset/rendering fit | 4.55/5 | JSON parses and references resolve; no major renderer issues found. |
-| Overall | 4.05/5 | A solid book case that needs a control-plane hardening pass before it feels production-complete. |
+| System design soundness | 4.55/5 | Strong control-plane model, state machines, admission, and rollout safety; remaining gaps are mostly workflow depth and edge cases. |
+| Production realism | 4.35/5 | Good treatment of runners, cache trust, artifacts, approvals, mobile stores, gates, audit, and idempotency; flaky-test ops, queue fairness, and flag ownership need more emphasis. |
+| Pedagogical flow | 4.45/5 | Clear progression with useful concepts, traps, options, and deep dives; a few more alternatives would make the decision tree more instructive. |
+| Dataset/rendering fit | 4.70/5 | JSON parses and references resolve; structured views/options/flows are valid; only minor content-shape polish remains. |
+| Overall | 4.50/5 | A strong CI/CD interview dataset with credible production mechanics and a few focused improvements left. |
 
 ## What Works Well
 
-- The step order is natural. Each recap names the new risk that motivates the
-  next step, which makes the walkthrough easy to narrate in an interview.
-- The initial build-box baseline is useful rather than throwaway. It exposes
-  speed, parallelism, heterogeneous targets, secret handling, and unsafe deploys.
-- Step `orchestrate` correctly introduces DAG scheduling and ephemeral runners
-  before cache or artifact concerns. That is the right foundation.
-- Step `fast-feedback` teaches the two biggest monorepo levers: affected-target
-  graph computation and content-keyed cache reuse.
-- Step `artifacts` has the right invariant: build once, sign, attest, and
-  promote the same bytes through every environment.
-- Step `deploy` separates build from release and introduces GitOps, canary, and
-  blue-green without pretending one rollout strategy fits every case.
-- Step `rollback` includes the most important safety loop: compare canary
-  golden signals against stable, then abort and shift back.
-- Step `mobile` is a strong final contrast. It explains why mobile cannot use
-  server-style instant rollback and correctly points to staged rollout,
-  forward-fix, and feature flags.
-- The final design includes all high-level nodes introduced through the steps.
-- Renderer-facing checks are clean: source JSON parses; step and final-design
-  node/link references resolve; sequence participants resolve; `patterns`,
-  `technologyChoices`, and `satisfies` step references resolve; node types are
-  canonical.
+- The previous control-plane weakness is largely fixed. The data model now has
+  `run_stages`, `jobs`, `job_attempts`, `approvals`,
+  `environment_versions`, `deployment_steps`, `mobile_releases`,
+  `audit_events`, and `idempotency_keys`.
+- The API now exposes realistic operations: log lookup, job rerun, run cancel,
+  approval/rejection, pause/resume, rollback, environment history, mobile
+  release creation/status, and mobile halt.
+- Capacity is much more useful. It sizes peak commit rate, affected targets,
+  job count/duration, Linux warm vCPU slots, macOS scarcity, cache footprint,
+  artifact/log retention, latency, and deploy cadence.
+- The supply-chain story is now end to end: OIDC-style runner identity,
+  SBOM/scanning, signed provenance, protected-branch signal, and deploy-time
+  admission that fails closed.
+- The rollback step now treats rollout as a state machine and adds the right
+  deep dives: expand/contract migration and gate policy inputs with thresholds,
+  windows, and sample-size concerns.
+- Mobile is no longer hand-waved. It models store tracks, review state,
+  callback/polling, staged rollout, crash gates, halt/forward-fix, version
+  skew, `min_backend_version`, and kill switches.
+- Options were added where they matter most: DAG orchestration compares
+  Kubernetes-native runners, Jenkins-style controllers, and managed CI; deploy
+  compares canary, blue-green, and rolling update.
+- Renderer-facing checks are clean: step/final nodes and links resolve,
+  option-view nodes and links resolve, sequence participants resolve,
+  `satisfies[*].steps[*]` resolve, and `technologyChoices[*].steps[*]`
+  resolve.
 
 ## Highest-Impact Issues
 
-### 1. The API and data model do not model the control plane deeply enough
+### 1. The state model is strong, but workflow sequences are still sparse
 
-The requirements promise run status, logs, version-to-environment history,
-approvals, promotion, rollback, and mobile release. The current API has useful
-starting endpoints, but it compresses the platform into `runs`, `artifacts`,
-and `deployments`. That is not enough state for a realistic delivery platform.
+The data model now captures the right entities, but only three steps have
+sequence flows (`orchestrate`, `deploy`, `mobile`), and the final design has no
+structured flow. That leaves some of the newly added state machines less
+visible than they should be.
 
-Missing or under-specified surfaces:
+Recommended edits:
 
-- stages/jobs inside a run, including dependencies, attempts, runner type,
-  cache keys, queue time, start/end time, exit reason, and log pointers;
-- approval records with actor, policy, environment, expiry, override reason,
-  and audit trail;
-- environment state, including current live version, previous known-good
-  version, desired GitOps revision, rollout strategy, and active traffic split;
-- deployment step state, such as `pending_approval`, `ramping`, `paused`,
-  `aborted`, `live`, `rollback_in_progress`, and `rolled_back`;
-- mobile release records with platform, track, store submission id, review
-  status, staged rollout percentage, crash gate status, and halt/forward-fix
-  linkage;
-- log/artifact retention, audit events, and idempotency keys for retried
-  webhooks, run starts, deploy requests, and rollback calls.
+- Add a final-design flow from webhook to DAG scheduling to artifact creation
+  to deploy admission to rollout gate.
+- Add a deployment approval flow: `POST /deployments`, policy check,
+  pending approval, approval decision, GitOps revision, rollout start.
+- Add a rollback flow that includes gate failure, pause/abort,
+  `rollback_in_progress`, previous-good traffic shift, and post-rollback
+  verification.
+- Add a mobile store-state flow that includes upload, review callback/poll,
+  staged rollout, crash-gate halt, and forward-fix linkage.
 
-Concrete fix:
+### 2. Fast-feedback scaling is good, but the alternatives are under-taught
 
-- Add `run_stages`, `jobs`, `job_attempts`, `approvals`,
-  `environment_versions`, `deployment_steps`, `mobile_releases`,
-  `audit_events`, and `idempotency_keys` to the data model.
-- Expand the API with endpoints for approving/rejecting a promotion, listing
-  environment history, fetching logs by stage/job, cancelling/rerunning a job,
-  pausing/resuming a rollout, and querying mobile release status.
-- Put idempotency keys on `POST /webhooks/vcs`, `POST /deployments`, rollback,
-  and mobile release creation so retries do not create duplicate runs or
-  duplicate submissions.
+The affected-target graph and cache correctness deep dive are strong. The
+design also mentions merge queues and speculative pre-merge testing as a
+follow-up, but this is a major CI/CD scaling topic and should be closer to the
+main path.
 
-### 2. Capacity is useful but too small to size the platform
+Recommended edits:
 
-The capacity section states 500 commits/day, 40 services, two mobile apps, p50
-pipeline under 15 minutes, and tens to hundreds of deploys/day. Those are good
-headline constraints, but they do not let a candidate estimate the actual
-bottlenecks.
+- Add options under `fast-feedback`: affected-only builds plus cache, remote
+  build execution, test selection, and brute-force full rebuild with massive
+  parallelism.
+- Add a short merge-queue sequence or deep dive covering stale green PRs,
+  batching, speculative execution, and how to preserve main-branch health.
+- Clarify cache bandwidth and p95 shared-library changes. A 25-target p95 run
+  can saturate cache egress and runner slots even if the average PR looks
+  small.
+- Distinguish "120 warm vCPU-slots" from runner count. Candidates may need to
+  translate slots into pod concurrency, per-job CPU/memory, and autoscaler
+  headroom.
 
-The design needs numbers for:
+### 3. Flaky-test operations are still mostly a follow-up
 
-- peak commit/webhook rate, not just daily volume;
-- average and p95 affected targets per change;
-- average jobs per target and average job duration;
-- concurrent PR runs and maximum queue delay;
-- Linux runner count, autoscaling warm-pool size, and cold-start penalty;
-- macOS runner availability, because iOS capacity is often the scarce resource;
-- cache size, hit rate, eviction window, and remote-cache bandwidth;
-- artifact size and retention for images, web bundles, `.ipa`, `.aab`, SBOMs,
-  attestations, logs, and test reports;
-- observability volume from deploy markers, logs, metrics, and traces.
+The API supports rerunning a failed/flaky job as a new attempt, and the follow
+ups ask about flaky tests. That is a good start, but in real CI/CD systems
+flaky tests are a core reliability and trust problem. If the platform lets
+reruns turn red into green without audit, the pipeline can become unsafe.
 
-Concrete fix:
+Recommended edits:
 
-- Add a small sizing paragraph, for example: 500 commits/day with a 4x work-hour
-  peak, 6 affected targets per PR on average, 8 jobs per target, 3-8 minute job
-  duration, and a target queue wait under 2 minutes.
-- Derive an approximate runner pool from those numbers, then call out separate
-  Linux and macOS pools.
-- Add retention assumptions such as 90 days of logs, one year of audit, and N
-  retained artifact versions per service/environment.
+- Add a `test_results` or `quality_signals` record with test identity,
+  historical flake rate, owner, quarantine state, and confidence.
+- Add a trap for "rerun until green" and the safer behavior: record every
+  attempt, require bounded reruns, quarantine known flakes, and keep a signal
+  visible to owners.
+- Add a failure drill for a flaky integration suite that either blocks all PRs
+  or lets regressions through.
+- Mention how merge queues interact with flakes: one flaky batch can starve the
+  queue or hide which PR caused the failure.
 
-### 3. Rollout safety is correct conceptually but missing stateful edge cases
+### 4. Feature flags are correctly scoped as external, but the dependency is too implicit
 
-The canary/rollback story is directionally right, especially the stable-versus
-canary comparison. The dataset should make the boundaries clearer for the cases
-that often decide whether a CI/CD design is production-safe.
+The final design says feature flags are external to the CI/CD platform but
+required for safe mobile and cross-client releases. That is a reasonable scope
+choice, but the design should still define the contract because several safety
+claims depend on it.
 
-Gaps to address:
+Recommended edits:
 
-- database migrations are mentioned only as a trap, not integrated into the
-  rollout flow;
-- feature flag state is mentioned for mobile but not represented as a platform
-  dependency for server/web compatibility;
-- rollback is modeled as a traffic shift, but not as a state machine with
-  pause, abort, retry, manual override, and post-rollback verification;
-- web bundle activation on a CDN needs versioned assets, an active pointer,
-  cache invalidation strategy, and compatibility with backend APIs;
-- gates need explicit inputs, windows, and thresholds, otherwise "metrics
-  healthy" can hide noisy or slow signals.
+- Add a lightweight `FlagService` external node, or explicitly add flag
+  dependencies to `mobile_releases` and `deployment_steps`.
+- Record flag ownership, rollout percentage, kill-switch state, audit history,
+  and dependency on `min_backend_version`.
+- Add a flow for a server/web/mobile feature coordinated by flags: backend
+  compatible deploy first, web active-pointer flip, mobile staged rollout,
+  flag ramp, and kill switch.
+- Add a failure drill for deleting or misconfiguring a flag while old mobile
+  clients are still active.
 
-Concrete fix:
+### 5. Mobile is strong, but could teach one more trade-off
 
-- Add an expand/contract migration sequence or deep dive under `rollback`:
-  deploy backward-compatible schema, deploy app, migrate data, remove old
-  fields later.
-- Add rollout states and gate result records to the data model.
-- Add one failure drill for a canary with a bad migration and one for a web
-  bundle that calls a backend API not yet available to all users.
-- Name the gate policy inputs: error rate, latency, saturation, crash-free
-  sessions for mobile, synthetic checks, business guardrails, and minimum
-  sample size.
+The mobile step is now realistic. It would teach better if it included at
+least one explicit option, because mobile build and release infrastructure has
+real cost and operational trade-offs.
 
-### 4. Mobile is well explained but under-modeled operationally
+Recommended edits:
 
-Step `mobile` is one of the strongest teaching steps, but the final system still
-treats app stores as a single external box. Real mobile release management is
-asynchronous and stateful. A candidate should see how the pipeline tracks that
-state without pretending it can control the stores like Kubernetes.
+- Add options for self-hosted macOS runners plus Fastlane, managed mobile CI,
+  and a hybrid approach where Linux builds Android while scarce macOS capacity
+  handles iOS signing/builds.
+- Add one deep dive for mobile signing material: certificate/profile expiry,
+  key rotation, app-store role permissions, and emergency revocation.
+- Add a failure drill for app-store rejection or metadata/privacy-form failure,
+  not only crash or backend incompatibility.
 
-Missing details:
+### 6. Some data-model fields are compressed for readability
 
-- TestFlight/internal track, Play internal/closed/open tracks, production
-  staged rollout, halt, resume, and reject states;
-- store callbacks or polling for review status;
-- mobile crash and adoption metrics feeding release gates;
-- phased rollout differences between iOS and Android;
-- feature flag and server compatibility as first-class release dependencies;
-- version skew policy for clients that cannot or will not update.
+Several data model entries combine multiple fields into one label, such as
+`queued_at / started_at / ended_at`, `signed / attestation_ref`,
+`actor / policy`, and `store_submission_id / review_status`. This renders
+readably, but it blurs the schema if a reader treats the data model as a
+literal contract.
 
-Concrete fix:
+Recommended edits:
 
-- Add a `MobileRelease` data model with `platform`, `artifact_version`,
-  `track`, `store_submission_id`, `review_status`, `rollout_pct`,
-  `crash_gate_status`, `min_backend_version`, and `kill_switches`.
-- Add a short sequence from upload to store review to staged rollout to halt or
-  ramp.
-- Add one follow-up or failure drill for a backend change that must support old
-  mobile clients for weeks.
-
-### 5. Supply-chain security is introduced but not end-to-end
-
-The dataset correctly mentions signing, secrets, provenance, and vault-backed
-credentials. To feel production-grade, it should connect those mechanisms from
-source to deploy admission.
-
-Missing security checks:
-
-- runner identity and short-lived credentials, for example OIDC from the CI
-  system to the cloud account or vault;
-- dependency and container scanning;
-- SBOM generation and retention;
-- signed commits or trusted branch protection as an input signal;
-- policy checks before promotion, such as "only signed artifacts with passing
-  tests and no critical vulnerabilities can deploy";
-- verification at deploy time that the digest and attestation match the
-  approved run.
-
-Concrete fix:
-
-- Add a policy/admission gate between registry and deployer, or make it part of
-  the deployment controller.
-- Include SBOM and vulnerability scan records in the artifact model.
-- Add a failure drill: "attestation missing or signing key rotated during a
-  release" and expected behavior.
-
-### 6. The walkthrough has few explicit trade-off options
-
-The prose and prompts teach trade-offs, but all seven steps have a single path
-and there are no `options` or `deepDives`. That makes the generated decision
-tree a straight line and gives the reader fewer chances to compare plausible
-alternatives.
-
-Concrete fix:
-
-- Add options to two or three high-leverage steps:
-  - `orchestrate`: Jenkins-style central controller vs Kubernetes-native DAG
-    runner vs managed CI.
-  - `fast-feedback`: affected-only builds vs full rebuild with brute-force
-    parallelism vs remote execution/test selection.
-  - `deploy`: canary vs blue-green vs rolling update, with when each fails.
-  - `mobile`: self-hosted macOS runners vs managed mobile CI.
-- Add one deep dive for "hermetic builds and remote cache correctness" and one
-  for "GitOps versus imperative deploy APIs".
+- Split combined field names into separate fields where they represent
+  independently queried or indexed values.
+- Keep grouped wording only in notes, not in field names.
+- Add indexes/partition hints for the high-cardinality tables: run by repo and
+  commit, job attempts by job, logs by object-store pointer, audit events by
+  target and time, environment history by environment and version.
 
 ## System Design Soundness
 
-The architecture is directionally sound. A VCS webhook enters a trigger, the
-orchestrator persists run state and schedules a DAG onto ephemeral runners, the
-cache accelerates repeat work, the registry stores immutable signed artifacts,
-and a separate deployment controller promotes versions into runtime
-environments. That is the right split between CI and CD.
+The design is now sound at the architecture level. A VCS webhook enters a
+trigger, the orchestrator persists a run/stage/job/attempt model, ephemeral
+runners execute the DAG, cache and affected-target logic reduce work, immutable
+signed artifacts land in the registry, and the deployment controller promotes
+verified versions through environments. Observability gates close the loop for
+server/web rollback, while mobile takes an explicitly asynchronous store path.
 
-The strongest invariant is build-once-promote-everywhere. It prevents staging
-and production drift and gives the deployer a concrete digest to verify. The
-dataset should make the verification path explicit: the deployment controller
-should check the artifact signature, provenance, policy status, and approved
-run before changing desired state.
+The most important invariant, build once and promote the same signed digest,
+is now backed by concrete mechanics: SBOM, scan result, provenance, signature,
+short-lived runner credentials, and deploy-time admission. That is the right
+answer for a modern CI/CD system.
 
-The rollback design is sound for stateless services and web assets if old
-versions are kept warm and compatible. The dataset should be more explicit that
-rollback is not sufficient for stateful schema changes, incompatible APIs, or
-mobile clients that have already updated.
+The capacity model is now credible enough for an interview. It gives a
+candidate numbers to reason about queueing, affected-target fan-out, warm
+capacity, macOS scarcity, cache hit rate, retention, and deploy cadence. The
+next precision improvement is p95 and burst analysis: p95 shared-library
+changes, cache egress, and macOS saturation can dominate the average case.
 
-The API and data model are the main soundness gap. A production CI/CD platform
-is mostly a state machine and audit log. Without stage/job attempts, approvals,
-environment state, rollout steps, idempotency, and mobile release records, the
-candidate cannot reason precisely about retries, duplicate webhooks, paused
-rollouts, partial failures, audit requirements, or who approved what.
+The state-machine coverage is also much improved. Deployment states include
+approval, ramping, pause, abort, live, rollback, and rolled-back. Mobile
+release states include review, rollout percentage, and crash gate. The design
+should now add sequences that make those transitions visible.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: One Script on a Build Box
 
-This is a good baseline. It names the exact failures: serial execution, rebuild
-everything, no iOS build capacity, secrets in script, no canary, and no
-rollback. The improvement would be to add one concrete failure number, such as
-"40 services * 8 minutes each means the queue exceeds the workday under peak
-commit load."
+This remains a good baseline. The added numeric example, 40 services times
+roughly 8 minutes leading to multi-hour serial work, gives the reader a real
+reason to need parallelism, affected builds, and caching. The trap against
+shipping the build-box script as "good enough CI/CD" is useful.
 
 ### Step 2: Model the Pipeline as a DAG on Ephemeral Runners
 
-This step introduces the right abstractions and the sequence flow is clear. It
-should add a small amount of control-plane state: stages, jobs, attempts,
-runner leases, retry policy, and log pointers. "A crashed run resumes or fails
-cleanly" is a good claim, but the schema does not yet show how.
+This step is now much stronger. It introduces durable run/stage/job/attempt
+state, runner leases, retry policy, queue/start/end timing, and log pointers.
+The options are valuable because Jenkins-style, Kubernetes-native, and managed
+CI systems really do fail differently. Consider adding a small note on queue
+fairness between PR, main, release, and mobile jobs.
 
 ### Step 3: Fast Feedback: Affected-Only Builds + Caching
 
-The target-graph and cache discussion is strong. To make it production-ready,
-add remote cache correctness details: cache namespace, key inputs, poisoning
-prevention, write policy for untrusted PRs, fallback on cache miss, and
-observability for hit rate. This step is also a natural place to mention merge
-queues or speculative pre-merge testing as a follow-up.
+The cache correctness deep dive is one of the best additions. It covers content
+keys, untrusted PR write restrictions, correctness fallback, and hit-rate
+observability. The remaining gap is strategy comparison: remote execution,
+test selection, and merge queues deserve explicit treatment because they are
+common senior-level follow-ups.
 
 ### Step 4: Immutable, Signed Artifacts
 
-This step has the right contract and the best security content in the dataset.
-It should connect signing and attestation to deploy-time admission. A registry
-entry should not be enough to deploy; the controller should require a valid
-signature, provenance for the expected commit, passing checks, and policy
-approval.
+This is now production-grade for the interview scope. The step connects
+artifact immutability to provenance, SBOMs, scan results, vault-backed signing,
+short-lived credentials, and admission. The traps are practical and
+high-signal. Splitting the combined artifact fields in the data model would
+make the schema clearer.
 
 ### Step 5: Progressive Delivery for Services + Web
 
-The separation between promotion and build is clear. GitOps is a good default
-because it gives auditability and revertability. The step would teach more if
-it compared canary, blue-green, and rolling update as options. It should also
-make web/CDN release semantics concrete: versioned assets, active pointer,
-cache TTL/invalidation, and backend compatibility.
+The added options make this step teach trade-offs rather than a single
+preferred path. Canary, blue-green, and rolling update are compared with
+practical pros and cons. The web/CDN compatibility note is important and should
+remain. A sequence for approval -> GitOps desired state -> active rollout would
+make the control plane easier to visualize.
 
 ### Step 6: Automated Gates + Rollback
 
-This step closes the safety loop correctly. The failure drill is useful but too
-narrow. Add drills for false-positive metrics, insufficient canary traffic,
-stateful schema migration, and a rollback that fails because the old version
-was not kept warm or compatible.
+This step now has the right operational depth. The expand/contract migration
+deep dive fixes the previous rollback oversimplification, and gate policy
+inputs are specific enough to prevent "metrics healthy" hand-waving. Add a
+sequence for rollback states and a drill for insufficient canary traffic or
+false-positive gates.
 
 ### Step 7: Mobile Release Pipeline
 
-The mobile contrast is accurate and important. The next improvement is to model
-the async store workflow and long-lived version skew. Mobile needs release
-track state, review status, staged rollout percentage, crash gate results,
-server compatibility policy, and feature flag ownership.
+The mobile contrast lands well and is now appropriately stateful. Store tracks,
+review state, callback/polling, crash-free sessions, staged rollout, halt, and
+version skew are all present. The next teaching improvement is an explicit
+mobile infrastructure option set and a deep dive on certificates/profiles/store
+permissions.
 
 ## Final Design Review
 
-The final design integrates the main components: developer, Git host, trigger,
+The final design integrates the right components: developer, Git host, trigger,
 orchestrator, pipeline state store, runner pool, cache, registry, signing,
-deployer, Kubernetes runtime, CDN, app stores, and observability gates. The
-description correctly distinguishes server/web deploy-on-demand from mobile
-store-gated release.
+deployer, Kubernetes runtime, CDN, app stores, observability gates, and GitOps.
+The description now captures the control-plane contracts rather than only the
+boxes.
 
-What is missing is the operational contract between those boxes. The final
-design should name policy/admission as part of deployment, approvals as a
-durable workflow, and environment state as the source of truth for what is live.
-It should also either add a feature-flag service or explicitly state that
-feature flags are external to the CI/CD platform but required for safe mobile
-and cross-client releases.
+Two refinements would make it stronger. First, add at least one final-design
+flow so readers can see how the state store, admission checks, approvals, and
+gates interact across the whole system. Second, make the feature-flag
+dependency explicit, either as an external node or as a named contract in the
+mobile and deployment state models.
 
 ## Concept Introduction and Learning Flow
 
-Concepts are introduced just in time: hermetic build before caching, affected
-target graph before artifact promotion, provenance before deploy, canary before
-gates, and staged rollout after server rollback. That sequence works.
+Concept staging is strong. Hermetic builds, idempotency, runner trust
+boundaries, affected target graphs, provenance, SBOMs, canaries, error-budget
+gates, expand/contract migration, staged rollout, review state, and version
+skew are introduced close to where they are used.
 
-The concept set should be expanded slightly. Useful additions are:
-
-- idempotency for webhook/run/deploy creation;
-- runner trust boundary and untrusted PR isolation;
-- merge queue;
-- rollout state machine;
-- expand/contract migration;
-- SBOM and admission policy;
-- version skew and feature flags.
+The overview concepts page should now be useful because the dataset has enough
+per-step concepts to form a coherent glossary. The main additions I would make
+are merge queue, flaky-test quarantine, rollout sample size, and feature-flag
+ownership.
 
 ## Step-to-Final-Design Coherence
 
-The steps build cleanly toward the final diagram. Every final-design node is
-introduced before the end, and the `satisfies` mapping ties requirements to the
-right steps.
+The step-to-final-design mapping is coherent. Every final-design node is
+introduced in the steps, and the `satisfies` section ties requirements to the
+right parts of the walkthrough. The recent additions also close most of the
+old promise-versus-model gaps: approvals, logs, policy gates, audit, mobile
+store state, idempotency, and deployment state are now represented.
 
-The weakest coherence gap is that several promises are described in prose but
-do not appear as nodes, state, or API concepts in the final design:
-approvals, logs, policy gates, audit, mobile crash gates, feature flags, and
-store-status polling/callbacks. These do not all need separate diagram nodes,
-but they should appear in the data model or sequence flows.
+The remaining coherence issue is mostly visual/flow-based. The final diagram
+shows the components, but the most important product behavior is in the
+stateful transitions. Additional sequence flows would bridge that gap without
+adding more boxes.
 
 ## Realism Compared With Production Systems
 
-The dataset has the right production instincts: ephemeral runners, cache
-correctness, immutable digests, provenance, vault-backed secrets, GitOps,
-progressive delivery, SLO gates, deploy markers, and mobile staged rollout.
+This is now realistic for a senior system design interview. It covers the
+operational mechanics that often separate a generic CI/CD answer from a real
+delivery platform: ephemeral runner isolation, content-keyed caches,
+untrusted-PR restrictions, immutable artifacts, signed provenance, admission,
+GitOps, durable approvals, audit, rollout gates, migration compatibility,
+mobile store state, and version skew.
 
-The production realism falls short around lifecycle and failure handling. Real
-CI/CD systems spend a lot of complexity on duplicate events, retries,
-concurrency control, approvals, runner isolation, log retention, partial
-rollouts, rollout pause/resume, flaky tests, queue starvation, and audit. The
-case mentions some of these indirectly, but it should make the highest-impact
-ones visible in the design.
+The main production areas still underrepresented are flaky-test governance,
+merge-queue starvation, quota management across runner pools, and feature-flag
+operations. Those are not fatal omissions, but they are common pain points in
+large CI/CD systems and would make the case feel even more battle-tested.
 
 ## Dataset and Renderer-Facing Observations
 
@@ -365,77 +316,74 @@ ones visible in the design.
 - The dataset uses structured `view.nodes` and `view.links`; no raw Mermaid
   architecture diagrams are used in steps or final design.
 - Step view nodes and links resolve against `highLevelArchitecture`.
+- Option view nodes and links resolve against `highLevelArchitecture`.
 - Final-design view nodes and links resolve against `highLevelArchitecture`.
-- Sequence participants and message endpoints resolve to canonical node IDs.
+- Sequence participants resolve to canonical node IDs.
 - `satisfies.functional[*].steps` and `satisfies.nonFunctional[*].steps`
   resolve to existing steps.
-- `patterns[*].steps` and `technologyChoices[*].steps` resolve to existing
-  steps.
+- `technologyChoices[*].steps` resolve to existing steps.
 - High-level architecture node types are canonical.
-- There are no step options, option diagrams, or deep dives. That is valid, but
-  it limits the value of the auto-generated decision tree and reduces
-  trade-off coverage.
+- The dataset now has options on `orchestrate` and `deploy`, and deep dives on
+  `fast-feedback`, `artifacts`, `deploy`, and `rollback`.
 - The dataset has no `probeLinks`, `aiVisual`, `explainerComic`, or generated
-  requirement illustrations. That is not a correctness issue, only an optional
-  enrichment opportunity.
+  requirement illustrations. This is optional enrichment, not a correctness
+  issue.
+- Minor polish: `POST /deployments/{id}/pause` says "pass action"; consider
+  rewording to "takes `{ action: 'pause'|'resume' }`" for clarity.
 
 ## Recommended Edits, Prioritized
 
-### P1: Add the missing control-plane model
+### P1: Add end-to-end workflow sequences
 
-Add state records for stages, jobs, attempts, approvals, environment versions,
-deployment steps, mobile releases, audit events, and idempotency keys. Expand
-the API to expose approvals, logs, reruns/cancels, rollout pause/resume, and
-environment history.
+Add final-design and per-step flows for approval, deploy admission, rollback,
+and mobile store-state transitions. This will make the newly improved state
+model visible to readers.
 
-### P1: Add capacity math for runner pools and retention
+### P1: Promote flaky-test and merge-queue operations from follow-up to content
 
-Turn the headline numbers into a rough sizing model: peak commits, affected
-targets, jobs per target, job duration, queue SLO, Linux runner pool, macOS
-runner pool, cache footprint, artifact/log retention, and observability volume.
+Add a small data model/API/deep-dive treatment for flaky tests, bounded reruns,
+quarantine, ownership, merge queues, speculative execution, and queue
+starvation.
 
-### P1: Make rollout and rollback state explicit
+### P2: Add fast-feedback and mobile option sets
 
-Add rollout states, gate records, rollback states, and migration compatibility
-guidance. Include failure drills for stateful migration, noisy metrics, and web
-bundle/backend incompatibility.
+Add options for remote execution/test selection/merge queues under
+`fast-feedback`, and self-hosted versus managed mobile CI under `mobile`.
 
-### P2: Model mobile as an async release workflow
+### P2: Make feature-flag dependency explicit
 
-Add a mobile-release table and sequence covering store submission, review,
-track/staged rollout, crash gating, halt/resume, and forward-fix.
+Represent flags as an external node or a named state-model dependency with
+ownership, audit, rollout percentage, kill-switch state, and version
+compatibility.
 
-### P2: Connect supply-chain security to deploy admission
+### P3: Normalize compressed data-model fields
 
-Add SBOM/scanning/policy status to artifacts and require deploy-time
-verification of signature, provenance, and policy pass before promotion.
-
-### P2: Add trade-off options and deep dives
-
-Introduce options for orchestration, caching/remote execution, rollout
-strategy, and mobile runner strategy. Add deep dives for cache correctness and
-GitOps versus imperative deployment.
+Split slash-combined field labels into individual fields and add index or
+partition hints for high-cardinality records.
 
 ### P3: Add optional enrichment assets
 
-Consider generated AI visuals, requirement illustrations, and `probeLinks` once
-the core content pass is complete.
+Consider `probeLinks`, generated AI visuals, requirement illustrations, or an
+explainer comic after the content pass. These are presentation enhancements,
+not blockers.
 
 ## What Not To Change
 
-- Keep the seven-step spine. It is coherent and teaches the design in the right
-  order.
-- Keep mobile as the final step. The contrast lands better after server/web
-  rollback is already understood.
-- Keep build-once-promote-everywhere as the central artifact invariant.
-- Keep the concise prompts and recaps. They are useful for interview narration.
-- Keep the high-level architecture node set mostly intact; the next pass should
-  add state/contracts more than add boxes.
+- Keep the seven-step spine. It is coherent and still the right teaching order.
+- Keep mobile as the final step. The contrast works best after server/web
+  rollback is already established.
+- Keep build-once-promote-everywhere as the central invariant.
+- Keep the current control-plane state model; it is the biggest improvement in
+  the current version.
+- Keep the deploy-time admission deep dive and the expand/contract migration
+  deep dive. They are high-value senior-level teaching content.
+- Keep feature flags scoped as external if you do not want another platform
+  subsystem, but define the dependency clearly.
 
 ## Bottom Line
 
-This is a strong CI/CD interview foundation with a clear narrative and correct
-core architecture. The next improvement pass should make it feel like a real
-delivery control plane: explicit job/stage state, approvals, idempotency,
-environment history, rollout state machines, mobile release state, and
-deploy-time policy verification.
+The recent changes successfully moved this CI/CD interview from a good
+architecture walkthrough to a credible production control-plane design. The
+next pass should not add many more boxes; it should add workflow sequences and
+operational depth around flaky tests, merge queues, feature flags, and mobile
+infrastructure trade-offs.

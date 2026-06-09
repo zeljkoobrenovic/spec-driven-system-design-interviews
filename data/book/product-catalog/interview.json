@@ -104,6 +104,27 @@
         "description": "Owns prices/promotions; changes frequently and independently."
       },
       {
+        "id": "PriceDB",
+        "label": "Pricing Store",
+        "type": "database",
+        "category": "state",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Authoritative current price/promotion per item, owned by the pricing service."
+      },
+      {
+        "id": "EdgeCache",
+        "label": "Edge / CDN Cache",
+        "type": "cache",
+        "category": "traffic",
+        "traits": [
+          "stateless",
+          "derived"
+        ],
+        "description": "Caches hot product views and popular search results near the shopper; volatile stock/price bypass it."
+      },
+      {
         "id": "ChangeStream",
         "label": "Catalog Change Stream",
         "type": "stream",
@@ -216,10 +237,28 @@
         "label": "live availability"
       },
       {
+        "id": "detail-price",
+        "from": "CatalogSvc",
+        "to": "PriceSvc",
+        "label": "live price"
+      },
+      {
         "id": "inv-db",
         "from": "InvSvc",
         "to": "InvDB",
         "label": "read/write stock"
+      },
+      {
+        "id": "price-db",
+        "from": "PriceSvc",
+        "to": "PriceDB",
+        "label": "read/write price"
+      },
+      {
+        "id": "edge-cache",
+        "from": "LB",
+        "to": "EdgeCache",
+        "label": "cache hot reads"
       }
     ],
     "types": [
@@ -248,7 +287,15 @@
         "nodes": [
           "InvSvc",
           "InvDB",
-          "PriceSvc"
+          "PriceSvc",
+          "PriceDB"
+        ]
+      },
+      {
+        "id": "edge",
+        "label": "Edge / Caching",
+        "nodes": [
+          "EdgeCache"
         ]
       }
     ]
@@ -292,28 +339,53 @@
   "capacity": [
     {
       "label": "Products",
-      "value": "100s of millions",
-      "note": "Sharded catalog + index."
+      "value": "~300M",
+      "note": "~1–2 KB write record each; ~3–5 KB rendered read-model view → ~1–1.5 TB read model, sharded across catalog + index."
+    },
+    {
+      "label": "Shoppers",
+      "value": "~100M DAU",
+      "note": "Peak ~3–4× average; assume ~5 page views per session."
+    },
+    {
+      "label": "Search QPS",
+      "value": "~150k avg / ~500k peak",
+      "note": "Dominant read path; ~10–20 search shards by product, replicated 3× for query volume."
+    },
+    {
+      "label": "Detail QPS",
+      "value": "~300k avg / ~1M peak",
+      "note": "Served from read model + edge cache; target ~90% edge/cache hit so origin sees ~100k."
+    },
+    {
+      "label": "Seller writes",
+      "value": "~1–2k/sec",
+      "note": "Plus bursty bulk imports (millions of rows) that buffer in the change stream."
+    },
+    {
+      "label": "Price/stock events",
+      "value": "~50–100k/sec peak",
+      "note": "Repricing + every order decrement; far outpaces catalog edits — why volatile values are read live, not projected."
     },
     {
       "label": "Read:write",
-      "value": "reads >> writes",
-      "note": "Justifies a read-optimized model."
-    },
-    {
-      "label": "Price changes",
-      "value": "very frequent",
-      "note": "Promotions, repricing; independent of catalog edits."
-    },
-    {
-      "label": "Stock changes",
-      "value": "continuous",
-      "note": "Every order decrements inventory."
+      "value": "~1000:1",
+      "note": "Justifies a read-optimized, independently-scaled read side."
     },
     {
       "label": "Read latency",
       "value": "< 200 ms p99",
       "note": "Search + detail page."
+    },
+    {
+      "label": "Projection lag SLO",
+      "value": "p99 < 5 s",
+      "note": "Seller edit visible in search/detail within seconds; alarm above threshold."
+    },
+    {
+      "label": "Rebuild time",
+      "value": "partial: minutes; full: hours",
+      "note": "Partial reindex by product/category/shard before resorting to a full reproject from the write model."
     }
   ],
   "api": [
@@ -372,7 +444,7 @@
     {
       "method": "GET",
       "path": "/v1/products/{id}",
-      "description": "Get the product detail view; availability/price fetched live for purchase accuracy.",
+      "description": "Get the product detail view; content from the read model, with availability and price fetched live from their owning services for purchase accuracy.",
       "request": "(id in path)",
       "response": "{ \"id\": \"p_9\", \"title\": \"...\", \"price\": \"79.99\", \"inStock\": true }",
       "sequence": {
@@ -391,6 +463,10 @@
           {
             "id": "InvSvc",
             "label": "Inventory Service"
+          },
+          {
+            "id": "PriceSvc",
+            "label": "Pricing Service"
           }
         ],
         "messages": [
@@ -414,6 +490,12 @@
           },
           {
             "from": "CatalogSvc",
+            "to": "PriceSvc",
+            "arrow": "->>",
+            "label": "live price"
+          },
+          {
+            "from": "CatalogSvc",
             "to": "Client",
             "arrow": "-->>",
             "label": "200 product page"
@@ -424,19 +506,23 @@
     {
       "method": "PUT",
       "path": "/v1/products/{id}",
-      "description": "Seller creates/updates a product; emits a change event projected into read model + index.",
-      "request": "{ \"title\": \"...\", \"attrs\": { ... } }",
-      "response": "{ \"version\": 5 }"
+      "description": "Seller creates/updates a product they own; uses optimistic concurrency (If-Match on version) and emits a change event projected into read model + index after validation/moderation.",
+      "request": "Headers: If-Match: \"4\", Idempotency-Key: <uuid>  Body: { \"title\": \"...\", \"attrs\": { ... } }",
+      "response": "{ \"version\": 5, \"status\": \"pending_review\" }  // 412 on version mismatch, 403 if not owner"
     }
   ],
   "dataModel": [
     {
       "name": "products (write model)",
-      "note": "Authoritative normalized product record.",
+      "note": "Authoritative normalized product record, owned by the catalog service. seller_id gates ownership/authorization; version drives optimistic concurrency (If-Match); status gates moderation before it reaches search facets.",
       "fields": [
         {
           "name": "product_id",
           "type": "uuid PK (shard key)"
+        },
+        {
+          "name": "seller_id",
+          "type": "uuid (owner; authorizes writes)"
         },
         {
           "name": "title",
@@ -452,17 +538,29 @@
         },
         {
           "name": "attributes",
-          "type": "json (facetable)"
+          "type": "json (category-scoped, validated → facetable)"
+        },
+        {
+          "name": "attribute_schema_version",
+          "type": "int (which category attribute schema validated against)"
+        },
+        {
+          "name": "status",
+          "type": "enum (draft|pending_review|active|suppressed)"
         },
         {
           "name": "version",
-          "type": "bigint"
+          "type": "bigint (optimistic-concurrency / projection ordering)"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp"
         }
       ]
     },
     {
       "name": "product_view (read model)",
-      "note": "Denormalized, render-ready detail view.",
+      "note": "Denormalized, render-ready detail view. Carries source ownership: catalog content is projected; price/stock here are display-only badges, verified live at purchase time.",
       "fields": [
         {
           "name": "product_id",
@@ -470,7 +568,15 @@
         },
         {
           "name": "rendered",
-          "type": "json (title, images, attrs, rating summary)"
+          "type": "json (title, images[], attrs, category path, rating_summary)"
+        },
+        {
+          "name": "display_price",
+          "type": "money (last-projected; not authoritative for checkout)"
+        },
+        {
+          "name": "stock_badge",
+          "type": "enum (in_stock|low|out — approximate)"
         },
         {
           "name": "source_version",
@@ -479,8 +585,44 @@
       ]
     },
     {
+      "name": "category (taxonomy)",
+      "note": "Category hierarchy + per-category attribute/facet schema. Owns which attributes are searchable vs filterable and their normalized value sets.",
+      "fields": [
+        {
+          "name": "category_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "parent_id",
+          "type": "bigint (hierarchy)"
+        },
+        {
+          "name": "facet_schema",
+          "type": "json (attribute → {searchable, filterable, normalized values})"
+        }
+      ]
+    },
+    {
+      "name": "rating_summary",
+      "note": "Derived review/rating rollup, owned by the reviews system and projected into the read model + index for sort-by-rating.",
+      "fields": [
+        {
+          "name": "product_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "avg_rating",
+          "type": "decimal"
+        },
+        {
+          "name": "review_count",
+          "type": "bigint"
+        }
+      ]
+    },
+    {
       "name": "inventory",
-      "note": "Authoritative stock, owned by the inventory service.",
+      "note": "Authoritative stock, owned by the inventory service; read live at purchase decision.",
       "fields": [
         {
           "name": "product_id",
@@ -493,6 +635,54 @@
         {
           "name": "available",
           "type": "int"
+        }
+      ]
+    },
+    {
+      "name": "price / offers",
+      "note": "Authoritative price/promotion, owned by the pricing service; read live for display and verified at checkout. Multi-seller offers/buy-box live here.",
+      "fields": [
+        {
+          "name": "product_id",
+          "type": "uuid"
+        },
+        {
+          "name": "seller_id",
+          "type": "uuid (per-offer)"
+        },
+        {
+          "name": "price",
+          "type": "money"
+        },
+        {
+          "name": "promo",
+          "type": "json (optional; effective window)"
+        }
+      ]
+    },
+    {
+      "name": "projection_checkpoint",
+      "note": "Per-projector consumer state, used for idempotent replay and lag detection. Each change event carries event_id + per-product version for ordering and dedupe.",
+      "fields": [
+        {
+          "name": "projector_id",
+          "type": "string PK (read-model | search-index)"
+        },
+        {
+          "name": "shard / partition",
+          "type": "int"
+        },
+        {
+          "name": "last_event_id",
+          "type": "uuid (dedupe key)"
+        },
+        {
+          "name": "committed_offset",
+          "type": "bigint (stream position / CDC LSN)"
+        },
+        {
+          "name": "lag_seconds",
+          "type": "gauge (vs source)"
         }
       ]
     }
@@ -559,7 +749,7 @@
       "title": "1. Naive: Query the Normalized Products Table Directly (the baseline)",
       "description": [
         "Start with one normalized products table in a relational database. Product pages are a row lookup (plus a few joins for category/brand), and search is a LIKE/keyword query with WHERE filters over the same table.",
-        "This is fine for a small store and exposes exactly why a catalog needs more. Keyword search and faceting over hundreds of millions of rows can't be served by a SQL LIKE scan at low latency, and assembling a rich product page from many joined tables on every request is too slow under massive read volume. The write-shaped normalized model is simply the wrong shape for read-heavy browse.",
+        "This is fine for a small store and exposes exactly why a catalog needs more. At ~300M products and ~150k search QPS, a SQL LIKE scan with per-filter facet aggregations can't meet a < 200 ms p99, and assembling a rich product page from many joined tables on every one of ~300k detail QPS is too slow under massive read volume. The write-shaped normalized model is simply the wrong shape for read-heavy browse.",
         "So the baseline motivates the rest: split reads from writes (CQRS), build a search/facet index for discovery, and precompute a denormalized read model for fast pages."
       ],
       "view": {
@@ -621,7 +811,7 @@
           "CatalogSvc",
           "CatalogDB"
         ],
-        "caption": "The shopper client's seller writes go through the gateway to the catalog service, which reads and writes the catalog store as the single source of truth.",
+        "caption": "This step establishes the source of truth: seller writes go through the gateway to the catalog service, which owns the catalog store. The derived read model and search index are drawn in the next steps.",
         "links": [
           "client-lb",
           "lb-catalog",
@@ -760,12 +950,14 @@
       "view": {
         "nodes": [
           "Client",
+          "LB",
           "SearchSvc",
           "SearchIdx",
           "ReadModel"
         ],
         "caption": "The search service queries the search/facet index by query and facets, then hydrates matching results from the product read model.",
         "links": [
+          "client-lb",
           "lb-search",
           "search-idx",
           "search-readmodel"
@@ -1000,12 +1192,14 @@
       "view": {
         "nodes": [
           "Client",
+          "LB",
           "CatalogSvc",
           "ReadModel",
           "CatalogDB"
         ],
         "caption": "The catalog service serves product-detail reads from a precomputed denormalized read model while still reading and writing the catalog store.",
         "links": [
+          "client-lb",
           "lb-detail",
           "catalog-readmodel",
           "catalog-db"
@@ -1182,8 +1376,8 @@
       },
       "flows": [
         {
-          "name": "Product page read: denormalized view + live availability",
-          "note": "Content comes from the read model in one lookup; volatile stock/price is read live from its owning service at the purchase decision.",
+          "name": "Product page read: denormalized view + live availability/price",
+          "note": "Content comes from the read model in one lookup; volatile stock and price are read live from their owning services at the purchase decision rather than trusted from the projected view.",
           "sequence": {
             "participants": [
               {
@@ -1200,6 +1394,10 @@
               {
                 "id": "InvSvc",
                 "label": "Inventory Service"
+              },
+              {
+                "id": "PriceSvc",
+                "label": "Pricing Service"
               }
             ],
             "messages": [
@@ -1220,6 +1418,12 @@
                 "to": "InvSvc",
                 "arrow": "->>",
                 "label": "live availability"
+              },
+              {
+                "from": "CatalogSvc",
+                "to": "PriceSvc",
+                "arrow": "->>",
+                "label": "live price"
               },
               {
                 "from": "CatalogSvc",
@@ -1419,14 +1623,27 @@
         "before": "Stale read stores after edits.",
         "after": "Read model + index updated from a change stream; rebuildable.",
         "newRisk": "Price and stock change far more often and being stale on them causes wrong purchases."
-      }
+      },
+      "deepDives": [
+        {
+          "title": "Projection mechanics: exactly-once-effect, ordering, and recovery",
+          "points": [
+            "Source via transactional outbox / CDC: the event is committed in the same transaction as the write, so there is no dual-write gap. Every event carries an event_id (dedupe key) and the per-product write version.",
+            "Idempotent upserts keyed by product_id and guarded by version — apply only if event.version > stored source_version — so duplicate or out-of-order deliveries are harmless. Partition the stream by product_id so a product's events stay ordered.",
+            "Each projector commits a checkpoint (stream offset / CDC position) per partition; lag is exported per partition against the p99 < 5 s SLO and alarms when breached.",
+            "A poison event that repeatedly fails goes to a dead-letter queue with bounded retry/backoff rather than blocking its partition.",
+            "Recovery is tiered: replay from the last checkpoint for a crashed projector, partial reindex by product / category / shard for a corrupted slice, and a full reproject from the authoritative write model only as a last resort.",
+            "Bulk imports buffer in the stream and are throttled so live-shopper-visible fields stay within the lag SLO."
+          ]
+        }
+      ]
     },
     {
       "id": "consistency",
       "title": "6. Inventory and Price: Freshness Where It Matters",
       "description": [
         "Catalog content tolerating seconds of staleness is fine. Price and availability do not: showing an out-of-stock item as buyable, or a stale price at checkout, is a real defect.",
-        "Treat inventory and pricing as separate services owning their authoritative data. For volatile values, read them live from their owner at decision time (add-to-cart, checkout) rather than trusting a projected snapshot. The read model can show an approximate badge ('in stock') but the purchase path verifies live.",
+        "Treat inventory and pricing as separate services owning their authoritative data (their own stores). For volatile values, read them live from their owner at decision time (add-to-cart, checkout) rather than trusting a projected snapshot. The read model can show an approximate badge ('in stock') and a display price, but the purchase path verifies both live: the catalog detail endpoint calls the pricing and inventory services, and checkout re-verifies an authoritative price quote.",
         "This splits consistency by data type: eventually-consistent catalog content via projection, authoritative live reads for money/stock."
       ],
       "view": {
@@ -1435,12 +1652,15 @@
           "InvSvc",
           "InvDB",
           "PriceSvc",
+          "PriceDB",
           "ChangeStream"
         ],
-        "caption": "The catalog service reads live availability from the inventory service (backed by its store) and price from the pricing service, both emitting changes to the change stream.",
+        "caption": "The catalog service reads live availability from the inventory service and live price from the pricing service (each backed by its own store), while both also emit changes to the change stream.",
         "links": [
           "detail-inv",
+          "detail-price",
           "inv-db",
+          "price-db",
           "inv-stream",
           "price-stream"
         ],
@@ -1472,12 +1692,15 @@
               "InvSvc",
               "InvDB",
               "PriceSvc",
+              "PriceDB",
               "ChangeStream"
             ],
-            "caption": "The catalog service reads volatile inventory and price live at decision time while those services also emit changes to the change stream.",
+            "caption": "The catalog service reads volatile inventory and price live at decision time from their owning stores, while those services also emit changes to the change stream.",
             "links": [
               "detail-inv",
+              "detail-price",
               "inv-db",
+              "price-db",
               "inv-stream",
               "price-stream"
             ],
@@ -1599,6 +1822,11 @@
           "trap": "Serving stock/price from the cached read model.",
           "why": "A stale 'in stock' or old price leads to failed/incorrect purchases.",
           "instead": "Read volatile values live from their owning service at the purchase decision."
+        },
+        {
+          "trap": "Over-projecting price into the search index/read model because it makes browse fast.",
+          "why": "It speeds search/detail but breaks purchase trust — a stale projected price shown at checkout is a real defect. Using a fast-changing price as a hard search facet also churns the index.",
+          "instead": "Keep at most a display price/badge in the projection; verify price live at the purchase decision and treat price facets as bucketed with explicit acceptable staleness."
         }
       ]
     },
@@ -1612,26 +1840,33 @@
       ],
       "view": {
         "nodes": [
+          "Client",
+          "LB",
+          "EdgeCache",
           "SearchSvc",
           "SearchIdx",
           "ReadModel",
           "Indexer",
           "ChangeStream"
         ],
-        "caption": "The search service serves reads from the search index and product read model, both kept fresh by the indexer consuming the change stream.",
+        "caption": "Hot product views and popular search results are served from an edge/CDN cache; misses fall through to the search index and read model, both kept fresh by the indexer consuming the change stream. Volatile stock/price bypass the cache.",
         "links": [
+          "client-lb",
+          "edge-cache",
           "search-idx",
           "search-readmodel",
           "indexer-readmodel",
           "stream-indexer"
         ],
         "highlight": [
+          "EdgeCache",
           "SearchIdx",
           "ReadModel"
         ],
         "groups": [
           "read-path",
-          "write-path"
+          "write-path",
+          "edge"
         ]
       },
       "decisionPrompt": "A deal makes one product go viral. What absorbs the read spike, and what stays authoritative?",
@@ -1651,30 +1886,45 @@
       },
       "bottlenecks": [
         {
-          "issue": "Hot category/product read spike.",
-          "mitigation": "Edge cache + read replicas + index shard replication."
+          "issue": "Viral product detail page (a deal goes hot).",
+          "mitigation": "Edge/CDN cache absorbs the content read at ~90%+ hit; origin read-model lookup is cheap; only live stock/price calls reach the owning services. Signal: edge hit-rate stays high, origin QPS stays flat."
         },
         {
-          "issue": "Bulk import floods projection.",
-          "mitigation": "Change stream buffers; autoscale projectors; prioritize live-shopper-visible fields."
+          "issue": "Hot category / hot search query.",
+          "mitigation": "Replicate the affected index shard, cache popular query results with a short TTL, and cap facet cardinality. Signal: per-shard query latency stays within budget; cache hit-rate on top queries climbs."
+        },
+        {
+          "issue": "Bulk import floods projection (projector lag spikes).",
+          "mitigation": "Change stream buffers the burst; autoscale projectors; throttle and prioritize live-shopper-visible fields. Signal: per-partition lag gauge returns under the p99 < 5 s SLO."
         }
       ],
       "failureDrills": [
         {
-          "scenario": "The search index is corrupted.",
-          "expectedBehavior": "Rebuild it by reprojecting from the write model / change log; reads degrade gracefully meanwhile.",
-          "mitigation": "Treat index + read model as rebuildable derived state."
+          "scenario": "A search index shard is corrupted.",
+          "expectedBehavior": "Serve from healthy replicas/shards while the bad shard is rebuilt by partial reproject from the write model / change log; affected queries degrade gracefully (reduced recall) rather than erroring.",
+          "mitigation": "Treat index + read model as rebuildable derived state; partial reindex by shard before full reproject."
+        },
+        {
+          "scenario": "Projector lag breaches the SLO during a bulk import.",
+          "expectedBehavior": "Lag alarm fires; live-visible fields are prioritized so detail/search stay fresh enough; volatile stock/price are unaffected because they are read live.",
+          "mitigation": "Autoscale projectors, throttle import ingestion, and let the stream absorb the backlog."
+        },
+        {
+          "scenario": "A poison change event repeatedly fails projection.",
+          "expectedBehavior": "The event is routed to a DLQ after bounded retries so its partition keeps flowing; an operator inspects and replays it after a fix.",
+          "mitigation": "Per-partition DLQ with backoff; idempotent reapply on replay."
         }
       ]
     }
   ],
   "finalDesign": {
     "title": "Final Design — CQRS Product Catalog",
-    "description": "The catalog service owns the normalized write model; a change stream projects edits into a denormalized product read model and a sharded search/facet index (eventually consistent, rebuildable). Shoppers search/filter via the index and hydrate result cards and detail pages from the read model in a single lookup. Inventory and pricing are separate services owning authoritative data; volatile stock/price are read live from them at purchase-decision time while content stays projected. Reads are sharded, replicated, and edge-cached; projection bursts buffer in the stream; all derived stores rebuild from the authoritative write model.",
+    "description": "The catalog service owns the normalized write model; a change stream (transactional outbox/CDC) projects edits into a denormalized product read model and a sharded search/facet index (eventually consistent, rebuildable, p99 < 5 s lag). Shoppers search/filter via the index and hydrate result cards and detail pages from the read model in a single lookup. Inventory and pricing are separate services owning authoritative data in their own stores; volatile stock/price are read live from them at purchase-decision time while content stays projected. Hot reads are sharded, replicated, and edge/CDN-cached (volatile values bypass the cache); projection bursts buffer in the stream; all derived stores rebuild from the authoritative write model.",
     "view": {
       "nodes": [
         "Client",
         "LB",
+        "EdgeCache",
         "CatalogSvc",
         "CatalogDB",
         "ReadModel",
@@ -1684,11 +1934,13 @@
         "Indexer",
         "InvSvc",
         "InvDB",
-        "PriceSvc"
+        "PriceSvc",
+        "PriceDB"
       ],
-      "caption": "The shopper client reaches the gateway for catalog detail and search, served from the read model and search index, which the change stream and indexer keep fresh from the catalog store plus inventory and pricing services.",
+      "caption": "The shopper client reaches the gateway for catalog detail and search, served from an edge cache, the read model, and search index — which the change stream and indexer keep fresh from the catalog store — with volatile stock/price read live from the inventory and pricing services.",
       "links": [
         "client-lb",
+        "edge-cache",
         "lb-search",
         "lb-detail",
         "lb-catalog",
@@ -1703,12 +1955,15 @@
         "indexer-readmodel",
         "indexer-searchidx",
         "detail-inv",
-        "inv-db"
+        "detail-price",
+        "inv-db",
+        "price-db"
       ],
       "groups": [
         "read-path",
         "write-path",
-        "domains"
+        "domains",
+        "edge"
       ]
     }
   },
@@ -1738,7 +1993,7 @@
       },
       {
         "requirement": "Accurate price/availability",
-        "how": "Live reads from inventory/pricing services.",
+        "how": "Live reads from the inventory and pricing services (each owns its store) at the purchase decision; checkout re-verifies an authoritative price quote.",
         "steps": [
           "consistency"
         ]

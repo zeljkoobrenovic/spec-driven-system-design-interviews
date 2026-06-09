@@ -5,486 +5,443 @@ Review date: 2026-06-09
 
 ## Executive Summary
 
-This is a coherent object-storage walkthrough with the right conceptual spine:
-single-server baseline, metadata/data-plane split, replication versus erasure
-coding, commit-metadata-last consistency, multipart upload, repair/GC, and
-prefix listing at scale. The step order is easy to teach and the structured
-diagrams resolve cleanly.
+The recent hardening pass materially improved this dataset. The previous major
+gaps around qualitative capacity, missing API endpoints, thin metadata records,
+ambiguous LIST consistency, missing security/tenancy, and absent technology
+choices are now largely addressed. The interview now reads like a credible
+S3-like object-storage case rather than a conceptual blob-store sketch.
 
-The main gap is that the dataset reads more like a strong conceptual overview
-than a production-grade S3-style design. Capacity is qualitative, the API only
-shows three endpoints despite requirements for delete/list/versioning/multipart,
-and the data model omits several records and invariants that make durability,
-versioning, listing, lifecycle, and tenant isolation safe. The design should
-also choose more precise semantics for listing consistency and for the hybrid
-replication/erasure-coding policy it recommends in prose.
+The core teaching spine is strong: start with a single-server baseline, split
+metadata from data, choose tiered replication/erasure coding, commit metadata
+last, support multipart upload, maintain durability with scrub/repair/GC, and
+scale listing through a strongly consistent bucket index. The remaining work is
+mostly precision: make the write state machine concrete enough to remove row
+lifecycle ambiguity, tighten the strong-LIST transaction and pagination story,
+choose one data-path shape for client uploads/downloads, and add a few
+production flows for degraded reads, repair, and GC.
 
 | Area | Rating | Notes |
 | --- | --- | --- |
-| System design soundness | 3.9/5 | Correct architecture and durability concepts; needs sharper API, schema, consistency, repair, and capacity contracts. |
-| Production realism | 3.55/5 | Repair and GC are present, but auth, quotas, encryption, lifecycle, observability, idempotency, and exact state transitions are thin. |
-| Pedagogical flow | 4.15/5 | Clear progression and useful trade-off options; some production mechanisms are compressed into prose instead of concrete flows. |
-| Dataset/rendering fit | 4.65/5 | JSON parses; step/final views, option views, highlights, pattern refs, probe refs, and `satisfies` step refs resolve cleanly. |
-| Overall | 3.95/5 | A solid book case foundation that needs a hardening pass before it feels production-complete. |
+| System design soundness | 4.55/5 | Correct architecture, capacity framing, API, metadata model, consistency contract, and durability policy; a few transactional and state-machine details still need sharper boundaries. |
+| Production realism | 4.35/5 | Authz, quotas, KMS, idempotency, lifecycle, repair, GC, observability, and technology choices are present; degraded-read/repair/GC execution flows could be more explicit. |
+| Pedagogical flow | 4.55/5 | The sequence of decisions is clear and interview-friendly; the case now teaches one pressure point at a time without losing the final design. |
+| Dataset/rendering fit | 4.75/5 | JSON parses; step, option, and final-design view references resolve; sequence participant references resolve; review-only edits do not require a docs rebuild. |
+| Overall | 4.50/5 | A strong book-ready case with a few precision edits left before it is excellent. |
 
 ## What Works Well
 
-- The metadata/data-plane split is exactly the right organizing idea for this
-  interview. Step 2 explains why the key-to-placement mapping and bulk bytes
-  scale differently.
-- The durability section teaches the right first principles: full replicas are
-  simple and fast; erasure coding controls storage overhead; placement across
-  independent failure domains is what makes either scheme meaningful.
-- Step `replication-vs-ec` is a useful sub-step. It gives the reader a compact
-  explanation of why real stores often use both schemes.
-- The commit-metadata-last step is the strongest correctness mechanism in the
-  dataset. It explains read-after-write visibility and orphan-data GC without
-  overcomplicating the first pass.
-- Multipart upload is introduced at the right time, after the write protocol is
-  clear and before maintenance.
-- Repair, scrubbing, and GC are not left as footnotes. The dataset correctly
-  says durability is maintained over time, not just achieved at initial write.
-- The final design integrates every component introduced in the steps.
-- Renderer-facing checks are clean: source JSON parses, node IDs and link IDs
-  resolve for step views, option views, and final design; `satisfies` step refs,
-  pattern refs, probe links, and the sub-step parent all resolve.
+- Capacity is now useful. It names object count, bytes, object-size mix,
+  PUT/GET/LIST/DELETE rates, metadata footprint, storage overhead, repair
+  targets, and failure domains.
+- The API now matches the requirements: PUT, GET, HEAD, DELETE, LIST, multipart
+  initiate/upload/complete/abort, version reads, checksums, conditional writes,
+  idempotency keys, auth headers, storage class, and KMS key references.
+- The data model now supports the promised behavior: buckets, object versions,
+  latest pointers, bucket index, multipart uploads/parts, shard placements, and
+  idempotency keys.
+- The design makes a clear redundancy choice: replicate hot/small objects and
+  erasure-code large/cold objects, with lifecycle transition as objects cool.
+- The consistency decision is now explicit: successful PUT/DELETE is visible to
+  GET, HEAD, and LIST because version, latest pointer, and bucket index commit
+  together.
+- Repair and GC are first-class parts of the case. The dataset now discusses
+  scrub cadence, checksum quarantine, repair prioritization, repair throttling,
+  retention windows, and abandoned multipart upload cleanup.
+- Security and tenancy are no longer afterthoughts. Bucket policy, quotas,
+  tenant/account ownership, TLS, KMS/envelope encryption, and audit are threaded
+  into the requirements, API, model, final design, and wrap-up.
+- The final design integrates the components introduced in the steps instead of
+  introducing a new architecture at the end.
 
 ## Highest-Impact Issues
 
-### 1. Capacity is qualitative, so the design cannot be sized or stress-tested
+### 1. The write state machine is strong in prose but still slightly ambiguous in storage
 
-The capacity section has useful labels - trillions of objects, exabytes, 11
-nines, bytes-to-TBs object sizes, racks/zones - but no request rates, object
-size distribution, metadata footprint, write/read bandwidth, listing volume, or
-repair budget. That makes several later decisions hard to evaluate:
+The final design names the right state machine:
+`pending_data -> data_durable -> committed -> deleting/delete_marker -> gc_eligible -> reclaimed`.
+The `object_versions` table also includes those states, but its note says it is
+"one immutable row per (bucket, key, version_id)." That can confuse the most
+important correctness boundary: before metadata commit, is there already an
+`object_versions` row, a separate write-intent row, or only an idempotency
+record plus durable placement receipt?
 
-- how many metadata shards are needed;
-- whether the bucket index can keep up with writes and listings;
-- how much cross-zone or intra-cluster bandwidth repair needs;
-- how much write amplification replication or erasure coding creates;
-- whether small-object metadata dominates storage or request cost.
-
-Concrete fix:
-
-- Add numeric rows for peak PUT/s, GET/s, LIST/s, DELETE/s, average and p95
-  object size, small-object percentage, object metadata bytes, total metadata
-  footprint, and expected hot-bucket skew.
-- Add durability-specific sizing: chosen replication or EC policy, raw-storage
-  multiplier, write amplification, repair bandwidth budget, and target time to
-  restore redundancy after a node/rack loss.
-- Include one back-of-the-envelope example, such as:
-  `10T objects * ~1 KB metadata ~= 10 PB logical metadata before indexes and replicas`.
-- Tie the capacity numbers back to Step 7's metadata sharding and Step 6's
-  repair prioritization.
-
-### 2. The API does not cover the stated object-store contract
-
-The requirements include PUT, GET, DELETE, prefix list, multipart upload,
-optional versioning, and read-after-write. The API section currently shows only:
-
-- `PUT /{bucket}/{key}`;
-- `GET /{bucket}/{key}`;
-- `POST /{bucket}/{key}?uploads` to initiate multipart upload.
-
-That leaves core behavior implied but not specified. A candidate reading this
-does not see how to delete an object, list a bucket by prefix, complete or abort
-a multipart upload, upload individual parts, request a specific version, or use
-conditional/idempotent writes.
+Why it matters: commit-metadata-last is the central teaching point. If the
+candidate cannot state which row exists before visibility and which transaction
+flips visibility, retry, GC, and delete-marker behavior become hand-wavy again.
 
 Concrete fix:
 
-- Add endpoints for `DELETE /{bucket}/{key}`, `GET /{bucket}?prefix=&delimiter=&cursor=`,
-  `PUT /{bucket}/{key}?partNumber=&uploadId=`, `POST ...?uploadId=complete`,
-  `DELETE ...?uploadId=abort`, and optionally `HEAD /{bucket}/{key}`.
-- Show version semantics explicitly: `GET ?versionId=`, delete markers, latest
-  pointer behavior, and whether non-versioned buckets overwrite in place or
-  create hidden generations.
-- Add request headers that drive correctness: content checksum, idempotency key,
-  conditional write headers, storage class, encryption key reference, and
-  expected object size for admission/quota checks.
-- Add at least one sequence for multipart complete, because "parts then atomic
-  complete" is a central correctness boundary.
+- Add a small `write_intents` or `pending_writes` record, or explicitly state
+  that uncommitted `object_versions` rows are invisible until `object_latest`
+  and `bucket_index` point at them.
+- In the PUT and multipart-complete sequences, show the transition:
+  idempotency reserved -> data durable receipt -> transaction commits version,
+  latest pointer, bucket index, quota/usage counters, and idempotency result.
+- State the crash outcomes for each boundary:
+  before data durable, after data durable but before metadata commit, and after
+  commit but before the client receives the response.
 
-### 3. The data model is too small for the promised semantics
+### 2. Strong LIST consistency needs transaction-scope and pagination details
 
-The current data model has `objects (metadata)`, `data shards`, and
-`multipart_uploads`. That is enough to explain the first diagram, but it does
-not yet support several promises made elsewhere in the dataset.
+The dataset now correctly chooses strong LIST consistency by committing the
+bucket index with the latest pointer. That is the right S3-like semantic. The
+remaining gap is implementation precision at the stated scale: 300k PUT/s, 50k
+LIST/s, 10T objects, hot buckets, and a key-ordered index.
 
-Missing or under-modeled surfaces:
-
-- bucket/account identity, tenant ownership, bucket policy, and quota state;
-- object version table versus a latest pointer;
-- delete markers and lifecycle state for versioned and non-versioned buckets;
-- per-object checksum, encryption/KMS key reference, storage class, retention
-  or legal-hold state, and created/updated timestamps;
-- multipart part records with part number, size, checksum/etag, placement, and
-  TTL;
-- bucket index records with ordered key, version/delete-marker visibility, and
-  pagination cursor support;
-- placement generation/epoch so repair and reads know which placement map they
-  are using;
-- idempotency records for retried PUT/complete/delete calls.
+Why it matters: "same metadata commit" is only credible if the design explains
+how the version row, latest pointer, index row, and cursor ordering share a
+transaction boundary or a deterministic commit watermark. Otherwise the
+candidate gets the right answer without showing how to keep it true under
+sharding.
 
 Concrete fix:
 
-- Split metadata into explicit tables or records:
-  `buckets`, `object_versions`, `object_latest`, `multipart_uploads`,
-  `multipart_parts`, `bucket_index`, `shard_placements`, and `idempotency_keys`.
-- Add a compact state machine:
-  `pending_data -> data_durable -> metadata_committed -> deleting/delete_marker -> gc_eligible -> reclaimed`.
-- State which updates are transactionally coupled in `MetaDB`, and which are
-  asynchronous but recoverable from logs.
+- State whether `object_latest` and `bucket_index` are co-located by
+  `(bucket, key)` shard or whether the metadata store provides cross-shard
+  transactions.
+- Define cursor semantics under concurrent writes/deletes. The current
+  "last returned key/version" explanation is a good start, but it should say
+  whether a page is a snapshot, a monotonic high-watermark scan, or a live range
+  scan that may include later commits.
+- Add one sentence about hot-bucket mitigation for the ordered index:
+  bucket-prefix partitioning, adaptive split points, write fanout limits, or a
+  per-bucket sequencer only when necessary.
 
-### 4. Write, read, and repair flows need sharper failure boundaries
+### 3. The upload/download data path should choose one concrete shape
 
-The step-level consistency flow says data is acknowledged durable before
-metadata commits, which is good. The top-level API PUT sequence, however, jumps
-from "write shards" to "200 versionId" without showing how the metadata service
-learns that the data write is durable. This compresses the most important
-failure boundary in the design.
+The architecture intentionally separates metadata and bytes, but the current
+diagrams and sequences use three slightly different shapes:
 
-The same issue appears in reads and repair. The dataset says any replica or
-enough fragments can serve a read, and that repair rebuilds missing
-replicas/fragments, but it does not show:
+- the high-level link says the client streams data directly to `DataNodes`;
+- the PUT API sequence has the client stream to `EC`;
+- the final-design caption says the client calls the API and upload coordinator,
+  while the replication/erasure coder writes shards to data nodes.
 
-- who coordinates a PUT and owns retries after client timeout;
-- how duplicate PUT or complete requests are deduplicated;
-- how a GET falls back from a missing/corrupt shard to another replica or EC
-  reconstruction;
-- how corrupt shards are quarantined before replacement;
-- how repair is prioritized when a whole rack is lost;
-- how GC proves a shard is not live before deleting it.
+All three are plausible variants, but together they leave the reader unsure
+whether `EC` is a gateway, a client library function, an internal service, or a
+data-node-side pipeline.
 
 Concrete fix:
 
-- Amend the PUT flow so `EC/DataNodes -> MetaSvc` or a write coordinator returns
-  a durable placement receipt before metadata commit.
-- Add one read-degraded flow: metadata resolves placement, one shard fails
-  checksum, client/service reads alternate fragments, object is reconstructed,
-  and repair is queued.
-- Add one GC safety invariant: GC only deletes data whose metadata version is
-  deleted/expired and whose retention window has passed, preferably after a
-  mark/sweep or generation check.
-- Add failure drills for client retry after timeout, metadata commit failure
-  after data write, and repair backlog after rack loss.
+- Pick one path and name it consistently. For example: `MetaSvc` returns a
+  signed upload plan to the client, the client streams to a data-plane gateway
+  that performs replication/EC, and the gateway returns a durable placement
+  receipt to `MetaSvc`.
+- If clients write directly to data nodes, state how authz tokens, checksums,
+  placement epochs, retries, and partial failures are handled.
+- If bytes flow through an internal EC service, rename it as a data-plane
+  gateway/coordinator and account for backpressure and bandwidth cost.
 
-### 5. Listing consistency conflicts with the stated S3-like expectations
+### 4. Degraded reads, repair, and GC deserve one explicit sequence or mini-flow
 
-Step 7 chooses a derived ordered bucket index for prefix listing. That is a good
-shape, but the option explicitly says sync lag can make a just-written key
-temporarily missing from listings. The requirements say "read-after-write
-visibility for new objects" and the title frames the case as S3-like. Modern
-S3-style expectations often include strong list visibility, or at least require
-the design to state where list consistency is weaker than GET consistency.
+The prose and failure drills now cover degraded reads, checksum quarantine,
+repair prioritization, and GC safety. That is a big improvement. The dataset
+would be stronger if one of those operational paths had the same concrete flow
+treatment as PUT and multipart complete.
 
 Concrete fix:
 
-- Decide whether `LIST` must be strongly consistent with successful PUT/DELETE.
-- If yes, make the bucket index update part of the metadata commit path, or
-  commit through a log/transaction that makes the index read path observe the
-  same version before acknowledging the write.
-- If no, explicitly scope the guarantee to `GET/HEAD` and call out that listing
-  is eventually consistent. Then reflect that weaker guarantee in
-  `requirements`, `satisfies`, and the interview script.
-- Define pagination cursor semantics under concurrent writes and deletes.
+- Add a degraded-read flow: metadata resolves placement, one shard fails
+  checksum or times out, the system reads alternate replicas/fragments,
+  reconstructs the object, returns correct bytes, quarantines the bad shard, and
+  enqueues repair.
+- Add a compact GC invariant: only reclaim a placement when no live latest or
+  retained version references it, retention/legal hold has passed, and the
+  placement generation still matches the metadata row observed during marking.
+- Optionally add `repair_jobs`, `quarantined_shards`, or `gc_marks` to the data
+  model if you want the operational machinery to be inspectable.
 
-### 6. Security, tenancy, and compliance are mostly absent
+### 5. Cross-region disaster recovery is correctly scoped as an extension, but the scope should be explicit
 
-The front-end/API node says it authenticates, routes, and rate-limits, but the
-walkthrough and data model do not carry those concerns forward. For an
-S3-like object store, these are central production requirements rather than
-optional finishing touches.
+The design covers racks/zones/failure domains well and includes cross-region
+replication in follow-up prompts. It does not promise regional disaster
+recovery in the main requirements, which is reasonable for a focused interview.
+Because the title says S3-like and the scale is exabytes, make that boundary
+explicit.
 
 Concrete fix:
 
-- Add tenant/account/bucket identity to API paths or required request context.
-- Mention bucket policies/IAM-style authorization on every metadata operation.
-- Add per-tenant quotas and admission control for bytes, object count, request
-  rate, and multipart orphan bytes.
-- Include encryption at rest with KMS/envelope key metadata, and TLS/signed
-  URLs or scoped tokens for direct data-node/object transfer.
-- Add retention/legal hold/lifecycle policies as explicit extensions if they
-  are out of core scope.
-- Add audit logs for administrative and object-level access where appropriate.
+- Add a short non-goal or extension note: "This design covers multi-zone
+  durability inside a region; cross-region replication/DR is a follow-up."
+- If the intended mainline answer includes multi-region durability, add it to
+  requirements, capacity, data model, repair/lifecycle, and final design.
 
 ## System Design Soundness
 
-The core architecture is directionally sound. The dataset correctly separates
-the metadata plane from the data plane, uses placement across failure domains,
-keeps data invisible until metadata commits, and recognizes that repair and GC
-are part of the durability story.
+The system design is now strong. The dataset has the important object-storage
+mechanisms in the right places:
 
-The strongest system-design idea is commit-metadata-last. It gives a clean
-answer to the common "what if the service crashes mid-write?" question: failed
-writes leave orphan data, not visible metadata pointing to missing bytes. This
-should become the explicit state machine for PUT, multipart complete, delete,
-and GC.
+- metadata is authoritative for visibility;
+- data nodes hold opaque bytes/shards;
+- placement crosses failure domains;
+- redundancy is tiered by object class;
+- metadata commits last after durable data write;
+- object versions and delete markers preserve overwrite/delete semantics;
+- bucket index updates are part of the write contract for strong LIST;
+- multipart upload is visible only after validated complete;
+- repair and GC maintain the durability and cost properties over time.
 
-Durability is presented correctly at the conceptual level, but it needs math.
-Replication versus EC cannot be evaluated without object-size mix, storage
-overhead, write/read amplification, degraded-read latency, and repair bandwidth.
-The dataset says 11 nines but does not show how repair speed and failure-domain
-placement maintain that target after failures.
+The biggest remaining soundness issue is not missing components but exact
+transaction boundaries. The design should make it mechanically obvious which
+metadata rows exist before and after a crash at each point in PUT, multipart
+complete, delete, and GC. This would turn the current strong prose into a fully
+defensible correctness story.
 
-The consistency story is good for `GET` after `PUT`, but less clear for
-`LIST`, overwrite, delete, and versioning. Object storage interviews often turn
-on these edge cases. The dataset should define whether the metadata store
-serializes updates per `(bucket, key)`, how latest-version pointers are updated,
-and what readers see during overwrite/delete races.
+Capacity is now good enough for interview use. The numbers are intentionally
+round, but they support the later choices: sharded metadata, ordered bucket
+index, CDN/cache fronting for hot reads, hybrid redundancy, and repair budget.
+One possible addition would be a worked storage-cost example, such as how 1 EB
+logical maps to raw storage under 3x replication versus EC 10+4 plus hot-object
+replication.
 
-Availability is present but thin. "Any copy/enough fragments serve reads" is
-right, but the design should explain degraded reads, request hedging, timeouts,
-and how repair traffic is isolated from serving traffic.
+The API shape is much improved. The only API precision I would add is explicit
+range GET and versioned GET examples, because range reads are common for object
+storage and the response model already mentions version IDs.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: Store the Blob on One Fileserver
 
-This is a clean baseline. It exposes both durability and scale failure with no
-unnecessary machinery. Keep it.
+This remains a clean baseline. It uses the new capacity numbers to show why a
+single server fails independently on durability, bytes, object count, and NIC
+throughput. Keep it short.
 
-Suggested improvement: connect the failure to a numeric capacity example once
-the capacity section is hardened. For example, show why metadata count, disk
-capacity, and network throughput each fail independently.
+Suggested improvement: none required beyond preserving the baseline as a foil.
 
 ### Step 2: Split Metadata from Data
 
-This step introduces the right abstraction. The distinction between queryable
-metadata and opaque bytes is clear and sets up placement, versioning, listing,
-and multipart upload.
+This is the right first architectural move. The step now carries authz/quota
+and metadata authority more clearly, and it sets up later versioning and
+listing decisions.
 
-Suggested improvement: introduce the authoritative metadata invariants here:
-metadata is the source of visibility, data nodes are not authoritative for
-object existence, and readers should never trust data without metadata.
+Suggested improvement: add one invariant sentence here: data nodes never decide
+object visibility; only committed metadata/latest/index rows do.
 
 ### Step 3: Durability: Replication vs Erasure Coding
 
-The options teach meaningful trade-offs. The default option is erasure coding,
-while the sub-step later says real stores use both replication and EC. That is
-not wrong, but the selected architecture should be more explicit.
+This step now has the right default: tiered replication for hot/small objects
+and erasure coding for large/cold objects. The options are realistic rather than
+strawmen.
 
-Suggested improvement: make the chosen policy "tiered: replicate small/hot,
-erasure-code large/cold" unless the intended answer is deliberately pure EC.
-Then update the default option, final design wording, and decision-tree path to
-match.
+Suggested improvement: add one numeric cost comparison in the step body:
+`1 EB logical * 3x = 3 EB raw` versus `1 EB logical * 1.4x = 1.4 EB raw` for
+cold data, while acknowledging hot replicated data increases the blended
+multiplier.
 
 ### Step 3a: Replication vs Erasure Coding
 
-This sub-step is useful and concise. It explains read latency, repair
-amplification, storage overhead, and why object class matters.
+The sub-step is now aligned with Step 3. It teaches the tradeoff compactly:
+replication is simple and fast; EC saves storage but increases read/repair
+amplification.
 
-Suggested improvement: add one concrete rule of thumb, such as "replicate
-objects below X MB or recently written objects; EC larger/colder objects after
-a background transition." It can be illustrative rather than prescriptive.
+Suggested improvement: keep this as a sub-step, not a full top-level step. It
+adds depth without interrupting the main architecture progression.
 
 ### Step 4: Read-After-Write via Commit Ordering
 
-This is the best teaching step in the dataset. It explains the correctness
-lever and the failure outcome.
+This remains the strongest correctness step. The option comparison and PUT
+sequence now include a durable placement receipt, idempotency, and a single
+metadata transaction for version/latest/index.
 
-Suggested improvement: add a write coordinator or durable placement receipt to
-the flow. The candidate should be able to answer, "who knows the data write
-succeeded before committing metadata?"
+Suggested improvement: make crash outcomes table-driven:
+`client timeout before receipt`, `receipt but no metadata commit`, `commit but
+client timeout`, and `duplicate retry with same idempotency key`.
 
 ### Step 5: Multipart Upload for Large Objects
 
-The conceptual flow is right: initiate, upload parts independently, then
-complete atomically. The prose also correctly says abandoned parts need GC.
+The multipart section is now credible: initiate, upload parts, validate etags
+and sizes, complete exactly once, abort, and TTL cleanup are all present.
 
-Suggested improvement: model part records and completion semantics more
-explicitly. Multipart complete should validate the submitted part list,
-checksums, sizes, and upload state, then commit the final object exactly once.
-Abort and timeout cleanup should be first-class.
+Suggested improvement: explicitly say whether the final ETag is an MD5-style
+multipart digest, a content checksum, or an opaque version validator. This is
+minor but prevents readers from assuming ETag always equals a full-object hash.
 
 ### Step 6: Scrubbing, Repair, and Garbage Collection
 
-This step prevents the common mistake of treating durability as a write-time
-property. The rack-loss failure drill is a good start.
+This step now feels operational. Scrub cadence, checksum quarantine, repair
+priority, bandwidth throttling, and repair targets are all concrete enough for
+an interview.
 
-Suggested improvement: add more operational details: scrub cadence, checksum
-scope, repair queue priority, repair bandwidth throttling, corrupted-shard
-quarantine, and GC proof of non-reachability.
+Suggested improvement: add one structured flow or data-model record for repair
+jobs/quarantined shards so the operational path is as inspectable as the write
+path.
 
 ### Step 7: Listing, Sharding, and Availability at Scale
 
-This step covers the right pressure point: metadata becomes the scale bottleneck
-and prefix listing does not fit a pure hash-sharded point lookup store.
+The step now makes the right decision: do not scan every metadata shard for
+LIST; maintain a key-ordered bucket index and commit it with the object update.
 
-Suggested improvement: decide on list consistency and pagination. The derived
-index option is strong, but the current "sync lag" caveat needs to be aligned
-with the requirements.
+Suggested improvement: specify whether listing pages are snapshot-consistent,
+watermark-consistent, or live scans. Also mention how the ordered index splits a
+hot bucket/prefix when one tenant creates a skewed key pattern.
 
 ## Final Design Review
 
-The final design includes the introduced components: client/API, metadata
-service/store, placement service, replication/erasure coder, data nodes,
-multipart coordinator, repair/scrubber, GC, and bucket index. It is coherent as
-a teaching diagram.
+The final design is now coherent and high quality. It integrates every major
+step:
 
-The final design should carry a few production commitments that are currently
-only implied:
+- `Client` and `Front-End / API` from the request boundary;
+- `Metadata Service`, `Metadata Store`, and `Placement Service` from the
+  metadata/data split;
+- `Replication / Erasure Coder` and `Storage Data Nodes` from durability;
+- commit-last write coordination from consistency;
+- `Multipart Upload Coordinator` from large-object support;
+- `Repair / Scrubber` and `Garbage Collector` from maintenance;
+- `Bucket Index` from listing and scale.
 
-- selected redundancy policy: pure EC, pure replication, or hybrid by object
-  class/lifecycle;
-- exact write state machine and durable acknowledgement path;
-- version/delete/list semantics;
-- tenant/bucket authorization and quota enforcement;
-- repair and GC safety invariants;
-- observability and operational SLOs.
+The final description is unusually useful because it also states the chosen
+policy, not just the components: tiered redundancy, idempotent commit-last
+writes, strong GET/HEAD/LIST, repair throttling, GC safety, KMS encryption,
+audit, degraded reads, and hot-object caching.
 
-It also lacks a `technologyChoices` section, which many book datasets use to
-compare self-hosted and managed options. Object storage is a good fit for that
-section: metadata store, storage engine/data nodes, queue/log for repair and
-index updates, CDN, KMS, observability, and managed cloud object-store choices.
+The only final-design polish needed is to resolve data-path naming. Decide
+whether `EC` is a client-side/library encoder, a data-plane gateway, or an
+internal service that receives streams. Then make the high-level links, API
+sequence, step captions, and final caption all say the same thing.
 
 ## Concept Introduction and Learning Flow
 
-The concepts are introduced just in time. Metadata/data-plane split appears
-before durability, durability appears before consistency, and consistency
-appears before multipart. That order is effective.
+The concept sequence is strong and just-in-time:
 
-The learning flow would be stronger if a few concepts were named explicitly:
+- metadata/data split before placement;
+- redundancy before consistency;
+- commit ordering before multipart complete;
+- multipart before GC;
+- repair/GC before listing at scale;
+- technology choices after the design has enough surface area to compare.
 
-- write state machine;
-- idempotency key;
-- delete marker;
-- lifecycle transition;
-- repair amplification;
-- degraded read;
-- bucket index consistency;
-- envelope encryption/KMS;
-- per-tenant quota and rate limiting.
+The dataset now introduces most of the concepts a senior candidate needs:
+failure domains, replication, EC, tiered redundancy, commit metadata last,
+idempotency, version/latest pointer semantics, delete markers, multipart
+completion, repair amplification, degraded reads, bucket index consistency,
+envelope encryption, quota, and observability.
 
-These do not all need full steps. Most can appear as concepts, traps, failure
-drills, or data-model fields.
+The learning flow would benefit from one small addition: make "write intent" or
+"visibility pointer" a named concept. It is the mental model that ties
+commit-last PUT, multipart complete, delete markers, LIST, retry idempotency,
+and GC together.
 
 ## Step-to-Final-Design Coherence
 
-Most step mechanisms appear in the final design. The final diagram contains the
-metadata service/store from Step 2, placement and EC/data nodes from Step 3,
-commit-last components from Step 4, the upload coordinator from Step 5,
-repair/GC from Step 6, and the bucket index from Step 7.
+Coherence is now high. The previous mismatch between the default EC option and
+the hybrid policy is fixed. The previous mismatch between eventual LIST wording
+and S3-like expectations is fixed. The previous missing API/data-model surfaces
+are fixed.
 
-The main coherence gaps are:
+Remaining coherence gaps:
 
-- Step 3a recommends a hybrid replication/EC system, while the default option
-  path favors EC and the final design says "replicas or erasure-coded
-  fragments" without choosing the policy.
-- Step 4's detailed consistency flow is stronger than the API PUT sequence; the
-  top-level API flow should not hide the durable acknowledgement boundary.
-- Step 7's listing option permits index lag, while the high-level requirements
-  imply immediate visibility for new objects unless listing is explicitly
-  weaker than GET.
+- data path terminology differs slightly between high-level links, API
+  sequences, and captions;
+- the write state machine is in final-design prose but not represented as a
+  distinct flow/table in the earlier steps;
+- repair/GC concepts are present but less diagrammed than PUT and multipart.
+
+These are precision issues, not structural failures.
 
 ## Realism Compared With Production Systems
 
-The dataset captures the distinctive parts of object storage better than a
-generic blob-store answer would: placement, EC, metadata/data split, multipart,
-repair, and listing are all present.
+The case now compares well with production object-storage systems. It covers
+the distinctive hard parts: exabyte capacity, trillions of metadata rows,
+durability math, hybrid redundancy, placement, read-after-write, strongly
+consistent listing, multipart upload, repair, scrub, GC, lifecycle cleanup,
+authz, quotas, KMS, audit, observability, and technology tradeoffs.
 
-The missing realism is mostly in operational contracts:
+The remaining realism opportunities are operational:
 
-- authentication and authorization per account/bucket/key;
-- bucket policies, signed URLs, and scoped direct-transfer credentials;
-- encryption and KMS key metadata;
-- quota enforcement and abuse controls;
-- request idempotency and retry behavior under timeouts;
-- lifecycle policies, retention, legal hold, and object lock;
-- cross-region replication and disaster recovery as extensions;
-- observability for durability risk, repair lag, orphan bytes, hot buckets,
-  data-node errors, checksum failures, and index lag;
-- admission control and backpressure when repair or listing competes with
-  foreground traffic.
-
-These additions would make the case feel like an operated service rather than a
-clean architecture sketch.
+- define how data-plane upload tokens or signed placement plans work;
+- isolate repair/index/lifecycle queues from foreground request traffic;
+- show degraded-read fallback as a flow, not only as prose;
+- state how metadata shard splits preserve ordered LIST semantics;
+- clarify whether cross-region replication is a follow-up or part of the
+  offered durability product;
+- add SLO-oriented metrics: p99 GET/PUT latency, list latency, objects below
+  target redundancy, repair backlog age, scrub coverage, orphan bytes, quota
+  rejection rate, KMS failures, and hot-prefix pressure.
 
 ## Dataset and Renderer-Facing Observations
 
 - `interview.json` parses successfully.
-- Top-level dataset structure is valid for the project: requirements, capacity,
-  API, data model, patterns, steps, final design, satisfies, interview script,
-  level variants, follow-ups, and probe links are present.
-- Step view nodes all exist in `highLevelArchitecture.nodes`.
-- Step view string links all exist in `highLevelArchitecture.links`.
-- Option view nodes and string links resolve.
+- Top-level dataset structure is valid for this project: requirements,
+  capacity, API, data model, patterns, steps, final design, satisfies,
+  technology choices, interview script, level variants, follow-ups, and probe
+  links are present.
+- Step view nodes resolve to `highLevelArchitecture.nodes`.
+- Step view links resolve to `highLevelArchitecture.links`.
+- Option view nodes and links resolve.
 - Final-design view nodes and links resolve.
 - Step highlights resolve to nodes in the displayed step views.
+- API sequence and step flow messages reference declared participants.
 - `satisfies.functional[*].steps` and `satisfies.nonFunctional[*].steps`
   resolve to real step IDs.
+- `technologyChoices[*].steps` and `patterns[*].steps` resolve to real step IDs.
 - `step.parent` for `replication-vs-ec` resolves to `durability`.
-- Pattern references and probe links resolve.
-- No generated `docs/` changes are needed for this review file alone.
+- The source review file is repo-only; no generated `docs/` rebuild is needed
+  for this review update.
 
 Potential dataset polish:
 
-- Several options and flows use `name` rather than `title`, which is consistent
-  with this repo's option shape, but ad hoc jq summaries that look for `title`
-  report them as null. No renderer issue was observed from static checks.
-- The dataset has no `technologyChoices`; that is optional, but adding it would
-  match the stronger book cases.
-- The API `POST /{bucket}/{key}?uploads` has no sequence while the two simpler
-  endpoints do. Multipart is important enough to deserve a sequence.
+- `technologyChoices` uses bare string chips rather than assigned icon objects.
+  That is schema-valid, but running the icon assignment script would make the
+  book wrap-up visually match fuller cases.
+- The dataset has no AI visuals or explainer comic. Those are optional; the
+  structured diagrams are enough for this interview.
+- Several sequence/flow objects do not expose a human title in jq summaries.
+  This is not a rendering issue, but titles could make future static summaries
+  easier to scan.
 
 ## Recommended Edits, Prioritized
 
-### P1: Add capacity numbers and use them in the design
+### P1: Clarify the write-intent / visibility state machine
 
-Add PUT/GET/LIST/DELETE rates, object-size distribution, metadata footprint,
-storage overhead, bandwidth, repair budget, and hot-bucket assumptions. Tie
-those numbers to metadata sharding, EC/replication choice, bucket index design,
-and repair scheduling.
+Add a `write_intents` record or explicitly document invisible pre-commit
+`object_versions`. Show when idempotency, durable placement receipt,
+object-version creation, latest pointer, bucket index, and quota counters are
+reserved or committed.
 
-### P1: Expand the API and metadata model to cover requirements
+### P1: Define strong-LIST transaction and cursor semantics
 
-Add delete, list, multipart part/complete/abort, version-specific reads,
-conditional/idempotent writes, checksum headers, and range/head reads. Add data
-model records for buckets, object versions, latest pointers, delete markers,
-multipart parts, bucket index entries, placements, and idempotency.
+State the transaction/co-location model for `object_latest` plus
+`bucket_index`, and specify whether pagination is snapshot, watermark, or live
+range scanning under concurrent writes/deletes.
 
-### P1: Decide and document consistency semantics
+### P1: Normalize the data-path role of `EC`
 
-Define whether read-after-write includes `LIST`, overwrites, deletes, and
-versioned reads. Align requirements, Step 7 option text, `satisfies`, and the
-API/data model with that decision.
+Choose whether `EC` is a gateway, library, internal service, or data-node-side
+pipeline. Align high-level links, API sequences, step captions, and final
+caption.
 
-### P2: Make write, read, repair, and GC failure boundaries explicit
+### P2: Add one degraded-read / repair / GC flow
 
-Add compact flows or failure drills for durable placement receipt before
-metadata commit, degraded reads/reconstruction, retry idempotency after timeout,
-metadata commit failure after data write, and GC proof of non-reachability.
+Add a concrete sequence for checksum failure and degraded read, or a compact
+maintenance flow showing quarantine, repair job enqueue, rebuild, and GC
+non-reachability proof.
 
-### P2: Add security, tenancy, lifecycle, and observability
+### P2: Make regional scope explicit
 
-Thread authz, bucket policies, quotas, encryption/KMS, lifecycle/retention,
-audit, metrics, alerts, and operational dashboards through the main design or
-add a late production-hardening step.
+State that the main design is multi-zone/single-region unless cross-region
+replication is promoted from follow-up to a core requirement.
 
-### P3: Clarify the chosen redundancy policy
+### P3: Add visual/book polish
 
-Make the default path either hybrid replication/EC or pure EC, then update Step
-3 options, Step 3a, final design, and the wrap-up script to say the same thing.
-
-### P3: Add `technologyChoices`
-
-Compare metadata stores, data-node storage engines, repair/index queues,
-managed object stores, CDN/front-door options, KMS, and observability tooling.
+Optionally assign technology-choice icons and add AI visuals or an explainer
+comic later. These are presentation improvements, not design blockers.
 
 ## What Not To Change
 
 - Keep the metadata/data-plane split as the central organizing mechanism.
-- Keep commit-metadata-last as the consistency teaching moment.
-- Keep repair/GC in the main walkthrough; it is one of the case's strongest
-  differentiators from shallow object-store answers.
-- Keep the sub-step comparing replication and EC.
-- Keep the diagrams structured rather than adding raw Mermaid to architecture
-  steps.
+- Keep tiered replication plus erasure coding as the selected durability
+  policy.
+- Keep commit-metadata-last as the main correctness lesson.
+- Keep LIST strongly consistent now that the requirements explicitly promise
+  it.
+- Keep repair, scrub, and GC in the main walkthrough rather than moving them to
+  follow-ups.
+- Keep the current step order; it builds naturally from baseline to final
+  design.
 
 ## Bottom Line
 
-This is a strong conceptual S3-like object-storage case with clean renderer
-structure and a good interview progression. The next hardening pass should make
-the public API, metadata records, capacity math, consistency contract, and
-operational safeguards concrete enough that the design can survive production
-failure scenarios, not just explain the main architecture.
+The object-storage interview has moved from "solid conceptual overview" to a
+strong production-oriented case. The remaining edits are about removing the last
+ambiguities in transaction boundaries, pagination semantics, and data-plane
+roles. After those, this should be one of the stronger book datasets.

@@ -184,6 +184,38 @@
           "derived"
         ],
         "description": "Per-user listening history and model features feeding online recommendation retrieval."
+      },
+      {
+        "id": "CandStore",
+        "label": "Candidate / Model Store",
+        "type": "database",
+        "category": "state",
+        "traits": [
+          "stateful",
+          "derived"
+        ],
+        "description": "Batch-computed candidate sets and model outputs (embeddings, ANN index, generated-playlist tracklists) retrieved at serving time."
+      },
+      {
+        "id": "Fraud",
+        "label": "Fraud / Risk Filter",
+        "type": "service",
+        "category": "async",
+        "traits": [
+          "stateless"
+        ],
+        "description": "Scores play events for bot/farm/velocity abuse; emits a clean stream that royalty accounting can trust and quarantines suspicious plays for appeal."
+      },
+      {
+        "id": "Observability",
+        "label": "Observability / QoE Metrics",
+        "type": "observability",
+        "category": "ops",
+        "traits": [
+          "stateful",
+          "derived"
+        ],
+        "description": "Collects client playback telemetry (start latency, rebuffer), CDN/origin metrics, entitlement failures, and pipeline lag for alerting on QoE and integrity."
       }
     ],
     "links": [
@@ -320,12 +352,6 @@
         "label": "index new tracks"
       },
       {
-        "id": "playlog-royalty",
-        "from": "PlayLog",
-        "to": "Royalty",
-        "label": "play events"
-      },
-      {
         "id": "royalty-db",
         "from": "Royalty",
         "to": "RoyaltyDB",
@@ -348,6 +374,60 @@
         "from": "Ingest",
         "to": "RightsDB",
         "label": "register rights window"
+      },
+      {
+        "id": "playlog-fraud",
+        "from": "PlayLog",
+        "to": "Fraud",
+        "label": "score abuse"
+      },
+      {
+        "id": "fraud-royalty",
+        "from": "Fraud",
+        "to": "Royalty",
+        "label": "clean play stream"
+      },
+      {
+        "id": "feature-cand",
+        "from": "FeatureStore",
+        "to": "CandStore",
+        "label": "batch candidates / embeddings"
+      },
+      {
+        "id": "cand-rec",
+        "from": "CandStore",
+        "to": "RecSvc",
+        "label": "retrieve + rank"
+      },
+      {
+        "id": "client-rec",
+        "from": "Client",
+        "to": "RecSvc",
+        "label": "home / personalized feed"
+      },
+      {
+        "id": "cdn-obs",
+        "from": "CDN",
+        "to": "Observability",
+        "label": "edge/origin metrics"
+      },
+      {
+        "id": "client-obs",
+        "from": "Client",
+        "to": "Observability",
+        "label": "playback QoE telemetry"
+      },
+      {
+        "id": "stream-obs",
+        "from": "StreamSvc",
+        "to": "Observability",
+        "label": "entitlement/manifest metrics"
+      },
+      {
+        "id": "playlog-obs",
+        "from": "PlayLog",
+        "to": "Observability",
+        "label": "consumer lag"
       }
     ],
     "types": [
@@ -381,6 +461,8 @@
           "PlayLog",
           "RecSvc",
           "FeatureStore",
+          "CandStore",
+          "Fraud",
           "Royalty",
           "RoyaltyDB"
         ]
@@ -435,7 +517,7 @@
     },
     {
       "label": "Concurrent streams",
-      "value": "~30M peak, ~3 MB/s aggregate per 10k streams",
+      "value": "~30M peak, ~20 KB/s per stream",
       "note": "At 160 kbps ≈ 20 KB/s per stream, 30M streams ≈ 600 GB/s edge egress — must be CDN-served, never origin (step 2)."
     },
     {
@@ -786,25 +868,51 @@
     },
     {
       "name": "royalty_ledger (accounting output)",
-      "note": "Idempotent royalty consumer's authoritative billable-stream counts.",
+      "note": "Idempotent royalty consumer's authoritative billable-stream counts, scoped to an accounting period that closes and can be replayed.",
       "fields": [
         {
-          "name": "(track_id, period)",
-          "type": "PK"
+          "name": "(track_id, market, period)",
+          "type": "PK (per-territory counts)"
         },
         {
           "name": "billable_streams",
           "type": "bigint (deduped, fraud-filtered)"
         },
         {
-          "name": "rights_holder_id / isrc",
-          "type": "bigint / varchar"
+          "name": "period_state",
+          "type": "enum (open / closed / corrected) — closed periods are immutable; fixes land as adjustment rows"
+        },
+        {
+          "name": "isrc / source_offset",
+          "type": "varchar / bigint (replay watermark for reproducibility)"
         }
       ]
     },
     {
-      "name": "feature_store (rec output)",
-      "note": "Per-user history/features for online recommendation retrieval.",
+      "name": "rights_holder_split",
+      "note": "Maps a track's streams to who gets paid: labels, publishers, and performers by territory and effective window. Splits change over time, so they are versioned and dated, not a single owner field.",
+      "fields": [
+        {
+          "name": "(isrc, market, effective_window)",
+          "type": "PK (tsrange)"
+        },
+        {
+          "name": "rights_holder_id / role",
+          "type": "bigint / enum (label / publisher / performer)"
+        },
+        {
+          "name": "split_pct",
+          "type": "decimal (sums to 100 per market/window)"
+        },
+        {
+          "name": "contract_id / dispute_state",
+          "type": "bigint / enum (active / disputed / corrected)"
+        }
+      ]
+    },
+    {
+      "name": "feature_store (rec input)",
+      "note": "Per-user history/features for online recommendation retrieval; updated by streaming + batch jobs off the play log.",
       "fields": [
         {
           "name": "user_id",
@@ -812,11 +920,33 @@
         },
         {
           "name": "recent_tracks / genres",
-          "type": "list (decayed history)"
+          "type": "list (decayed history, near-real-time)"
         },
         {
           "name": "embedding",
           "type": "vector (batch-computed taste profile)"
+        }
+      ]
+    },
+    {
+      "name": "rec_candidates (model output)",
+      "note": "Batch/streaming model outputs retrieved at serving time: candidate sets, ANN-indexed embeddings, and precomputed generated-playlist tracklists.",
+      "fields": [
+        {
+          "name": "(user_id, shelf)",
+          "type": "PK (home shelf / Discover Weekly / radio seed)"
+        },
+        {
+          "name": "candidate_track_ids",
+          "type": "list (ranked, with scores)"
+        },
+        {
+          "name": "generated_at / model_version",
+          "type": "timestamp / varchar (freshness + rollback)"
+        },
+        {
+          "name": "is_fallback",
+          "type": "bool (cold-start: popular-by-market / editorial)"
         }
       ]
     }
@@ -897,12 +1027,21 @@
     },
     {
       "name": "Async ingestion pipeline",
-      "what": "Encode uploaded masters into streaming assets off the serving path.",
+      "what": "Encode uploaded masters into streaming assets off the serving path, as an idempotent state machine with deterministic output keys and a publish-last step.",
       "whenToUse": "Adding content to the catalog without blocking playback.",
       "steps": [
-        "playback"
+        "scale"
       ],
-      "group": "Segmented Audio Delivery via CDN"
+      "group": "Ingestion, Hot Content, and Scale"
+    },
+    {
+      "name": "Recommendation serving funnel",
+      "what": "Turn the play log into features, batch candidate generation + model outputs, then online retrieval/ranking for home and generated playlists, with popularity/editorial fallbacks for cold start.",
+      "whenToUse": "Personalized feeds where candidate generation is expensive but serving must be fast.",
+      "steps": [
+        "signals"
+      ],
+      "group": "Play Events: Recommendations and Royalties"
     }
   ],
   "steps": [
@@ -1273,6 +1412,7 @@
       "description": [
         "Two very different data shapes: the catalog is huge, shared, and mostly immutable (tracks/albums/artists); the library is per-user, small, and mutable (saved tracks, playlists). Keep them in separate services/stores so each scales on its own terms.",
         "The catalog DB is the authoritative metadata store, but it is the wrong tool for search: prefix/typo-tolerant queries and relevance ranking over ~100M tracks need an inverted index, not LIKE scans. So search/browse runs against a separate search index fed from the catalog (and from ingestion as new tracks land), ranked by relevance + popularity and filtered to the user's market. The catalog DB stays the source of truth; the index is rebuildable derived state.",
+        "Because the index is derived, it can lag the catalog: after a takedown or region change the index may still surface a track for a moment. The catalog/rights store is authoritative, so availability is re-checked at query/hydration time (filtered to market, unavailable tracks greyed out) and the index is rebuildable — stale search results never let a user play something they aren't entitled to.",
         "The library service owns per-user state, sharded by user. Audio assets are referenced from the catalog; neither service stores audio bytes. This split mirrors the e-commerce catalog pattern: a shared read-optimized catalog plus per-user mutable state, with search as its own read path."
       ],
       "view": {
@@ -1496,14 +1636,26 @@
         "before": "Catalog + library exist.",
         "after": "Efficient reference-based playlists (item rows + versioning) hydrated on read, unavailable tracks handled.",
         "newRisk": "Users want music without connectivity — offline download and sync."
-      }
+      },
+      "failureDrills": [
+        {
+          "scenario": "Two collaborators reorder the same collaborative playlist at the same moment.",
+          "expectedBehavior": "Both inserts land on distinct fractional ranks so neither is lost; if they target the identical position a deterministic tie-break orders them, and a stale version write gets a 409 so the client re-reads and retries instead of clobbering.",
+          "mitigation": "Per-item fractional rank + playlist version (optimistic concurrency); edits touch one row and converge."
+        },
+        {
+          "scenario": "A track in a popular playlist is taken down right as thousands hydrate it.",
+          "expectedBehavior": "Hydration resolves it through the cached catalog + rights policy and renders it greyed-out 'unavailable'; the rest of the playlist still loads and plays. No dangling reference breaks the page.",
+          "mitigation": "Reference-by-id hydration through a cache + rights check; unavailable tracks degrade gracefully."
+        }
+      ]
     },
     {
       "id": "offline",
       "title": "5. Offline Download and Sync",
       "description": [
         "Offline is a state machine, not just 'download files.' A download moves through pending → downloaded → (expired | revoked). On request the library service first checks entitlement (subscription, market, and the per-device offline limit), then issues an offline DRM license bound to the device with an expiry; only then does the client fetch and cache the chosen-bitrate segments into an encrypted local store so content isn't freely extractable.",
-        "Library edits made offline (new playlist, saved track, reorder) buffer locally as operations and reconcile on reconnect against a sync cursor — pull changes since the last cursor, replay local ops, and resolve conflicts (playlists are versioned ordered lists, so concurrent edits merge via fractional ranks rather than clobbering). Play events recorded offline also buffer and flush (step 6).",
+        "Library edits made offline (new playlist, saved track, reorder) buffer locally as operations and reconcile on reconnect against a sync cursor — pull changes since the last cursor, replay local ops, and resolve conflicts (playlists are versioned ordered lists, so concurrent edits merge via fractional ranks rather than clobbering). Play events recorded offline buffer and flush through the same `/v1/plays:batch` path on reconnect, carrying client_ts ≪ server_ts; event_id dedupe makes the late delivery idempotent, and a very late play that arrives after its royalty period has closed lands as an adjustment in a later period rather than mutating a closed ledger (step 6/7).",
         "The offline license must be revalidated periodically (e.g. every 30 days online) and on reconnect: if the subscription lapsed, the market changed, or the track was taken down, the local copy is expired/revoked and made unplayable. Downloads survive short offline windows but can't outlive entitlement."
       ],
       "view": {
@@ -1686,30 +1838,40 @@
       "title": "6. Play Events: Recommendations and Royalties",
       "description": [
         "Every play/skip is a signal. Clients append play events to a durable, partitioned stream — each event carries an event_id (idempotency), a session_id + sequence number, ms_played, and both a client and server timestamp. Events are buffered offline and flushed on reconnect (client_ts ≪ server_ts marks a late/offline play), so offline plays still count.",
-        "One stream, several independent consumers with different correctness and latency needs — don't collapse them into one path: recommendations (build per-user features/history → online retrieval → generated playlists), royalty accounting (dedupe by event_id, filter fraud/bot plays, count a play past a threshold as a billable stream, write to an authoritative ledger), fraud filtering, resume-position, and metrics. The stream is at-least-once, so each consumer is idempotent on event_id; the royalty ledger must be exactly-once in effect.",
-        "Separating royalty accounting from recommendations matters: recommendations can be eventually consistent and approximate, but the ledger is money and must be deduped, auditable, and reproducible. Recommendations reuse a candidate-gen + ranking funnel over the feature store; generated playlists are written back into the user's library."
+        "One stream, several independent consumers with different correctness and latency needs — don't collapse them into one path: recommendations, royalty accounting (dedupe by event_id, filter fraud/bot plays, count a play past a threshold as a billable stream, write to an authoritative ledger), fraud filtering, resume-position, and metrics. The stream is at-least-once, so each consumer is idempotent on event_id; the royalty ledger must be exactly-once in effect.",
+        "Recommendation serving is its own funnel, not just 'recs write to library.' Streaming + batch jobs turn the play log into per-user features (recent tracks, decayed genre affinity) and batch-compute candidate sets and embeddings into a candidate/model store. At request time the recommendation service does online retrieval (ANN over embeddings + candidate sets) then ranking, and serves two distinct surfaces: the personalized home/feed must return in tens of milliseconds per request (retrieve + rank precomputed candidates), whereas generated playlists like Discover Weekly are batch jobs run on a cadence (e.g. weekly) and written into the library. Cold-start users with no history fall back to popular-by-market and editorial shelves until enough signal accrues.",
+        "Fraud filtering is a first-class consumer that sits before royalties: bot/farm detection, device/account velocity, and suspicious-repeat heuristics score each play; only the clean stream feeds the ledger, and quarantined plays get an appeal/replay path. It is deliberately separate from recommendation features so abuse scoring and payment integrity don't entangle taste modeling.",
+        "Separating royalty accounting from recommendations matters: recommendations can be eventually consistent and approximate, but the ledger is money and must be deduped, fraud-filtered, auditable, and reproducible. Raw play events retain for ~30 days (for replay/backfill) then aggregate; listening history is sensitive, so user deletion/export propagates to the feature store and aggregates are anonymized."
       ],
       "view": {
         "nodes": [
           "Client",
           "PlayLog",
           "FeatureStore",
+          "CandStore",
           "RecSvc",
+          "Fraud",
           "Royalty",
           "RoyaltyDB",
           "LibrarySvc"
         ],
-        "caption": "The client appends play/skip events to the partitioned play event log; one consumer builds features for recommendations (written back to the library), an independent idempotent consumer dedupes events into the royalty ledger.",
+        "caption": "The client appends play/skip events to the partitioned play event log; a feature/candidate pipeline feeds online recommendation serving (home feed + generated playlists), a fraud filter cleans the stream, and an independent idempotent consumer dedupes the clean stream into the royalty ledger.",
         "links": [
           "client-playlog",
           "playlog-feature",
+          "feature-cand",
+          "cand-rec",
           "feature-rec",
+          "client-rec",
           "rec-library",
-          "playlog-royalty",
+          "playlog-fraud",
+          "fraud-royalty",
           "royalty-db"
         ],
         "highlight": [
           "PlayLog",
+          "RecSvc",
+          "Fraud",
           "Royalty"
         ],
         "groups": [
@@ -1735,22 +1897,30 @@
               "Client",
               "PlayLog",
               "FeatureStore",
+              "CandStore",
               "RecSvc",
+              "Fraud",
               "Royalty",
               "RoyaltyDB",
               "LibrarySvc"
             ],
-            "caption": "Play/skip events are appended to a partitioned log; a recommendation consumer builds features and writes generated playlists, while an independent idempotent royalty consumer dedupes into the ledger.",
+            "caption": "Play/skip events are appended to a partitioned log; features + candidates feed online recommendation serving and generated playlists, a fraud filter cleans the stream, and an independent idempotent royalty consumer dedupes the clean stream into the ledger.",
             "links": [
               "client-playlog",
               "playlog-feature",
+              "feature-cand",
+              "cand-rec",
               "feature-rec",
+              "client-rec",
               "rec-library",
-              "playlog-royalty",
+              "playlog-fraud",
+              "fraud-royalty",
               "royalty-db"
             ],
             "highlight": [
               "PlayLog",
+              "RecSvc",
+              "Fraud",
               "Royalty"
             ],
             "groups": [
@@ -1801,6 +1971,7 @@
       "decisionPrompt": "Why route play events through a stream instead of writing each play to the DB synchronously?",
       "patterns": [
         "Play-event stream",
+        "Recommendation serving funnel",
         "Idempotent royalty ledger"
       ],
       "probeLinks": [
@@ -1819,6 +1990,20 @@
           "whyItMatters": "Reliable behavior capture (incl. offline) feeding personalization and billing.",
           "example": "Play > 30s -> counts as a stream; history -> Discover Weekly.",
           "group": "Play Events: Recommendations and Royalties"
+        },
+        {
+          "term": "Candidate generation → ranking funnel",
+          "definition": "Batch-compute candidate sets/embeddings into a candidate store, then retrieve (ANN) + rank online per request; generated playlists are a separate batch job.",
+          "whyItMatters": "Home feed must serve in tens of ms while heavy modeling runs offline; weekly playlists can be precomputed; both share the feature store.",
+          "example": "Home shelf: retrieve 500 candidates by embedding, rank to 30. Discover Weekly: weekly batch writes 30 tracks to the library.",
+          "group": "Play Events: Recommendations and Royalties"
+        },
+        {
+          "term": "Fraud filter before the ledger",
+          "definition": "A dedicated consumer scores bot/farm/velocity abuse and emits a clean stream; only clean plays become billable, with an appeal/replay path.",
+          "whyItMatters": "Behavior data drives money, so abuse must be filtered before royalties — and kept separate from recommendation features.",
+          "example": "1000 identical 31s plays from one device in an hour → quarantined, not counted.",
+          "group": "Play Events: Recommendations and Royalties"
         }
       ],
       "recap": {
@@ -1828,8 +2013,8 @@
       },
       "flows": [
         {
-          "name": "Play event → stream → recs + royalty ledger",
-          "note": "Play/skip events stream asynchronously (buffered offline) and fan out to independent consumers — recommendations build features, royalty accounting dedupes into the ledger — never blocking playback.",
+          "name": "Play event → stream → recs + fraud + royalty ledger",
+          "note": "Play/skip events stream asynchronously (buffered offline) and fan out to independent consumers — features feed recommendation serving and generated playlists, a fraud filter cleans the stream before royalty accounting dedupes into the ledger — never blocking playback.",
           "sequence": {
             "participants": [
               {
@@ -1840,16 +2025,20 @@
                 "label": "Play Event Log"
               },
               {
+                "id": "FeatureStore",
+                "label": "Feature / Candidate Store"
+              },
+              {
                 "id": "RecSvc",
                 "label": "Recommendation Service"
               },
               {
-                "id": "Royalty",
-                "label": "Royalty Accounting"
+                "id": "Fraud",
+                "label": "Fraud Filter"
               },
               {
-                "id": "LibrarySvc",
-                "label": "Library Service"
+                "id": "Royalty",
+                "label": "Royalty Accounting"
               }
             ],
             "messages": [
@@ -1861,26 +2050,46 @@
               },
               {
                 "from": "PlayLog",
+                "to": "FeatureStore",
+                "arrow": "->>",
+                "label": "features + batch candidates"
+              },
+              {
+                "from": "Client",
                 "to": "RecSvc",
                 "arrow": "->>",
-                "label": "history signals → features"
+                "label": "request home feed"
               },
               {
                 "from": "RecSvc",
-                "to": "LibrarySvc",
+                "to": "FeatureStore",
                 "arrow": "->>",
-                "label": "write generated playlists"
+                "label": "retrieve + rank candidates"
+              },
+              {
+                "from": "RecSvc",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "personalized shelf (cold-start: popular)"
               },
               {
                 "from": "PlayLog",
+                "to": "Fraud",
+                "arrow": "->>",
+                "label": "score abuse"
+              },
+              {
+                "from": "Fraud",
                 "to": "Royalty",
                 "arrow": "->>",
-                "label": "dedupe + fraud-filter → billable stream"
+                "label": "clean stream → dedupe → billable"
               }
             ]
           },
           "highlight": [
             "PlayLog",
+            "RecSvc",
+            "Fraud",
             "Royalty"
           ]
         }
@@ -1895,6 +2104,16 @@
           "trap": "Putting recommendations and royalty accounting on the same consumer/path.",
           "why": "They have opposite requirements — recs tolerate lag and approximation; royalties must be exact, deduped, and reproducible. Coupling them makes one's backlog or bug corrupt the other.",
           "instead": "Independent consumer groups off the same stream, each idempotent, scaled and operated separately."
+        },
+        {
+          "trap": "Generating the home feed by running the full model on every request.",
+          "why": "Heavy candidate generation per request blows the tens-of-ms latency budget and the home page stalls under load.",
+          "instead": "Batch-compute candidates/embeddings offline into a candidate store; serve home by retrieving + ranking precomputed candidates, with popular-by-market fallbacks for cold-start users."
+        },
+        {
+          "trap": "Treating raw listening history as ordinary analytics data with no governance.",
+          "why": "Listening history is sensitive personal data and it also drives payments; unbounded retention and no deletion path create privacy and compliance risk.",
+          "instead": "Bound raw-event retention (~30 days) then aggregate/anonymize; honor user deletion/export across the feature store; keep fraud/abuse scoring separate from taste features."
         }
       ]
     },
@@ -1904,7 +2123,7 @@
       "description": [
         "New content enters via an async ingestion/transcode pipeline — a state machine off the serving path, so adding music never affects playback. A master moves through received → transcoding (each bitrate in the ladder) → segmented → published to the catalog, search index, and rights policy. Output keys are deterministic (track+bitrate+segment), so a retry is idempotent and re-running a failed job overwrites the same objects instead of duplicating. Failed jobs go to a dead-letter queue for inspection; publish is the last, atomic step so a track is never half-visible. Rollback unpublishes a bad encode without deleting audio.",
         "Hot content (a viral track, a new release) gets disproportionate reads — absorbed by the CDN (audio) and catalog cache (metadata), with prewarming and an origin shield ahead of an announced drop, and a per-track popularity cache to keep the hottest segments resident. Play-event bursts buffer in the partitioned stream with autoscaled, independent consumers; backpressure is the log's depth, not the playback path.",
-        "Shard catalog and library by their access keys; replicate catalog reads and the CDN globally. Audio is durable in object storage; catalog/library/rights/ledger are authoritative; CDN, caches, search index, and feature store are rebuildable derived state. Operate to SLOs (below): start latency, rebuffer ratio, CDN hit ratio, play-log lag, royalty-pipeline lag, and ingestion backlog."
+        "Shard catalog and library by their access keys; replicate catalog reads and the CDN globally. Audio is durable in object storage; catalog/library/rights/ledger are authoritative; CDN, caches, search index, feature store, and candidate store are rebuildable derived state. Royalty ledgers are per-territory and close per accounting period: a closed period is immutable, and late offline plays or fraud reversals land as adjustment rows rather than mutating history — the deduped event log makes a period replayable. Operate to SLOs via the observability path (below): start latency, rebuffer ratio, CDN hit ratio, entitlement/manifest failures, play-log lag, royalty-pipeline lag, fraud-filtered rate, and ingestion backlog all flow to metrics and alerting."
       ],
       "view": {
         "nodes": [
@@ -1914,18 +2133,23 @@
           "CatalogSvc",
           "SearchIdx",
           "CDN",
-          "PlayLog"
+          "PlayLog",
+          "Observability"
         ],
-        "caption": "At scale the ingestion/transcode pipeline fills the object store and registers tracks in the catalog and search index, while the CDN serves audio and the play event log absorbs high-volume client events.",
+        "caption": "At scale the ingestion/transcode pipeline fills the object store and registers tracks in the catalog and search index, the CDN serves audio and the play event log absorbs high-volume client events, and observability collects QoE/CDN/entitlement/pipeline metrics for alerting.",
         "links": [
           "ingest-audio",
           "ingest-catalog",
           "ingest-search",
           "cdn-audio",
-          "client-playlog"
+          "client-playlog",
+          "client-obs",
+          "cdn-obs",
+          "playlog-obs"
         ],
         "highlight": [
-          "Ingest"
+          "Ingest",
+          "Observability"
         ],
         "groups": [
           "data",
@@ -1936,11 +2160,35 @@
       "whyNow": [
         "Closing on async ingestion + hot-content scaling shows the design adds content cleanly and survives release spikes."
       ],
+      "concepts": [
+        {
+          "term": "Ingestion state machine",
+          "definition": "A master moves received → transcoding → segmented → published as an idempotent pipeline with deterministic output keys, retry/dead-letter, and publish as the last atomic step.",
+          "whyItMatters": "Adding content never half-publishes or blocks playback; failed jobs retry cheaply to the same keys or dead-letter for inspection.",
+          "example": "A corrupt master retries to the same track+bitrate+segment keys, then dead-letters; the track stays unpublished, not half-visible.",
+          "group": "Ingestion, Hot Content, and Scale"
+        },
+        {
+          "term": "Hot-content prewarming + origin shield",
+          "definition": "Push hot segments to the edge before an announced drop and collapse concurrent origin misses behind a shield so origin sees one fetch per segment.",
+          "whyItMatters": "Protects the ~1-2% origin-miss budget at ~3M segment GETs/sec so a cold-cache new release doesn't become an origin miss-storm.",
+          "example": "Prewarm a Friday album release; request collapsing turns millions of cold-segment misses into one origin fetch each.",
+          "group": "Ingestion, Hot Content, and Scale"
+        },
+        {
+          "term": "Observability for QoE",
+          "definition": "Collect client playback telemetry, CDN/origin metrics, entitlement/manifest failures, and consumer lag as first-class signals.",
+          "whyItMatters": "For media, quality-of-experience metrics are how operators catch CDN regressions, bad bitrate ladders, entitlement outages, fraud spikes, and pipeline backlogs.",
+          "example": "Page when start-latency p99 or rebuffer ratio breaches target, or royalty-consumer lag grows.",
+          "group": "Ingestion, Hot Content, and Scale"
+        }
+      ],
       "probeLinks": [
         "kafka-design",
         "netflix-open-connect",
         "apple-hls",
-        "dash-if"
+        "dash-if",
+        "prometheus-docs"
       ],
       "recap": {
         "before": "Functional service.",
@@ -1994,7 +2242,7 @@
   ],
   "finalDesign": {
     "title": "Final Design — Audio Streaming",
-    "description": "An async ingestion pipeline transcodes masters into bitrate segments in object storage and publishes tracks to the catalog, search index, and rights policy. Playback first checks entitlement (subscription, region, availability) via the entitlement/license service, then hands out signed CDN segment URLs and a DRM license for instant-start adaptive streaming. A catalog/library split keeps the shared, cacheable catalog (with a dedicated search index) separate from per-user playlists (item rows referencing tracks, versioned, hydrated on read); offline download issues a device-bound license and caches encrypted audio locally with edits reconciled against a sync cursor on reconnect. Play/skip events stream (buffered offline, deduped by event_id) and fan out to independent consumers — a feature store feeding recommendations and an idempotent royalty consumer writing an auditable ledger. Audio is CDN-served and durable; catalog/library/rights/ledger are authoritative; CDN, caches, search index, and feature store are rebuildable derived state.",
+    "description": "An async ingestion pipeline (an idempotent state machine with deterministic keys and a publish-last step) transcodes masters into bitrate segments in object storage and publishes tracks to the catalog, search index, and rights policy. Playback first checks entitlement (subscription, region, availability) via the entitlement/license service, then hands out signed CDN segment URLs and a DRM license for instant-start adaptive streaming. A catalog/library split keeps the shared, cacheable catalog (with a dedicated search index) separate from per-user playlists (item rows referencing tracks, versioned, hydrated on read); offline download issues a device-bound license and caches encrypted audio locally with edits reconciled against a sync cursor on reconnect. Play/skip events stream (buffered offline, deduped by event_id) and fan out to independent consumers — a feature + candidate store feeding online recommendation serving (home feed plus batch-generated playlists, with cold-start fallbacks), a fraud filter that cleans the stream, and an idempotent royalty consumer writing a per-territory, period-closing auditable ledger keyed to versioned rights-holder splits. An observability path collects playback QoE, CDN/origin, entitlement, pipeline-lag, and fraud metrics. Audio is CDN-served and durable; catalog/library/rights/ledger are authoritative; CDN, caches, search index, feature store, and candidate store are rebuildable derived state.",
     "view": {
       "nodes": [
         "Client",
@@ -2012,11 +2260,14 @@
         "Ingest",
         "PlayLog",
         "FeatureStore",
+        "CandStore",
         "RecSvc",
+        "Fraud",
         "Royalty",
-        "RoyaltyDB"
+        "RoyaltyDB",
+        "Observability"
       ],
-      "caption": "End to end: clients stream entitlement-checked segments from the CDN via the streaming service, search/browse the catalog, manage playlists in the library service, and feed the play event log that fans out to recommendations (via the feature store) and the royalty ledger — all fed by the ingestion pipeline.",
+      "caption": "End to end: clients stream entitlement-checked segments from the CDN via the streaming service, search/browse the catalog, manage playlists in the library service, and feed the play event log that fans out to recommendation serving (feature + candidate store), a fraud filter, and the royalty ledger — all fed by the ingestion pipeline, with observability collecting QoE/CDN/entitlement/pipeline metrics.",
       "links": [
         "client-lb",
         "lb-stream",
@@ -2037,11 +2288,19 @@
         "ingest-rights",
         "client-playlog",
         "playlog-feature",
+        "feature-cand",
+        "cand-rec",
         "feature-rec",
+        "client-rec",
         "rec-library",
-        "playlog-royalty",
+        "playlog-fraud",
+        "fraud-royalty",
         "royalty-db",
-        "client-library"
+        "client-library",
+        "client-obs",
+        "cdn-obs",
+        "stream-obs",
+        "playlog-obs"
       ],
       "groups": [
         "playback",
@@ -2082,10 +2341,18 @@
         ]
       },
       {
-        "requirement": "Personalized playlists",
-        "how": "Play-event stream -> feature store -> recs -> library.",
+        "requirement": "Personalized home + playlists",
+        "how": "Play-event stream -> feature + candidate store -> online retrieval/ranking for home feed and batch-generated playlists, with cold-start fallbacks.",
         "steps": [
           "signals"
+        ]
+      },
+      {
+        "requirement": "Licensed playback/download only",
+        "how": "Per-play/-download entitlement check (subscription/region/availability) + DRM/offline licenses bound to device, backed by a versioned rights policy that invalidates on takedown.",
+        "steps": [
+          "playback",
+          "offline"
         ]
       }
     ],
@@ -2128,19 +2395,18 @@
         ]
       },
       {
-        "requirement": "Licensed playback only",
-        "how": "Per-play entitlement check (subscription/region/availability) + DRM/offline licenses + versioned rights policy.",
+        "requirement": "Accurate royalty accounting",
+        "how": "Fraud-filtered then idempotent consumer writing a per-territory, period-closing auditable ledger keyed to versioned rights-holder splits, isolated from recommendations.",
         "steps": [
-          "playback",
-          "offline",
+          "signals",
           "scale"
         ]
       },
       {
-        "requirement": "Accurate royalty accounting",
-        "how": "Idempotent, fraud-filtered consumer writing an auditable ledger, isolated from recommendations.",
+        "requirement": "Observable QoE & integrity",
+        "how": "Observability path collecting playback QoE, CDN/origin, entitlement, pipeline-lag, and fraud metrics for SLO alerting.",
         "steps": [
-          "signals"
+          "scale"
         ]
       }
     ]

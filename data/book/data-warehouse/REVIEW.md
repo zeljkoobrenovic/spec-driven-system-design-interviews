@@ -1,287 +1,371 @@
 # Review: Data Warehouse / ETL Ingestion - System Design
 
 Reviewed file: `data/book/data-warehouse/interview.json`
-Review date: 2026-06-04
+Review date: 2026-06-09
 
 ## Executive Summary
 
-This review reflects the current dataset after the recent improvement pass. The
-previous highest-impact findings have largely been addressed: the baseline now
-uses an operational database instead of the warehouse, the capacity model is
-quantitative, CDC/watermark semantics are explicit, atomic publish/read
-isolation are taught, the API and data model are much richer, and
-`technologyChoices` has been added.
+This dataset is now a strong book-quality walkthrough. It teaches a coherent
+modern analytical platform: heterogeneous ingestion, immutable raw landing,
+idempotent ELT, schema evolution, partitioned columnar serving, controlled
+backfills, quality-gated orchestration, lineage, and governance.
 
-The interview is now a strong book-quality data-platform case. The remaining
-work is less about the core architecture and more about making the production
-contract visible everywhere it matters: operator APIs, raw-data governance,
-serving/cost operations, and the final orchestration/quality/lineage workflow.
+The previous review's biggest concerns have largely been addressed in the
+current `interview.json`: governance is now first-class, the run API includes
+idempotency/versioning, serving operations are explained, step 7 has a sequence
+flow, technology icons and generated visuals are wired, and structural
+references validate cleanly.
+
+The remaining work is mostly about tightening the operator control plane and
+teaching the newer production concerns as reusable patterns.
 
 | Area | Rating | Notes |
 | --- | --- | --- |
-| System design soundness | 4.5/5 | The architecture is coherent and now includes CDC, idempotency, atomic publish, schema evolution, backfills, and quality gates. |
-| Production realism | 4/5 | Much stronger, but raw-lake governance, API state transitions, workload controls, and cost operations should be more explicit. |
-| Pedagogical flow | 4.5/5 | The seven-step progression is natural and each step exposes the next problem. Step 7 is still dense. |
-| Dataset/rendering fit | 4.5/5 | JSON is valid and structural references resolve; remaining issues are content polish and optional visual/icon assets. |
-| Overall | 4.5/5 | Near-ready. Tightening the control-plane and governance details would move it from strong to excellent. |
+| System design soundness | 4.7/5 | The architecture is credible and internally consistent; remaining gaps are lifecycle/state-model details. |
+| Production realism | 4.5/5 | Strong on CDC, snapshots, governance, quality, and backfills; query/cost operations need a concrete contract. |
+| Pedagogical flow | 4.6/5 | The seven-step progression is natural; newer concepts should be promoted into patterns/concepts/traps. |
+| Dataset/rendering fit | 4.8/5 | JSON, graph references, step links, sequence participants, and asset references validate cleanly. |
+| Overall | 4.6/5 | Near-ready. A focused control-plane polish pass would move it from strong to excellent. |
 
 ## What Works Well
 
-- The ELT spine is now very clear: transform-first ETL into an operational DB is
-  the baseline, then the design moves raw landing, idempotent transforms,
-  schema evolution, serving, backfills, and orchestration into place.
-- The capacity section now gives useful interview numbers: source count, hot
-  tables, 5 TB/day raw ingest, 2x to 4x storage multiplier, retention,
-  query concurrency, and a concrete 90-day backfill example.
-- Step `ingest` now teaches a real CDC contract: offsets/LSNs, primary keys,
-  event time, ingest time, source version, operation type, tombstones,
-  watermarks, and late/out-of-order handling.
-- Step `transform` now explains the most important correctness mechanism:
-  write temporary output, validate, atomically publish, then advance the output
-  watermark while readers pin to committed snapshots.
-- The data model now supports the promised control plane with `source`,
-  `pipeline`, `pipeline_run / task_run`, `output_snapshot`, `schema_version`,
-  `quality_check_result`, `lineage_edge`, and `backfill_job`.
-- The option comparisons are realistic: ELT vs ETL, partition overwrite vs
-  append/dedup vs MERGE, warehouse vs lakehouse vs OLAP cube.
-- The technology choices section is useful and covers warehouse/lakehouse,
-  table formats, transform frameworks, orchestrators, CDC/connectors, and event
-  streams.
+- The interview has a clear spine: naive ETL into an operational DB, raw ELT
+  landing, idempotent transforms, schema evolution, serving, backfills, then
+  orchestration/quality/lineage.
+- Step `ingest` now teaches the CDC contract well: offsets/LSNs, source
+  version, primary key, op type, tombstones, event time, ingest time,
+  completeness watermarks, late events, and replay.
+- Raw-lake governance is now structurally represented through a non-functional
+  requirement, architecture node, architecture links, data-model entities,
+  governance APIs, technology choices, and final-design prose.
+- Step `transform` correctly teaches the key reliability invariant: write a
+  temporary/unpublished snapshot, validate, atomically publish, then advance the
+  output watermark while readers pin to committed snapshots.
+- Step `serve` now connects storage layout to operations: compaction, snapshot
+  expiry, table stats, clustering/sorting, materialized rollups, query
+  isolation, quotas, budgets, kill/cancel controls, and cost telemetry.
+- Step `orchestrate` now has the missing quality-gated publish flow, including
+  pass/fail branches and lineage recording after publish.
+- The final design integrates all high-level nodes and links, including
+  governance.
+- Generated assets are now present: requirements/capacity visuals, per-step AI
+  visuals, final-design visual, design-vs-requirements visuals, comic, and
+  technology icons.
 
 ## Highest-Impact Issues
 
-### 1. The API examples lag behind the new control-plane contract
+### 1. The run-state contract is close but not explicit enough
 
-The prose and data model now teach idempotency keys, output snapshots, quality
-gates, atomic publish, cancel/retry, lineage, and controlled backfills. The
-first API, `POST /v1/pipelines/{id}/run`, is still too simple:
+The API and data model use related but not identical state language. For
+example, `POST /v1/pipelines/{id}/run` returns `state: "loading"`, retry returns
+`state: "running"`, and the `pipeline_run / task_run` data model lists only
+`running, succeeded, failed, cancelled`. The architecture prose needs more
+states than that: queued/admitted, loading, transforming, validating,
+publishing, succeeded, failed, cancelled, and possibly blocked.
 
-- Request: `{ "partition": "2026-06-01", "mode": "incremental" }`
-- Response: `{ "runId": "r_9", "state": "running" }`
-- Sequence: load partition, write staging, transform partition, write modeled
-  marts, mark run complete.
+This matters because the dataset is now teaching an operator-facing platform,
+not just a data path. A candidate should be able to explain exactly when the
+run is retryable, when a temp snapshot exists, when the output is visible, when
+dependents can unblock, and what a cancel request can still cancel.
 
-That sequence skips the new temporary output, quality validation, snapshot
-commit, output watermark advancement, and failure branch. It also does not show
-the idempotency key or transform/schema version that later sections rely on.
+Concrete fix:
 
-Concrete fix: update the run API to carry `idempotencyKey`, `partition` or
-`range`, `mode`, `transformVersion`, optional `schemaVersion`, and maybe
-`priority`. Update the sequence to match step `transform`: write temp snapshot,
-run quality checks, commit/publish on pass, discard temp output on fail, then
-advance the watermark. The richer `GET /v1/runs/{runId}` response is good; the
-trigger API should expose the same contract.
+- Expand `pipeline_run / task_run.state` to match the API and sequence flow:
+  `queued`, `loading`, `transforming`, `validating`, `publishing`, `succeeded`,
+  `failed`, `cancelled`.
+- Add `failure_reason`, `blocked_by`, `cancel_requested_at`, and
+  `completed_at` fields, or mention them in the run-status API.
+- Make `output_snapshot.state` distinguish `pending`, `committed`,
+  `superseded`, and `aborted` so failed temp output has a clean lifecycle.
+- Add one sentence to step `transform` or `orchestrate` that describes the
+  visibility boundary: only `committed` snapshots are queryable; failed or
+  cancelled runs abort temp snapshots and leave the last good snapshot visible.
 
-### 2. Raw-lake governance is acknowledged but not designed
+### 2. Query and cost operations are in prose but not in the API/data model
 
-Step `ingest` correctly notes that sensitive fields land in the lake before
-masking, so governance must cover raw data. The rest of the dataset does not
-carry that concern forward. There is no requirement, architecture node, API, or
-data-model entity for raw-data access control, classification, masking,
-retention, audit, legal hold, or deletion workflows.
+Step `serve` rightly says the platform needs workload isolation, query queues,
+quotas, budgets, kill/cancel controls, and cost telemetry. The exposed query
+API is still:
 
-This matters because ELT intentionally keeps unmodified raw data. That is the
-source of reprocessability, but it also means the raw lake is the most sensitive
-part of the system.
+`GET /v1/query` with `{ "sql": "SELECT ..." }` returning `{ "rows": [ ... ] }`.
 
-Concrete fix: add a small governance thread without turning the case into a
-compliance interview:
+That is fine for a minimal query example, but it does not support the operating
+story the step now teaches. There is no query job ID, queue/warehouse selection,
+bytes-scanned estimate, caller identity, access/masking decision, cost
+attribution, or query cancellation endpoint.
 
-- Non-functional requirement: governed raw retention and auditable access.
-- Data model: `data_classification`, `access_policy`, `retention_policy`,
-  `audit_event`, and maybe `deletion_request` or `legal_hold`.
-- Architecture: either a `Catalog` responsibility extension or a small
-  governance/access-control node.
-- Step text: raw is encrypted, access is least-privilege, sensitive columns are
-  tagged, modeled outputs apply masking/tokenization, and raw retention/deletion
-  policies are enforced.
+Concrete fix:
 
-### 3. Serving and cost operations need one more layer of mechanism
+- Replace or supplement `GET /v1/query` with an async query-job contract:
+  `POST /v1/query-jobs`, `GET /v1/query-jobs/{id}`, and
+  `POST /v1/query-jobs/{id}/cancel`.
+- Include `workloadClass` or `queue`, `principal`, `estimatedBytes`,
+  `budgetPolicy`, `state`, `bytesScanned`, `computeSeconds`, and
+  `costAttribution`.
+- Add a small `query_job` or `workload_policy` data-model entry.
+- Tie the governance response to this query contract: the effective access
+  decision should explain whether the result is raw denied, modeled allowed,
+  or column-masked.
 
-The capacity model, serving traps, and technology choices now mention small
-files, compaction, query concurrency, rollups, and storage/compute trade-offs.
-That is good, but the default serving path still mostly teaches partitioning
-and columnar scans. It does not show how the platform keeps those tables healthy
-over time.
+### 3. Governance deletion is credible but under-modeled
 
-Concrete fix: expand step `serve` or step `orchestrate` with operational knobs:
+The dataset now has strong governance coverage, including classification,
+access policy, retention/legal hold, audit events, and deletion-request APIs.
+The remaining ambiguity is how deletion requests interact with raw retention,
+modeled snapshots, and backfills.
 
-- Compaction and file-size targets for the lakehouse path.
-- Table statistics, clustering/sorting, and partition-pruning health checks.
-- Materialized view or rollup refresh ownership.
-- Workload isolation for dashboards vs ad-hoc queries.
-- Query queues, quotas, budgets, and kill/cancel controls.
-- Cost telemetry tied to pipeline runs, backfills, and query workloads.
+The API says a deletion request can crypto-shred and record an audit event, but
+the data model has no `deletion_request` entity. The walkthrough also does not
+say whether erasure creates tombstones, rewrites affected modeled partitions,
+marks snapshots as expired, or prevents future backfills from resurrecting
+erased raw data.
 
-This would connect the new capacity numbers to operating decisions.
+Concrete fix:
 
-### 4. Orchestration, quality, and lineage are correct but visually compressed
+- Add a small `deletion_request` entity with `request_id`, `subject_key`,
+  `scope`, `state`, `blocked_by_legal_hold`, `created_by`, and `completed_at`.
+- Mention the propagation rule: a deletion request either records a tombstone or
+  crypto-shreds the subject key, schedules modeled-partition rewrites, and
+  makes future backfills apply the same erasure policy.
+- Add one governance trap: "Deleting only modeled rows while retained raw can
+  re-create them during a backfill."
 
-Step `orchestrate` contains the right ideas: DAG dependencies, retries,
-watermarks, quality gates, blocking vs advisory checks, owner alerts,
-remediation, and lineage. The step has a focused architecture view, but no
-sequence flow. Because the step closes the interview, it should show the final
-production workflow as concretely as step `transform` shows atomic publish.
+### 4. New production mechanisms are not fully promoted into pedagogy fields
 
-Concrete fix: add one sequence flow such as:
+The current top-level `patterns` list still has the original six patterns:
+ELT, CDC/batch ingestion, idempotent partition loads, schema registry,
+partitioning/columnar, and backfill. The dataset now teaches additional
+book-worthy mechanisms that deserve the same treatment:
 
-`Orchestrator -> Transform -> Quality -> Warehouse -> Catalog/Lineage -> Orchestrator`
+- Atomic snapshot publish.
+- Governed raw lake.
+- Quality-gated orchestration.
+- Workload isolation and cost controls.
+- Data lineage at run/snapshot granularity.
 
-Include the failure branch: blocking quality failure alerts the owner, leaves
-the last good snapshot visible, records the failed check, and waits for retry or
-remediation. Include the success branch: commit output snapshot, record lineage,
-advance watermark, unblock dependents.
+Step `orchestrate` also has no `concepts` and no `traps`, even though it now
+carries several production concepts. That makes the wrap-up and concept review
+less useful than the step content itself.
+
+Concrete fix:
+
+- Add top-level patterns for atomic publish, raw-lake governance,
+  quality-gated orchestration, and workload isolation.
+- Add `step.patterns` for `orchestrate`, likely "Quality-gated orchestration"
+  and "Run/snapshot lineage".
+- Add 1-2 `concepts` to step `orchestrate`, especially blocking vs advisory
+  quality gates and lineage granularity.
+- Add a trap for step `orchestrate`: treating lineage as table-level metadata
+  only, instead of recording source offsets, transform version, and output
+  snapshot per run.
 
 ## System Design Soundness
 
-The high-level architecture is sound for a modern analytical data platform. It
-separates ingestion, raw storage, staging, transform compute, modeled serving,
-schema control, orchestration, quality checks, and BI/query access. It also
-does the right thing pedagogically: it motivates why raw retention matters
-before asking candidates to reason about backfills.
+The design is sound for a modern data warehouse / ELT ingestion platform. The
+major architectural boundaries are in place:
 
-The strongest improvement is the explicit publish boundary. The design now
-distinguishes source offsets/LSNs from output watermarks and from freshness.
-That avoids a common interview bug where "watermark" is used for too many
-different meanings. It also correctly ties idempotency to an atomic publish
-mechanism rather than just saying "overwrite the partition."
+- `Sources`, `CDC`, and `EventBus` separate capture paths from storage.
+- `Landing` is immutable raw storage and the replay source of truth.
+- `Loader` and `Staging` isolate typed loading from modeled transformation.
+- `Transform` writes modeled outputs into `Warehouse`.
+- `Catalog` handles schema/version contracts and lineage metadata.
+- `Orchestrator` owns dependencies, retries, state, and backfills.
+- `Quality` gates outputs before publish.
+- `Governance` covers raw and modeled access, masking, audit, retention,
+  deletion, and legal hold.
+- `Query` serves analysts over committed modeled snapshots.
 
-The main system-design gap is governance. A platform that stores raw CDC and
-batch extracts for one to seven years needs a policy plane. That policy plane
-does not have to dominate the interview, but without it the design overstates
-how safe raw retention is.
+The capacity model is useful and concrete: 500 source tables, 50 hot tables,
+5 TB/day raw ingest, 2-4x stored volume, 90-day hot modeled retention,
+1-7 year raw retention, about 200 queries/min peak, about 20 long dashboard
+queries, and a 90-day backfill example.
 
-The second gap is operational cost control. The capacity section gives enough
-numbers to size storage, query concurrency, and backfill pressure, but the
-architecture does not yet show the controls that keep those costs bounded.
+The best part of the system design is the explicit separation of watermarks and
+visibility:
+
+- Source offsets/LSNs belong to ingestion replay.
+- Output watermarks belong to published partitions/snapshots.
+- Freshness is an SLA/lag measurement, not a checkpoint.
+
+That distinction prevents a common interview failure where "watermark" is used
+as a vague correctness word.
+
+The main system-design polish is the operator state model. The components now
+exist, but the API/data model should expose their lifecycle more explicitly.
 
 ## Step-by-Step Pedagogical Review
 
-### Step 1: Naive baseline
+### Step 1: Naive Baseline
 
-This step is now coherent. The view uses a local `OperationalDB` node and the
-caption/story match: a transform-first script writes to the operational DB that
-analysts query directly. That cleanly motivates both ELT and a separate
-analytical warehouse.
+This is a good starting point. It avoids strawman complexity by showing a
+plausible small-company script, then exposes exactly the two reasons the rest
+of the design exists: raw data is discarded and analytical scans contend with
+operational traffic.
+
+The local `OperationalDB` node is appropriate and the trap is useful.
 
 ### Step 2: Ingest into a Raw Lake
 
-This is now one of the strongest steps. The CDC contract is concrete enough for
-a senior interview: offsets/LSNs, tombstones, late data, watermarks, and the
-micro-batch vs streaming boundary all appear.
+This is one of the strongest steps. It teaches ELT, immutable raw retention,
+CDC metadata, tombstones, late/out-of-order data, micro-batch vs streaming, and
+governance at landing time.
 
-The remaining addition is raw governance. The option cons mention sensitive
-fields before masking, but the chosen design should say how raw access,
-classification, retention, and audit are controlled.
+The governance content is now appropriately early. That is important because
+ELT makes raw retention central to correctness and central to risk.
+
+Potential improvement: add a top-level pattern for "Governed raw lake" so this
+important mechanism appears in the Patterns entry, not only inside the step.
 
 ### Step 3: Idempotent Loads and ELT Transformation
 
-This step now teaches the right correctness invariant: idempotent partition
-processing plus temporary output plus validation plus atomic publish. The flow
-is useful and directly answers the follow-up about half-written partitions.
+This step teaches the core correctness mechanism well. It no longer relies on
+"overwrite the partition" as a hand-wave; it explains temp output, validation,
+atomic publish, committed-snapshot reads, and output watermark advancement.
 
-The API section should be updated to match this step; otherwise a reader sees a
-strong step flow and a weaker public run API.
+The sequence flow is strong. The run API mostly matches it now, but the data
+model should align with the fuller run-state lifecycle.
 
 ### Step 4: Schema Evolution
 
-The step has the right depth now. It distinguishes additive from breaking
-changes, uses versioning and owner approval, and warns against pinning
-transforms to "latest." The sequence flow makes the registry behavior concrete.
+The schema step is well scoped. It distinguishes additive from breaking
+changes, teaches owner approval and mapping rules, and warns against pinning
+transforms to "latest" schema. The data-contract sentence about notifying
+downstream owners is a good production detail.
 
-One possible polish item: connect schema changes to data contracts and consumer
-communication. For example, show how downstream owners are notified or how
-breaking changes are staged before modeled tables change.
+One optional addition: connect schema changes to governance classification. A
+new column can be both a schema event and a classification event if it contains
+PII or secrets.
 
 ### Step 5: Partitioning and Columnar Serving
 
-The core serving story is correct and the options are useful. The step now
-includes `Transform` in the view, so the earlier renderer mismatch is resolved.
+This step is much stronger than a basic "partition by date" explanation. It now
+covers compaction, snapshot expiry, stats, clustering, materialized rollups,
+workload isolation, queues, quotas, budgets, kill/cancel controls, and cost
+telemetry.
 
-To reach staff-level realism, add a little more on table health and workload
-management: compaction, stats, clustering, materialized rollups, query queues,
-separate dashboard/ad-hoc compute, and cost controls.
+The main gap is contract visibility. Since the step teaches those controls, the
+API/data model should show at least a small query-job or workload-policy shape.
 
 ### Step 6: Reprocessing and Backfills
 
-This step is strong. It ties together raw retention, idempotent partition
-processing, atomic publish, admission control, dry-run estimates, approval,
-cancellation, and fresh-data preemption.
+This step is strong. It ties together raw retention, idempotent partitioned
+processing, atomic publish, admission control, dry-run estimates, owner
+approval, cancellation, and fresh-data preemption.
 
-Consider adding a failure drill for a bad backfill that publishes incorrect
-history: expected behavior would be rollback to previous snapshots, pause
-dependent jobs, notify owners, and re-run with a corrected transform version.
+One useful addition would be a failure drill for a bad backfill that publishes
+incorrect history. The expected answer should include rolling back to previous
+snapshots, pausing dependents, notifying owners, and rerunning with a corrected
+transform version.
 
 ### Step 7: Orchestration, Quality, and Lineage
 
-The content is correct but compressed. This step is carrying DAG scheduling,
-dependency gating, retries, quality checks, alerting, remediation, and lineage.
-The architecture view is enough to orient the reader, but a sequence flow would
-make the final operational contract much easier to defend.
+The content and sequence are now correct. The step shows dependency checks,
+temporary snapshot production, blocking/advisory quality checks, snapshot
+commit, lineage recording, watermark advancement, and failure behavior.
+
+The remaining weakness is pedagogical metadata. This step should introduce at
+least one explicit concept and one trap because it carries several senior-level
+production mechanisms. The step content is good; the wrap-up learning aids just
+do not expose it enough.
 
 ## Final Design Review
 
-The final design now integrates the steps well. It includes CDC/connectors,
-event stream, raw lake, loader, staging, transform engine, warehouse, schema
-catalog, orchestrator, query layer, and quality checks. It also states the
-publish boundary clearly: temporary/unpublished snapshot, quality validation,
-atomic commit, output watermark advancement, and committed-snapshot reads.
+The final design is coherent and integrates all steps. It includes every
+high-level architecture node and all major links:
 
-The final design would be stronger if it named governance and cost controls as
-first-class platform responsibilities. Those are the two remaining production
-areas that are implied but not structurally represented.
+- source capture and event stream to raw lake;
+- raw lake to loader to staging;
+- staging to transform to warehouse;
+- schema validation through catalog;
+- orchestration over load/transform;
+- query serving over warehouse;
+- quality checks over staging and warehouse;
+- governance over raw lake, warehouse, and query access.
+
+The final-design prose also includes the right operational details:
+checkpointed offsets/LSNs, raw record metadata, idempotent staging loads,
+schema evolution, temporary snapshots, quality validation, atomic publish,
+committed-snapshot reads, table health, workload isolation, backfill admission
+control, lineage, and governance.
+
+The final design would be excellent if the operator state machine and query
+control plane were a little more explicit in the API/data model.
 
 ## Concept Introduction and Learning Flow
 
-The concept order is strong:
+The learning flow is strong:
 
-1. Baseline pain: raw data lost and operational DB overloaded.
-2. ELT/raw lake: preserve source truth.
-3. Idempotency/atomic publish: make retries safe.
-4. Schema evolution: keep source changes from breaking downstream tables.
-5. Partitioning/columnar: make analytical serving fast.
-6. Backfills: use raw plus idempotency to fix history.
-7. Orchestration/quality/lineage: operate the platform.
+1. Start with a simple transform-first baseline.
+2. Preserve raw source truth with ELT.
+3. Make transformations idempotent and publish atomically.
+4. Handle schema evolution deliberately.
+5. Serve queries efficiently and operate table health.
+6. Use raw plus idempotency for backfills.
+7. Coordinate the whole platform with orchestration, quality, lineage, and
+   governance.
 
-This is a good interview progression. The only learning-flow issue is that the
-last step introduces many operational concepts at once. A flow diagram would
-help those ideas feel like one system instead of a list of production concerns.
+The best teaching quality is that each step exposes the reason for the next
+step. The reader does not get a shopping list of data-platform tools; they see
+why each subsystem exists.
+
+The concept metadata should now catch up with the prose. The step text has
+grown into a stronger teaching artifact than the `patterns` and `concepts`
+sections reflect.
 
 ## Step-to-Final-Design Coherence
 
-The earlier coherence issues are resolved:
+The step-to-final-design coherence is good. Every major final-design component
+is introduced before the wrap-up:
 
-- Step `naive` now uses `OperationalDB`, matching the story.
-- Step `transform` no longer includes filtered-out context links in its focused
-  view.
-- Step `serve` now includes `Transform` when it mentions writes into the
-  warehouse.
-- `satisfies[*].steps[*]`, `technologyChoices[*].steps[*]`, pattern step links,
-  and probe links resolve cleanly.
+- `Landing` and `CDC` come from step `ingest`.
+- `Loader`, `Staging`, `Transform`, and `Warehouse` come from step `transform`.
+- `Catalog` comes from step `schema`.
+- `Query` and serving operations come from step `serve`.
+- `Orchestrator` and replay/backfill behavior come from step `backfill`.
+- `Quality` and lineage come from step `orchestrate`.
+- `Governance` is introduced in step `ingest` and carried through the final
+  architecture.
 
-The remaining coherence polish is mostly textual. The `satisfies` entry for
-"Idempotent loads" says "Partition-replace + watermarks"; it should include the
-new atomic publish/snapshot mechanism because that is now the actual guarantee.
+The design-vs-requirements section is also aligned. In particular, the
+"Idempotent loads" answer now names temp snapshots, validation, atomic publish,
+output watermark advancement, and committed reads.
+
+The remaining coherence issues are small and actionable:
+
+- API run states should match the data model.
+- Query serving controls should be represented somewhere beyond prose.
+- Deletion requests should have a data-model counterpart and a backfill
+  interaction rule.
+- Newer concepts should be reflected in `patterns`, `step.patterns`, and
+  `concepts`.
 
 ## Realism Compared With Production Systems
 
-The dataset now covers many production realities that were previously thin:
-CDC semantics, late data, tombstones, output watermarks, snapshot publish,
-schema versions, quality gates, lineage, backfill admission control, and
-technology trade-offs.
+This is now realistic enough for a senior/staff data-platform interview. The
+dataset covers the details that usually separate a credible answer from a
+generic one:
 
-Remaining realism gaps:
+- CDC replay metadata and tombstones.
+- Late and out-of-order events.
+- Immutable raw storage.
+- Idempotent partitioned processing.
+- Atomic publish and snapshot isolation.
+- Schema versioning and breaking-change review.
+- Table health operations.
+- Workload isolation and cost visibility.
+- Backfill admission control.
+- Quality gates and remediation.
+- Lineage at source/transform/output-snapshot level.
+- Raw and modeled governance.
 
-- Raw-data governance: classification, access control, masking/tokenization,
-  audit, retention, legal hold, and deletion policy.
-- Operator state transitions: the API should show run states from submitted to
-  loading, transforming, validating, publishing, succeeded/failed/cancelled.
-- Serving operations: compaction, stats, clustering, query queue isolation,
-  materialized-view refresh, and budget enforcement.
-- Incident workflow: what happens when quality fails, a bad schema version is
-  approved, or a backfill publishes bad history.
-- Multi-team ownership: source owner, pipeline owner, data product owner, and
-  alert owner are mentioned only lightly.
+The biggest realism gaps are not missing components. They are missing
+contracts:
+
+- The run-state lifecycle should be formal enough for operators and retries.
+- Query jobs should have enough metadata to support queues, budgets, cancel,
+  audit, and cost attribution.
+- Governance deletion should explain how raw retention and future backfills do
+  not resurrect erased data.
 
 ## Dataset and Renderer-Facing Observations
 
@@ -289,85 +373,76 @@ Validated successfully:
 
 - `interview.json` parses as JSON.
 - Top-level shape is complete for this case: requirements, capacity, API,
-  data model, highLevelArchitecture, steps, finalDesign, satisfies,
-  technologyChoices, interviewScript, levelVariants, followUps, and
-  toProbeFurther.
-- Step, option, and final-design `view.nodes` string IDs reference canonical
-  high-level architecture nodes; local option nodes are used where appropriate.
-- Step, option, and final-design `view.links` string IDs resolve to
-  `highLevelArchitecture.links`.
-- Step and API sequence participants resolve to the participants used by their
-  messages.
-- `satisfies[*].steps[*]`, `technologyChoices[*].steps[*]`, pattern step links,
-  and `probeLinks` references resolve.
+  data model, high-level architecture, steps, final design, satisfies,
+  technology choices, interview script, level variants, follow-ups, probe
+  links, AI visuals, and comic.
+- Step `view.nodes` string references resolve to canonical high-level nodes;
+  local option nodes are authored as objects where needed.
+- Step `view.links` string references resolve to `highLevelArchitecture.links`.
+- Option view node/link references resolve.
+- Final-design view node/link references resolve.
+- `satisfies[*].steps[*]`, `technologyChoices[*].steps[*]`, and
+  `patterns[*].steps[*]` resolve to real step IDs.
+- Step and API sequence messages reference declared participants.
+- Authored asset references resolve; 135 referenced icons/images were checked
+  and none were missing.
 
-Issues or polish:
+Renderer-facing polish:
 
-- The first run API sequence is a content mismatch with the newer
-  atomic-publish flow, not a renderer problem.
-- `technologyChoices` chips are valid bare strings, but icon assignment has not
-  been run for this dataset. For book polish, run
-  `_scripts/assign_tech_icons.py data/book/data-warehouse/interview.json` and
-  rebuild the book docs if those generated assets are desired.
-- There are no `aiVisual`, design-vs-requirements illustrations, or
-  `explainerComic` assets. These are optional, but this case would benefit from
-  generated visuals for atomic publish, backfill, and the final architecture.
-- Requirements and capacity diagrams are raw Mermaid arrays. If they are edited
-  later, they still need browser-side visual validation.
+- Some technology chips still use `assets/tech-icons/tech.png` fallback icons
+  because the icon mapping does not have specific matches for those products.
+  This is acceptable but visible book polish remains.
+- Requirements and capacity diagrams are intentionally simple raw Mermaid. If
+  they are edited later, browser-side visual validation is still needed.
+- No rebuild is needed for the review-only change. If `interview.json` changes
+  later, rebuild `docs/book/`.
 
 ## Recommended Edits, Prioritized
 
-### P1: Align the APIs with the corrected design
+### P1: Align run states across API, data model, and prose
 
-- Update `POST /v1/pipelines/{id}/run` to include idempotency key, transform or
-  schema version, partition/range, and priority.
-- Update that API sequence to include temp output, quality validation, snapshot
-  commit, watermark advancement, and failure handling.
-- Tighten the `satisfies` "Idempotent loads" summary to name atomic publish and
-  committed snapshots.
+Define a richer run lifecycle, add missing state fields, and make retry/cancel
+semantics explicit around the temporary snapshot and publish boundary.
 
-### P1: Add raw-data governance
+### P1: Add a query-job/control-plane contract
 
-- Add a non-functional requirement for governed raw retention and auditable
-  access.
-- Add governance/policy entities to the data model.
-- Carry masking/classification/access-control language from the ingest option
-  cons into the chosen design path.
+Promote serving operations from prose into API/data-model shape: async query
+jobs, workload queues, cancel, bytes scanned, cost attribution, budget policy,
+and governance access/masking decisions.
 
-### P2: Make serving operations explicit
+### P2: Add deletion-request lifecycle modeling
 
-- Add compaction, table statistics, clustering/sorting, query queue isolation,
-  materialized rollup refresh, and cost controls to step `serve` or
-  `orchestrate`.
-- Tie these controls back to the capacity numbers.
+Add `deletion_request` and clarify how erasure affects raw data, modeled
+snapshots, future backfills, audit, and legal hold.
 
-### P2: Add an orchestration/quality/lineage sequence
+### P2: Promote new mechanisms into patterns/concepts/traps
 
-- Show success and failure branches for a quality-gated publish.
-- Record lineage and unblock dependents only after publish succeeds.
-- Show owner alert/remediation when a blocking quality check fails.
+Add patterns and concepts for atomic snapshot publish, governed raw lake,
+quality-gated orchestration, workload isolation, and run/snapshot lineage.
 
-### P3: Add book polish
+### P3: Tighten polish
 
-- Assign technology icons.
-- Add generated AI visuals for the final design, atomic publish, and backfill.
-- Add a failure drill for a bad backfill or bad schema-version approval.
+Add specific icon mappings for the remaining `tech.png` fallbacks, add a bad
+backfill failure drill, and consider a slightly richer capacity diagram that
+shows query/backfill/governance pressure in addition to raw ingest volume.
 
 ## What Not To Change
 
-- Keep the compact seven-step flow. It now has enough depth without becoming a
-  catalog of every data-platform subsystem.
-- Keep ELT plus immutable raw as the central teaching decision.
-- Keep the option sets; they are realistic and useful in an interview.
+- Keep the seven-step structure; it is compact and coherent.
+- Keep ELT plus immutable raw as the central design decision.
 - Keep the explicit distinction among source offsets, output watermarks, and
   freshness.
-- Keep the final design as one integrated platform rather than splitting ingest,
-  warehousing, and orchestration into separate cases.
+- Keep governance in the main architecture instead of relegating it to a
+  compliance footnote.
+- Keep the option sets; they teach real trade-offs without derailing the
+  walkthrough.
+- Keep final design as one integrated platform rather than splitting ingestion,
+  warehousing, orchestration, and governance into separate interviews.
 
 ## Bottom Line
 
-The recent changes moved this dataset from a solid draft to a strong
-book-quality interview. The core architecture is now defensible. The next best
-edits are to make the operator-facing API match the atomic-publish contract, add
-raw-data governance, and show the final orchestration/quality/lineage workflow
-as a concrete sequence.
+The data-warehouse interview is in strong shape. It is production-realistic,
+teachable, and structurally valid. The next improvement pass should not add
+more architecture boxes; it should make the existing operator contracts sharper:
+run states, query/cost controls, deletion lifecycle, and reusable teaching
+patterns for the production mechanisms already present.

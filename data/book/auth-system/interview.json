@@ -71,6 +71,16 @@
         "description": "Login Rate Limiter: Synchronous application component that owns request-time business logic."
       },
       {
+        "id": "Counters",
+        "label": "Risk / Counter Store",
+        "type": "cache",
+        "category": "state",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Risk / Counter Store: Fast replicated in-memory store (e.g. Redis) holding multi-dimensional rate-limit counters and risk signals with per-window TTL expiry, owned by the Login Rate Limiter."
+      },
+      {
         "id": "MFA",
         "label": "MFA Service",
         "type": "service",
@@ -313,6 +323,12 @@
         "label": "login attempts"
       },
       {
+        "id": "limiter-counters",
+        "from": "Limiter",
+        "to": "Counters",
+        "label": "incr/check counters"
+      },
+      {
         "id": "limiter-auth-within-limits",
         "from": "Limiter",
         "to": "Auth",
@@ -504,34 +520,32 @@
       "sequence": {
         "participants": [
           {
-            "id": "C",
+            "id": "Client",
             "label": "Client"
           },
           {
             "id": "Auth",
-            "label": "Auth Service",
-            "alias": "A"
+            "label": "Auth Service"
           },
           {
-            "id": "U",
+            "id": "UserDB",
             "label": "Credential Store"
           },
           {
             "id": "Token",
-            "label": "Token Service",
-            "alias": "T"
+            "label": "Token Service"
           }
         ],
         "messages": [
           {
-            "from": "C",
+            "from": "Client",
             "to": "Auth",
             "arrow": "->>",
             "label": "POST /login (user, password)"
           },
           {
             "from": "Auth",
-            "to": "U",
+            "to": "UserDB",
             "arrow": "->>",
             "label": "fetch password hash"
           },
@@ -547,7 +561,7 @@
             "messages": [
               {
                 "from": "Auth",
-                "to": "C",
+                "to": "Client",
                 "arrow": "-->>",
                 "label": "200 mfa_required + mfa_pending_token"
               }
@@ -563,7 +577,7 @@
                 },
                 {
                   "from": "Auth",
-                  "to": "C",
+                  "to": "Client",
                   "arrow": "-->>",
                   "label": "200 tokens"
                 }
@@ -585,7 +599,78 @@
       "path": "/v1/mfa/verify",
       "description": "Verify the second factor and, only on success, issue full access + refresh tokens. Failed verifications are rate-limited and audited; the mfa_pending_token alone never grants resource access.",
       "request": "{ \"challenge_id\": \"chl_...\", \"code\": \"123456\" }  // or { \"challenge_id\": \"chl_...\", \"webauthn_assertion\": { ... } }; Authorization: Bearer <mfa_pending_token>",
-      "response": "200 OK { \"access_token\": \"...\", \"refresh_token\": \"...\", \"expires_in\": 900 }  // 401 on bad/expired factor"
+      "response": "200 OK { \"access_token\": \"...\", \"refresh_token\": \"...\", \"expires_in\": 900 }  // 401 on bad/expired factor",
+      "sequence": {
+        "participants": [
+          {
+            "id": "Client",
+            "label": "Client"
+          },
+          {
+            "id": "MFA",
+            "label": "MFA Service"
+          },
+          {
+            "id": "Token",
+            "label": "Token Service"
+          }
+        ],
+        "messages": [
+          {
+            "from": "Client",
+            "to": "MFA",
+            "arrow": "->>",
+            "label": "POST /mfa/verify (challenge_id, code) [mfa_pending_token]"
+          },
+          {
+            "from": "MFA",
+            "to": "MFA",
+            "arrow": "->>",
+            "label": "load challenge: pending? not expired/consumed? purpose=mfa_pending?"
+          },
+          {
+            "type": "alt",
+            "label": "factor valid",
+            "messages": [
+              {
+                "from": "MFA",
+                "to": "MFA",
+                "arrow": "->>",
+                "label": "mark challenge consumed (single-use)"
+              },
+              {
+                "from": "MFA",
+                "to": "Token",
+                "arrow": "->>",
+                "label": "issue access + refresh (full session)"
+              },
+              {
+                "from": "MFA",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "200 full tokens"
+              }
+            ],
+            "else": {
+              "label": "invalid / expired / attempt cap hit",
+              "messages": [
+                {
+                  "from": "MFA",
+                  "to": "MFA",
+                  "arrow": "->>",
+                  "label": "increment attempt_count; rate-limit + audit"
+                },
+                {
+                  "from": "MFA",
+                  "to": "Client",
+                  "arrow": "-->>",
+                  "label": "401 — no tokens"
+                }
+              ]
+            }
+          }
+        ]
+      }
     },
     {
       "method": "POST",
@@ -604,23 +689,220 @@
     {
       "method": "POST",
       "path": "/v1/token/refresh",
-      "description": "Exchange a refresh token for a new access token; rotates the refresh token.",
+      "description": "Exchange a refresh token for a new access token; rotates the refresh token. The presented token is hashed and looked up in its family: a current token rotates (old retired, new issued); a retired token replayed signals theft and revokes the whole family.",
       "request": "{ \"refresh_token\": \"...\" }",
-      "response": "200 OK { \"access_token\": \"...\", \"refresh_token\": \"...new...\" }"
+      "response": "200 OK { \"access_token\": \"...\", \"refresh_token\": \"...new...\" }  // 401 + family revoked if a retired token is reused",
+      "sequence": {
+        "participants": [
+          {
+            "id": "Client",
+            "label": "Client"
+          },
+          {
+            "id": "Token",
+            "label": "Token Service"
+          },
+          {
+            "id": "Revoke",
+            "label": "Revocation List"
+          },
+          {
+            "id": "Keys",
+            "label": "Signing Keys"
+          }
+        ],
+        "messages": [
+          {
+            "from": "Client",
+            "to": "Token",
+            "arrow": "->>",
+            "label": "POST /token/refresh (refresh_token)"
+          },
+          {
+            "from": "Token",
+            "to": "Revoke",
+            "arrow": "->>",
+            "label": "hash + look up token in family; current or retired?"
+          },
+          {
+            "type": "alt",
+            "label": "current",
+            "messages": [
+              {
+                "from": "Token",
+                "to": "Revoke",
+                "arrow": "->>",
+                "label": "rotate: retire old, record new"
+              },
+              {
+                "from": "Token",
+                "to": "Keys",
+                "arrow": "->>",
+                "label": "sign new access token"
+              },
+              {
+                "from": "Token",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "new access + new refresh"
+              }
+            ],
+            "else": {
+              "label": "retired token reused (theft)",
+              "messages": [
+                {
+                  "from": "Token",
+                  "to": "Revoke",
+                  "arrow": "->>",
+                  "label": "revoke entire family; audit refresh_reuse"
+                },
+                {
+                  "from": "Token",
+                  "to": "Client",
+                  "arrow": "-->>",
+                  "label": "401 — re-authenticate"
+                }
+              ]
+            }
+          }
+        ]
+      }
     },
     {
       "method": "POST",
       "path": "/v1/logout",
-      "description": "Revoke the current session/refresh token (and optionally all sessions).",
+      "description": "Revoke the current session/refresh token (and optionally all sessions). Retires the refresh-token family and denylists the still-valid access token until it expires; with all_devices it enumerates the user's sessions and revokes every family.",
       "request": "{ \"all_devices\": false }",
-      "response": "204 No Content"
+      "response": "204 No Content",
+      "sequence": {
+        "participants": [
+          {
+            "id": "Client",
+            "label": "Client"
+          },
+          {
+            "id": "Token",
+            "label": "Token Service"
+          },
+          {
+            "id": "Revoke",
+            "label": "Revocation List"
+          }
+        ],
+        "messages": [
+          {
+            "from": "Client",
+            "to": "Token",
+            "arrow": "->>",
+            "label": "POST /logout (all_devices?)"
+          },
+          {
+            "type": "alt",
+            "label": "this device",
+            "messages": [
+              {
+                "from": "Token",
+                "to": "Revoke",
+                "arrow": "->>",
+                "label": "retire this family + denylist live access token"
+              }
+            ],
+            "else": {
+              "label": "all_devices",
+              "messages": [
+                {
+                  "from": "Token",
+                  "to": "Revoke",
+                  "arrow": "->>",
+                  "label": "revoke every family for user (each user_session)"
+                }
+              ]
+            }
+          },
+          {
+            "from": "Token",
+            "to": "Client",
+            "arrow": "-->>",
+            "label": "204 — credential dead within seconds"
+          }
+        ]
+      }
     },
     {
       "method": "POST",
       "path": "/v1/authorize",
       "description": "Internal decision: may this subject perform this action on this resource? A POST carries full context — tenant, resource owner, and ABAC attributes — so RBAC and ABAC rules can both be evaluated. The response echoes the policy_version it was decided under and a cache TTL; callers may cache the decision until ttl_ms elapses or that policy_version is invalidated.",
       "request": "{ \"subject\": \"usr_1\", \"action\": \"delete\", \"resource\": \"doc_9\", \"tenant_id\": \"t_42\", \"resource_owner\": \"usr_7\", \"attributes\": { \"env\": \"prod\", \"sensitivity\": \"high\" }, \"decision_context\": { \"mfa_satisfied\": true } }",
-      "response": "200 OK { \"allow\": false, \"reason\": \"missing role editor\", \"policy_version\": 187, \"cache_ttl_ms\": 5000 }"
+      "response": "200 OK { \"allow\": false, \"reason\": \"missing role editor\", \"policy_version\": 187, \"cache_ttl_ms\": 5000 }",
+      "sequence": {
+        "participants": [
+          {
+            "id": "API",
+            "label": "API Gateway"
+          },
+          {
+            "id": "AuthZ",
+            "label": "Authorization Service"
+          },
+          {
+            "id": "Policy",
+            "label": "Policy / Roles Store"
+          },
+          {
+            "id": "Resource",
+            "label": "Resource Service"
+          }
+        ],
+        "messages": [
+          {
+            "from": "API",
+            "to": "AuthZ",
+            "arrow": "->>",
+            "label": "authorize(subject, action, resource, tenant, attrs)"
+          },
+          {
+            "from": "AuthZ",
+            "to": "AuthZ",
+            "arrow": "->>",
+            "label": "decision cache hit for key + current policy_version?"
+          },
+          {
+            "type": "alt",
+            "label": "cache miss",
+            "messages": [
+              {
+                "from": "AuthZ",
+                "to": "Policy",
+                "arrow": "->>",
+                "label": "evaluate RBAC/ABAC; cache allow/deny @ policy_version"
+              }
+            ],
+            "else": {
+              "label": "cache hit (still-current policy_version)",
+              "messages": [
+                {
+                  "from": "AuthZ",
+                  "to": "AuthZ",
+                  "arrow": "->>",
+                  "label": "serve cached decision"
+                }
+              ]
+            }
+          },
+          {
+            "from": "AuthZ",
+            "to": "API",
+            "arrow": "-->>",
+            "label": "allow/deny + policy_version + cache_ttl_ms"
+          },
+          {
+            "from": "API",
+            "to": "Resource",
+            "arrow": "->>",
+            "label": "forward (broad allow); repeat OBJECT-level check before mutation"
+          }
+        ]
+      }
     }
   ],
   "dataModel": [
@@ -697,6 +979,52 @@
         {
           "name": "revocation_reason",
           "type": "varchar null (logout | reuse_detected | admin | password_change)"
+        }
+      ]
+    },
+    {
+      "name": "mfa_challenges",
+      "note": "Short-lived pending-auth state created when a password verifies but MFA is still owed. It binds the challenge to the login attempt, the user, the chosen factor, and the device/risk context so the second factor can't be replayed or brute-forced. The mfa_pending_token is a short-lived signed token carrying claim purpose=mfa_pending + this challenge_id — it can ONLY drive /v1/mfa/* and never grants resource access. status/consumed_at make verification single-use; attempt_count enforces a per-challenge cap on top of the separate MFA rate limit.",
+      "fields": [
+        {
+          "name": "challenge_id",
+          "type": "uuid PK (chl_...)"
+        },
+        {
+          "name": "user_id",
+          "type": "uuid"
+        },
+        {
+          "name": "factor_id",
+          "type": "uuid (which enrolled factor)"
+        },
+        {
+          "name": "device_id",
+          "type": "uuid null"
+        },
+        {
+          "name": "tenant_id",
+          "type": "uuid null"
+        },
+        {
+          "name": "risk_score",
+          "type": "float null (drives step-up / extra friction)"
+        },
+        {
+          "name": "attempt_count",
+          "type": "int (per-challenge cap before invalidation)"
+        },
+        {
+          "name": "status",
+          "type": "varchar (pending | verified | expired | consumed)"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamptz (short TTL, e.g. 5 min)"
+        },
+        {
+          "name": "consumed_at",
+          "type": "timestamptz null (single-use on success)"
         }
       ]
     },
@@ -821,6 +1149,48 @@
         {
           "name": "ttl",
           "type": "seconds (auto-expire)"
+        }
+      ]
+    },
+    {
+      "name": "user_sessions",
+      "note": "Device/session inventory backing 'manage sessions & devices'. One row per active login (a refresh-token family), so a user can list and selectively revoke devices and 'log out everywhere' enumerates these rows. tenant_id scopes the session; revoking sets revoked_at and denylists the family.",
+      "fields": [
+        {
+          "name": "session_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "user_id",
+          "type": "uuid"
+        },
+        {
+          "name": "family_id",
+          "type": "uuid (the refresh-token family for this session)"
+        },
+        {
+          "name": "tenant_id",
+          "type": "uuid null"
+        },
+        {
+          "name": "device_label",
+          "type": "varchar (e.g. 'Chrome on macOS')"
+        },
+        {
+          "name": "ip_hash",
+          "type": "bytea"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz"
+        },
+        {
+          "name": "last_seen_at",
+          "type": "timestamptz"
+        },
+        {
+          "name": "revoked_at",
+          "type": "timestamptz null"
         }
       ]
     },
@@ -1055,34 +1425,32 @@
           "sequence": {
             "participants": [
               {
-                "id": "C",
+                "id": "Client",
                 "label": "Client"
               },
               {
                 "id": "Auth",
-                "label": "Auth Service",
-                "alias": "A"
+                "label": "Auth Service"
               },
               {
-                "id": "U",
+                "id": "UserDB",
                 "label": "Credential Store"
               },
               {
                 "id": "Token",
-                "label": "Token Service",
-                "alias": "T"
+                "label": "Token Service"
               }
             ],
             "messages": [
               {
-                "from": "C",
+                "from": "Client",
                 "to": "Auth",
                 "arrow": "->>",
                 "label": "POST /login (user, password)"
               },
               {
                 "from": "Auth",
-                "to": "U",
+                "to": "UserDB",
                 "arrow": "->>",
                 "label": "fetch salted hash"
               },
@@ -1104,7 +1472,7 @@
                   },
                   {
                     "from": "Auth",
-                    "to": "C",
+                    "to": "Client",
                     "arrow": "-->>",
                     "label": "200 tokens"
                   }
@@ -1114,7 +1482,7 @@
                   "messages": [
                     {
                       "from": "Auth",
-                      "to": "C",
+                      "to": "Client",
                       "arrow": "-->>",
                       "label": "401 (generic)"
                     }
@@ -1180,12 +1548,14 @@
           "name": "Stateless access tokens (default, with revocation later)",
           "description": "The client carries a signed JWT whose claims any service verifies by checking the signature against the public key, with no per-request store lookup.",
           "pros": [
-            "No per-request store lookup — scales to the whole platform.",
-            "Self-contained claims usable across services."
+            "No per-request store lookup — any service verifies by signature, so it scales to the whole platform.",
+            "Self-contained claims (subject, tenant, scopes) travel with the request, usable across services.",
+            "No central session store to keep highly available on the hot path."
           ],
           "cons": [
-            "Hard to revoke before expiry (addressed with short TTL + denylist).",
-            "Token size and key management."
+            "Hard to revoke before expiry — addressed later with short TTLs plus a denylist.",
+            "Token size grows with claims, and signing-key management/rotation becomes your responsibility.",
+            "Payload is readable (signed, not encrypted), so it can't carry secrets."
           ],
           "view": {
             "nodes": [
@@ -1207,12 +1577,14 @@
           "name": "Server-side sessions",
           "description": "Login creates a session record in a shared store and hands the client an opaque id; the gateway looks that id up on every request.",
           "pros": [
-            "Revoke instantly by deleting the session.",
-            "Small opaque cookie; server holds the data."
+            "Revoke instantly by deleting the session row — no waiting for a token to expire.",
+            "Small opaque cookie leaks nothing; the server holds all the session data.",
+            "Easy to inspect and manage active sessions per user."
           ],
           "cons": [
-            "A store lookup on every request becomes a hot dependency.",
-            "Sticky/shared session store to scale."
+            "A store lookup on every request makes the session store a hot dependency.",
+            "That store must be fast, shared, and horizontally scaled to keep up.",
+            "Forfeits the local, no-network verification that stateless tokens allow."
           ],
           "view": {
             "nodes": [
@@ -1320,46 +1692,45 @@
           "sequence": {
             "participants": [
               {
-                "id": "C",
+                "id": "Client",
                 "label": "Client"
               },
               {
                 "id": "Auth",
-                "label": "Auth Service",
-                "alias": "A"
+                "label": "Auth Service"
               },
               {
-                "id": "I",
+                "id": "IdP",
                 "label": "IdP"
               }
             ],
             "messages": [
               {
-                "from": "C",
-                "to": "I",
+                "from": "Client",
+                "to": "IdP",
                 "arrow": "->>",
                 "label": "redirect to consent"
               },
               {
-                "from": "I",
-                "to": "C",
+                "from": "IdP",
+                "to": "Client",
                 "arrow": "-->>",
                 "label": "redirect back with code"
               },
               {
-                "from": "C",
+                "from": "Client",
                 "to": "Auth",
                 "arrow": "->>",
                 "label": "code"
               },
               {
                 "from": "Auth",
-                "to": "I",
+                "to": "IdP",
                 "arrow": "->>",
                 "label": "exchange code (server-side)"
               },
               {
-                "from": "I",
+                "from": "IdP",
                 "to": "Auth",
                 "arrow": "-->>",
                 "label": "id token"
@@ -1372,7 +1743,7 @@
               },
               {
                 "from": "Auth",
-                "to": "C",
+                "to": "Client",
                 "arrow": "-->>",
                 "label": "local session/token"
               }
@@ -1569,8 +1940,8 @@
       "concepts": [
         {
           "term": "Refresh-token rotation",
-          "definition": "Each refresh issues a new refresh token and invalidates the old one.",
-          "whyItMatters": "Detects token theft — a reused old refresh token signals compromise.",
+          "definition": "Each refresh issues a new refresh token and retires the old one in its family.",
+          "whyItMatters": "Detects token theft — a replayed retired refresh token signals compromise.",
           "group": "Token Refresh & Revocation"
         },
         {
@@ -1585,7 +1956,7 @@
           "title": "Bounding stolen-token damage",
           "points": [
             "Short access TTL (minutes) bounds how long a stolen access token works.",
-            "Rotate refresh tokens; a replayed old one means theft -> revoke the whole chain.",
+            "Rotate refresh tokens; a replayed retired one means theft -> revoke the whole family.",
             "Keep a denylist of revoked session ids; check it on refresh and for sensitive operations."
           ]
         }
@@ -1630,7 +2001,7 @@
       "flows": [
         {
           "name": "Refresh with rotation + reuse detection",
-          "note": "A refresh token is checked against the denylist; a valid one rotates (old invalidated, new issued); a reused/retired one signals theft and revokes the whole chain.",
+          "note": "A refresh token is looked up in its family; a current one rotates (old retired, new issued); a replayed retired one signals theft and revokes the whole family.",
           "sequence": {
             "participants": [
               {
@@ -1661,7 +2032,7 @@
                 "from": "Token",
                 "to": "Revoke",
                 "arrow": "->>",
-                "label": "is this refresh revoked/retired?"
+                "label": "hash + look up token in family; current or retired?"
               },
               {
                 "type": "alt",
@@ -1693,7 +2064,7 @@
                       "from": "Token",
                       "to": "Revoke",
                       "arrow": "->>",
-                      "label": "revoke entire token chain"
+                      "label": "revoke entire family"
                     },
                     {
                       "from": "Token",
@@ -1864,11 +2235,13 @@
           "name": "Central policy service + cached decisions (default)",
           "description": "The gateway asks a policy service 'may this principal do this action?'; the service evaluates roles/attributes against the policy store, with decisions cached on the hot path.",
           "pros": [
-            "One place to define and audit policy.",
-            "Cache decisions/roles to keep the hot path fast."
+            "One place to define, version, and audit policy across the whole platform.",
+            "Short-TTL decision caching keyed by policy_version keeps the hot path fast.",
+            "Carries full context (tenant, owner, attributes), so RBAC and ABAC rules both evaluate."
           ],
           "cons": [
-            "A dependency on the request path; cache staleness on permission change."
+            "Adds a dependency on the request path (mitigated by caching most decisions).",
+            "Cached decisions can go stale on a role/policy change until policy_version bumps invalidate them."
           ],
           "view": {
             "nodes": [
@@ -1890,11 +2263,13 @@
           "name": "Embed permissions in the token",
           "description": "Roles and permissions are baked into the access token's claims at issuance, so the gateway reads them off the token without any authorization lookup.",
           "pros": [
-            "No authz lookup — claims travel with the token."
+            "No authz lookup on the request path — permission claims travel with the token.",
+            "Self-contained: any service can decide coarse access from the verified claims alone."
           ],
           "cons": [
-            "Stale until the token expires; a revoked role still works.",
-            "Token bloat for many permissions."
+            "Permissions are stale until the token expires — a revoked role keeps working in the meantime.",
+            "Token bloat once a principal has many fine-grained permissions.",
+            "Can't express resource- or ownership-level (ABAC) rules that depend on request context."
           ],
           "view": {
             "nodes": [
@@ -1932,6 +2307,11 @@
           "trap": "Baking coarse permissions into long-lived tokens",
           "why": "Revoking a role doesn't take effect until the token expires.",
           "instead": "Evaluate sensitive authz against current policy (or short token TTL)."
+        },
+        {
+          "trap": "Trusting a valid token for any tenant's resources",
+          "why": "A subject valid in tenant A could reach tenant B's data if the check only asks 'is this token valid?'.",
+          "instead": "Carry tenant_id as a token claim; the verifier and authz reject any request whose resource tenant doesn't match the token's tenant — a valid subject is not a cross-tenant pass."
         }
       ],
       "failureDrills": [
@@ -2307,11 +2687,20 @@
         {
           "title": "Counter mechanics and abuse alerting",
           "points": [
-            "Counters live in a fast replicated store (e.g. Redis), keyed by dimension (account, IP, subnet, tenant, device) with per-window TTL expiry — never in the primary DB on the hot path.",
+            "Counters live in a fast replicated store (the Risk / Counter Store, e.g. Redis), keyed by dimension (account, IP, subnet, tenant, device) with per-window TTL expiry — never in the primary DB on the hot path.",
             "Treat login throttling, MFA-prompt throttling, and account-recovery throttling as separate limits: each has a different abuse mode (stuffing vs MFA-bombing vs recovery hijack).",
             "Counters are best-effort across regions; a small over-count from eventual consistency is acceptable — favor availability over a globally exact count.",
             "Alert from the audit stream on refresh-token reuse, impossible-travel logins, credential-stuffing spikes (global failure rate), and signing-key anomalies.",
             "Give legitimate users a recovery path after a suspicious-activity block (verified email/MFA step-up) so anomaly defense never becomes a permanent lockout."
+          ]
+        },
+        {
+          "title": "Degraded dependencies: counter store and MFA provider",
+          "points": [
+            "Counter store degraded/unreachable: don't fail open to unlimited login (a stuffing free-for-all) and don't hard-fail-closed (self-inflicted outage). Fall back to a conservative local per-node limit + mandatory CAPTCHA/step-up — a challenge-only mode that bounds throughput without a global count.",
+            "MFA provider (SMS/push) degraded: never drop MFA for an MFA account. Fail closed on the second factor but route to alternative enrolled factors (TOTP/WebAuthn don't need the provider) and offer backup codes; only the unavailable channel is affected.",
+            "False positives: a wrongly-challenged user must have a self-service path back (verified email link or step-up MFA), and support needs an audited override — anomaly defense that strands real users is its own outage.",
+            "Make the degraded behavior explicit and audited so an incident responder can see the system entered challenge-only or factor-fallback mode."
           ]
         }
       ],
@@ -2356,19 +2745,21 @@
         "nodes": [
           "Client",
           "Limiter",
+          "Counters",
           "Auth",
           "Audit"
         ],
-        "caption": "Login attempts pass through the Login Rate Limiter, which forwards within-limit traffic to the Auth Service, throttles or challenges the client, and records events in the Audit Log.",
+        "caption": "Login attempts pass through the Login Rate Limiter, which increments multi-dimensional counters in the Risk / Counter Store, forwards within-limit traffic to the Auth Service, throttles or challenges the client, and records events in the Audit Log.",
         "links": [
           "client-limiter-login-attempts",
+          "limiter-counters",
           "limiter-auth-within-limits",
           "limiter-client-throttle-challenge",
           "auth-audit"
         ],
         "highlight": [
           "Limiter",
-          "Audit"
+          "Counters"
         ]
       },
       "options": [
@@ -2389,19 +2780,21 @@
             "nodes": [
               "Client",
               "Limiter",
+              "Counters",
               "Auth",
               "Audit"
             ],
-            "caption": "Login attempts hit the multi-dimensional Login Rate Limiter, which forwards within-limit traffic to the Auth Service, throttles or challenges abusers, and feeds the Audit Log.",
+            "caption": "Login attempts hit the multi-dimensional Login Rate Limiter, which keeps its counters in the Risk / Counter Store, forwards within-limit traffic to the Auth Service, throttles or challenges abusers, and feeds the Audit Log.",
             "links": [
               "client-limiter-login-attempts",
+              "limiter-counters",
               "limiter-auth-within-limits",
               "limiter-client-throttle-challenge",
               "auth-audit"
             ],
             "highlight": [
               "Limiter",
-              "Audit"
+              "Counters"
             ]
           }
         },
@@ -2512,12 +2905,13 @@
           "name": "Local signature verification via JWKS + small denylist (default)",
           "description": "Every service verifies a token's signature locally using public keys fetched from the published JWKS, consulting a small replicated denylist only for sensitive operations.",
           "pros": [
-            "No central auth call per request — scales to the whole platform.",
-            "Key rotation is transparent via published JWKS."
+            "No central auth call per request — verification scales to the whole platform.",
+            "Key rotation is transparent: verifiers fetch the current keys from the published JWKS.",
+            "A bounded denylist (short access TTL → few live tokens) keeps revocation cheap and replicable."
           ],
           "cons": [
-            "Revocation needs the denylist (small, replicated, checked for sensitive ops).",
-            "Key management discipline required."
+            "Revocation isn't instant for already-issued tokens — it relies on the denylist plus short TTLs.",
+            "Demands key-management discipline: scheduled rotation, overlap, and emergency revoke runbooks."
           ],
           "view": {
             "nodes": [
@@ -2537,10 +2931,12 @@
           "name": "Central introspection per request",
           "description": "The gateway calls the auth service to introspect each presented token on every request rather than verifying it locally.",
           "pros": [
-            "Instant revocation; central control."
+            "Revocation is instant — the auth service is consulted on every request.",
+            "Central control: token state and policy live in one authoritative place."
           ],
           "cons": [
-            "The auth service becomes a hot dependency on every request — a scaling and availability bottleneck."
+            "The auth service becomes a hot dependency on every request — a scaling and availability bottleneck.",
+            "Adds a network round trip to the latency of every authenticated call."
           ],
           "view": {
             "nodes": [
@@ -2624,11 +3020,12 @@
   ],
   "finalDesign": {
     "title": "Final Design",
-    "description": "End-to-end, read as four paths. Login path: limiter → auth → credential store / OIDC → MFA → token service, where full tokens are issued only after the second factor verifies. Refresh path: token service → hashed refresh-token family → rotation/reuse detection → signing keys. Request (hot) path: the gateway and resource verify the JWT locally against rotating JWKS keys, with a denylist check only for sensitive operations, then a cached RBAC/ABAC decision scoped by tenant. Operations path: every security-relevant event is audited, risk signals drive abuse alerts, and key rotation runs on a schedule with emergency revocation available. Salted slow-hashed passwords (or federated OAuth/OIDC) sit behind the rate-limited, abuse-aware login; short access tokens bound exposure and rotating refresh tokens plus the denylist make revocation real.",
+    "description": "End-to-end, read as four paths. Login path: limiter → auth → credential store / OIDC → MFA → token service, where full tokens are issued only after the second factor verifies. Refresh path: token service → hashed refresh-token family → rotation/reuse detection → signing keys. Request (hot) path: the gateway and resource verify the JWT locally against rotating JWKS keys, with a denylist check only for sensitive operations, then a cached RBAC/ABAC decision scoped by tenant. Operations path: every security-relevant event is audited, risk signals drive abuse alerts, and key rotation runs on a schedule with emergency revocation available. Salted slow-hashed passwords (or federated OAuth/OIDC) sit behind the rate-limited, abuse-aware login; short access tokens bound exposure and rotating refresh tokens plus the denylist make revocation real. Out of scope but production-critical (call these out rather than pretend they're solved): account recovery and factor loss (often the real weakest link), support/admin override workflows with their own audit trail, full device/session inventory (modeled as user_sessions) for self-service 'log out everywhere', strict multi-tenant isolation (tenant_id in token claims, rejected on mismatch by verifier and authz), and passwordless/passkey migration.",
     "view": {
       "nodes": [
         "Client",
         "Limiter",
+        "Counters",
         "Auth",
         "UserDB",
         "IdP",
@@ -2643,9 +3040,10 @@
         "Resource",
         "Audit"
       ],
-      "caption": "The client app passes through the Login Rate Limiter to the Auth Service, which authenticates via the credential store, IdP, and MFA, issues JWKS-signed tokens, and the API Gateway then verifies them, checks revocation, authorizes against policy, and serves resources while auditing throughout.",
+      "caption": "The client app passes through the Login Rate Limiter (counters in the Risk / Counter Store) to the Auth Service, which authenticates via the credential store, IdP, and MFA, issues JWKS-signed tokens, and the API Gateway then verifies them, checks revocation, authorizes against policy, and serves resources while auditing throughout.",
       "links": [
         "client-limiter",
+        "limiter-counters",
         "limiter-auth",
         "auth-userdb",
         "auth-idp",
@@ -2663,7 +3061,273 @@
         "auth-audit",
         "authz-audit"
       ]
-    }
+    },
+    "flows": [
+      {
+        "name": "Login with MFA (password → pending → factor → full tokens)",
+        "note": "The defining lifecycle: a correct password never yields full tokens on its own. The Auth Service verifies the slow hash, creates an mfa_challenge, and returns only a short-lived mfa_pending_token; access + refresh are minted by the Token Service strictly after the second factor verifies.",
+        "sequence": {
+          "participants": [
+            {
+              "id": "Client",
+              "label": "Client"
+            },
+            {
+              "id": "Auth",
+              "label": "Auth Service"
+            },
+            {
+              "id": "MFA",
+              "label": "MFA Service"
+            },
+            {
+              "id": "Token",
+              "label": "Token Service"
+            }
+          ],
+          "messages": [
+            {
+              "from": "Client",
+              "to": "Auth",
+              "arrow": "->>",
+              "label": "POST /login (user, password)"
+            },
+            {
+              "from": "Auth",
+              "to": "Auth",
+              "arrow": "->>",
+              "label": "verify slow hash; create mfa_challenge"
+            },
+            {
+              "from": "Auth",
+              "to": "Client",
+              "arrow": "-->>",
+              "label": "200 mfa_required + mfa_pending_token + challenge_id"
+            },
+            {
+              "from": "Client",
+              "to": "MFA",
+              "arrow": "->>",
+              "label": "POST /mfa/verify (challenge_id, code) [mfa_pending_token]"
+            },
+            {
+              "from": "MFA",
+              "to": "Token",
+              "arrow": "->>",
+              "label": "factor ok → issue access + refresh"
+            },
+            {
+              "from": "Token",
+              "to": "Client",
+              "arrow": "-->>",
+              "label": "200 full tokens"
+            }
+          ]
+        },
+        "highlight": [
+          "Auth",
+          "MFA",
+          "Token"
+        ]
+      },
+      {
+        "name": "Refresh reuse → family revocation",
+        "note": "Why rotation is more than 'issue a new token': a retired refresh token replayed (the real user already rotated past it) is treated as theft and revokes the whole family, with the event audited.",
+        "sequence": {
+          "participants": [
+            {
+              "id": "Client",
+              "label": "Client"
+            },
+            {
+              "id": "Token",
+              "label": "Token Service"
+            },
+            {
+              "id": "Revoke",
+              "label": "Revocation List"
+            },
+            {
+              "id": "Audit",
+              "label": "Audit Log"
+            }
+          ],
+          "messages": [
+            {
+              "from": "Client",
+              "to": "Token",
+              "arrow": "->>",
+              "label": "POST /token/refresh (retired token)"
+            },
+            {
+              "from": "Token",
+              "to": "Revoke",
+              "arrow": "->>",
+              "label": "hash lookup → token retired (already rotated past)"
+            },
+            {
+              "from": "Token",
+              "to": "Revoke",
+              "arrow": "->>",
+              "label": "revoke entire family"
+            },
+            {
+              "from": "Token",
+              "to": "Audit",
+              "arrow": "->>",
+              "label": "audit refresh_reuse (theft)"
+            },
+            {
+              "from": "Token",
+              "to": "Client",
+              "arrow": "-->>",
+              "label": "401 — re-authenticate"
+            }
+          ]
+        },
+        "highlight": [
+          "Token",
+          "Revoke"
+        ]
+      },
+      {
+        "name": "Hot request path (local verify → sensitive revocation check → cached authz → object check → audit)",
+        "note": "The path 100k req/s take: the gateway verifies the JWT locally against JWKS (no central call), checks the denylist only for sensitive ops, gets a cached RBAC/ABAC decision scoped by tenant, and the resource service repeats an object-level check before mutating.",
+        "sequence": {
+          "participants": [
+            {
+              "id": "Client",
+              "label": "Client"
+            },
+            {
+              "id": "API",
+              "label": "API Gateway"
+            },
+            {
+              "id": "AuthZ",
+              "label": "Authorization Service"
+            },
+            {
+              "id": "Resource",
+              "label": "Resource Service"
+            },
+            {
+              "id": "Audit",
+              "label": "Audit Log"
+            }
+          ],
+          "messages": [
+            {
+              "from": "Client",
+              "to": "API",
+              "arrow": "->>",
+              "label": "request + access token"
+            },
+            {
+              "from": "API",
+              "to": "API",
+              "arrow": "->>",
+              "label": "verify JWT signature locally (JWKS); sensitive op → denylist check"
+            },
+            {
+              "from": "API",
+              "to": "AuthZ",
+              "arrow": "->>",
+              "label": "authorize(subject, action, resource, tenant) — cached @ policy_version"
+            },
+            {
+              "from": "AuthZ",
+              "to": "API",
+              "arrow": "-->>",
+              "label": "allow"
+            },
+            {
+              "from": "API",
+              "to": "Resource",
+              "arrow": "->>",
+              "label": "forward; resource repeats OBJECT-level check (ownership/tenant)"
+            },
+            {
+              "from": "Resource",
+              "to": "Audit",
+              "arrow": "->>",
+              "label": "audit mutation"
+            }
+          ]
+        },
+        "highlight": [
+          "API",
+          "AuthZ",
+          "Resource"
+        ]
+      },
+      {
+        "name": "Key rotation (scheduled overlap + emergency revoke)",
+        "note": "Operations path for signing keys: publish current+next via JWKS, overlap during rotation so in-flight tokens stay valid, retire on schedule. On a suspected key leak, stop signing with the leaked kid and drop it from JWKS so every token bearing it fails verification immediately.",
+        "sequence": {
+          "participants": [
+            {
+              "id": "Token",
+              "label": "Token Service"
+            },
+            {
+              "id": "Keys",
+              "label": "Signing Keys / JWKS"
+            },
+            {
+              "id": "API",
+              "label": "API Gateway"
+            }
+          ],
+          "messages": [
+            {
+              "from": "Token",
+              "to": "Keys",
+              "arrow": "->>",
+              "label": "publish next key (current + next overlap)"
+            },
+            {
+              "from": "API",
+              "to": "Keys",
+              "arrow": "->>",
+              "label": "fetch JWKS; cache by max-age; pick key by kid"
+            },
+            {
+              "type": "alt",
+              "label": "scheduled rotation",
+              "messages": [
+                {
+                  "from": "Token",
+                  "to": "Keys",
+                  "arrow": "->>",
+                  "label": "retire old key once in-flight tokens expire"
+                }
+              ],
+              "else": {
+                "label": "emergency: key compromise",
+                "messages": [
+                  {
+                    "from": "Token",
+                    "to": "Keys",
+                    "arrow": "->>",
+                    "label": "stop signing leaked kid; drop from JWKS"
+                  },
+                  {
+                    "from": "API",
+                    "to": "Keys",
+                    "arrow": "->>",
+                    "label": "refetch on unknown kid → tokens with leaked kid fail"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "highlight": [
+          "Keys"
+        ]
+      }
+    ]
   },
   "satisfies": {
     "functional": [

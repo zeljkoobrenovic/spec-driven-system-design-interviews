@@ -135,6 +135,12 @@
         "label": "store source"
       },
       {
+        "id": "naive-serve",
+        "from": "RawStore",
+        "to": "Viewer",
+        "label": "serve original file"
+      },
+      {
         "id": "upload-meta",
         "from": "UploadSvc",
         "to": "MetaSvc",
@@ -192,7 +198,10 @@
         "id": "play-cdn",
         "from": "PlaySvc",
         "to": "CDN",
-        "label": "signed segment URLs"
+        "label": "mints segment tokens (control plane)",
+        "render": {
+          "arrow": "-.-"
+        }
       },
       {
         "id": "viewer-cdn",
@@ -275,43 +284,60 @@
       "Processing is async — upload returns fast; playback becomes available when renditions are ready.",
       "Durable storage of source and renditions.",
       "Low-latency, high-throughput playback globally (CDN).",
-      "Scale ingestion (hundreds of hours uploaded per minute) and serving (billions of watch hours) independently."
+      "Scale ingestion (hundreds of hours uploaded per minute) and serving (billions of watch hours) independently.",
+      "Access control on playback: public, unlisted, private, and geo-restricted videos enforced without breaking CDN cacheability.",
+      "Out of scope but acknowledged: content validation/moderation (malware scan, policy, copyright matching) as a pre-publish hook; operational SLOs (playback start latency, rebuffering ratio, transcode latency, upload success rate)."
     ]
   },
   "capacity": [
     {
-      "label": "Upload rate",
-      "value": "100s of hours/min",
-      "note": "Drives transcode fleet size."
+      "label": "Upload ingress",
+      "value": "~300 hr/min → ~0.5 GB/s",
+      "note": "300 hr/min ≈ 5 hr/s; at ~100 MB per source-minute that's ~0.5 GB/s sustained upload bandwidth. Motivates resumable chunked upload (step 2)."
     },
     {
-      "label": "Renditions per video",
-      "value": "~5-8",
-      "note": "240p..4K x codecs; multiplies storage + compute."
+      "label": "Transcode multiplier",
+      "value": "~5-8x compute-hours per source-hour",
+      "note": "5-8 renditions (240p..4K × codecs), each roughly real-time-ish to encode. One uploaded hour ≈ several compute-hours → segment-parallel fanout (step 4)."
     },
     {
-      "label": "Source file size",
-      "value": "MBs to many GB",
-      "note": "Requires chunked, resumable upload."
+      "label": "Worker fleet / backlog",
+      "value": "thousands of cores; queue depth = burst buffer",
+      "note": "300 src-hr/min × ~6x ≈ 1800 transcode-hr/min ≈ 30 transcode-hr/s of work; spikes buffer as queue depth and autoscale the fleet (steps 3, 7)."
     },
     {
-      "label": "Concurrent viewers",
-      "value": "millions",
-      "note": "Served from CDN edge, not origin."
+      "label": "Storage growth",
+      "value": "source + ~1.5-2x for renditions",
+      "note": "Immutable source dominates; the rendition ladder adds ~0.5-1x on top. Petabytes/day of net growth → cost tiering (step 7)."
+    },
+    {
+      "label": "CDN edge QPS",
+      "value": "millions of segment req/s; hit ratio >95%",
+      "note": "Millions of concurrent viewers × a 2-6s-segment request every few seconds = millions of segment fetches/sec, almost all served from edge cache (step 5)."
+    },
+    {
+      "label": "Origin miss bandwidth",
+      "value": "<5% of edge traffic, skewed to long tail",
+      "note": "Hot videos cache; cold/long-tail content drives origin pulls from the rendition store. Sizes origin-shield and pre-warm decisions (step 5)."
+    },
+    {
+      "label": "View-event throughput",
+      "value": "~100k-1M view events/sec at peak",
+      "note": "Far higher than metadata write rate — must be aggregated async, not a synchronous counter increment (step 6)."
     },
     {
       "label": "Read:write",
-      "value": "watch >> upload",
-      "note": "CDN absorbs the read fanout."
+      "value": "watch >> upload (orders of magnitude)",
+      "note": "Read fanout lives in the CDN; metadata writes (status, view-count deltas) stay small."
     }
   ],
   "api": [
     {
       "method": "POST",
       "path": "/v1/uploads",
-      "description": "Start a resumable upload session; returns an upload URL the client streams chunks to.",
-      "request": "{ \"filename\": \"clip.mov\", \"size\": 4200000000 }",
-      "response": "{ \"uploadId\": \"u_9\", \"uploadUrl\": \"...\" }",
+      "description": "Start a resumable upload session. Idempotency-Key header dedupes retried session creates; returns the session and chunk part size.",
+      "request": "Idempotency-Key: k_abc\n{ \"filename\": \"clip.mov\", \"size\": 4200000000, \"contentType\": \"video/quicktime\" }",
+      "response": "{ \"uploadId\": \"u_9\", \"videoId\": \"v_3\", \"partSize\": 8388608, \"expiresAt\": \"2026-06-09T12:00:00Z\" }",
       "sequence": {
         "participants": [
           {
@@ -375,11 +401,32 @@
       }
     },
     {
+      "method": "PUT",
+      "path": "/v1/uploads/{uploadId}/parts/{partNumber}",
+      "description": "Upload one chunk. Content-Range gives the byte offset; the server stores the part, records its checksum/ETag, and is idempotent on re-sent parts (same partNumber + checksum is a no-op).",
+      "request": "Content-Range: bytes 25165824-33554431/4200000000\nContent-MD5: <checksum>\n<chunk bytes>",
+      "response": "{ \"partNumber\": 4, \"etag\": \"e_4\", \"receivedBytes\": 33554432 }"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/uploads/{uploadId}",
+      "description": "Resume probe: returns how much the server has and which parts it holds, so the client knows where to continue after an interruption. 409 if client- and server-side total_bytes disagree.",
+      "request": "(uploadId in path)",
+      "response": "{ \"status\": \"in_progress\", \"receivedBytes\": 33554432, \"totalBytes\": 4200000000, \"parts\": [{ \"partNumber\": 1, \"etag\": \"e_1\" }], \"partSize\": 8388608 }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/uploads/{uploadId}/complete",
+      "description": "Finalize the upload. The client sends the ordered part list; the server verifies all parts and total length, assembles/commits the immutable source object, flips the video to 'processing', and enqueues transcode jobs. Idempotent — a retried complete returns the same videoId.",
+      "request": "{ \"parts\": [{ \"partNumber\": 1, \"etag\": \"e_1\" }, { \"partNumber\": 2, \"etag\": \"e_2\" }] }",
+      "response": "{ \"videoId\": \"v_3\", \"status\": \"processing\", \"sourceKey\": \"raw/v_3/source.mov\" }"
+    },
+    {
       "method": "GET",
       "path": "/v1/videos/{id}/playback",
-      "description": "Get the adaptive-streaming manifest and signed segment URLs for a ready video.",
-      "request": "(id in path)",
-      "response": "{ \"manifestUrl\": \"...\", \"renditions\": [\"240p\",\"720p\",\"1080p\"] }",
+      "description": "Control plane: the playback service authorizes the viewer (handles private/unlisted/geo), then returns the manifest plus short-TTL tokenized segment URLs (or a signed cookie). The player fetches segments directly from the CDN — the playback service is never in the segment data path.",
+      "request": "(id in path; viewer auth in header)",
+      "response": "{ \"manifestUrl\": \"https://cdn/.../master.m3u8?token=...\", \"renditions\": [\"240p\",\"720p\",\"1080p\"], \"tokenTtlSeconds\": 300 }",
       "sequence": {
         "participants": [
           {
@@ -415,13 +462,13 @@
             "from": "PlaySvc",
             "to": "Viewer",
             "arrow": "-->>",
-            "label": "manifest + signed CDN URLs"
+            "label": "authorize → manifest + tokenized URLs"
           },
           {
             "from": "Viewer",
             "to": "CDN",
             "arrow": "->>",
-            "label": "fetch segments (adaptive)"
+            "label": "fetch segments directly (adaptive)"
           }
         ]
       }
@@ -429,9 +476,16 @@
     {
       "method": "GET",
       "path": "/v1/videos/{id}/status",
-      "description": "Creator polls processing status.",
+      "description": "Creator polls processing status. Status distinguishes uploading, processing, ready_to_watch (at least one rendition playable), fully_processed (whole ladder done), and failed; per-rendition state surfaces a single failed rendition without blocking the others.",
       "request": "(id in path)",
-      "response": "{ \"status\": \"processing\", \"ready\": [\"240p\",\"480p\"] }"
+      "response": "{ \"status\": \"ready_to_watch\", \"renditions\": [{ \"rendition\": \"240p\", \"state\": \"ready\" }, { \"rendition\": \"1080p\", \"state\": \"pending\" }, { \"rendition\": \"4k\", \"state\": \"failed\" }] }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/videos/{id}/views",
+      "description": "Ingest a view event (fire-and-forget, batched by the player). The pipeline dedupes by (video, session) within a window and only counts once watched_seconds passes the threshold; request_id makes retries idempotent.",
+      "request": "{ \"sessionId\": \"s_42\", \"playbackStart\": \"2026-06-09T11:00:00Z\", \"watchedSeconds\": 31, \"requestId\": \"r_88\" }",
+      "response": "202 Accepted"
     }
   ],
   "dataModel": [
@@ -449,7 +503,7 @@
         },
         {
           "name": "status",
-          "type": "enum(uploading, processing, ready, failed)"
+          "type": "enum(uploading, processing, ready_to_watch, fully_processed, failed)"
         },
         {
           "name": "source_key",
@@ -489,7 +543,7 @@
     },
     {
       "name": "upload_sessions",
-      "note": "Resumable-upload bookkeeping.",
+      "note": "Resumable-upload bookkeeping; one row per in-flight upload.",
       "fields": [
         {
           "name": "upload_id",
@@ -500,12 +554,142 @@
           "type": "uuid"
         },
         {
+          "name": "owner_id",
+          "type": "bigint"
+        },
+        {
+          "name": "idempotency_key",
+          "type": "text (dedupes session create)"
+        },
+        {
+          "name": "status",
+          "type": "enum(in_progress, completed, expired, aborted)"
+        },
+        {
+          "name": "part_size",
+          "type": "int (bytes)"
+        },
+        {
           "name": "received_bytes",
           "type": "bigint (resume offset)"
         },
         {
           "name": "total_bytes",
           "type": "bigint"
+        },
+        {
+          "name": "source_key",
+          "type": "committed raw object key (set on complete)"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamp (GC abandoned sessions)"
+        },
+        {
+          "name": "created_at / updated_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "upload_parts",
+      "note": "One row per uploaded chunk, for resume reconciliation and idempotent re-sends.",
+      "fields": [
+        {
+          "name": "upload_id",
+          "type": "uuid (PK part 1)"
+        },
+        {
+          "name": "part_number",
+          "type": "int (PK part 2)"
+        },
+        {
+          "name": "byte_offset",
+          "type": "bigint"
+        },
+        {
+          "name": "size",
+          "type": "int"
+        },
+        {
+          "name": "checksum_etag",
+          "type": "text (dedupes a re-sent identical part)"
+        },
+        {
+          "name": "received_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "rendition_tasks",
+      "note": "Per-segment transcode work: where retry/lease state lives so the fanout is a real pipeline, not just a queue.",
+      "fields": [
+        {
+          "name": "task_id",
+          "type": "(video_id, rendition, segment_id) PK"
+        },
+        {
+          "name": "state",
+          "type": "enum(pending, leased, done, failed, dead_letter)"
+        },
+        {
+          "name": "attempt",
+          "type": "int"
+        },
+        {
+          "name": "lease_until",
+          "type": "timestamp (reclaim if worker dies)"
+        },
+        {
+          "name": "input_keyframe_range",
+          "type": "source byte/keyframe range to encode"
+        },
+        {
+          "name": "output_key",
+          "type": "deterministic key (idempotent re-run overwrites)"
+        },
+        {
+          "name": "checksum",
+          "type": "text (validate stitched output)"
+        },
+        {
+          "name": "error_code",
+          "type": "text (set on failure / dead-letter)"
+        },
+        {
+          "name": "created_at / updated_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "view_events",
+      "note": "Raw ingested view events (short-retention); aggregated into videos.view_count. Authoritative analytics/monetization keep their own longer-retention store.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid (= request_id, idempotent)"
+        },
+        {
+          "name": "video_id",
+          "type": "uuid"
+        },
+        {
+          "name": "session_id",
+          "type": "text (dedup key with video_id)"
+        },
+        {
+          "name": "playback_start",
+          "type": "timestamp"
+        },
+        {
+          "name": "watched_seconds",
+          "type": "int (threshold gate)"
+        },
+        {
+          "name": "event_time",
+          "type": "timestamp (windowing / late-arrival)"
         }
       ]
     }
@@ -582,10 +766,11 @@
           "RawStore",
           "Viewer"
         ],
-        "caption": "The creator does a resumable upload to the upload service, which stores the source file in the raw upload store.",
+        "caption": "The creator uploads to the upload service, which stores one source file in the raw upload store; viewers are handed that exact original file to play — no transcoding, no CDN.",
         "links": [
           "creator-upload",
-          "upload-raw"
+          "upload-raw",
+          "naive-serve"
         ],
         "highlight": [
           "UploadSvc",
@@ -619,9 +804,10 @@
       "id": "upload",
       "title": "2. Resumable Chunked Upload",
       "description": [
-        "Source files can be many GB and connections drop. Start an upload session and accept the file in chunks tracked by byte offset, so a dropped connection resumes from the last received chunk instead of restarting.",
-        "Store the source in durable object storage and create a video record in 'uploading' state. The upload service does no processing — it just gets bytes safely to storage.",
-        "Validate format/size early; reject obviously bad uploads before storing."
+        "Source files can be many GB and connections drop. Start an upload session (idempotency-keyed so a retried create doesn't fork a second session) and accept the file as fixed-size parts tracked by byte offset, so a dropped connection resumes from the last received part instead of restarting.",
+        "The session is a small state machine: each PUT part records its offset, size, and a checksum/ETag; a re-sent identical part is a no-op (idempotent), and the server reconciles received_bytes from the parts it actually holds. To resume, the client does GET /uploads/{id} to read the server's offset and part list, then continues from there. If client and server disagree on total_bytes, return 409 rather than silently corrupting the assembly.",
+        "Only on POST /complete does the server verify all parts and total length, commit the immutable source object, flip the video to 'processing', and enqueue transcode jobs — so processing never starts on a half-uploaded file. Sessions carry expires_at so abandoned uploads are garbage-collected.",
+        "Store the source in durable object storage and create the video record in 'uploading' state. The upload service does no processing — it just gets bytes safely to storage. Validate format/size early; reject obviously bad uploads before storing."
       ],
       "view": {
         "nodes": [
@@ -640,7 +826,9 @@
         ],
         "highlight": [
           "UploadSvc",
-          "RawStore"
+          "RawStore",
+          "MetaSvc",
+          "MetaDB"
         ],
         "groups": [
           "ingest"
@@ -685,9 +873,9 @@
       "id": "pipeline",
       "title": "3. Decouple Processing with a Job Queue",
       "description": [
-        "Transcoding is CPU/GPU-heavy and slow — it must not block the upload response. Once the source is stored, enqueue processing jobs and return immediately; the video stays 'processing' until renditions are ready.",
-        "A queue decouples ingestion rate from processing capacity: upload spikes buffer in the queue, and the worker fleet scales independently.",
-        "Update video status as renditions complete so creators see progress and playback unlocks per-rendition."
+        "Transcoding is CPU/GPU-heavy and slow — it must not block the upload response. Jobs are enqueued only after the upload is committed (the /complete step), not when the first chunks land, so workers never run against a half-uploaded source. Once committed, enqueue and return immediately; the video stays 'processing' until renditions are ready.",
+        "A queue decouples ingestion rate from processing capacity: upload spikes buffer as queue depth (the backpressure signal that later autoscales the fleet), and the worker fleet scales independently.",
+        "Update video status as renditions complete so creators see progress and playback unlocks per-rendition. Guard the enqueue: if the metadata write succeeds but the queue publish fails, a reconciler re-enqueues from videos in 'processing' with no live tasks, so a video can't get stuck never-processed."
       ],
       "view": {
         "nodes": [
@@ -742,8 +930,9 @@
       "title": "4. Transcode Fanout into Renditions",
       "description": [
         "Each source is transcoded into several renditions (e.g. 240p..4K, multiple codecs). Fan these out as independent parallel jobs so a video becomes available rendition-by-rendition.",
-        "For long videos, split the source into segments and transcode segments in parallel, then stitch — cutting wall-clock time for a single big upload.",
-        "Workers read the source, encode, write renditions to durable storage, and mark each rendition ready in metadata. Jobs are idempotent and retryable so a worker crash just re-runs that job."
+        "For long videos, split the source on keyframe boundaries into segments and transcode segments in parallel, then stitch — cutting wall-clock time for a single big upload.",
+        "The task state is what makes this a pipeline rather than 'put it in a queue'. Each unit of work is a row keyed by (video_id, rendition, segment_id) with state, attempt count, and a lease_until. A worker claims a task by taking a lease; if it crashes, the lease expires and another worker reclaims it. Output keys are deterministic (derived from the task id), so a re-run overwrites the same object idempotently and partial output from the dead attempt is harmless. After a max attempt count a task moves to dead_letter rather than retrying forever, and a coordinator (owned by the metadata service here) tracks the per-rendition task set, validates the stitched checksum, and only marks a rendition ready when all its segments are done.",
+        "Workers read the source, encode, write renditions to durable storage, and update task/rendition state in metadata."
       ],
       "view": {
         "nodes": [
@@ -916,8 +1105,13 @@
       "failureDrills": [
         {
           "scenario": "A transcode worker crashes mid-job.",
-          "expectedBehavior": "The job returns to the queue and another worker re-runs it; the partial output is discarded.",
-          "mitigation": "Idempotent jobs keyed by (video, rendition, segment); at-least-once queue."
+          "expectedBehavior": "The task's lease expires; another worker reclaims it and re-runs. The deterministic output key means the re-run overwrites the dead attempt's partial output, so nothing is double-counted.",
+          "mitigation": "Lease-based claim + lease_until reclaim; idempotent tasks keyed by (video, rendition, segment) with deterministic output keys."
+        },
+        {
+          "scenario": "One segment keeps failing (e.g. a corrupt source region).",
+          "expectedBehavior": "After max attempts the task moves to dead_letter with an error_code; the rendition is marked failed without blocking other renditions, and an operator/alert is notified.",
+          "mitigation": "Per-task attempt cap → dead-letter; per-rendition state so one failure doesn't fail the whole video."
         }
       ],
       "flows": [
@@ -984,6 +1178,83 @@
             "JobQ",
             "Workers"
           ]
+        },
+        {
+          "name": "Worker crash -> lease reclaim -> retry / dead-letter",
+          "note": "A segment task is claimed via a lease. If the worker dies, the lease expires and another worker reclaims and re-runs it idempotently; a task that keeps failing past its attempt cap is dead-lettered and its rendition marked failed without blocking others.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "JobQ",
+                "label": "Job Queue"
+              },
+              {
+                "id": "Workers",
+                "label": "Transcode Workers"
+              },
+              {
+                "id": "RenditionStore",
+                "label": "Rendition Store"
+              },
+              {
+                "id": "MetaSvc",
+                "label": "Metadata (coordinator)"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Workers",
+                "to": "JobQ",
+                "arrow": "->>",
+                "label": "claim task (lease until T)"
+              },
+              {
+                "type": "alt",
+                "label": "worker crashes before done",
+                "messages": [
+                  {
+                    "from": "JobQ",
+                    "to": "Workers",
+                    "arrow": "->>",
+                    "label": "lease expires → reclaim by another worker"
+                  },
+                  {
+                    "from": "Workers",
+                    "to": "RenditionStore",
+                    "arrow": "->>",
+                    "label": "re-run → overwrite deterministic output key"
+                  },
+                  {
+                    "from": "Workers",
+                    "to": "MetaSvc",
+                    "arrow": "->>",
+                    "label": "segment done (attempt++)"
+                  }
+                ],
+                "else": {
+                  "label": "task exceeds attempt cap",
+                  "messages": [
+                    {
+                      "from": "Workers",
+                      "to": "MetaSvc",
+                      "arrow": "->>",
+                      "label": "dead-letter task; mark rendition failed"
+                    }
+                  ]
+                }
+              },
+              {
+                "from": "MetaSvc",
+                "to": "MetaSvc",
+                "arrow": "->>",
+                "label": "all segments done → validate checksum, mark rendition ready"
+              }
+            ]
+          },
+          "highlight": [
+            "Workers",
+            "MetaSvc"
+          ]
         }
       ]
     },
@@ -992,7 +1263,8 @@
       "title": "5. Adaptive Bitrate Streaming via CDN",
       "description": [
         "Renditions are segmented (a few seconds each) with an HLS/DASH manifest listing the available qualities. The player downloads the manifest, then fetches segments, switching rendition up/down to match the viewer's bandwidth.",
-        "Serve segments from a CDN, not the origin: the CDN caches them near viewers and absorbs the massive read fanout. The playback service returns the manifest and signed, time-limited segment URLs.",
+        "Keep the control plane and data plane separate. The playback service is control plane: it authorizes the viewer (public/unlisted/private, geo restrictions) and returns the manifest plus short-TTL signed segment URLs or a signed cookie. It is never on the per-segment hot path. The player then fetches segments directly from the CDN; the CDN caches them near viewers and origin-fetches from the rendition store only on a miss. So a single playback request hits the service once, but the millions of segment fetches never touch it.",
+        "CDN specifics that make this work: the cache key is the rendition+segment path (the signing token is excluded from the key, so signed-but-equivalent requests still share a cache entry); segments are immutable so TTLs are long, while manifests get short TTLs; an origin shield tier collapses many edge misses into one origin fetch for long-tail content. Private/unlisted videos stay cacheable without leaking because access is gated by the short-lived token the service mints per authorized viewer — the bytes are public-cacheable but only reachable with a valid token, and tokens expire fast enough that a leaked URL is low-value.",
         "This is the metadata/blob/CDN split: small manifest/metadata from the service, large segments from object storage via CDN edge."
       ],
       "view": {
@@ -1003,7 +1275,7 @@
           "CDN",
           "RenditionStore"
         ],
-        "caption": "The viewer requests playback from the playback service, which fetches the manifest from metadata and hands back signed CDN URLs; the viewer pulls segments from the streaming CDN, which origin-fetches from the rendition store.",
+        "caption": "Control plane: the viewer requests playback once from the playback service, which fetches the manifest from metadata and returns short-TTL tokenized URLs. Data plane: the viewer then pulls segments directly from the streaming CDN, which origin-fetches from the rendition store only on a miss — the playback service is never in the segment path.",
         "links": [
           "viewer-play",
           "play-meta",
@@ -1260,8 +1532,9 @@
       "title": "6. View Counting at Scale",
       "description": [
         "A synchronous counter increment per view would hammer the database for popular videos. Instead, emit view events into an async pipeline that dedups and aggregates them into counts.",
-        "Dedup per (video, viewer/session) within a window to avoid inflating counts from replays/refreshes; aggregate and periodically write the count back to video metadata.",
-        "Counts are eventually consistent — acceptable for a view counter — and the pipeline absorbs spikes from viral videos."
+        "Define what a view actually is. A view event is (video_id, session/device, playback_start, watched_seconds, event_time, request_id). A view is only counted once watched_seconds crosses a threshold (e.g. 30s, or % of a short clip) — that prevents accidental autoplay/refresh inflation. Dedup per (video, session) within a window so replays and refreshes don't double-count; request_id makes retried ingests idempotent. Events are windowed by event_time, and the pipeline tolerates late arrivals (a watermark + grace period) before sealing a window.",
+        "Add bot/fraud filtering before counting: drop events failing simple signals (no engagement, datacenter IPs, impossible rates). The public display count is eventually consistent and approximate — acceptable for a view counter — and the pipeline absorbs spikes from viral videos.",
+        "Separate the public count from authoritative counts. Recommendations, abuse detection, and especially monetization/ads need stricter, audited, longer-retention records and may apply different validity rules — so the fast approximate public counter and the slower exact analytics/monetization pipeline are deliberately different paths, even if both start from the same event stream."
       ],
       "view": {
         "nodes": [
@@ -1426,8 +1699,10 @@
       "id": "scale",
       "title": "7. Storage, Cost, and Reliability at Scale",
       "description": [
+        "This step synthesizes the reliability and cost mechanisms introduced where they belong (resumable session GC in step 2, the lease/retry/dead-letter task state in step 4, cache/TTL in step 5, dedup/late-event handling in step 6) into the operating picture.",
         "Storage is dominated by sources + renditions. Keep the immutable source (for re-transcode if codecs change), use cheaper/colder storage tiers for old or rarely-watched content, and consider dropping rarely-used renditions.",
-        "Make the pipeline reliable end to end: idempotent retryable jobs, dead-letter for repeatedly-failing videos, and per-rendition status so a single failed rendition doesn't block the others.",
+        "Make the pipeline reliable end to end: idempotent retryable tasks, dead-letter for repeatedly-failing segments, and per-rendition status so a single failed rendition doesn't block the others.",
+        "Observe it where users feel it: queue age / transcode backlog, transcode latency percentiles, per-rendition failure rate, playback start latency and rebuffering ratio, CDN hit ratio and origin egress, and upload completion rate. These are the SLO signals that drive autoscaling and alerting.",
         "Scale ingestion (upload + transcode fleet) and serving (CDN + playback) independently, since their load profiles differ."
       ],
       "view": {
@@ -1480,7 +1755,7 @@
   ],
   "finalDesign": {
     "title": "Final Design — Video Upload & Streaming Pipeline",
-    "description": "Creators upload sources via resumable chunked upload to durable storage; the metadata service creates the video as 'processing' and enqueues transcode jobs. Workers fan out renditions (segment-parallel for long videos), write segmented HLS/DASH output to the rendition store, and mark renditions ready. Viewers get a manifest + signed URLs from the playback service and stream adaptively from the CDN. View events flow through an async dedup'd counting pipeline. Source + renditions are cost-tiered; ingestion and serving scale independently; jobs are idempotent and retryable.",
+    "description": "Creators upload sources via resumable chunked upload (session + part state, committed on /complete) to durable storage; the metadata service creates the video as 'processing' and enqueues transcode jobs. Workers fan out renditions (segment-parallel for long videos) over lease-based, idempotent, dead-letterable tasks, write segmented HLS/DASH output to the rendition store, and a coordinator validates and marks renditions ready. The playback service is control plane only: it authorizes the viewer and returns a manifest plus short-TTL tokenized URLs; viewers then stream segments directly from the CDN (origin-shielded over the rendition store) — the service is never on the segment hot path. View events flow through an async, deduped, threshold-gated counting pipeline, with the public approximate counter kept separate from authoritative analytics/monetization records. The state surfaces that make this real: upload session/part state, transcode task/coordinator state, manifest/segment metadata, view-event aggregation state, and operational SLO monitoring. Source + renditions are cost-tiered; ingestion and serving scale independently.",
     "view": {
       "nodes": [
         "Creator",

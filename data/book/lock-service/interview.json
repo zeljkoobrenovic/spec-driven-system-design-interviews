@@ -70,7 +70,7 @@
         "traits": [
           "stateless"
         ],
-        "description": "Expires leases whose holder didn't renew in time."
+        "description": "Finds leases past expiry and PROPOSES expire(key, expectedLeaseId) through the leader — it never mutates lock state directly."
       },
       {
         "id": "Resource",
@@ -78,7 +78,17 @@
         "type": "external",
         "category": "boundary",
         "traits": [],
-        "description": "The thing being guarded (a file, a DB write, a job) that checks the token."
+        "description": "The guarded system (a file store, a DB, a job). It persists max_seen_token per lock key and atomically rejects any write whose fencing token is lower."
+      },
+      {
+        "id": "ShardMap",
+        "label": "Shard Map (routing)",
+        "type": "service",
+        "category": "compute",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Versioned key-range -> owning consensus group + current leader. The stateless API tier consults it to route each key to the right group; it is the control plane for safe range migration and membership change."
       }
     ],
     "links": [
@@ -131,10 +141,11 @@
         "label": "renew lease (heartbeat)"
       },
       {
-        "id": "sweeper-lockstate",
+        "id": "sweeper-leader",
         "from": "Sweeper",
-        "to": "LockState",
-        "label": "expire stale leases"
+        "to": "Leader",
+        "label": "propose expire(key, leaseId)",
+        "arrow": "-.-"
       },
       {
         "id": "api-client",
@@ -152,7 +163,14 @@
         "id": "resource-check",
         "from": "Resource",
         "to": "Resource",
-        "label": "reject stale token"
+        "label": "token >= max_seen_token ? accept : reject"
+      },
+      {
+        "id": "api-shardmap",
+        "from": "LockAPI",
+        "to": "ShardMap",
+        "label": "route key -> owning group (versioned)",
+        "arrow": "-.-"
       }
     ],
     "types": [
@@ -161,7 +179,8 @@
         "label": "API Tier",
         "nodes": [
           "LockAPI",
-          "Sweeper"
+          "Sweeper",
+          "ShardMap"
         ]
       },
       {
@@ -214,38 +233,305 @@
   },
   "capacity": [
     {
-      "label": "Lock keys",
-      "value": "many",
-      "note": "Each independently lockable."
+      "label": "Active locks",
+      "value": "~1M held concurrently",
+      "note": "Out of a much larger key universe; most keys are idle at any moment."
+    },
+    {
+      "label": "Renew QPS",
+      "value": "~200K renews/sec",
+      "note": "Dominant load: 1M leases × renew every 5s (TTL 15s) = 200K writes/sec before replication. Renewals, not acquires, drive the write budget."
+    },
+    {
+      "label": "Acquire / release QPS",
+      "value": "~20K acquire + ~20K release/sec",
+      "note": "Plus ~50K read/status QPS (linearizable holder checks)."
+    },
+    {
+      "label": "Deployment assumption",
+      "value": "single-region / one AZ-set quorum, durable local storage",
+      "note": "The throughput and latency figures below assume a regional quorum with local (intra-region) round trips and group-committed fsync to durable local storage. Cross-region consensus would multiply p99 by the inter-region RTT (tens of ms) in exchange for regional-failure tolerance — a different design point. Treat all the numbers here as one illustrative sizing pass, not a universal promise."
+    },
+    {
+      "label": "Per-group write budget",
+      "value": "~10–20K committed ops/sec",
+      "note": "A single Raft group is bounded by leader fsync + quorum round trip, assuming the single-region topology above with group commit / batched durable writes (per-op fsync without batching is materially lower). ~240K total writes/sec / ~15K per group ⇒ ~16–24 consensus groups, then round up further for tail latency, noisy neighbors, and shard imbalance."
+    },
+    {
+      "label": "Latency targets",
+      "value": "acquire p50 5ms / p99 30ms; renew p50 2ms / p99 20ms",
+      "note": "Dominated by one quorum round trip; tail driven by leader fsync and failover. Renew is the hot path — keep it cheap."
+    },
+    {
+      "label": "Lease TTL / renewal",
+      "value": "TTL 15s, renew every 5s",
+      "note": "Renew at TTL/3 so a holder survives one or two missed heartbeats before expiry. Short TTL ⇒ faster recovery but more renew load; long TTL ⇒ slower reclaim."
+    },
+    {
+      "label": "State size",
+      "value": "~1M locks × ~200B ≈ 200MB lock table",
+      "note": "Plus log retention before compaction, periodic snapshots, an idempotency/dedup table (TTL'd), and an expiration index/timer wheel. All rebuildable from snapshot + log tail."
     },
     {
       "label": "Replication",
-      "value": "consensus group (3/5)",
-      "note": "Quorum for durability + availability."
+      "value": "consensus group (3 or 5 nodes), per shard",
+      "note": "Quorum (2/3 or 3/5) for durability + availability. Tolerates a minority failing."
     },
     {
-      "label": "Lease TTL",
-      "value": "seconds",
-      "note": "Short enough to recover fast, long enough to renew."
+      "label": "Availability",
+      "value": "majority-side operation only",
+      "note": "Target ~99.9%+ on the quorum side; the minority side is deliberately unavailable for grants (CP)."
     },
     {
-      "label": "Safety",
-      "value": "at most one holder",
-      "note": "The whole point."
+      "label": "Hot keys",
+      "value": "serialized by design",
+      "note": "A single contended key is one lock — it cannot be horizontally scaled for writes without weakening mutual-exclusion semantics. Sharding scales across keys, never within one key."
     },
     {
       "label": "Consistency",
       "value": "linearizable (CP)",
-      "note": "Correctness over availability for lock grants."
+      "note": "Correctness over availability for lock grants — refuse service rather than risk two holders."
     }
   ],
   "api": [
     {
       "method": "POST",
       "path": "/v1/locks/{key}/acquire",
-      "description": "Acquire the lock with a lease TTL; returns a fencing token if granted.",
-      "request": "{ \"clientId\": \"w_3\", \"ttlSec\": 15 }",
-      "response": "{ \"granted\": true, \"fencingToken\": 42, \"expiresAt\": \"...\" }",
+      "description": "Acquire the lock with a lease TTL. clientId is the authenticated caller identity (from the auth token, not a free-form string); requestId makes the acquire idempotent across retries and leader failover. mode chooses fail-fast vs bounded wait: with mode=wait the server holds the request as a bounded long-poll (registered in a per-key server-side waiter queue) for up to waitMs, returning the grant the moment the key frees or WAIT_TIMEOUT if it doesn't — the queue is best-effort FIFO, not a strict fairness guarantee (a late acquire can still win a race). On success returns a durable leaseId and a monotonic fencingToken. ttlSec is clamped to [minTtl, maxTtl] server-side. Errors: HELD (fail_fast, key taken), WAIT_TIMEOUT (waited waitMs, still held), QUORUM_UNAVAILABLE (no majority), NOT_LEADER (retryable redirect).",
+      "request": "{ \"clientId\": \"w_3\", \"requestId\": \"a1f9-...\", \"ttlSec\": 15, \"mode\": \"wait\", \"waitMs\": 2000 }",
+      "response": "{ \"granted\": true, \"leaseId\": \"L_88\", \"fencingToken\": 42, \"ttlSec\": 15, \"expiresAt\": \"2026-06-09T12:00:15Z\" }",
+      "sequence": {
+        "participants": [
+          {
+            "id": "Client"
+          },
+          {
+            "id": "LockAPI",
+            "label": "Lock API"
+          },
+          {
+            "id": "Leader",
+            "label": "Consensus Leader"
+          },
+          {
+            "id": "Followers",
+            "label": "Followers"
+          },
+          {
+            "id": "Log",
+            "label": "Replicated Log"
+          },
+          {
+            "id": "LockState",
+            "label": "Lock State"
+          }
+        ],
+        "messages": [
+          {
+            "from": "Client",
+            "to": "LockAPI",
+            "arrow": "->>",
+            "label": "acquire(key, requestId)"
+          },
+          {
+            "from": "LockAPI",
+            "to": "Leader",
+            "arrow": "->>",
+            "label": "propose acquire (dedup on requestId)"
+          },
+          {
+            "from": "Leader",
+            "to": "Log",
+            "arrow": "->>",
+            "label": "append acquire entry"
+          },
+          {
+            "from": "Leader",
+            "to": "Followers",
+            "arrow": "->>",
+            "label": "replicate (quorum)"
+          },
+          {
+            "from": "Log",
+            "to": "LockState",
+            "arrow": "->>",
+            "label": "apply committed: holder=w_3, token++"
+          },
+          {
+            "from": "LockAPI",
+            "to": "Client",
+            "arrow": "-->>",
+            "label": "granted + fencing token 42"
+          }
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/v1/locks/{key}/renew",
+      "description": "Extend the lease before it expires (heartbeat). Requires the leaseId returned at acquire; the server checks the caller is still the holder of that exact lease. Errors: NOT_HOLDER (someone else holds it now), LEASE_EXPIRED (already swept — the client must stop acting and re-acquire), QUORUM_UNAVAILABLE, NOT_LEADER. On a renew timeout the client cannot assume the renew committed: it must treat ownership as uncertain and stop touching the resource until it confirms via a fresh acquire or status read.",
+      "request": "{ \"clientId\": \"w_3\", \"leaseId\": \"L_88\", \"requestId\": \"r2c0-...\" }",
+      "response": "{ \"ok\": true, \"fencingToken\": 42, \"expiresAt\": \"2026-06-09T12:00:20Z\" }",
+      "sequence": {
+        "participants": [
+          {
+            "id": "Client"
+          },
+          {
+            "id": "LockAPI",
+            "label": "Lock API"
+          },
+          {
+            "id": "Leader",
+            "label": "Consensus Leader"
+          },
+          {
+            "id": "Log",
+            "label": "Replicated Log"
+          },
+          {
+            "id": "LockState",
+            "label": "Lock State"
+          }
+        ],
+        "messages": [
+          {
+            "from": "Client",
+            "to": "LockAPI",
+            "arrow": "->>",
+            "label": "renew(key, leaseId=L_88, requestId)"
+          },
+          {
+            "from": "LockAPI",
+            "to": "Leader",
+            "arrow": "->>",
+            "label": "propose renew (precondition: holder still holds L_88)"
+          },
+          {
+            "from": "Leader",
+            "to": "Log",
+            "arrow": "->>",
+            "label": "append renew; replicate to quorum"
+          },
+          {
+            "from": "Log",
+            "to": "LockState",
+            "arrow": "->>",
+            "label": "apply: extend expires_at"
+          },
+          {
+            "type": "alt",
+            "label": "commit acknowledged in time",
+            "messages": [
+              {
+                "from": "LockAPI",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "ok, lease extended (token unchanged)"
+              }
+            ],
+            "else": {
+              "label": "response lost / times out",
+              "messages": [
+                {
+                  "from": "LockAPI",
+                  "to": "Client",
+                  "arrow": "-x",
+                  "label": "timeout: ownership UNCERTAIN"
+                },
+                {
+                  "from": "Client",
+                  "to": "Client",
+                  "arrow": "->>",
+                  "label": "stop acting; re-confirm via status read or idempotent re-acquire (same requestId)"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/v1/locks/{key}/release",
+      "description": "Explicitly release a held lock. Requires leaseId; release is a precondition'd, idempotent op — it only frees the key if this lease still holds it (a stale release after expiry/regrant is a no-op, so it can never release someone else's lock). Errors: NOT_HOLDER, LEASE_EXPIRED (treated as success — already released).",
+      "request": "{ \"clientId\": \"w_3\", \"leaseId\": \"L_88\", \"requestId\": \"r3d1-...\" }",
+      "response": "{ \"released\": true }",
+      "sequence": {
+        "participants": [
+          {
+            "id": "Client"
+          },
+          {
+            "id": "LockAPI",
+            "label": "Lock API"
+          },
+          {
+            "id": "Leader",
+            "label": "Consensus Leader"
+          },
+          {
+            "id": "LockState",
+            "label": "Lock State"
+          }
+        ],
+        "messages": [
+          {
+            "from": "Client",
+            "to": "LockAPI",
+            "arrow": "->>",
+            "label": "release(key, leaseId=L_88)"
+          },
+          {
+            "from": "LockAPI",
+            "to": "Leader",
+            "arrow": "->>",
+            "label": "propose release (precondition: current lease == L_88)"
+          },
+          {
+            "type": "alt",
+            "label": "L_88 still holds the key",
+            "messages": [
+              {
+                "from": "Leader",
+                "to": "LockState",
+                "arrow": "->>",
+                "label": "apply: free key (committed)"
+              },
+              {
+                "from": "LockAPI",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "released: true"
+              }
+            ],
+            "else": {
+              "label": "lease already expired / re-granted to someone else",
+              "messages": [
+                {
+                  "from": "Leader",
+                  "to": "LockState",
+                  "arrow": "->>",
+                  "label": "precondition fails -> no-op (can't free another holder's lock)"
+                },
+                {
+                  "from": "LockAPI",
+                  "to": "Client",
+                  "arrow": "-->>",
+                  "label": "released: true (idempotent stale-release success)"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/locks/{key}",
+      "description": "Read current holder, leaseId, fencingToken, and expiry. Linearizable (served through the leader / read-index) by default; pass ?consistency=stale for a cheap, possibly-stale follower read used only for non-authoritative inspection.",
+      "request": "(query) ?consistency=linearizable",
+      "response": "{ \"key\": \"job-42\", \"holder\": \"w_3\", \"leaseId\": \"L_88\", \"fencingToken\": 42, \"expiresAt\": \"2026-06-09T12:00:20Z\" }",
       "sequence": {
         "participants": [
           {
@@ -270,79 +556,116 @@
         ],
         "messages": [
           {
-            "from": "Client",
-            "to": "LockAPI",
-            "arrow": "->>",
-            "label": "acquire(key)"
-          },
-          {
-            "from": "LockAPI",
-            "to": "Leader",
-            "arrow": "->>",
-            "label": "propose acquire"
-          },
-          {
-            "from": "Leader",
-            "to": "Followers",
-            "arrow": "->>",
-            "label": "replicate (quorum)"
-          },
-          {
-            "from": "Leader",
-            "to": "LockState",
-            "arrow": "->>",
-            "label": "apply: holder=w_3, token++"
-          },
-          {
-            "from": "LockAPI",
-            "to": "Client",
-            "arrow": "-->>",
-            "label": "granted + fencing token 42"
+            "type": "alt",
+            "label": "linearizable (default): authoritative holder check",
+            "messages": [
+              {
+                "from": "Client",
+                "to": "LockAPI",
+                "arrow": "->>",
+                "label": "GET /locks/{key}?consistency=linearizable"
+              },
+              {
+                "from": "LockAPI",
+                "to": "Leader",
+                "arrow": "->>",
+                "label": "read-index: confirm still leader via quorum heartbeat"
+              },
+              {
+                "from": "Leader",
+                "to": "LockState",
+                "arrow": "->>",
+                "label": "read holder/lease at/after read-index"
+              },
+              {
+                "from": "LockAPI",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "current holder, leaseId, fencingToken, expiresAt"
+              }
+            ],
+            "else": {
+              "label": "stale read: cheap follower inspection only",
+              "messages": [
+                {
+                  "from": "Client",
+                  "to": "LockAPI",
+                  "arrow": "->>",
+                  "label": "GET /locks/{key}?consistency=stale"
+                },
+                {
+                  "from": "LockAPI",
+                  "to": "Followers",
+                  "arrow": "->>",
+                  "label": "read local applied state (may lag the leader)"
+                },
+                {
+                  "from": "LockAPI",
+                  "to": "Client",
+                  "arrow": "-->>",
+                  "label": "possibly-stale snapshot (dashboards/metrics, never to decide to act)"
+                }
+              ]
+            }
           }
         ]
       }
-    },
-    {
-      "method": "POST",
-      "path": "/v1/locks/{key}/renew",
-      "description": "Extend the lease before it expires (heartbeat).",
-      "request": "{ \"clientId\": \"w_3\", \"fencingToken\": 42 }",
-      "response": "{ \"ok\": true, \"expiresAt\": \"...\" }"
-    },
-    {
-      "method": "POST",
-      "path": "/v1/locks/{key}/release",
-      "description": "Explicitly release a held lock.",
-      "request": "{ \"clientId\": \"w_3\", \"fencingToken\": 42 }",
-      "response": "{ \"released\": true }"
     }
   ],
   "dataModel": [
     {
       "name": "lock",
-      "note": "Current lock state, applied from the replicated log.",
+      "note": "Current lock state per key, applied deterministically from the committed log (derived, rebuildable).",
       "fields": [
         {
           "name": "key",
           "type": "string PK"
         },
         {
+          "name": "tenant",
+          "type": "tenant_id (isolation / quota scope)"
+        },
+        {
           "name": "holder",
-          "type": "client_id | null"
+          "type": "client_id | null (authenticated identity)"
+        },
+        {
+          "name": "lease_id",
+          "type": "opaque id, new per grant (renew/release require it)"
+        },
+        {
+          "name": "holder_session_id",
+          "type": "client session this grant belongs to"
         },
         {
           "name": "fencing_token",
           "type": "monotonic int (incremented each grant)"
         },
         {
+          "name": "last_renewed_at",
+          "type": "leader-applied timestamp of last renew"
+        },
+        {
           "name": "expires_at",
-          "type": "lease expiry"
+          "type": "lease expiry (in the committed timeline, not a local clock)"
+        },
+        {
+          "name": "version",
+          "type": "row version (optimistic precondition)"
+        },
+        {
+          "name": "log_index",
+          "type": "log index of the op that last mutated this row"
+        },
+        {
+          "name": "status",
+          "type": "held | free | expiring"
         }
       ]
     },
     {
       "name": "replicated_log",
-      "note": "Agreed, durable sequence of lock ops (the source of truth).",
+      "note": "Agreed, durable sequence of lock ops (the source of truth). Expiry is a logged op like any other.",
       "fields": [
         {
           "name": "index",
@@ -354,9 +677,982 @@
         },
         {
           "name": "op",
-          "type": "acquire/renew/release(key, client)"
+          "type": "acquire | renew | release | expire (key)"
+        },
+        {
+          "name": "request_id",
+          "type": "client/request id for idempotent apply"
+        },
+        {
+          "name": "expected_lease_id",
+          "type": "precondition for renew/release/expire (CAS on holder)"
+        },
+        {
+          "name": "ttl_sec",
+          "type": "lease TTL carried by acquire/renew"
+        },
+        {
+          "name": "token_assigned",
+          "type": "fencing token granted (acquire only)"
+        },
+        {
+          "name": "result",
+          "type": "applied | rejected (precondition failed)"
         }
       ]
+    },
+    {
+      "name": "request_dedup",
+      "note": "Idempotency records so retries across timeouts/leader failover apply at most once. Keyed by (tenant, client, request_id); TTL'd longer than the max client retry window.",
+      "fields": [
+        {
+          "name": "dedup_key",
+          "type": "(tenant, client_id, request_id) PK"
+        },
+        {
+          "name": "result",
+          "type": "cached response (granted? lease_id, token)"
+        },
+        {
+          "name": "applied_log_index",
+          "type": "the log entry that committed this request"
+        },
+        {
+          "name": "expires_at",
+          "type": "retention deadline for the dedup record"
+        }
+      ]
+    },
+    {
+      "name": "shard_map / group_membership",
+      "note": "Control plane: which consensus group owns a key range, and the group's members/leader/term. Used by the stateless API tier to route a key to its current leader. The map is versioned so routers can detect a stale view (get a retryable NOT_OWNER redirect) and refresh after a range migration.",
+      "fields": [
+        {
+          "name": "key_range",
+          "type": "hash range / ring segment PK"
+        },
+        {
+          "name": "map_version",
+          "type": "monotonic version (bumped on ownership change; routers redirect on stale)"
+        },
+        {
+          "name": "group_id",
+          "type": "owning consensus group"
+        },
+        {
+          "name": "members",
+          "type": "node ids in the group"
+        },
+        {
+          "name": "leader",
+          "type": "current leader node + term"
+        },
+        {
+          "name": "reconfig_status",
+          "type": "stable | joining | leaving (safe membership change)"
+        }
+      ]
+    },
+    {
+      "name": "expiration_index",
+      "note": "A timer wheel / ordered index of (expires_at -> key) so the sweeper finds soon-to-expire leases without scanning every lock. Rebuilt from lock state.",
+      "fields": [
+        {
+          "name": "expires_at",
+          "type": "bucketed expiry time (sort key)"
+        },
+        {
+          "name": "key",
+          "type": "lock key due to expire"
+        },
+        {
+          "name": "expected_lease_id",
+          "type": "lease the expiry op must match (else it's a no-op)"
+        }
+      ]
+    },
+    {
+      "name": "resource_fence (outside lock service)",
+      "note": "State the PROTECTED RESOURCE keeps, not the lock service. Each guarded write carries (lock_key, fencing_token, holder_id); the resource atomically checks token >= max_seen_token and bumps it. Without this, the lock is only advisory.",
+      "fields": [
+        {
+          "name": "lock_key",
+          "type": "the lock guarding this resource/object PK"
+        },
+        {
+          "name": "max_seen_token",
+          "type": "highest fencing token accepted so far"
+        }
+      ]
+    }
+  ],
+  "technologyChoices": [
+    {
+      "concern": "API edge, tenant identity, and admission control",
+      "steps": [
+        "lease",
+        "availability",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Kong",
+          "icon": "assets/tech-icons/kong.png"
+        },
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "HAProxy",
+          "icon": "assets/tech-icons/haproxy.png"
+        },
+        {
+          "name": "Keycloak",
+          "icon": "assets/tech-icons/keycloak.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          },
+          {
+            "name": "WAF",
+            "icon": "assets/tech-icons/Arch_AWS-WAF_64.png"
+          },
+          {
+            "name": "Cognito",
+            "icon": "assets/tech-icons/Arch_Amazon-Cognito_64.png"
+          },
+          {
+            "name": "ALB",
+            "icon": "assets/tech-icons/Arch_Elastic-Load-Balancing_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Endpoints",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Armor",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Identity Platform",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          },
+          {
+            "name": "Cloud Load Balancing",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "API Management",
+            "icon": "assets/tech-icons/10042-icon-service-API-Management-Services.svg"
+          },
+          {
+            "name": "Application Gateway",
+            "icon": "assets/tech-icons/10076-icon-service-Application-Gateways.svg"
+          },
+          {
+            "name": "Microsoft Entra ID",
+            "icon": "assets/tech-icons/10231-icon-service-Entra-ID-Protection.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Keep tenant authentication, quotas, TLS, and request-size limits in front of the quorum path so bad clients do not consume consensus capacity.",
+        "Self-hosted gateways give tight control over routing and admission policies, but every proxy fleet outage becomes a global lock-service outage.",
+        "Managed API edges simplify certificates, WAF rules, and identity integration, but can hide per-key hot spots unless they export tenant/key-level metrics."
+      ],
+      "makesIrrelevant": "A managed edge with WAF, OAuth/OIDC integration, and throttling removes much of the custom gateway, TLS rotation, and coarse abuse-filtering code from the stateless API tier."
+    },
+    {
+      "concern": "Consensus membership and replicated lock state",
+      "steps": [
+        "consensus",
+        "availability",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "etcd",
+          "icon": "assets/tech-icons/etcd.png"
+        },
+        {
+          "name": "Consul",
+          "icon": "assets/tech-icons/consul.png"
+        },
+        {
+          "name": "ZooKeeper",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "CockroachDB",
+          "icon": "assets/tech-icons/cockroach.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "EC2",
+            "icon": "assets/tech-icons/Arch_Amazon-EC2_64.png"
+          },
+          {
+            "name": "EKS",
+            "icon": "assets/tech-icons/Arch_Amazon-Elastic-Kubernetes-Service_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Compute Engine",
+            "icon": "assets/tech-icons/Compute-512-color.png"
+          },
+          {
+            "name": "GKE",
+            "icon": "assets/tech-icons/Containers-512-color.png"
+          },
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Virtual Machines",
+            "icon": "assets/tech-icons/10021-icon-service-Virtual-Machine.svg"
+          },
+          {
+            "name": "AKS",
+            "icon": "assets/tech-icons/10023-icon-service-Kubernetes-Services.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A purpose-built quorum service (Raft/Paxos over a small replica group) matches the interview's linearizable lock-grant contract and explicit failover model.",
+        "Coordination stores like etcd, Consul, and ZooKeeper are strong references for low-cardinality coordination, but a 200K renew/sec service may need custom sharded groups and a slimmer hot path.",
+        "Managed conditional stores are attractive for simpler advisory locks, but they do not remove the need to reason about leases, fencing, request deduplication, and hot-key serialization."
+      ],
+      "makesIrrelevant": [
+        "A battle-tested coordination store can remove most custom Raft membership, log replication, and snapshot code for small-scale leader-election use cases.",
+        "It does not remove the protected resource's fencing-token check."
+      ]
+    },
+    {
+      "concern": "Replicated log persistence, snapshots, and compaction",
+      "steps": [
+        "consensus",
+        "availability",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "RocksDB",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Ceph",
+          "icon": "assets/tech-icons/ceph.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "EBS",
+            "icon": "assets/tech-icons/Arch_Amazon-Elastic-Block-Store_64.png"
+          },
+          {
+            "name": "EC2",
+            "icon": "assets/tech-icons/Arch_Amazon-EC2_64.png"
+          },
+          {
+            "name": "S3",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Storage-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Persistent Disk",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Compute Engine",
+            "icon": "assets/tech-icons/Compute-512-color.png"
+          },
+          {
+            "name": "Cloud Storage",
+            "icon": "assets/tech-icons/Storage-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Managed Disks",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Virtual Machines",
+            "icon": "assets/tech-icons/10021-icon-service-Virtual-Machine.svg"
+          },
+          {
+            "name": "Blob Storage",
+            "icon": "assets/tech-icons/10781-icon-service-Blob-Page.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Local embedded storage keeps each consensus group's commit path short and predictable, with object storage used for snapshots and disaster recovery.",
+        "A relational store is easier to inspect and operate, but it adds a second consensus/storage layer unless it is only used for snapshots or low-throughput metadata.",
+        "Object storage is excellent for compacted snapshots and backups, not for the synchronous per-renew write-ahead log."
+      ],
+      "makesIrrelevant": "Durable snapshot storage with lifecycle policies removes the need to retain an unbounded replicated log or build a bespoke archival system."
+    },
+    {
+      "concern": "Lease expiry index and sweeper execution",
+      "steps": [
+        "lease",
+        "availability"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Temporal",
+          "icon": "assets/tech-icons/temporal.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Durable Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "The expiry index can be an in-memory timer wheel rebuilt from lock state, but every actual expire transition still has to commit through the leader.",
+        "External schedulers or queues are useful for driving sweeper work, not for declaring ownership changes on their own.",
+        "A durable KV table with TTL makes cleanup easier, but TTL expiry callbacks are too weak to be the source of truth for releasing a correctness-critical lock."
+      ],
+      "makesIrrelevant": "A managed scheduler or durable TTL index removes much of the homegrown polling and cleanup scaffolding around the sweeper, while the consensus log remains the authority."
+    },
+    {
+      "concern": "Waiter queues, watches, and leadership-change notifications",
+      "steps": [
+        "lease",
+        "election",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "NATS (JetStream)",
+          "icon": "assets/tech-icons/nats.png"
+        },
+        {
+          "name": "RabbitMQ",
+          "icon": "assets/tech-icons/rabbitmq.png"
+        },
+        {
+          "name": "Redis Streams",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "MSK",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Streaming-for-Apache-Kafka_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Managed Service for Apache Kafka",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Server-side wait queues and watch notifications prevent busy polling when clients wait for a held lock or a leader key to free.",
+        "Queues and streams are delivery aids; a notification can wake clients, but the next acquire still goes through consensus and may still lose the race.",
+        "A log/stream helps replay watcher state after reconnect, while a simple queue is cheaper for one-shot wakeups but weaker for ordered fanout."
+      ],
+      "makesIrrelevant": "A managed queue or stream with DLQs and consumer lag metrics removes much of the custom watcher fanout, reconnect buffering, and retry-loop instrumentation."
+    },
+    {
+      "concern": "Request idempotency and deduplication records",
+      "steps": [
+        "consensus",
+        "availability"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Cassandra",
+          "icon": "assets/tech-icons/cassandra.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Dedup records must survive leader failover long enough to make retried acquires, renews, and releases return the original result.",
+        "In-memory stores are fast for requestId lookups, but they need persistence or replication if the dedup window is part of the correctness contract.",
+        "Wide-column or managed KV stores make TTL and horizontal scale easy, but every lookup adds latency to the already hot renew path."
+      ],
+      "makesIrrelevant": "A store with conditional writes and TTL expiry removes most custom requestId garbage collection and duplicate-result cache code."
+    },
+    {
+      "concern": "Fencing token enforcement at protected resources",
+      "steps": [
+        "fencing",
+        "election"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "MySQL",
+          "icon": "assets/tech-icons/mysql.png"
+        },
+        {
+          "name": "CockroachDB",
+          "icon": "assets/tech-icons/cockroach.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "Aurora",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "RDS",
+            "icon": "assets/tech-icons/Arch_Amazon-RDS_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Firestore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          },
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "The protected resource must atomically compare the incoming fencing token with max_seen_token and reject stale epochs.",
+        "Relational stores make token checks and idempotent guarded writes straightforward with transactions and unique constraints.",
+        "Managed KV/document stores can scale per-resource token records, but the update must still be a conditional write, not a read-then-write race."
+      ],
+      "makesIrrelevant": "A resource datastore with native compare-and-set or transactional conditional updates removes the need for a separate fencing proxy in front of that resource."
+    },
+    {
+      "concern": "Shard map, ownership transfer, and group membership control plane",
+      "steps": [
+        "availability",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "etcd",
+          "icon": "assets/tech-icons/etcd.png"
+        },
+        {
+          "name": "Consul",
+          "icon": "assets/tech-icons/consul.png"
+        },
+        {
+          "name": "ZooKeeper",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "AppConfig",
+            "icon": "assets/tech-icons/Arch_AWS-AppConfig_64.png"
+          },
+          {
+            "name": "Cloud Map",
+            "icon": "assets/tech-icons/Arch_AWS-Cloud-Map_64.png"
+          },
+          {
+            "name": "Route 53",
+            "icon": "assets/tech-icons/Arch_Amazon-Route-53_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Firestore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud DNS",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure App Configuration",
+            "icon": "assets/tech-icons/10219-icon-service-App-Configuration.svg"
+          },
+          {
+            "name": "Traffic Manager",
+            "icon": "assets/tech-icons/10065-icon-service-Traffic-Manager-Profiles.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "The shard map is small but safety-critical: range ownership and group membership changes need versioned, single-owner cutovers.",
+        "A coordination store is a natural fit for map_version, owner, leader, and reconfiguration status, but it becomes a dependency for every route refresh.",
+        "DNS/service-discovery systems help routers find leaders, but they are not sufficient for proving range ownership during migration."
+      ],
+      "makesIrrelevant": "A strongly consistent control-plane store removes most ad hoc shard-map propagation, stale-router bookkeeping, and hand-rolled membership metadata storage."
+    },
+    {
+      "concern": "Runtime scheduling and zone-aware replica placement",
+      "steps": [
+        "availability",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kubernetes",
+          "icon": "assets/tech-icons/kubernetes.png"
+        },
+        {
+          "name": "Nomad",
+          "icon": "assets/tech-icons/nomad.png"
+        },
+        {
+          "name": "Consul",
+          "icon": "assets/tech-icons/consul.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "EKS",
+            "icon": "assets/tech-icons/Arch_Amazon-Elastic-Kubernetes-Service_64.png"
+          },
+          {
+            "name": "EC2",
+            "icon": "assets/tech-icons/Arch_Amazon-EC2_64.png"
+          },
+          {
+            "name": "Auto Scaling",
+            "icon": "assets/tech-icons/Arch_AWS-Auto-Scaling_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "GKE",
+            "icon": "assets/tech-icons/Containers-512-color.png"
+          },
+          {
+            "name": "Compute Engine",
+            "icon": "assets/tech-icons/Compute-512-color.png"
+          },
+          {
+            "name": "Managed Instance Groups",
+            "icon": "assets/tech-icons/Compute-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "AKS",
+            "icon": "assets/tech-icons/10023-icon-service-Kubernetes-Services.svg"
+          },
+          {
+            "name": "Virtual Machine Scale Sets",
+            "icon": "assets/tech-icons/10034-icon-service-VM-Scale-Sets.svg"
+          },
+          {
+            "name": "Azure Load Balancer",
+            "icon": "assets/tech-icons/10062-icon-service-Load-Balancers.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Stateful consensus groups need stable identity, explicit zone spread, controlled rolling restarts, and safe one-at-a-time replacement.",
+        "Kubernetes and managed node groups simplify placement and repair, but the lock service still owns quorum membership and cannot let the scheduler replace multiple voters at once blindly.",
+        "Plain VMs offer predictable storage and networking for low-latency quorum commits, at the cost of more operational automation."
+      ],
+      "makesIrrelevant": "A platform with anti-affinity, pod disruption budgets, health checks, and node auto-repair removes much of the manual placement and restart orchestration."
+    },
+    {
+      "concern": "Secrets, TLS, and service-to-service identity",
+      "steps": [
+        "consensus",
+        "availability",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "HashiCorp Vault",
+          "icon": "assets/tech-icons/hashicorp_vault.png"
+        },
+        {
+          "name": "Keycloak",
+          "icon": "assets/tech-icons/keycloak.png"
+        },
+        {
+          "name": "JWT (signed)",
+          "icon": "assets/tech-icons/jwt.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "KMS",
+            "icon": "assets/tech-icons/Arch_AWS-Key-Management-Service_64.png"
+          },
+          {
+            "name": "Secrets Manager",
+            "icon": "assets/tech-icons/Arch_AWS-Secrets-Manager_64.png"
+          },
+          {
+            "name": "CloudHSM",
+            "icon": "assets/tech-icons/Arch_AWS-CloudHSM_64.png"
+          },
+          {
+            "name": "Cognito",
+            "icon": "assets/tech-icons/Arch_Amazon-Cognito_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud KMS",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          },
+          {
+            "name": "Secret Manager",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          },
+          {
+            "name": "Workload Identity",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          },
+          {
+            "name": "Identity Platform",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Key Vault",
+            "icon": "assets/tech-icons/10245-icon-service-Key-Vaults.svg"
+          },
+          {
+            "name": "Managed HSM",
+            "icon": "assets/tech-icons/02322-icon-service-Dedicated-HSM.svg"
+          },
+          {
+            "name": "Microsoft Entra ID",
+            "icon": "assets/tech-icons/10231-icon-service-Entra-ID-Protection.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Lock holders and quorum members need authenticated identities; clientId should come from credentials, not from request JSON.",
+        "Self-hosted secret systems are portable and flexible, but they add another correctness-critical availability dependency.",
+        "Managed KMS and identity services reduce key custody and rotation burden, but require careful regional dependency planning for a CP service."
+      ],
+      "makesIrrelevant": "Managed key and identity services remove most custom certificate rotation, secret distribution, and token-signing infrastructure."
+    },
+    {
+      "concern": "Correctness observability, audit, and SLO dashboards",
+      "steps": [
+        "lease",
+        "fencing",
+        "availability",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Prometheus",
+          "icon": "assets/tech-icons/prometheus.png"
+        },
+        {
+          "name": "Grafana",
+          "icon": "assets/tech-icons/grafana.png"
+        },
+        {
+          "name": "Jaeger",
+          "icon": "assets/tech-icons/jaeger.png"
+        },
+        {
+          "name": "ELK Stack",
+          "icon": "assets/tech-icons/elasticsearch.png"
+        },
+        {
+          "name": "Fluentd/Fluent Bit",
+          "icon": "assets/tech-icons/fluentd.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "X-Ray",
+            "icon": "assets/tech-icons/Arch_AWS-X-Ray_64.png"
+          },
+          {
+            "name": "CloudTrail",
+            "icon": "assets/tech-icons/Arch_AWS-CloudTrail_64.png"
+          },
+          {
+            "name": "Managed Service for Prometheus",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Service-for-Prometheus_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Trace",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Logging",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Google Cloud Managed Service for Prometheus",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Application Insights",
+            "icon": "assets/tech-icons/00012-icon-service-Application-Insights.svg"
+          },
+          {
+            "name": "Log Analytics",
+            "icon": "assets/tech-icons/00009-icon-service-Log-Analytics-Workspaces.svg"
+          },
+          {
+            "name": "Azure Managed Grafana",
+            "icon": "assets/tech-icons/02905-icon-service-Azure-Managed-Grafana.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "The important signals are correctness signals: double-grant prevention, failed renewals, stale-token rejects, leader churn, quorum latency, compaction lag, and per-shard hot keys.",
+        "Self-hosted observability gives query flexibility and lower steady-state cost at high cardinality, but must be isolated from the quorum path.",
+        "Managed observability shortens time to dashboards and alerts, but high-cardinality lock-key labels can become expensive or throttled."
+      ],
+      "makesIrrelevant": "A managed metrics, tracing, and audit stack removes much of the custom log pipeline and dashboard hosting, but not the need to choose low-cardinality labels carefully."
     }
   ],
   "patterns": [
@@ -420,8 +1716,9 @@
       "id": "naive",
       "title": "1. Naive: A Lock Row in a Single Database",
       "description": [
-        "Start with the simplest thing that works: one row per key in a single database, acquired with a conditional write (SET key IF NOT EXISTS, or INSERT ... an UPDATE ... WHERE holder IS NULL). The atomic conditional means only one client wins the row, so in the happy path you really do get mutual exclusion.",
+        "Start with the simplest thing that works: one row per key in a single database, acquired with a conditional write (SET key IF NOT EXISTS, or an UPDATE ... WHERE holder IS NULL). The atomic conditional means only one client wins the row, so in the happy path you really do get mutual exclusion.",
         "It fails on the two hard requirements. Liveness: if the holder dies after acquiring, the row stays set forever — a permanent deadlock, because nothing ever releases it. Safety + availability: the single database is a single point of failure; if it dies the whole fleet loses locking, and if you make it highly available with async-replicated failover, a failover or partition can promote a replica that doesn't know about the latest grant — split-brain, two holders.",
+        "This isn't always wrong: a single-row lock is perfectly fine where the blast radius is tiny — a single process coordinating its own threads, a small internal tool, or purely advisory locking where an occasional double-grant is harmless. The rejection here is scoped to a correctness-critical, fault-tolerant, fleet-wide lock service, not to all uses of a DB row.",
         "So the baseline motivates the design. To avoid permanent deadlock the grant must be time-bounded and auto-expire (leases). To avoid split-brain the state must be agreed by a quorum, not a single node or a lossy failover (consensus). And to stay safe even when a holder pauses past expiry you need fencing tokens. The steps that follow add exactly these."
       ],
       "view": {
@@ -445,9 +1742,10 @@
       ],
       "probeLinks": [
         "redis-locks",
+        "dynamodb-lock-client",
+        "kleppmann-locking",
         "chubby-paper",
-        "zookeeper-paper",
-        "raft-paper"
+        "consul-sessions"
       ],
       "recap": {
         "before": "Nothing.",
@@ -460,15 +1758,17 @@
           "why": "A crashed holder never releases the row (permanent deadlock), and a single DB is a SPOF whose failover can promote a stale replica and grant two holders.",
           "instead": "Bound the grant with a lease that auto-expires, back the state with consensus, and hand out fencing tokens."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/01-naive.jpg"
     },
     {
       "id": "consensus",
       "title": "2. Consensus-Backed Lock State",
       "description": [
         "A lock service's one job is mutual exclusion, so its state must never diverge — two nodes can't each think a different client holds the lock. Replicate the lock state across a small group (3 or 5 nodes) via a consensus protocol (Raft/Paxos): one leader proposes each lock operation, a quorum agrees and appends it to a replicated log, and that committed log is the source of truth.",
+        "Every state-changing op is a log entry: acquire, renew, release, AND expire all go through the leader and commit before they take effect. There is no out-of-band mutation of lock state — the only way ownership changes is by applying a committed log entry deterministically, so all replicas agree.",
         "This makes operations linearizable (a single total order) and durable (survives a minority of nodes failing) — deliberately choosing CP (consistency over availability): if quorum is lost, the service refuses grants rather than risk two holders.",
-        "Lock state (holder, expiry, token per key) is a deterministic application of the committed log, so all replicas agree."
+        "Reads have two modes: authoritative checks (who holds this lock?) are served linearizably through the leader / a read-index so they reflect all committed ops; cheap, possibly-stale follower reads are fine only for non-authoritative inspection (dashboards, metrics), never for deciding whether to act on the resource."
       ],
       "view": {
         "nodes": [
@@ -500,6 +1800,9 @@
       "options": [
         {
           "name": "Consensus-replicated lock state (default)",
+          "title": "Consensus-replicated lock state",
+          "label": "Default",
+          "tradeoff": "Pays a quorum round trip per write and needs a 3/5-node cluster, but it's the only option that can't grant two holders through a failover — the right trade for a service whose entire value is correctness.",
           "description": "Each acquire and release is committed through a leader to a majority quorum and an ordered log, giving one agreed, linearizable order of lock operations that survives failover.",
           "pros": [
             "A majority quorum commits each lock op, so no single node loss can grant a conflicting lock.",
@@ -537,10 +1840,14 @@
               "api-tier",
               "consensus"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-consensus-opt1.jpg"
         },
         {
           "name": "Single fast database (SET NX)",
+          "title": "Single fast database (SET NX)",
+          "label": "Rejected",
+          "tradeoff": "Fastest and simplest (one atomic SET, no quorum), but async-replicated failover can promote a replica that missed the latest grant and hand out a duplicate — only acceptable for advisory locks where double-grant is harmless.",
           "description": "Locks are a single atomic set-if-not-exists on one node, with no quorum round trip; a replica takes over on failover via asynchronous replication.",
           "pros": [
             "Trivial and very fast: one atomic SET-if-not-exists on a single node, no quorum round trip.",
@@ -566,10 +1873,14 @@
             "highlight": [
               "LockState"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-consensus-opt2.jpg"
         },
         {
           "name": "Multi-node majority on independent stores (Redlock)",
+          "title": "Multi-node majority on independent stores (Redlock)",
+          "label": "Rejected",
+          "tradeoff": "Tolerates a minority outage without a shared cluster, but its safety rests on bounded clock drift and timing that GC pauses and network delays break — widely critiqued as unsafe for correctness-critical locks unless paired with fencing.",
           "description": "A client acquires the lock with a plain SET NX on a majority of N independent, unrelated stores, relying on timing and bounded clock drift rather than a shared consensus log.",
           "pros": [
             "Acquires the lock on a majority of N independent single-node stores, tolerating a minority outage.",
@@ -625,7 +1936,8 @@
             "groups": [
               "api-tier"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-consensus-opt3.jpg"
         }
       ],
       "decisionPrompt": "Why must lock state go through consensus rather than a single fast database?",
@@ -640,9 +1952,11 @@
       ],
       "probeLinks": [
         "raft-paper",
-        "redis-locks",
+        "paxos-made-live",
         "chubby-paper",
-        "zookeeper-paper"
+        "zookeeper-paper",
+        "etcd-api-guarantees",
+        "linearizability-paper"
       ],
       "patterns": [
         "Consensus-replicated state",
@@ -668,26 +1982,29 @@
       "id": "lease",
       "title": "3. Leases with TTL (No Permanent Deadlock)",
       "description": [
-        "If a lock were held until explicitly released, a client that crashes while holding it would block the resource forever. Grant locks as leases with a TTL: the holder must periodically renew (heartbeat) to keep it; if it stops (crash, hang, partition), the lease expires and the lock is reclaimed.",
-        "A lease sweeper (or the leader) expires leases past their TTL and frees the key. This gives liveness — a dead holder's lock is automatically released — at the cost of choosing a TTL: too short risks expiring a slow-but-alive holder; too long delays recovery.",
-        "Renew goes through consensus too (it extends committed state), but is the common, cheap path."
+        "If a lock were held until explicitly released, a client that crashes while holding it would block the resource forever. Grant locks as leases with a TTL: the holder must periodically renew (heartbeat) to keep it; if it stops (crash, hang, partition), the lease expires and the lock is reclaimed. Renew at about TTL/3 (e.g. every 5s on a 15s TTL) so the holder survives one or two missed heartbeats, and pick the TTL against your p99 renew latency — too short risks false expiry of a slow-but-alive holder; too long delays recovery. The TTL is a server-side policy, not a free client choice: the requested ttlSec is clamped to a server [minTtl, maxTtl] band, so a client can't request a pathologically tiny TTL (which would cause false-expiry storms) or an effectively-infinite one (which would let a crashed holder deadlock the key for hours). With ~1M active locks renewing every 5s, renewals dominate the write load (~200K writes/sec), so renew is the hot path to keep cheap.",
+        "Expiry is NOT a local mutation. In a linearizable lock service, expiry changes ownership, so it must be ordered with everything else: the sweeper (a leader-side task, or a stateless worker that routes through the leader) proposes expire(key, expectedLeaseId) into the log, and it's applied deterministically from the committed log just like acquire/renew/release. That defines the renew-vs-expire race precisely: a renew that arrives near the deadline wins only if it commits before the expire op in log order; whichever is ordered first by the leader takes effect, and the loser's precondition (expectedLeaseId) fails as a no-op. The expiry timeline is the leader's monotonic clock (or consensus-applied tick entries), never a follower's local wall clock, so replicas can't independently expire and diverge.",
+        "This gives liveness — a dead holder's lock is automatically released — and an honest failure mode: if a holder's renew times out, it cannot tell whether the renew committed, so it must treat ownership as uncertain and stop touching the resource until it re-confirms (and fencing tokens backstop it if it acts too late).",
+        "Waiting for a held lock should be a bounded long-poll, not a busy retry loop. With mode=wait the server registers the caller in a per-key waiter queue and holds the request open for up to waitMs, then either grants on release/expiry or returns WAIT_TIMEOUT — that turns a thundering herd of pollers into one cheap blocked request per waiter and avoids hammering the consensus group with rejected acquires. Be explicit about fairness: the queue is best-effort FIFO (waiters are woken in arrival order) but NOT strict fair locking — a freshly-arriving acquire can still win the race against a queued waiter, and a woken waiter must re-confirm it actually got the lease. The honest contract is safety plus bounded waiting, not guaranteed turn order. Size waiter capacity separately from write QPS: a key with thousands of blocked waiters costs memory and wake-up fan-out but no log writes, so cap the queue depth per key/tenant and shed new waiters (fail-fast) once it's full rather than letting blocked listeners accumulate unboundedly."
       ],
       "view": {
         "nodes": [
           "Client",
           "LockAPI",
+          "Leader",
           "LockState",
           "Sweeper"
         ],
-        "caption": "The client renews its lease by heartbeating the lock service API, which reads lock state, while a lease sweeper expires any stale lease in that state.",
+        "caption": "The client renews its lease by heartbeating the lock service API (committed through the leader); a lease sweeper proposes an expire op through the leader for any lapsed lease, so expiry is a consensus-ordered transition, not a direct write to lock state.",
         "links": [
           "client-renew",
-          "api-lockstate",
-          "sweeper-lockstate"
+          "api-leader",
+          "log-lockstate",
+          "sweeper-leader"
         ],
         "highlight": [
           "Sweeper",
-          "LockState"
+          "Leader"
         ],
         "groups": [
           "api-tier",
@@ -697,6 +2014,9 @@
       "options": [
         {
           "name": "TTL lease + heartbeat renewal (default)",
+          "title": "TTL lease + heartbeat renewal",
+          "label": "Default",
+          "tradeoff": "Liveness via auto-expiry, but a holder paused past its TTL silently loses the lease — which is exactly why fencing tokens are needed next.",
           "description": "A lock is granted with a time-to-live that the holder extends via heartbeats, and a background sweeper reclaims any lease whose TTL lapses, so a crash can't deadlock the resource.",
           "pros": [
             "A crashed holder's lock auto-expires after the TTL, so the resource is never deadlocked forever.",
@@ -712,27 +2032,33 @@
             "nodes": [
               "Client",
               "LockAPI",
+              "Leader",
               "LockState",
               "Sweeper"
             ],
-            "caption": "The holder extends its TTL by heartbeating the lock service API into lock state, and the lease sweeper reclaims leases whose TTL has lapsed.",
+            "caption": "The holder extends its TTL by heartbeating the lock service API (committed via the leader); the lease sweeper reclaims a lapsed lease by proposing expire(key, leaseId) through the leader, never writing lock state directly.",
             "links": [
               "client-renew",
-              "api-lockstate",
-              "sweeper-lockstate"
+              "api-leader",
+              "log-lockstate",
+              "sweeper-leader"
             ],
             "highlight": [
               "Sweeper",
-              "LockState"
+              "Leader"
             ],
             "groups": [
               "api-tier",
               "consensus"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-lease-opt1.jpg"
         },
         {
           "name": "Ephemeral session (ZooKeeper-style)",
+          "title": "Ephemeral session (ZooKeeper-style)",
+          "label": "Alternative",
+          "tradeoff": "Liveness is driven by real session loss rather than a tuned TTL, but every client must hold a persistent session and a long GC pause still drops it — the fencing gap is unchanged.",
           "description": "The lock is tied to the client's session; when its heartbeat to the cluster stops, the server expires the session and the lock vanishes, with no fixed TTL to tune.",
           "pros": [
             "The lock is tied to a session; if the client's heartbeat to the cluster stops, the session and lock vanish.",
@@ -772,7 +2098,8 @@
             "groups": [
               "api-tier"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-lease-opt2.jpg"
         }
       ],
       "decisionPrompt": "A worker acquires a lock and then crashes. How do you avoid locking the resource forever?",
@@ -786,10 +2113,14 @@
         }
       ],
       "probeLinks": [
-        "redis-locks",
         "chubby-paper",
-        "zookeeper-paper",
-        "raft-paper"
+        "zookeeper-recipes",
+        "curator-lock",
+        "consul-sessions",
+        "etcd-concurrency-api",
+        "kubernetes-leaderelection",
+        "redis-locks",
+        "jepsen-etcd-locks"
       ],
       "patterns": [
         "Lease with TTL",
@@ -805,8 +2136,8 @@
       },
       "flows": [
         {
-          "name": "Renew heartbeat, or sweeper expires a dead holder",
-          "note": "A live holder keeps the lease by renewing; if renewals stop, the sweeper expires the lease and frees the key for liveness.",
+          "name": "Renew heartbeat, or sweeper expires a dead holder (both committed)",
+          "note": "A live holder extends the lease via a committed renew; if renewals stop, the sweeper proposes an expire op through the leader. Both go through the log, so expiry is ordered against renewals, not a racy local write.",
           "sequence": {
             "participants": [
               {
@@ -817,8 +2148,8 @@
                 "label": "Lock API"
               },
               {
-                "id": "LockState",
-                "label": "Lock State"
+                "id": "Leader",
+                "label": "Consensus Leader"
               },
               {
                 "id": "Sweeper",
@@ -834,13 +2165,13 @@
                     "from": "Client",
                     "to": "LockAPI",
                     "arrow": "->>",
-                    "label": "renew(key, token)"
+                    "label": "renew(key, leaseId)"
                   },
                   {
                     "from": "LockAPI",
-                    "to": "LockState",
+                    "to": "Leader",
                     "arrow": "->>",
-                    "label": "extend expires_at"
+                    "label": "propose renew (commit extends expires_at)"
                   },
                   {
                     "from": "LockAPI",
@@ -854,15 +2185,15 @@
                   "messages": [
                     {
                       "from": "Sweeper",
-                      "to": "LockState",
+                      "to": "Leader",
                       "arrow": "->>",
-                      "label": "expire stale lease"
+                      "label": "propose expire(key, expectedLeaseId)"
                     },
                     {
-                      "from": "LockState",
+                      "from": "Leader",
                       "to": "Sweeper",
                       "arrow": "-->>",
-                      "label": "key freed (holder=null)"
+                      "label": "committed -> key freed (no renew won the race)"
                     }
                   ]
                 }
@@ -871,7 +2202,79 @@
           },
           "highlight": [
             "Sweeper",
-            "LockState"
+            "Leader"
+          ]
+        },
+        {
+          "name": "Renew times out near expiry (ownership uncertain)",
+          "note": "The holder's renew round-trips through the leader but the response is lost (timeout). The client doesn't know whether the renew committed, so it must stop acting until it re-confirms — fencing backstops any late write.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Client"
+              },
+              {
+                "id": "LockAPI",
+                "label": "Lock API"
+              },
+              {
+                "id": "Leader",
+                "label": "Consensus Leader"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Client",
+                "to": "LockAPI",
+                "arrow": "->>",
+                "label": "renew(key, leaseId)"
+              },
+              {
+                "from": "LockAPI",
+                "to": "Leader",
+                "arrow": "->>",
+                "label": "propose renew"
+              },
+              {
+                "from": "LockAPI",
+                "to": "Client",
+                "arrow": "-x",
+                "label": "response lost (timeout)"
+              },
+              {
+                "type": "alt",
+                "label": "client treats ownership as uncertain",
+                "messages": [
+                  {
+                    "from": "Client",
+                    "to": "Client",
+                    "arrow": "->>",
+                    "label": "STOP touching resource"
+                  },
+                  {
+                    "from": "Client",
+                    "to": "LockAPI",
+                    "arrow": "->>",
+                    "label": "re-confirm: GET /locks/{key} or re-acquire (idempotent requestId)"
+                  }
+                ],
+                "else": {
+                  "label": "acts anyway with stale token",
+                  "messages": [
+                    {
+                      "from": "Client",
+                      "to": "Client",
+                      "arrow": "->>",
+                      "label": "fencing rejects the lower token at the resource"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Client",
+            "Leader"
           ]
         }
       ]
@@ -882,6 +2285,9 @@
       "description": [
         "Leases introduce the classic distributed-lock hazard: a holder pauses (a long GC, a slow disk) past its lease expiry; the service grants the lock to someone else; the paused holder wakes up still believing it holds the lock and acts on the resource — now two clients act. No lock service alone can prevent this.",
         "The fix is fencing tokens: each grant returns a monotonically increasing token. The holder includes its token in every operation on the protected resource, and the resource rejects any token lower than the highest it has seen. The paused holder's stale (lower) token is refused.",
+        "Fencing is a three-party contract, not just a number in the response. Every guarded write carries (lockKey, fencingToken, holderId); the resource persists max_seen_token per lock key and atomically does `if token >= max_seen_token: accept and set max_seen_token = token else reject`. That per-key state (a small version counter) lives on the RESOURCE side, outside the lock service's storage. Token scope is per lock key — a per-key counter is enough and far cheaper than a global one, and the lock service already increments it on every grant.",
+        "The hard caveat: this only works if the protected system can perform that check. A resource that can't compare tokens (an arbitrary REST endpoint, a side-effecting external API) cannot be fenced — for it the lock is merely advisory, and you should say so rather than pretend the lease made it safe.",
+        "Know what fencing does NOT do: it orders epochs, it is not operation-level deduplication. Fencing rejects a stale-holder's write because its token is lower than max_seen_token, but it does not make the CURRENT holder's own retried, non-idempotent writes safe — a holder whose write times out and retries presents the SAME token both times, so the resource accepts both. If guarded side effects are non-idempotent (append, increment, charge), the resource still needs its own operation IDs, a CAS/compare-and-set precondition, or idempotency keys at its boundary, in addition to the fencing check. Fencing solves 'a deposed holder must not write'; resource-side idempotency solves 'the rightful holder must not double-apply on retry' — they're different problems and you need both.",
         "This is the key correctness insight: the lock provides mutual exclusion in the common case, but the fencing token is what makes the protected action actually safe under pauses/skew. The resource must check the token."
       ],
       "view": {
@@ -914,10 +2320,13 @@
         }
       ],
       "probeLinks": [
-        "redis-locks",
+        "kleppmann-locking",
+        "jepsen-etcd-locks",
+        "etcd-jepsen-response",
+        "consul-sessions",
+        "etcd-concurrency-api",
         "chubby-paper",
-        "zookeeper-paper",
-        "raft-paper"
+        "zookeeper-paper"
       ],
       "patterns": [
         "Fencing token"
@@ -939,12 +2348,17 @@
       ],
       "flows": [
         {
-          "name": "Paused holder fenced out by token",
-          "note": "After a pause past expiry the lock is regranted with a higher token; the resource rejects the old holder's stale (lower) token.",
+          "name": "Paused old holder fenced out; new holder accepted",
+          "note": "Two DISTINCT holders. The old holder writes with token 42 then pauses; after expiry the new holder gets token 43 and writes (resource bumps max_seen_token to 43); the resumed old holder's stale 42 is rejected because 42 < 43.",
           "sequence": {
             "participants": [
               {
-                "id": "Client"
+                "id": "OldHolder",
+                "label": "Old Holder (w_3)"
+              },
+              {
+                "id": "NewHolder",
+                "label": "New Holder (w_7)"
               },
               {
                 "id": "LockAPI",
@@ -952,53 +2366,59 @@
               },
               {
                 "id": "Resource",
-                "label": "Protected Resource"
+                "label": "Resource (max_seen_token)"
               }
             ],
             "messages": [
               {
                 "from": "LockAPI",
-                "to": "Client",
+                "to": "OldHolder",
                 "arrow": "-->>",
                 "label": "grant + token 42"
               },
               {
-                "from": "Client",
+                "from": "OldHolder",
                 "to": "Resource",
                 "arrow": "->>",
-                "label": "write (token 42)  [then GC pause]"
+                "label": "write (token 42) -> accept, max_seen_token=42 [then GC pause]"
               },
               {
                 "from": "LockAPI",
-                "to": "Client",
+                "to": "NewHolder",
                 "arrow": "-->>",
-                "label": "(after expiry) new holder gets token 43"
+                "label": "(after old lease expires) grant + token 43"
               },
               {
-                "from": "Client",
+                "from": "NewHolder",
+                "to": "Resource",
+                "arrow": "->>",
+                "label": "write (token 43) -> accept, max_seen_token=43"
+              },
+              {
+                "from": "OldHolder",
                 "to": "Resource",
                 "arrow": "->>",
                 "label": "paused holder resumes: write (token 42)"
               },
               {
                 "type": "alt",
-                "label": "token < highest seen (43)",
+                "label": "42 < max_seen_token (43)",
                 "messages": [
                   {
                     "from": "Resource",
-                    "to": "Client",
+                    "to": "OldHolder",
                     "arrow": "-->>",
                     "label": "reject stale token 42"
                   }
                 ],
                 "else": {
-                  "label": "token >= highest seen",
+                  "label": "token >= max_seen_token",
                   "messages": [
                     {
                       "from": "Resource",
-                      "to": "Client",
+                      "to": "NewHolder",
                       "arrow": "-->>",
-                      "label": "accept write"
+                      "label": "accept + bump max_seen_token"
                     }
                   ]
                 }
@@ -1009,7 +2429,8 @@
             "Resource"
           ]
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/04-fencing.jpg"
     },
     {
       "id": "election",
@@ -1017,7 +2438,8 @@
       "description": [
         "A distributed lock is the primitive for leader election: whoever holds a well-known lock (e.g. 'scheduler-leader') is the active leader; losing the lease means stepping down. This is exactly how systems pick a single active instance.",
         "The same mechanics apply: the leader renews its lease to stay leader; if it crashes/pauses, the lease expires and another instance acquires the lock and takes over. The fencing token becomes the leader's epoch — downstream systems reject actions from a stale (lower-epoch) ex-leader.",
-        "So the lock service both is internally leader-elected (its consensus group) and provides leader election to its clients — the same idea at two levels."
+        "Keep the two levels distinct. The service's OWN leader is chosen by consensus membership (the Raft leader of the replica group) — an internal implementation detail clients never see. Client-facing leader election is an APPLICATION-level use of an ordinary lock record (e.g. the key 'scheduler-leader'): whoever holds that lock is the elected scheduler. The Raft leader is not the holder of 'scheduler-leader'; they're different elections at different layers that happen to use the same underlying idea.",
+        "How clients learn the leadership changed matters as much as the election itself. The current leader doesn't get a push when it loses the lease — it learns by its own renew failing (timeout or NOT_HOLDER), so a leader must treat a failed renew as 'I may no longer be leader, step down NOW' before its TTL even visibly elapses, exactly like the renew-timeout posture. Followers waiting to take over shouldn't poll the key in a tight loop; they acquire with mode=wait (a bounded long-poll on 'scheduler-leader') so they block cheaply and are woken when the lease frees. A coordination service typically also exposes a watch/session: clients register interest in a key and get a one-shot notification when it changes (holder freed, lease expired), with a session whose own expiry implicitly drops every lock and watch the client held — that's how ephemeral-session systems (ZooKeeper) signal both 'you lost leadership' and 'the leader slot is now open' without polling. In all cases the fencing token doubles as the leader epoch, so a deposed ex-leader that acts late is rejected downstream even if it was slow to notice."
       ],
       "view": {
         "nodes": [
@@ -1051,8 +2473,11 @@
         }
       ],
       "probeLinks": [
-        "redis-locks",
-        "chubby-paper",
+        "zookeeper-recipes",
+        "curator-leader-election",
+        "kubernetes-leaderelection",
+        "etcd-concurrency-api",
+        "consul-sessions",
         "zookeeper-paper",
         "raft-paper"
       ],
@@ -1067,15 +2492,17 @@
         "before": "Locks for mutual exclusion.",
         "after": "Locks as a leader-election primitive with fenced epochs.",
         "newRisk": "The lock service's own leader can fail or partition — it must recover safely."
-      }
+      },
+      "aiVisual": "assets/generated/ai-visuals/steps/05-election.jpg"
     },
     {
       "id": "availability",
       "title": "6. Failure, Partitions, and the Worst Cases",
       "description": [
-        "The consensus group handles its own leader failure: if the leader dies, the followers elect a new one (a higher term); in-flight uncommitted ops are resolved by the protocol, and committed lock state is preserved — no two holders.",
-        "Network partitions are handled by quorum: only the side with a majority can commit grants; the minority side refuses to grant or renew (it can't reach quorum), so it can never independently hand out a lock. This is the CP choice — under partition the lock service sacrifices availability on the minority side to preserve safety.",
-        "Clock skew is why you don't trust local clocks for expiry decisions: lease expiry is judged relative to the consensus group's committed timeline (and fencing tokens backstop any timing error). The combination — quorum + fencing — is what makes it correct even in the nasty cases."
+        "The consensus group handles its own leader failure: if the leader dies, the followers elect a new one (a higher term); in-flight uncommitted ops are resolved by the protocol, and committed lock state is preserved — no two holders. Clients with an acquire/renew in flight during failover get a retryable NOT_LEADER redirect (or time out); they retry with the SAME requestId, so the idempotency record guarantees the op applies at most once — a retried acquire returns the original grant rather than a second one.",
+        "Network partitions are handled by quorum: only the side with a majority can commit grants; the minority side refuses to grant or renew (it can't reach quorum), so it can never independently hand out a lock. This is the CP choice — under partition the lock service sacrifices availability on the minority side to preserve safety. Crucially this also disciplines holders stranded on the minority side: a holder that can't reach quorum cannot renew, so it must STOP acting once it can no longer confirm its lease — even if its local TTL hasn't obviously elapsed — because the majority side may already have expired and re-granted the key.",
+        "Clock skew is why you don't trust local clocks for expiry decisions: lease expiry is judged relative to the consensus group's committed timeline (the leader's monotonic time / applied ticks), and fencing tokens backstop any timing error. The combination — quorum + fencing — is what makes it correct even in the nasty cases.",
+        "A 3/5-node group is not static: nodes die and get replaced, so the group needs safe membership change (joint-consensus / single-server add-remove) so reconfiguration never creates two disjoint majorities that could each elect a leader."
       ],
       "view": {
         "nodes": [
@@ -1102,6 +2529,9 @@
       "options": [
         {
           "name": "CP: majority side only (default)",
+          "title": "CP: majority side only",
+          "label": "Default",
+          "tradeoff": "The minority side goes fully unavailable for locking during a partition (and a no-majority split stalls everything), but that's the price of never granting two holders — correct for a lock service.",
           "description": "During a partition only the side holding quorum keeps granting locks while the minority refuses, so two holders can never exist and the minority rejoins from the log on heal.",
           "pros": [
             "On a 2-vs-3 split only the 3-node side has quorum, so just one side can grant locks — no split-brain.",
@@ -1134,10 +2564,14 @@
             "groups": [
               "consensus"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-availability-opt1.jpg"
         },
         {
           "name": "AP: both sides keep granting",
+          "title": "AP: both sides keep granting",
+          "label": "Rejected",
+          "tradeoff": "Maximum availability — nobody ever blocks on quorum — but both sides can grant the same lock, which is split-brain and directly violates the one guarantee a lock service exists to provide.",
           "description": "Every partition side keeps serving acquire requests independently, never refusing based on connectivity, so no client blocks waiting for quorum to return.",
           "pros": [
             "Maximum availability — every partition side keeps serving acquire requests.",
@@ -1181,7 +2615,8 @@
             "groups": [
               "consensus"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-availability-opt2.jpg"
         }
       ],
       "decisionPrompt": "The network partitions the consensus group 2-vs-3. Which side can grant locks, and why is that safe?",
@@ -1195,10 +2630,12 @@
         }
       ],
       "probeLinks": [
-        "redis-locks",
+        "raft-paper",
+        "paxos-made-live",
         "chubby-paper",
-        "zookeeper-paper",
-        "raft-paper"
+        "etcd-api-guarantees",
+        "jepsen-etcd-locks",
+        "kubernetes-leaderelection"
       ],
       "patterns": [
         "Consensus-replicated state",
@@ -1222,6 +2659,16 @@
           "scenario": "A client is partitioned from the service while holding a lock.",
           "expectedBehavior": "It can't renew -> its lease expires -> the lock is reclaimed; its stale fencing token is rejected if it later acts.",
           "mitigation": "Lease expiry + fencing tokens."
+        },
+        {
+          "scenario": "The holder is on the minority side of a partition (group split 2-vs-3).",
+          "expectedBehavior": "Its renew can't reach quorum and fails; the holder must stop acting once it can't confirm its lease, while the majority side independently expires and re-grants the key. Fencing rejects the old holder's lower token if it acts late.",
+          "mitigation": "CP: minority refuses renew + holder stops on renew failure + fencing tokens."
+        },
+        {
+          "scenario": "An acquire/renew is in flight when the leader fails over.",
+          "expectedBehavior": "The client gets a retryable NOT_LEADER/timeout, retries with the same requestId against the new leader; the dedup record makes it apply at most once (or returns the already-committed result).",
+          "mitigation": "Leader redirect + requestId idempotency / dedup records."
         }
       ],
       "flows": [
@@ -1278,6 +2725,99 @@
             "Followers",
             "Log"
           ]
+        },
+        {
+          "name": "Holder stranded on the minority side of a partition",
+          "note": "A holder is cut off on the minority side. Its renew can't reach quorum, so it must stop acting. The majority side independently expires the lease and re-grants the key with a higher token; if the stranded holder later acts on a stale token, fencing rejects it.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Holder",
+                "label": "Holder (minority side)"
+              },
+              {
+                "id": "Minority",
+                "label": "Minority (no quorum)"
+              },
+              {
+                "id": "Majority",
+                "label": "Majority (has quorum)"
+              },
+              {
+                "id": "NewHolder",
+                "label": "New Holder (majority side)"
+              },
+              {
+                "id": "Resource",
+                "label": "Resource (max_seen_token)"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Holder",
+                "to": "Minority",
+                "arrow": "->>",
+                "label": "renew(key, leaseId)"
+              },
+              {
+                "from": "Minority",
+                "to": "Holder",
+                "arrow": "-x",
+                "label": "QUORUM_UNAVAILABLE (can't reach majority)"
+              },
+              {
+                "from": "Holder",
+                "to": "Holder",
+                "arrow": "->>",
+                "label": "renew failed -> STOP acting (ownership unconfirmable)"
+              },
+              {
+                "from": "Majority",
+                "to": "Majority",
+                "arrow": "->>",
+                "label": "lease expires (committed); free key"
+              },
+              {
+                "from": "NewHolder",
+                "to": "Majority",
+                "arrow": "->>",
+                "label": "acquire -> grant + higher fencing token"
+              },
+              {
+                "type": "alt",
+                "label": "stranded holder resumes and acts late",
+                "messages": [
+                  {
+                    "from": "Holder",
+                    "to": "Resource",
+                    "arrow": "->>",
+                    "label": "write with stale (lower) token"
+                  },
+                  {
+                    "from": "Resource",
+                    "to": "Holder",
+                    "arrow": "-->>",
+                    "label": "reject: token < max_seen_token"
+                  }
+                ],
+                "else": {
+                  "label": "new holder acts",
+                  "messages": [
+                    {
+                      "from": "NewHolder",
+                      "to": "Resource",
+                      "arrow": "->>",
+                      "label": "write with higher token -> accept"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Majority",
+            "Resource"
+          ]
         }
       ]
     },
@@ -1285,27 +2825,32 @@
       "id": "scale",
       "title": "7. Scaling and Operating the Lock Service",
       "description": [
-        "A single consensus group has limited throughput (every write is a quorum round-trip). Scale by sharding the key space across multiple independent consensus groups, each owning a subset of keys — locks on different keys don't contend, so throughput scales horizontally while each group stays small and fast.",
-        "Keep leases short enough for timely recovery but long enough that renewals aren't excessive; clients renew well before expiry to tolerate a missed heartbeat. The API tier is stateless and routes a key to its group's current leader.",
-        "Operationally: the replicated log is the durable truth (snapshot + compact it so it doesn't grow forever); lock state is rebuildable from the log. Expose lock-held metrics and detect stuck/long-held locks. The whole design's value is correctness, so favor refusing service (CP) over ever granting two holders."
+        "Size it first. Assume ~1M active locks, TTL 15s with renew every 5s ⇒ ~200K renew writes/sec, plus ~20K acquire + ~20K release/sec ≈ ~240K committed writes/sec. A single Raft group commits maybe ~10–20K ops/sec (bounded by leader fsync + the quorum round trip), so one group breaks well below this — you need roughly 240K / 15K ≈ 16 groups, rounded up for headroom and hot shards. Renewals, not acquires, dominate, so the renew path drives the shard count.",
+        "Scale by sharding the key space across multiple independent consensus groups (each 3 or 5 nodes), each owning a key range — locks on different keys don't contend, so throughput scales horizontally while each group stays small and fast. A routed, versioned shard map (key range -> owning group + current leader + map version) lets the stateless API tier send each key to the right leader, and key ranges must move safely (hand off ownership through a controlled reconfiguration, draining or migrating committed state) so a range is never servable by two groups at once.",
+        "Make range migration concrete, because unsafe movement re-creates the very duplicate-owner bug the service exists to prevent. Moving a key range source->dest is a staged, single-owner handoff: (1) mark the range draining on the source so it stops accepting NEW acquires/waiters for those keys (in-flight renews still served); (2) transfer a consistent snapshot of the range's lock state plus the committed log tail to the destination group; (3) install the destination as owner and bump the shard-map version under the control plane's own consensus, only after the source confirms it has stopped committing for the range; (4) the source stops serving the range entirely. There is a single, ordered cutover point — ownership is never held by two groups at once. Membership changes WITHIN a group (replacing a dead node) use safe reconfiguration — one-server-at-a-time add/remove or joint consensus — so the group never has two disjoint majorities mid-change. Routers handle stale shard-map versions gracefully: a request carrying an old version (or hitting a group that no longer owns the range) gets a retryable redirect (NOT_OWNER / moved) that tells the client the new owner and version; the API tier refreshes its shard-map cache and retries, rather than serving from stale routing. Because every guarded write still carries a fencing token, even a request briefly misrouted during a cutover is backstopped by the resource's max_seen_token check.",
+        "Sharding has a hard limit: it scales across keys, never within one key. A single hot, contended lock is one consensus group's single key — it is serialized by design and cannot be sped up without weakening mutual exclusion. The honest answer to 'this one lock is too hot' is to redesign the contention (finer-grained keys, partition the work), not to scale the lock.",
+        "Protect the service from itself. Renewal storms (a fleet restart re-acquiring at once) can swamp a group, so apply backpressure, per-client / per-tenant quotas, and admission control on acquire/renew; shed or slow low-priority callers rather than topple a shard.",
+        "Operationally: the replicated log is the durable truth (snapshot + compact it so it doesn't grow forever); lock state is rebuildable from snapshot + tail. Track acquire/renew p99, quorum commit latency, failed renewals, expired leases, stale-token rejects at resources, leader-change rate, compaction lag, per-shard hot keys, and clock-skew warnings. The whole design's value is correctness, so favor refusing service (CP) over ever granting two holders."
       ],
       "view": {
         "nodes": [
           "LockAPI",
+          "ShardMap",
           "Leader",
           "Log",
           "LockState",
           "Followers"
         ],
-        "caption": "The lock service API proposes ops to the consensus leader, which appends to the replicated log and replicates to followers, with committed ops applied to lock state.",
+        "caption": "The stateless lock service API routes each key through the versioned shard map to the owning consensus group's leader, which appends to the replicated log and replicates to followers, with committed ops applied to lock state. Sharding scales across keys.",
         "links": [
+          "api-shardmap",
           "api-leader",
           "leader-log",
           "log-lockstate",
           "leader-followers"
         ],
         "highlight": [
-          "LockAPI"
+          "ShardMap"
         ],
         "groups": [
           "api-tier",
@@ -1317,10 +2862,13 @@
         "Closing on key-space sharding + log compaction + CP operating stance shows the service scales while never compromising the single-holder guarantee."
       ],
       "probeLinks": [
-        "redis-locks",
+        "etcd-runtime-reconfiguration",
+        "etcd-maintenance",
+        "etcd-monitoring",
+        "sre-monitoring",
         "chubby-paper",
         "zookeeper-paper",
-        "raft-paper"
+        "consul-sessions"
       ],
       "recap": {
         "before": "Single group.",
@@ -1329,23 +2877,128 @@
       },
       "bottlenecks": [
         {
-          "issue": "Single consensus group write throughput.",
-          "mitigation": "Shard keys across independent groups; locks on distinct keys don't contend."
+          "issue": "Single consensus group write throughput (~240K writes/sec >> ~15K per group).",
+          "mitigation": "Shard keys across ~16+ independent groups; locks on distinct keys don't contend."
+        },
+        {
+          "issue": "A single hot, contended key can't be scaled (serialized by one group).",
+          "mitigation": "Redesign contention (finer-grained keys / partition the work); sharding scales across keys, not within one."
+        },
+        {
+          "issue": "Renewal storms (fleet restart) swamp a shard.",
+          "mitigation": "Backpressure + per-client/tenant quotas + admission control; shed low-priority callers."
         },
         {
           "issue": "Replicated log grows unbounded.",
           "mitigation": "Snapshot + compact; rebuild state from snapshot + tail."
+        },
+        {
+          "issue": "Moving key ranges between groups risks two owners.",
+          "mitigation": "Shard map + controlled reconfiguration; hand off ownership so a range is never servable by two groups at once."
         }
-      ]
+      ],
+      "flows": [
+        {
+          "name": "Safe key-range migration (single-owner cutover)",
+          "note": "Moving a range from a source group to a destination is a staged handoff with one ordered cutover point. The source drains and stops committing before the destination is installed and the versioned shard map is bumped, so the range is never owned by two groups at once. A router still using the old version is redirected and refreshes.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Control",
+                "label": "Control Plane (shard map)"
+              },
+              {
+                "id": "Source",
+                "label": "Source Group"
+              },
+              {
+                "id": "Dest",
+                "label": "Destination Group"
+              },
+              {
+                "id": "Router",
+                "label": "API Router"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Control",
+                "to": "Source",
+                "arrow": "->>",
+                "label": "mark range DRAINING (no new acquires/waiters)"
+              },
+              {
+                "from": "Source",
+                "to": "Dest",
+                "arrow": "->>",
+                "label": "transfer lock-state snapshot + committed log tail"
+              },
+              {
+                "from": "Source",
+                "to": "Control",
+                "arrow": "-->>",
+                "label": "stopped committing for range"
+              },
+              {
+                "from": "Control",
+                "to": "Dest",
+                "arrow": "->>",
+                "label": "install owner; bump shard-map version (control-plane consensus)"
+              },
+              {
+                "type": "alt",
+                "label": "router still has old shard-map version",
+                "messages": [
+                  {
+                    "from": "Router",
+                    "to": "Source",
+                    "arrow": "->>",
+                    "label": "acquire(key in moved range)"
+                  },
+                  {
+                    "from": "Source",
+                    "to": "Router",
+                    "arrow": "-->>",
+                    "label": "NOT_OWNER -> new owner=Dest, version=N+1 (retryable)"
+                  },
+                  {
+                    "from": "Router",
+                    "to": "Dest",
+                    "arrow": "->>",
+                    "label": "refresh shard map; retry against Dest"
+                  }
+                ],
+                "else": {
+                  "label": "router has refreshed",
+                  "messages": [
+                    {
+                      "from": "Router",
+                      "to": "Dest",
+                      "arrow": "->>",
+                      "label": "acquire routed straight to new owner"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Dest",
+            "Control"
+          ]
+        }
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/07-scale.jpg"
     }
   ],
   "finalDesign": {
     "title": "Final Design — Distributed Lock Service",
-    "description": "Lock operations go through a consensus group (Raft/Paxos): a leader proposes, a quorum replicates to a durable log, and lock state (holder, expiry, fencing token per key) is the committed log applied deterministically — linearizable and CP, so it never grants two holders. Locks are leases with a TTL that holders renew; a sweeper expires dead holders' leases for liveness. Each grant returns a monotonically increasing fencing token, and protected resources reject stale tokens — defeating the paused-holder gap leases can't. The service is internally leader-elected and offers leader election to clients (lock = leader, token = epoch). Under partition only the majority grants locks; the key space shards across independent groups to scale, with compacted logs and a correctness-first (CP) posture.",
+    "description": "Lock operations go through a consensus group (Raft/Paxos): a leader proposes, a quorum replicates to a durable log, and lock state (holder, leaseId, expiry, fencing token per key) is the committed log applied deterministically — linearizable and CP, so it never grants two holders. Writes and expiry transitions go through the leader/log path; the API tier serves only applied/read-index reads from lock state, never mutating it outside consensus. Locks are leases with a TTL that holders renew; the sweeper reclaims a dead holder's lease by proposing expire(key, leaseId) through the leader, so expiry is itself a committed, ordered op (renew wins only if it commits before expire). Each grant returns a monotonically increasing fencing token, and protected resources persist max_seen_token per key and reject any lower token — defeating the paused-holder gap leases can't (the lock is only advisory for resources that can't fence). Retries are made safe by requestId-keyed idempotency records across leader failover. The service is internally leader-elected (by its own consensus membership) and offers leader election to clients (lock = leader, token = epoch). Under partition only the majority grants or renews; the key space shards across independent consensus groups via a routed shard map, with snapshots/compaction, per-client quotas, and a correctness-first (CP) posture.",
     "view": {
       "nodes": [
         "Client",
         "LockAPI",
+        "ShardMap",
         "Leader",
         "Followers",
         "Log",
@@ -1353,9 +3006,10 @@
         "Sweeper",
         "Resource"
       ],
-      "caption": "A client worker acquires through the lock service API, which commits via the consensus leader, log, and followers into replicated lock state, renews leases the sweeper reclaims, and hands out a fencing token the client presents to the protected resource.",
+      "caption": "A client worker acquires through the lock service API, which routes the key via the versioned shard map to the owning consensus group, commits via the leader, log, and followers into replicated lock state, renews leases the sweeper reclaims, and hands out a fencing token the client presents to the protected resource.",
       "links": [
         "client-api",
+        "api-shardmap",
         "api-leader",
         "leader-log",
         "leader-followers",
@@ -1363,7 +3017,7 @@
         "log-lockstate",
         "api-lockstate",
         "client-renew",
-        "sweeper-lockstate",
+        "sweeper-leader",
         "api-client",
         "client-resource",
         "resource-check"
@@ -1372,13 +3026,14 @@
         "api-tier",
         "consensus"
       ]
-    }
+    },
+    "aiVisual": "assets/generated/ai-visuals/final-design.jpg"
   },
   "satisfies": {
     "functional": [
       {
         "requirement": "Acquire / renew / release",
-        "how": "Consensus-committed lock ops via the API.",
+        "how": "Each is a consensus-committed log op through the leader, made safe to retry across failover by requestId-keyed idempotency records (a retried acquire returns the original grant, not a second one); release is precondition'd on the leaseId so a stale release is a no-op.",
         "steps": [
           "consensus",
           "lease"
@@ -1386,21 +3041,21 @@
       },
       {
         "requirement": "Auto-release on holder death",
-        "how": "Lease TTL + sweeper.",
+        "how": "TTL leases the holder must renew; when renewals stop, the sweeper proposes expire(key, leaseId) as a committed, log-ordered op (not a local timer write), so the renew-vs-expire race resolves deterministically by log order.",
         "steps": [
           "lease"
         ]
       },
       {
         "requirement": "Safe protected actions",
-        "how": "Fencing tokens checked by the resource.",
+        "how": "Per-grant monotonic fencing tokens that the protected resource enforces by persisting max_seen_token per key and rejecting any lower token; non-idempotent guarded writes still need resource-side idempotency on top.",
         "steps": [
           "fencing"
         ]
       },
       {
         "requirement": "Leader election primitive",
-        "how": "Lock-as-leader with token epoch.",
+        "how": "Holding a well-known lock key = being leader, the fencing token = the leader epoch; a deposed leader's lower epoch is fenced out, and clients learn leadership loss via renew failure / watch.",
         "steps": [
           "election"
         ]
@@ -1409,7 +3064,7 @@
     "nonFunctional": [
       {
         "requirement": "Mutual exclusion (safety)",
-        "how": "Linearizable consensus + quorum under partition.",
+        "how": "Linearizable lock state ordered by a single consensus log; under partition only the majority side can commit grants, so two holders can never exist.",
         "steps": [
           "consensus",
           "availability"
@@ -1417,14 +3072,14 @@
       },
       {
         "requirement": "Liveness (no deadlock)",
-        "how": "TTL leases auto-expire dead holders.",
+        "how": "TTL leases auto-expire a dead holder via a committed expire op, releasing the key without manual intervention.",
         "steps": [
           "lease"
         ]
       },
       {
         "requirement": "Correct under pauses/skew",
-        "how": "Fencing tokens + quorum-relative expiry.",
+        "how": "Fencing tokens enforced by the resource's max_seen_token check, plus expiry judged on the consensus group's committed timeline rather than any local wall clock.",
         "steps": [
           "fencing",
           "availability"
@@ -1432,7 +3087,7 @@
       },
       {
         "requirement": "Durable + HA",
-        "how": "Consensus-replicated, survives minority loss.",
+        "how": "Consensus-replicated committed log survives a minority of nodes failing; safe membership change replaces dead nodes without ever forming two disjoint majorities.",
         "steps": [
           "consensus",
           "availability"
@@ -1440,7 +3095,7 @@
       },
       {
         "requirement": "Scale throughput",
-        "how": "Key-space sharding across consensus groups.",
+        "how": "Key-space sharding across independent consensus groups via a versioned shard map, with safe single-owner range migration; scales across keys (never within one hot key).",
         "steps": [
           "scale"
         ]
@@ -1514,6 +3169,14 @@
     "Why can't a lease alone guarantee safety, and exactly how does a fencing token fix it?",
     "How do you choose the lease TTL, and what breaks if it's too short or too long?",
     "Under a network partition, which side can grant locks and why?",
+    "Why must lease expiry be a committed log op, and how is the renew-vs-expire race resolved?",
+    "A client's renew times out near expiry — what should it do, and why can't it assume it still holds the lock?",
+    "How do you make acquire/renew/release safe to retry across a leader failover?",
+    "What does the protected resource have to store and check for fencing to actually work, and what if it can't?",
+    "Fencing rejects a stale holder — does it also make the rightful holder's retried, non-idempotent writes safe? If not, what else is needed?",
+    "How does a client wait for a held lock without a polling storm, and what fairness does the waiter queue guarantee?",
+    "In lock-based leader election, how does a client learn it lost leadership, and how does a follower learn the slot is free?",
+    "How do you move a key range between consensus groups without ever having two owners, and how do routers handle a stale shard map?",
     "How would you support locking multiple keys atomically?",
     "Why is this a CP system, and when would a weaker (AP) lock be acceptable?"
   ],
@@ -1521,71 +3184,231 @@
     "links": [
       {
         "id": "chubby-paper",
-        "group": "Distributed Data",
-        "groupDescription": "Primary papers and docs for storage, replication, partitioning, consistency, and caching.",
+        "group": "Lock-Service Systems and Coordination Primitives",
+        "groupDescription": "Primary systems and project docs for locks, sessions, recipes, and coordination services.",
         "title": "The Chubby Lock Service for Loosely-Coupled Distributed Systems",
         "url": "https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/",
         "source": "Google Research",
         "type": "Paper",
-        "why": "Production lock-service design with leases, sessions, and failure semantics.",
+        "why": "Canonical production lock-service design covering coarse-grained locks, sessions, sequencers, availability, and real client behavior.",
         "year": "2006"
       },
       {
         "id": "zookeeper-paper",
-        "group": "Distributed Data",
-        "groupDescription": "Primary papers and docs for storage, replication, partitioning, consistency, and caching.",
+        "group": "Lock-Service Systems and Coordination Primitives",
+        "groupDescription": "Primary systems and project docs for locks, sessions, recipes, and coordination services.",
         "title": "ZooKeeper: Wait-free Coordination for Internet-scale Systems",
         "url": "https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf",
         "source": "Yahoo / USENIX",
         "type": "Paper",
-        "why": "Reference for coordination services, watches, ephemeral nodes, and distributed primitives.",
+        "why": "Shows how a coordination kernel provides ordered updates, ephemeral nodes, watches, and recipes for locks and leader election.",
         "year": "2010"
       },
       {
+        "id": "zookeeper-recipes",
+        "group": "Lock-Service Systems and Coordination Primitives",
+        "groupDescription": "Primary systems and project docs for locks, sessions, recipes, and coordination services.",
+        "title": "ZooKeeper Recipes and Solutions",
+        "url": "https://zookeeper.apache.org/doc/current/recipes.html",
+        "source": "Apache ZooKeeper",
+        "type": "Docs",
+        "why": "Gives concrete lock and leader-election recipes using ephemeral sequential nodes while avoiding herd effects."
+      },
+      {
+        "id": "curator-lock",
+        "group": "Lock-Service Systems and Coordination Primitives",
+        "groupDescription": "Primary systems and project docs for locks, sessions, recipes, and coordination services.",
+        "title": "Recipe: Shared Reentrant Lock",
+        "url": "https://curator.apache.org/docs/recipes-shared-reentrant-lock/",
+        "source": "Apache Curator",
+        "type": "Docs",
+        "why": "Shows the production client-library surface for ZooKeeper-backed locks and the connection-loss states clients must handle."
+      },
+      {
+        "id": "curator-leader-election",
+        "group": "Lock-Service Systems and Coordination Primitives",
+        "groupDescription": "Primary systems and project docs for locks, sessions, recipes, and coordination services.",
+        "title": "Recipe: Leader Election",
+        "url": "https://curator.apache.org/docs/recipes-leader-election/",
+        "source": "Apache Curator",
+        "type": "Docs",
+        "why": "Connects the interview's lock-as-leader pattern to a mature ZooKeeper recipe and its SUSPENDED/LOST handling rules."
+      },
+      {
+        "id": "etcd-concurrency-api",
+        "group": "Lock-Service Systems and Coordination Primitives",
+        "groupDescription": "Primary systems and project docs for locks, sessions, recipes, and coordination services.",
+        "title": "API Reference: Concurrency",
+        "url": "https://etcd.io/docs/v3.6/dev-guide/api_concurrency_reference_v3/",
+        "source": "etcd",
+        "type": "Docs",
+        "why": "Documents etcd's Lock and Election APIs, useful for mapping leases and leader election onto a Raft-backed key-value store."
+      },
+      {
+        "id": "consul-sessions",
+        "group": "Lock-Service Systems and Coordination Primitives",
+        "groupDescription": "Primary systems and project docs for locks, sessions, recipes, and coordination services.",
+        "title": "Sessions and Distributed Locks Overview",
+        "url": "https://developer.hashicorp.com/consul/docs/automate/session",
+        "source": "HashiCorp Consul",
+        "type": "Docs",
+        "why": "Explains session invalidation, TTL renewal, lock-delay, advisory locks, and the LockIndex/Session sequencer idea."
+      },
+      {
+        "id": "dynamodb-lock-client",
+        "group": "Lock-Service Systems and Coordination Primitives",
+        "groupDescription": "Primary systems and project docs for locks, sessions, recipes, and coordination services.",
+        "title": "Building Distributed Locks with the DynamoDB Lock Client",
+        "url": "https://aws.amazon.com/blogs/database/building-distributed-locks-with-the-dynamodb-lock-client/",
+        "source": "AWS Database Blog",
+        "type": "Case study",
+        "why": "A concrete advisory-lock implementation using conditional writes, heartbeat renewal, record-version numbers, and DynamoDB as the backing store.",
+        "year": "2017"
+      },
+      {
         "id": "raft-paper",
-        "group": "Distributed Data",
-        "groupDescription": "Primary papers and docs for storage, replication, partitioning, consistency, and caching.",
+        "group": "Consensus and Consistency Foundations",
+        "groupDescription": "Consensus and correctness references behind linearizable lock state.",
         "title": "In Search of an Understandable Consensus Algorithm",
         "url": "https://raft.github.io/raft.pdf",
         "source": "Raft",
         "type": "Paper",
-        "why": "Readable consensus reference for leader election, log replication, membership changes, and safety.",
+        "why": "Readable foundation for the leader, replicated log, quorum, safety, and membership-change mechanics in the design.",
         "year": "2014"
       },
       {
+        "id": "paxos-made-live",
+        "group": "Consensus and Consistency Foundations",
+        "groupDescription": "Consensus and correctness references behind linearizable lock state.",
+        "title": "Paxos Made Live - An Engineering Perspective",
+        "url": "https://research.google/pubs/paxos-made-live-an-engineering-perspective-2006-invited-talk/",
+        "source": "Google Research",
+        "type": "Paper",
+        "why": "Shows the engineering gap between textbook Paxos and a production fault-tolerant database, including operational lessons relevant to lock-state replication.",
+        "year": "2007"
+      },
+      {
+        "id": "linearizability-paper",
+        "group": "Consensus and Consistency Foundations",
+        "groupDescription": "Consensus and correctness references behind linearizable lock state.",
+        "title": "Linearizability: A Correctness Condition for Concurrent Objects",
+        "url": "https://cs.brown.edu/~mph/HerlihyW90/p463-herlihy.pdf",
+        "source": "Herlihy and Wing",
+        "type": "Paper",
+        "why": "Defines the correctness model behind a lock operation taking effect at one point in a real-time-respecting order.",
+        "year": "1990"
+      },
+      {
+        "id": "etcd-api-guarantees",
+        "group": "Consensus and Consistency Foundations",
+        "groupDescription": "Consensus and correctness references behind linearizable lock state.",
+        "title": "etcd API Guarantees",
+        "url": "https://etcd.io/docs/v3.6/learning/api_guarantees/",
+        "source": "etcd",
+        "type": "Docs",
+        "why": "Clarifies linearizable versus serializable reads, watch ordering, lease APIs, and the uncertainty clients face after timeouts."
+      },
+      {
         "id": "redis-locks",
-        "group": "Booking and Contention",
-        "groupDescription": "Inventory reservation, waiting rooms, locks, leases, and contention-management references.",
+        "group": "Leases, Fencing, and Failure Modes",
+        "groupDescription": "References for TTL leases, fencing tokens, Redlock tradeoffs, and unsafe timing assumptions.",
         "title": "Distributed Locks with Redis",
         "url": "https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/",
         "source": "Redis",
         "type": "Docs",
-        "why": "Clarifies when Redis locks are acceptable and why leases/fencing matter."
+        "why": "Useful contrast for single-instance SET NX, asynchronous-replication failures, Redlock's timing assumptions, and approximate advisory locks."
       },
       {
-        "id": "spanner-paper",
-        "group": "Distributed Data",
-        "groupDescription": "Primary papers and docs for storage, replication, partitioning, consistency, and caching.",
-        "title": "Spanner: Google's Globally Distributed Database",
-        "url": "https://research.google/pubs/spanner-googles-globally-distributed-database/",
-        "source": "Google Research",
-        "type": "Paper",
-        "why": "Reference for globally replicated transactions, external consistency, and geographically distributed state.",
-        "year": "2012"
+        "id": "kleppmann-locking",
+        "group": "Leases, Fencing, and Failure Modes",
+        "groupDescription": "References for TTL leases, fencing tokens, Redlock tradeoffs, and unsafe timing assumptions.",
+        "title": "How to Do Distributed Locking",
+        "url": "https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html",
+        "source": "Martin Kleppmann",
+        "type": "Explainer",
+        "why": "Sharp explanation of the paused-holder problem and why monotonic fencing tokens must be enforced by the protected resource.",
+        "year": "2016"
+      },
+      {
+        "id": "jepsen-etcd-locks",
+        "group": "Leases, Fencing, and Failure Modes",
+        "groupDescription": "References for TTL leases, fencing tokens, Redlock tradeoffs, and unsafe timing assumptions.",
+        "title": "Jepsen: etcd 3.4.3",
+        "url": "https://jepsen.io/analyses/etcd-3.4.3",
+        "source": "Jepsen",
+        "type": "Analysis",
+        "why": "Failure-injection analysis showing strict-serializable etcd key-value behavior while highlighting why lock APIs need fencing for external resources.",
+        "year": "2020"
+      },
+      {
+        "id": "etcd-jepsen-response",
+        "group": "Leases, Fencing, and Failure Modes",
+        "groupDescription": "References for TTL leases, fencing tokens, Redlock tradeoffs, and unsafe timing assumptions.",
+        "title": "Latest Jepsen Results Against etcd 3.4.3",
+        "url": "https://etcd.io/blog/2020/jepsen-343-results/",
+        "source": "etcd",
+        "type": "Case study",
+        "why": "Project-side response that explains the lock issue, revision-check fencing, and documentation changes after Jepsen testing.",
+        "year": "2020"
+      },
+      {
+        "id": "kubernetes-leaderelection",
+        "group": "Leases, Fencing, and Failure Modes",
+        "groupDescription": "References for TTL leases, fencing tokens, Redlock tradeoffs, and unsafe timing assumptions.",
+        "title": "leaderelection package",
+        "url": "https://pkg.go.dev/k8s.io/client-go/tools/leaderelection",
+        "source": "Kubernetes client-go",
+        "type": "Docs",
+        "why": "Documents Kubernetes lease-based leader election and explicitly states that it does not guarantee fencing, matching the interview's caution."
+      },
+      {
+        "id": "etcd-runtime-reconfiguration",
+        "group": "Operations, Scaling, and Reconfiguration",
+        "groupDescription": "Operational guidance for maintaining quorum-backed coordination systems.",
+        "title": "Runtime Reconfiguration",
+        "url": "https://etcd.io/docs/v3.6/op-guide/runtime-configuration/",
+        "source": "etcd",
+        "type": "Docs",
+        "why": "Operational reference for safely adding and removing consensus members without losing quorum or creating unsafe configurations."
+      },
+      {
+        "id": "etcd-maintenance",
+        "group": "Operations, Scaling, and Reconfiguration",
+        "groupDescription": "Operational guidance for maintaining quorum-backed coordination systems.",
+        "title": "Maintenance",
+        "url": "https://etcd.io/docs/v3.6/op-guide/maintenance/",
+        "source": "etcd",
+        "type": "Docs",
+        "why": "Covers compaction, defragmentation, and other maintenance tasks that keep a log-backed coordination system healthy."
+      },
+      {
+        "id": "etcd-monitoring",
+        "group": "Operations, Scaling, and Reconfiguration",
+        "groupDescription": "Operational guidance for maintaining quorum-backed coordination systems.",
+        "title": "Monitoring etcd",
+        "url": "https://etcd.io/docs/v3.6/op-guide/monitoring/",
+        "source": "etcd",
+        "type": "Docs",
+        "why": "Maps the interview's operational metrics to concrete monitoring guidance for quorum commit latency, leader changes, and storage health."
       },
       {
         "id": "sre-monitoring",
-        "group": "Foundations",
-        "groupDescription": "Core system design references for scalability, reliability, and operating distributed services.",
+        "group": "Operations, Scaling, and Reconfiguration",
+        "groupDescription": "Operational guidance for maintaining quorum-backed coordination systems.",
         "title": "Monitoring Distributed Systems",
         "url": "https://sre.google/sre-book/monitoring-distributed-systems/",
         "source": "Google SRE",
         "type": "Book chapter",
-        "why": "Grounds monitoring and alerting decisions in user-visible reliability signals."
+        "why": "Grounds lock-service alerting in symptoms, service-level signals, and actionable operational telemetry."
       }
     ]
   },
   "assets": {
     "icon": "icon.png"
-  }
+  },
+  "aiVisuals": {
+    "requirements": "assets/generated/ai-visuals/requirements.jpg",
+    "capacity": "assets/generated/ai-visuals/capacity.jpg"
+  },
+  "explainerComic": "assets/generated/comic/interview-comic.jpg"
 }

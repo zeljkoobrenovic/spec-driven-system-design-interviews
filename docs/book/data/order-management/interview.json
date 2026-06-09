@@ -118,6 +118,16 @@
           "stateless"
         ],
         "description": "Handles cancellations and returns; restocks + refunds."
+      },
+      {
+        "id": "Reconciler",
+        "label": "Reconciler / Ops Worker",
+        "type": "worker",
+        "category": "compute",
+        "traits": [
+          "stateless"
+        ],
+        "description": "Reconciles ambiguous external steps (auth/capture/shipment timeouts), expires reservations, drains DLQ, and parks stuck orders for support."
       }
     ],
     "links": [
@@ -210,6 +220,24 @@
         "from": "Returns",
         "to": "Payment",
         "label": "refund"
+      },
+      {
+        "id": "reconciler-db",
+        "from": "Reconciler",
+        "to": "OrderDB",
+        "label": "scan stuck / pending"
+      },
+      {
+        "id": "reconciler-payment",
+        "from": "Reconciler",
+        "to": "Payment",
+        "label": "poll auth/capture state"
+      },
+      {
+        "id": "reconciler-inventory",
+        "from": "Reconciler",
+        "to": "Inventory",
+        "label": "expire / release holds"
       }
     ],
     "types": [
@@ -219,7 +247,8 @@
         "nodes": [
           "OrderSvc",
           "OrderDB",
-          "Outbox"
+          "Outbox",
+          "Reconciler"
         ]
       },
       {
@@ -257,62 +286,86 @@
   ],
   "capacityDiagram": [
     "graph LR",
-    "  Orders[Millions of orders/day]",
-    "  Multi[Multi-service flow]",
-    "  Consistent[Consistent across services]",
-    "  Orders --> Multi",
-    "  Multi --> Consistent"
+    "  Orders[10M orders/day peak ~350/s]",
+    "  Items[~3 items/order ~1k reservations/s]",
+    "  Writes[~5 state writes/order ~1.7k/s]",
+    "  Events[outbox + callbacks ~2k events/s]",
+    "  Orders --> Items",
+    "  Items --> Writes",
+    "  Writes --> Events"
   ],
   "requirements": {
     "functional": [
       "Place an order spanning multiple items; reserve inventory and take payment.",
-      "Drive the order through its lifecycle: placed -> paid -> fulfilled -> shipped -> delivered.",
-      "Orchestrate fulfillment (route to a warehouse, pick/pack/ship) and track shipment.",
-      "Handle cancellations and returns: restock inventory, refund payment.",
+      "Drive the order through its lifecycle: placed -> paid -> fulfilled -> shipped -> delivered, with line-level state under the aggregate.",
+      "Orchestrate fulfillment (route to a warehouse, pick/pack/ship) and track shipment, including split shipments across warehouses.",
+      "Handle cancellations and returns — including partial cancel/return of some lines — restocking inventory and refunding payment.",
       "Notify the customer at each status change."
     ],
     "nonFunctional": [
       "Consistency across services — never charge without reserving stock, never ship without payment.",
-      "No double-processing: order operations are idempotent.",
-      "Reliable: a crash mid-flow resumes, never loses or duplicates an order.",
-      "Auditable: the full order history/state transitions are recorded.",
-      "Scale to millions of orders/day with many concurrent state changes."
+      "No double-processing: order operations are idempotent (key scoped by customer + endpoint + request fingerprint; provider idempotency keys reused on retry).",
+      "Reliable: a crash mid-flow resumes; ambiguous external steps are reconciled, never blindly retried; stuck orders park for support.",
+      "Auditable: the full order history/state transitions and support actions are recorded.",
+      "Scale to millions of orders/day with many concurrent state changes.",
+      "Secure & private: authenticate customers, authorize order access, keep payment data tokenized (PCI boundary at the provider), protect PII, retain/expire it on policy.",
+      "Observable & operable: stuck-saga and outbox-lag metrics, retry/DLQ counts, payment/WMS error rates, and support dashboards for manual repair."
     ]
   },
   "capacity": [
     {
-      "label": "Orders per day",
-      "value": "millions",
-      "note": "Sharded by order id."
+      "label": "Orders/day",
+      "value": "1M baseline, 10M peak",
+      "note": "1M/day ≈ 12 orders/s avg; a 10M peak day with a 3× intra-day spike ≈ 350 orders/s."
     },
     {
-      "label": "Services in the flow",
-      "value": "inventory, payment, fulfillment",
-      "note": "Not one ACID transaction."
+      "label": "Items/order",
+      "value": "~3 avg",
+      "note": "At 350 orders/s that is ~1,000 line-level reservation writes/s (per SKU+warehouse, not one counter)."
     },
     {
-      "label": "Order states",
-      "value": "~8",
-      "note": "Plus cancel/return branches."
+      "label": "State writes/order",
+      "value": "~5 transitions",
+      "note": "placed→paid→fulfilling→shipped→delivered ≈ 1,700 transition + history writes/s at peak."
     },
     {
-      "label": "Idempotency",
-      "value": "required",
-      "note": "Retries must not double-charge/ship."
+      "label": "Payment calls/order",
+      "value": "~2 (auth + capture)",
+      "note": "~700 payment provider calls/s at peak; refunds add a smaller tail."
     },
     {
-      "label": "Consistency",
-      "value": "saga (eventual + compensation)",
-      "note": "Cross-service correctness without 2PC."
+      "label": "Outbox events + callbacks",
+      "value": "~5–6/order",
+      "note": "One outbox event per transition plus WMS shipment callbacks ≈ 2,000 published events/s at peak."
+    },
+    {
+      "label": "Storage/day (10M)",
+      "value": "~20–30 GB/day",
+      "note": "orders + order_items + order_events + outbox_events at a few KB/order; transition history and outbox kept hot ~30–90 days, then archived."
+    },
+    {
+      "label": "Sharding vs hot SKUs",
+      "value": "two different problems",
+      "note": "Order-id sharding spreads order writes but does NOT relieve contention on a single popular SKU+warehouse row — that needs per-location stock, fan-out, or hold queues. When a hot SKU+warehouse row saturates (conditional updates start retrying), shift it to a hold queue / token bucket or pre-allocated reservation buckets per location."
+    },
+    {
+      "label": "Latency / SLO targets",
+      "value": "place p99 ~300 ms, read p99 ~100 ms",
+      "note": "Order placement returns once stock is reserved + payment authorized (p99 ~300 ms); status reads p99 ~100 ms; fulfillment/status events propagate within seconds (async, not on the request path); notification freshness target ~1 min."
+    },
+    {
+      "label": "Provider limits + retry amplification",
+      "value": "PSP/WMS are the bottleneck",
+      "note": "External PSP/WMS rate limits usually bind before the order store does. During a provider incident, naive retries amplify load several-fold — bound it with a per-provider token bucket + capped exponential backoff, shed to the reconciler/DLQ rather than hammering, and keep auth/capture idempotency keys so a retry storm can't double-charge."
     }
   ],
   "api": [
     {
       "method": "POST",
       "path": "/v1/orders",
-      "description": "Place an order; reserves inventory and authorizes payment. Idempotent.",
-      "request": "{ \"items\": [ {sku, qty} ], \"payment\": \"tok_9\", \"idempotencyKey\": \"k_1\" }",
-      "response": "{ \"orderId\": \"o_9\", \"state\": \"placed\" }",
+      "description": "Place an order; reserves inventory and authorizes payment. The customer identity is taken from the authenticated principal, not the body (a body customerId, if present, is only validated against the token, never trusted). Idempotent via Idempotency-Key (scoped customer+endpoint+fingerprint).",
+      "request": "{ \"items\": [ {lineId, sku, qty} ], \"shippingAddress\": {...}, \"currency\": \"USD\", \"paymentToken\": \"tok_9\", \"reservationTtlSec\": 900, \"idempotencyKey\": \"k_1\" } // customerId derived from auth",
+      "response": "{ \"orderId\": \"o_9\", \"state\": \"placed\", \"paymentState\": \"authorized\", \"reservations\": [ {lineId, sku, warehouseId, expiresAt} ] }",
       "sequence": {
         "participants": [
           {
@@ -372,16 +425,16 @@
     {
       "method": "GET",
       "path": "/v1/orders/{id}",
-      "description": "Get an order's current state and history.",
+      "description": "Get an order with line items, shipments, payment state, transition history, and pending compensations.",
       "request": "(id in path)",
-      "response": "{ \"orderId\": \"o_9\", \"state\": \"shipped\", \"tracking\": \"...\" }"
+      "response": "{ \"orderId\": \"o_9\", \"state\": \"partially_shipped\", \"items\": [ {lineId, sku, lineState} ], \"shipments\": [ {shipmentId, tracking, state} ], \"payment\": { \"state\": \"captured\" }, \"history\": [ {from, to, ts} ], \"pendingCompensations\": [] }"
     },
     {
       "method": "POST",
       "path": "/v1/orders/{id}/cancel",
-      "description": "Cancel/return an order; restocks inventory and refunds (compensation).",
-      "request": "{ \"reason\": \"changed_mind\" }",
-      "response": "{ \"state\": \"cancelled\" }",
+      "description": "Cancel an order or specific lines (only from cancellable states); releases reservations and voids/refunds. The response is line-aware: cancelling a subset rolls the aggregate up to partially_cancelled and reports per-line state and async compensation status. Idempotent.",
+      "request": "{ \"lineIds\": [\"li_1\"], \"reason\": \"changed_mind\", \"idempotencyKey\": \"k_2\" }",
+      "response": "{ \"state\": \"partially_cancelled\", \"lines\": [ {lineId: \"li_1\", lineState: \"cancelled\"}, {lineId: \"li_2\", lineState: \"reserved\"} ], \"compensation\": { \"reservationRelease\": \"done\", \"payment\": { \"action\": \"void\", \"status\": \"pending\", \"paymentId\": \"p_9\" } } }",
       "sequence": {
         "participants": [
           {
@@ -437,12 +490,40 @@
           }
         ]
       }
+    },
+    {
+      "method": "POST",
+      "path": "/v1/orders/{id}/returns",
+      "description": "Open a return for delivered lines; checks eligibility, then drives receive → restock decision → refund. Idempotent.",
+      "request": "{ \"items\": [ {orderItemId, qty} ], \"reason\": \"defective\", \"idempotencyKey\": \"k_3\" }",
+      "response": "{ \"returnId\": \"r_4\", \"eligibility\": \"approved\", \"state\": \"awaiting_receipt\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/webhooks/payment",
+      "description": "Provider callback for async payment results (auth/capture/refund). Verifies the provider's webhook signature, dedupes on provider event id (webhook_events), then resolves auth_pending/capture states. Returns 2xx only after the event is durably recorded so the provider stops retrying.",
+      "request": "{ \"providerEventId\": \"evt_7\", \"type\": \"capture.succeeded\", \"intent\": \"pi_9\", \"captureId\": \"cap_2\", \"signature\": \"whsec...\" }",
+      "response": "{ \"received\": true, \"applied\": true }"
+    },
+    {
+      "method": "POST",
+      "path": "/webhooks/wms/shipment",
+      "description": "Warehouse fulfillment event (packed/ready_to_ship → triggers capture; shipped/delivered → carrier handoff and beyond). Verifies an HMAC signature, dedupes on eventId, and tolerates out-of-order delivery; advances the line and order state via guarded transitions. `packed`/`ready_to_ship` means the package is built but still in the warehouse, so capture runs before `shipped`.",
+      "request": "{ \"eventId\": \"wms_5\", \"shipmentId\": \"s_2\", \"type\": \"ready_to_ship\", \"signature\": \"hmac...\", \"tracking\": \"1Z...\", \"items\": [ {orderItemId, qty} ] }",
+      "response": "{ \"received\": true, \"applied\": true }"
+    },
+    {
+      "method": "POST",
+      "path": "/admin/orders/{id}/actions",
+      "description": "Support/ops repair on a stuck order (park, replay a step, force-cancel, manual refund, resolve). Requires an authorized operator; every call is recorded in support_actions with the actor and reason. Idempotent per action key.",
+      "request": "{ \"action\": \"replay\", \"step\": \"capture\", \"reason\": \"provider recovered after incident\", \"actorId\": \"ops_3\", \"idempotencyKey\": \"a_1\" }",
+      "response": "{ \"actionId\": \"act_8\", \"orderState\": \"fulfilling\", \"triggered\": [ \"external_operations:capture\" ] }"
     }
   ],
   "dataModel": [
     {
       "name": "orders",
-      "note": "Authoritative order + lifecycle state + saga progress, sharded by order id.",
+      "note": "Authoritative order header + aggregate lifecycle state + saga progress, sharded by order id.",
       "fields": [
         {
           "name": "order_id",
@@ -453,27 +534,65 @@
           "type": "bigint"
         },
         {
-          "name": "items",
-          "type": "list<sku, qty, price>"
+          "name": "shipping_address",
+          "type": "jsonb"
+        },
+        {
+          "name": "currency",
+          "type": "char(3)"
+        },
+        {
+          "name": "total_amount",
+          "type": "decimal"
         },
         {
           "name": "state",
-          "type": "enum(placed, paid, fulfilling, shipped, delivered, cancelled, returned)"
+          "type": "enum(placed, paid, fulfilling, partially_shipped, shipped, delivered, cancelled, partially_cancelled, partially_returned, returned)"
         },
         {
           "name": "saga_step",
           "type": "current step / compensation marker"
         },
         {
-          "name": "idempotency_key",
-          "type": "varchar"
+          "name": "version",
+          "type": "int (optimistic lock)"
+        }
+      ]
+    },
+    {
+      "name": "order_items",
+      "note": "Line-level state and warehouse allocation; aggregate order state is derived from these.",
+      "fields": [
+        {
+          "name": "order_item_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "order_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "sku / qty / unit_price",
+          "type": "line"
+        },
+        {
+          "name": "warehouse_id",
+          "type": "allocation"
+        },
+        {
+          "name": "line_state",
+          "type": "enum(reserved, allocated, shipped, delivered, cancelled, returned)"
         }
       ]
     },
     {
       "name": "order_events",
-      "note": "Append-only history of state transitions (audit + outbox).",
+      "note": "Append-only history of state transitions (audit + resume + source for outbox).",
       "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid PK"
+        },
         {
           "name": "order_id",
           "type": "uuid"
@@ -483,30 +602,260 @@
           "type": "transition"
         },
         {
-          "name": "ts",
-          "type": "timestamp"
+          "name": "ts / cause",
+          "type": "timestamp + trigger (payment, shipment, cancel)"
+        }
+      ]
+    },
+    {
+      "name": "inventory_reservations",
+      "note": "Reservation per SKU+warehouse tied to a line item, with TTL and lifecycle.",
+      "fields": [
+        {
+          "name": "reservation_id",
+          "type": "uuid PK"
         },
         {
-          "name": "cause",
-          "type": "trigger (payment, shipment, cancel)"
+          "name": "sku / warehouse_id",
+          "type": "stock key"
+        },
+        {
+          "name": "order_id / order_item_id",
+          "type": "owner"
+        },
+        {
+          "name": "qty / state",
+          "type": "enum(held, consumed, released)"
+        },
+        {
+          "name": "expires_at / released_at",
+          "type": "timestamp (TTL + expiry worker)"
         }
       ]
     },
     {
       "name": "inventory",
-      "note": "Authoritative stock + reservations per SKU.",
+      "note": "Authoritative stock per SKU + warehouse (location, not a single global counter).",
       "fields": [
         {
-          "name": "sku",
-          "type": "string PK"
+          "name": "sku / warehouse_id",
+          "type": "composite PK"
         },
         {
-          "name": "available",
+          "name": "available / reserved",
           "type": "int"
+        }
+      ]
+    },
+    {
+      "name": "payment_attempts",
+      "note": "Tracks provider operation IDs and states for auth/capture/refund + reconciliation.",
+      "fields": [
+        {
+          "name": "payment_id",
+          "type": "uuid PK"
         },
         {
-          "name": "reserved",
-          "type": "int"
+          "name": "order_id",
+          "type": "uuid"
+        },
+        {
+          "name": "provider_intent / auth_id / capture_id / refund_id",
+          "type": "provider operation IDs"
+        },
+        {
+          "name": "amount / currency",
+          "type": "money"
+        },
+        {
+          "name": "state",
+          "type": "enum(auth_pending, authorized, captured, capture_failed, refunded, voided)"
+        },
+        {
+          "name": "provider_idempotency_key / auth_expires_at",
+          "type": "retry-safe key + expiry"
+        }
+      ]
+    },
+    {
+      "name": "shipments",
+      "note": "Package-level fulfillment unit; one order can have several (split shipments).",
+      "fields": [
+        {
+          "name": "shipment_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "order_id / warehouse_id",
+          "type": "owner + source"
+        },
+        {
+          "name": "item_allocations",
+          "type": "list<order_item_id, qty>"
+        },
+        {
+          "name": "carrier / tracking",
+          "type": "string"
+        },
+        {
+          "name": "state",
+          "type": "enum(requested, packed, ready_to_ship, shipped, delivered)"
+        }
+      ]
+    },
+    {
+      "name": "returns",
+      "note": "Return-after-delivery flow with eligibility, receipt, restock decision, and refund link.",
+      "fields": [
+        {
+          "name": "return_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "order_id / order_item_id",
+          "type": "scope"
+        },
+        {
+          "name": "eligibility / received_state",
+          "type": "enum"
+        },
+        {
+          "name": "restock_decision",
+          "type": "enum(restock, discard, refurbish)"
+        },
+        {
+          "name": "refund_payment_id",
+          "type": "FK payment_attempts"
+        }
+      ]
+    },
+    {
+      "name": "idempotency_keys",
+      "note": "Dedupes client requests; scoped by customer + endpoint + request fingerprint with a TTL.",
+      "fields": [
+        {
+          "name": "key",
+          "type": "varchar PK"
+        },
+        {
+          "name": "customer_id / endpoint",
+          "type": "scope"
+        },
+        {
+          "name": "request_fingerprint",
+          "type": "hash(body)"
+        },
+        {
+          "name": "response / status",
+          "type": "stored result"
+        },
+        {
+          "name": "ttl",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "outbox_events",
+      "note": "Events written in the same txn as the transition; a relay publishes them at-least-once.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid PK (consumer dedupe key)"
+        },
+        {
+          "name": "aggregate_id",
+          "type": "order_id"
+        },
+        {
+          "name": "type / payload_version",
+          "type": "OrderShipped, v2"
+        },
+        {
+          "name": "publish_status / attempts",
+          "type": "enum(pending, published) + int"
+        },
+        {
+          "name": "next_retry_at",
+          "type": "timestamp (DLQ after N attempts)"
+        }
+      ]
+    },
+    {
+      "name": "webhook_events",
+      "note": "Dedupe + audit record for every inbound provider callback (payment + WMS) so a redelivered or replayed webhook applies at most once.",
+      "fields": [
+        {
+          "name": "provider_event_id",
+          "type": "varchar PK (provider's id, e.g. evt_7 / wms_5)"
+        },
+        {
+          "name": "source / type",
+          "type": "enum(payment, wms) + event type"
+        },
+        {
+          "name": "signature_valid",
+          "type": "bool (HMAC/secret check result)"
+        },
+        {
+          "name": "received_at / applied_at",
+          "type": "timestamp"
+        },
+        {
+          "name": "apply_status",
+          "type": "enum(received, applied, ignored_stale, rejected_signature)"
+        }
+      ]
+    },
+    {
+      "name": "external_operations",
+      "note": "Durable record of each in-flight external step (auth/capture/refund/shipment) the reconciler scans; makes ambiguous timeouts resolvable instead of lost.",
+      "fields": [
+        {
+          "name": "operation_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "order_id / kind",
+          "type": "enum(auth, capture, refund, void, ship)"
+        },
+        {
+          "name": "provider_id / idempotency_key",
+          "type": "external ref + retry-safe key"
+        },
+        {
+          "name": "state",
+          "type": "enum(pending, confirmed, failed, parked)"
+        },
+        {
+          "name": "attempts / next_retry_at / last_error",
+          "type": "retry budget + diagnostics"
+        }
+      ]
+    },
+    {
+      "name": "support_actions",
+      "note": "Audit trail for manual repair: who changed what, why, and which compensating action fired — so parking/replaying/refunding a stuck order is never silent.",
+      "fields": [
+        {
+          "name": "action_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "order_id / actor_id",
+          "type": "scope + operator"
+        },
+        {
+          "name": "action / reason",
+          "type": "enum(park, replay, force_cancel, manual_refund, resolve) + note"
+        },
+        {
+          "name": "compensation_triggered",
+          "type": "ref external_operations / outbox_events"
+        },
+        {
+          "name": "ts",
+          "type": "timestamp"
         }
       ]
     }
@@ -574,7 +923,7 @@
       "description": [
         "Start with the simplest possible order placement: in a single request, the order service runs one synchronous flow — take the payment, decrement the stock, and mark the order shipped — ideally wrapped in one database transaction so it's all-or-nothing.",
         "This is correct and trivial when everything lives in one database. But the moment payment, inventory, and fulfillment are separate services with separate stores (which they are), there is no single transaction to wrap them in. A crash or timeout after charging the card but before decrementing stock leaves the customer charged for an item that never ships, with no record of where the flow stopped.",
-        "So the baseline motivates the rest of the design: model the order as an explicit, durable state machine, and coordinate the cross-service steps as a saga with compensation instead of pretending they're one ACID transaction."
+        "So we reject this baseline deliberately — its value is the list of invariants the real design must preserve: never charge without reserved stock, never ship without payment, always have a durable resume point, and make every step idempotent. The rest of the design earns those back: model the order as an explicit, durable state machine, and coordinate the cross-service steps as a saga with compensation instead of pretending they're one ACID transaction."
       ],
       "view": {
         "nodes": [
@@ -607,10 +956,11 @@
         "Trying the one-transaction version first makes the core problem unmistakable: the order spans independently-owned services, so you need a durable state machine plus compensation, not a single ACID transaction."
       ],
       "probeLinks": [
-        "debezium-outbox",
+        "aws-idempotent-apis",
         "dynamodb-transactions",
         "stripe-payment-intents",
-        "stripe-idempotency"
+        "stripe-idempotency",
+        "transactional-outbox"
       ],
       "recap": {
         "before": "Nothing.",
@@ -623,15 +973,17 @@
           "why": "Payment, inventory, and fulfillment own separate stores; no single transaction spans them, and a crash mid-flow strands the order with no recovery point.",
           "instead": "Persist an explicit order state machine and coordinate the steps as a saga with compensating actions."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/01-naive.jpg"
     },
     {
       "id": "lifecycle",
       "title": "2. The Order Lifecycle State Machine",
       "description": [
         "Model the order as an explicit state machine: placed -> paid -> fulfilling -> shipped -> delivered, with cancel/return branches. The order store persists the current state and every transition as the source of truth.",
-        "Transitions are triggered by events (payment captured, shipment created) and validated (you can't ship an unpaid order). The append-only transition history gives auditability and lets a crashed orchestrator resume from the persisted state.",
-        "This state machine is the backbone — inventory, payment, fulfillment, and notifications all hang off transitions, and 'what state is this order in' has exactly one authoritative answer."
+        "Transitions are triggered by events and guarded. The allowed-transition matrix (trigger → guard) is the contract: placed → paid requires an authorized payment AND reserved inventory; paid → fulfilling requires successful warehouse routing; fulfilling → shipped requires a WMS packed/ready_to_ship ack AND a successful capture (re-auth if expired) BEFORE carrier handoff; shipped → delivered requires a carrier delivery event; delivered → returned requires an accepted, eligible return; and any cancellable state (placed/paid/fulfilling, before ship) → cancelled releases the reservation and voids/refunds. Invalid transitions (e.g. ship an unpaid order, cancel an already-shipped line) are rejected by the guard, not just by convention.",
+        "Two levels of state coexist: the aggregate order state above, and per-line item state (reserved → allocated → shipped → delivered, with cancelled/returned branches) underneath it. The aggregate is *derived* from the lines — an order with some lines shipped and some pending rolls up to partially_shipped — so split shipments and partial cancel/return are first-class, not special cases.",
+        "This state machine is the backbone — inventory, payment, fulfillment, and notifications all hang off transitions, the append-only transition history gives auditability, and a crashed orchestrator resumes from the persisted state. 'What state is this order in' has exactly one authoritative answer."
       ],
       "view": {
         "nodes": [
@@ -662,13 +1014,21 @@
           "whyItMatters": "Guarantees valid progressions, auditability, and crash-resume.",
           "example": "fulfilling -> shipped only after payment captured + warehouse ack.",
           "group": "The Order Lifecycle State Machine"
+        },
+        {
+          "term": "Allowed-transition matrix (trigger → guard)",
+          "definition": "Each transition has a trigger and a guard the order store checks before applying it: placed→paid needs authorized payment AND reserved inventory; paid→fulfilling needs warehouse routing; fulfilling→shipped needs a WMS packed/ready_to_ship ack AND a successful capture (re-auth if expired) before carrier handoff; shipped→delivered needs a carrier delivery event; delivered→returned needs an accepted, eligible return; any pre-ship state→cancelled releases the reservation and voids/refunds.",
+          "whyItMatters": "Makes 'which transitions are legal from here' a checked contract, not a convention — impossible states (shipped-but-unpaid) are rejected by the guard.",
+          "example": "Attempting fulfilling→shipped with an expired auth fails the guard until a successful re-auth + capture; the package waits in the warehouse.",
+          "group": "The Order Lifecycle State Machine"
         }
       ],
       "probeLinks": [
+        "commercetools-orders",
+        "commercetools-states",
         "debezium-outbox",
-        "kafka-design",
         "dynamodb-transactions",
-        "stripe-payment-intents"
+        "postgres-isolation"
       ],
       "patterns": [
         "Order state machine"
@@ -680,15 +1040,29 @@
         "before": "A single synchronous transaction with no resume point.",
         "after": "A durable, auditable order lifecycle as the source of truth.",
         "newRisk": "An order touches inventory, payment, and fulfillment — separate services, not one transaction."
-      }
+      },
+      "traps": [
+        {
+          "trap": "Treating order state as a single display field updated wherever convenient.",
+          "why": "If any service can flip the state, guards aren't enforced and an order can reach impossible states (shipped-but-unpaid); resume and audit become unreliable.",
+          "instead": "Make the order store the only writer of state, validate every transition against the allowed-transition matrix, and append each transition to history."
+        },
+        {
+          "trap": "Modeling only one order-level state for a multi-item order.",
+          "why": "Split shipments, partial cancellation, and partial returns can't be represented, so the aggregate state lies about what actually happened to each line.",
+          "instead": "Keep per-line item state and derive the aggregate (partially_shipped, partially_returned) from the lines."
+        }
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/02-lifecycle.jpg"
     },
     {
       "id": "inventory",
       "title": "3. Inventory Reservation",
       "description": [
         "An order shouldn't be placed if items aren't available, and stock mustn't be oversold across the multi-step flow. Reserve inventory at order time: atomically check-and-reserve the quantities (decrement available, increment reserved) in the inventory service.",
-        "Reservation (not immediate decrement) holds the stock during the flow; it's decremented for real on ship and released back if the order is cancelled before shipping. This separates 'committed to this order' from 'shipped'.",
-        "The reserve is an atomic conditional update (reserve only if available >= qty), the same oversell-proof discipline as any limited-inventory system, applied per SKU."
+        "Reservation (not immediate decrement) holds the stock during the flow; it's decremented for real on ship and released back if the order is cancelled before shipping. This separates 'committed to this order' from 'shipped'. Each reservation carries a TTL so an abandoned checkout self-heals — an expiry worker releases holds that aren't confirmed in time.",
+        "The reserve is an atomic conditional update (reserve only if available >= qty), the same oversell-proof discipline as any limited-inventory system, applied per SKU and warehouse — inventory is location-scoped, so a multi-warehouse order reserves and allocates per line, not against a single global counter.",
+        "One edge case ties inventory to the saga and reconciliation: if a reservation's TTL is about to expire while payment authorization is still ambiguous (auth_pending), the expiry worker must NOT blindly release the hold — releasing stock for an order that may yet be charged risks overselling. Instead it extends the hold (or marks it reconcile-pending) and lets the reconciler resolve the payment first, then either consume or release."
       ],
       "view": {
         "nodes": [
@@ -712,17 +1086,17 @@
       },
       "options": [
         {
-          "name": "Atomic conditional decrement (default)",
-          "description": "Reserving stock is a single conditional UPDATE that decrements the SKU row only while availability is positive, so the database itself rejects oversell with no application lock.",
+          "name": "Atomic conditional reservation (default)",
+          "description": "Reserving stock is a single conditional UPDATE on the SKU+warehouse row — move qty from available to reserved only while available >= qty — so the database itself rejects oversell with no application lock. The real decrement happens on ship; the reservation releases on cancel/expiry.",
           "pros": [
-            "A single 'UPDATE SET avail = avail - 1 WHERE avail > 0' atomically rejects the oversell at the DB.",
+            "A single 'UPDATE SET available = available - q, reserved = reserved + q WHERE available >= q' atomically rejects oversell at the DB.",
             "No application-level lock to manage — concurrency safety is the row's job.",
-            "Cheap and correct for the common case of two orders racing for the last unit."
+            "Cheap and correct for the common case of two orders racing for the last unit; 'reserved' stays distinct from 'shipped'."
           ],
           "cons": [
-            "A genuinely hot SKU serializes all buyers on one row, capping throughput.",
-            "Decrement-on-reserve means abandoned checkouts strand stock until released.",
-            "Cross-SKU or warehouse-level allocation needs more than a single counter."
+            "A genuinely hot SKU+warehouse serializes all buyers on one row, capping throughput.",
+            "A reservation with no TTL strands stock if the order is abandoned mid-checkout — pair with an expiry worker.",
+            "Cross-warehouse allocation (which location fulfils which line) needs more than a single counter."
           ],
           "view": {
             "nodes": [
@@ -743,7 +1117,8 @@
               "orchestration",
               "domains"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-inventory-opt1.jpg"
         },
         {
           "name": "Reservation hold with TTL",
@@ -783,7 +1158,8 @@
               "orchestration",
               "domains"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-inventory-opt2.jpg"
         },
         {
           "name": "Pessimistic SELECT FOR UPDATE",
@@ -823,7 +1199,8 @@
               "orchestration",
               "domains"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-inventory-opt3.jpg"
         }
       ],
       "decisionPrompt": "Two orders want the last unit of a SKU at the same moment. How do you avoid overselling?",
@@ -837,8 +1214,8 @@
         }
       ],
       "probeLinks": [
-        "debezium-outbox",
-        "kafka-design",
+        "shopify-inventory-reservations",
+        "commercetools-inventory-overview",
         "dynamodb-transactions",
         "postgres-isolation"
       ],
@@ -859,8 +1236,8 @@
       "title": "4. Cross-Service Saga with Compensation",
       "description": [
         "Placing an order spans inventory (reserve), payment (authorize), and later fulfillment — across separate services and databases. You can't wrap them in one ACID transaction, so coordinate a saga: a sequence of local steps, each with a compensating action if a later step fails.",
-        "The orchestrator (order service) drives the saga, persisting progress in the order state so it's resumable. If payment fails after reserving stock, the compensation releases the reservation; if a step is ambiguous (timeout), reconcile rather than blindly retry.",
-        "Every step is idempotent (keyed by order id + step), so retries from the orchestrator don't double-reserve or double-charge. The state machine doubles as the saga's durable ledger."
+        "The orchestrator (order service) drives the saga, persisting progress in the order state so it's resumable. If payment fails cleanly after reserving stock, the compensation releases the reservation. The subtle case is an ambiguous step: if authorization times out, you don't know whether the charge happened. Record auth_pending, wait for the provider webhook or poll the provider with the same idempotency key, and only then advance or compensate — never blindly retry, which risks a double charge.",
+        "Every step is idempotent: internal steps keyed by order id + step, and external calls reuse a stable provider idempotency key so a retry collapses onto the same auth/capture/refund. The same reconcile-don't-retry discipline applies to WMS callbacks — an ambiguous or missing shipment event is resolved by event id and status polling, not by re-sending a fulfillment request. Each in-flight external step is tracked as an `external_operations` row so the reconciler can resume it; the state machine doubles as the saga's durable ledger."
       ],
       "view": {
         "nodes": [
@@ -919,7 +1296,8 @@
               "orchestration",
               "domains"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-saga-opt1.jpg"
         },
         {
           "name": "Choreographed saga (events)",
@@ -962,7 +1340,8 @@
               "orchestration",
               "domains"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-saga-opt2.jpg"
         },
         {
           "name": "Distributed transaction (2PC)",
@@ -1006,7 +1385,8 @@
               "orchestration",
               "domains"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-saga-opt3.jpg"
         }
       ],
       "decisionPrompt": "You reserved stock, then payment authorization fails. What has to happen?",
@@ -1027,10 +1407,14 @@
         }
       ],
       "probeLinks": [
+        "temporal-saga",
+        "azure-compensating-transaction",
+        "aws-idempotent-apis",
         "stripe-idempotency",
+        "microservices-saga",
         "debezium-outbox",
-        "dynamodb-transactions",
-        "stripe-payment-intents"
+        "transactional-outbox",
+        "stripe-auth-capture"
       ],
       "patterns": [
         "Saga with compensation",
@@ -1149,6 +1533,79 @@
             "OrderSvc",
             "Payment"
           ]
+        },
+        {
+          "name": "Ambiguous authorization timeout: reconcile, don't retry",
+          "note": "Authorization times out — the charge may or may not have happened. The orchestrator parks the order at auth_pending and reconciles via webhook/poll using the same provider key before advancing or compensating.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "OrderSvc",
+                "label": "Order Service"
+              },
+              {
+                "id": "OrderDB",
+                "label": "Order Store"
+              },
+              {
+                "id": "Payment",
+                "label": "Payment"
+              }
+            ],
+            "messages": [
+              {
+                "from": "OrderSvc",
+                "to": "Payment",
+                "arrow": "->>",
+                "label": "authorize {providerKey}"
+              },
+              {
+                "from": "Payment",
+                "to": "OrderSvc",
+                "arrow": "-->>",
+                "label": "timeout (no response)"
+              },
+              {
+                "from": "OrderSvc",
+                "to": "OrderDB",
+                "arrow": "->>",
+                "label": "record auth_pending"
+              },
+              {
+                "type": "alt",
+                "label": "webhook/poll: authorized",
+                "messages": [
+                  {
+                    "from": "Payment",
+                    "to": "OrderSvc",
+                    "arrow": "->>",
+                    "label": "auth confirmed (same key)"
+                  },
+                  {
+                    "from": "OrderSvc",
+                    "to": "OrderDB",
+                    "arrow": "->>",
+                    "label": "advance -> paid"
+                  }
+                ],
+                "else": {
+                  "label": "webhook/poll: not authorized",
+                  "messages": [
+                    {
+                      "from": "OrderSvc",
+                      "to": "OrderDB",
+                      "arrow": "->>",
+                      "label": "compensate: release reservation, mark failed"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "OrderSvc",
+            "Payment"
+          ]
         }
       ]
     },
@@ -1157,8 +1614,8 @@
       "title": "5. Fulfillment Orchestration",
       "description": [
         "Once paid, the order is fulfilled: the fulfillment service routes it to a warehouse (by location/stock), which picks, packs, and ships. The warehouse (WMS) is often external/async, so it emits shipment events back rather than responding synchronously.",
-        "Fulfillment is itself a saga sub-flow: capture payment on ship (not at order — you authorize at order, capture when it actually ships), decrement the reservation to a real decrement, and transition the order to shipped/delivered as shipment events arrive.",
-        "Split shipments and multi-warehouse routing add complexity (one order, several packages), each tracked as part of the order's fulfillment state."
+        "The capture/ship ordering is the subtle part, because the invariant is 'never ship without payment'. So capture happens on the pre-carrier-handoff event, not after the package leaves: the WMS emits `packed`/`ready_to_ship` once the package is built but still in the warehouse, the order service captures payment (re-authorizing idempotently if the auth expired) and consumes the reservation into a real decrement, and only then does it release the package to the carrier and record the WMS `shipped` event. If capture fails or the auth can't be collected, the order parks before carrier handoff — the package never leaves unpaid.",
+        "Split shipments and multi-warehouse routing add complexity (one order, several packages), each tracked as part of the order's fulfillment state with its own capture-then-ship boundary."
       ],
       "view": {
         "nodes": [
@@ -1186,10 +1643,11 @@
       },
       "options": [
         {
-          "name": "Authorize at placement, capture at shipment (default)",
-          "description": "Payment is authorized when the order is placed but the funds are only captured once the warehouse ships, and the auth is voided if the order is cancelled first.",
+          "name": "Authorize at placement, capture before carrier handoff (default)",
+          "description": "Payment is authorized when the order is placed but funds are captured only once the warehouse reports the package packed/ready_to_ship — before it is released to the carrier — and the auth is voided if the order is cancelled first.",
           "pros": [
-            "You verify funds up front but only take the money when goods actually ship — matches most consumer law and card-network rules.",
+            "You verify funds up front but only take the money once the package is built and about to ship — matches most consumer law and card-network rules.",
+            "Capturing on `packed`/`ready_to_ship` (not after the carrier has the package) preserves 'never ship without payment': capture failure parks the order before handoff.",
             "If the order is cancelled before shipment, you void the auth with no refund flow.",
             "Avoids charging for items that turn out to be unavailable at the warehouse."
           ],
@@ -1205,7 +1663,7 @@
               "Warehouse",
               "Payment"
             ],
-            "caption": "The order service authorizes payment at placement, lets the fulfillment service and warehouse ship, and captures the funds only on the returned shipment event.",
+            "caption": "The order service authorizes payment at placement and captures the funds only when the warehouse reports the package packed/ready_to_ship, before it is released to the carrier.",
             "links": [
               "order-fulfillment",
               "fulfillment-wh",
@@ -1221,7 +1679,8 @@
               "domains",
               "edges"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-fulfillment-opt1.jpg"
         },
         {
           "name": "Capture immediately at placement",
@@ -1264,44 +1723,158 @@
               "domains",
               "edges"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-fulfillment-opt2.jpg"
         }
       ],
       "decisionPrompt": "When do you capture the customer's payment — at order placement or at shipment? Why?",
       "concepts": [
         {
-          "term": "Authorize-then-capture on ship",
-          "definition": "Authorize payment at order; capture only when the item actually ships.",
-          "whyItMatters": "Avoids charging for something that may never ship (out of stock, cancelled).",
-          "example": "Authorize at placed; capture when the warehouse confirms shipment.",
+          "term": "Authorize-then-capture before carrier handoff",
+          "definition": "Authorize payment at order; capture on the warehouse packed/ready_to_ship event, then release the package to the carrier.",
+          "whyItMatters": "Avoids charging for something that may never ship (out of stock, cancelled), while never letting a package leave the warehouse before capture succeeds.",
+          "example": "Authorize at placed; capture when the warehouse reports the package packed; mark shipped only after capture confirms.",
           "group": "Fulfillment Orchestration"
         }
       ],
       "probeLinks": [
-        "debezium-outbox",
+        "shopify-order-routing-functions",
+        "shopify-fulfillment-order",
+        "shopify-order-routing-location-rule",
         "kafka-design",
-        "stripe-payment-intents",
+        "stripe-auth-capture",
+        "stripe-webhooks",
         "stripe-idempotency"
       ],
       "patterns": [
         "Saga with compensation"
       ],
       "whyNow": [
-        "Fulfillment is where the order becomes real; the authorize-at-order / capture-on-ship nuance and async warehouse events are senior signals."
+        "Fulfillment is where the order becomes real; the authorize-at-order / capture-before-carrier-handoff nuance and async warehouse events are senior signals."
       ],
       "recap": {
         "before": "Paid but unshipped.",
-        "after": "Warehouse-orchestrated fulfillment; capture on ship; tracked to delivery.",
+        "after": "Warehouse-orchestrated fulfillment; capture before carrier handoff; tracked to delivery.",
         "newRisk": "Customers and downstream systems need timely, reliable status — not lost updates."
-      }
+      },
+      "traps": [
+        {
+          "trap": "Capturing payment at order placement for physical goods and refunding later if you can't ship.",
+          "why": "It charges the customer before anything ships (often against card-network rules), and a refund is slower and costlier than voiding an auth.",
+          "instead": "Authorize at order, capture on the packed/ready_to_ship event before carrier handoff; re-authorize idempotently if the auth expired before a slow fulfillment ships."
+        },
+        {
+          "trap": "Capturing on the WMS 'shipped' event, after the package has already left the warehouse.",
+          "why": "If capture fails or the auth expired, the goods are already gone — you've shipped unpaid, violating the 'never ship without payment' invariant the design is built around.",
+          "instead": "Capture on the pre-handoff event (packed/ready_to_ship), then release to the carrier and mark shipped; if capture can't be collected, hold the package and park for support."
+        },
+        {
+          "trap": "Treating a WMS callback as a synchronous, exactly-once, in-order event.",
+          "why": "External warehouses deliver events asynchronously, duplicated, and out of order; applying them blindly double-captures or advances state wrongly.",
+          "instead": "Dedupe on the WMS event id, guard each transition against current line/order state, and ignore stale or duplicate callbacks."
+        }
+      ],
+      "flows": [
+        {
+          "name": "Packed -> capture -> consume reservation -> release to carrier -> shipped",
+          "note": "The WMS packed/ready_to_ship event (still in the warehouse) drives capture and the real stock decrement. Only after capture succeeds does the order service tell fulfillment to release to the carrier and record shipped — capture failure or an expired auth re-authorizes idempotently or parks the order, never shipping unpaid.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Warehouse",
+                "label": "Warehouse / WMS"
+              },
+              {
+                "id": "OrderSvc",
+                "label": "Order Service"
+              },
+              {
+                "id": "Payment",
+                "label": "Payment"
+              },
+              {
+                "id": "Inventory",
+                "label": "Inventory"
+              },
+              {
+                "id": "Fulfillment",
+                "label": "Fulfillment"
+              },
+              {
+                "id": "Outbox",
+                "label": "Outbox"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Warehouse",
+                "to": "OrderSvc",
+                "arrow": "->>",
+                "label": "packed/ready_to_ship {eventId, dedupe}"
+              },
+              {
+                "from": "OrderSvc",
+                "to": "OrderSvc",
+                "arrow": "->>",
+                "label": "validate state == fulfilling"
+              },
+              {
+                "type": "alt",
+                "label": "capture succeeds (re-auth first if expired)",
+                "messages": [
+                  {
+                    "from": "OrderSvc",
+                    "to": "Payment",
+                    "arrow": "->>",
+                    "label": "capture {providerKey} (re-auth if expired)"
+                  },
+                  {
+                    "from": "OrderSvc",
+                    "to": "Inventory",
+                    "arrow": "->>",
+                    "label": "consume reservation (real decrement)"
+                  },
+                  {
+                    "from": "OrderSvc",
+                    "to": "Fulfillment",
+                    "arrow": "->>",
+                    "label": "release to carrier"
+                  },
+                  {
+                    "from": "OrderSvc",
+                    "to": "Outbox",
+                    "arrow": "->>",
+                    "label": "transition shipped + event (same txn)"
+                  }
+                ],
+                "else": {
+                  "label": "capture fails / uncollectable",
+                  "messages": [
+                    {
+                      "from": "OrderSvc",
+                      "to": "OrderSvc",
+                      "arrow": "->>",
+                      "label": "park before handoff (support); package stays in warehouse"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Warehouse",
+            "Payment"
+          ]
+        }
+      ]
     },
     {
       "id": "events",
       "title": "6. Reliable Status Events (Outbox)",
       "description": [
-        "Every state change should notify the customer and feed downstream systems (analytics, fraud, loyalty). Don't publish events in a separate step from the state write — a crash between them diverges the order state and what was announced.",
-        "Use the transactional outbox: write the order event into an outbox table in the same transaction as the state transition. A relay streams outbox events to the notification service and other consumers at-least-once; consumers dedup on the transition id.",
-        "This guarantees an event exists iff the transition committed — the customer never gets a 'shipped' email for an order that didn't actually transition, and downstream stays consistent with the order's true state."
+        "Every state change should notify the customer and feed downstream systems (analytics, fraud, loyalty). Don't publish events in a separate step from the state write — a crash between them lets the order state and what was announced diverge.",
+        "Use the transactional outbox: write the order event into an outbox table in the same transaction as the state transition. A relay polls/tails the outbox and publishes unsent rows to a broker; the notification service and other consumers read from the broker and dedupe on the event id. Each row tracks publish_status, attempts, and next_retry_at; a row stuck past N attempts goes to a DLQ and raises a stuck-row alert, and the event carries a payload_version so schemas can evolve.",
+        "This guarantees an event exists iff the transition committed — the customer never gets a 'shipped' email for an order that didn't actually transition. But be precise about the guarantee: the outbox makes committed events eventually published at-least-once; it does NOT make the downstream side effect (the email, the analytics write) exactly-once — consumers must still dedupe on the event id."
       ],
       "view": {
         "nodes": [
@@ -1362,7 +1935,8 @@
               "orchestration",
               "edges"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-events-opt1.jpg"
         },
         {
           "name": "Dual write (publish after commit)",
@@ -1401,7 +1975,8 @@
               "orchestration",
               "edges"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-events-opt2.jpg"
         },
         {
           "name": "Change data capture (CDC) from the log",
@@ -1449,7 +2024,8 @@
               "orchestration",
               "edges"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-events-opt3.jpg"
         }
       ],
       "decisionPrompt": "Why write the 'order shipped' event in the same transaction as the state change instead of publishing it after?",
@@ -1463,6 +2039,7 @@
         }
       ],
       "probeLinks": [
+        "transactional-outbox",
         "kafka-design",
         "debezium-outbox"
       ],
@@ -1476,14 +2053,98 @@
         "before": "Events could diverge from order state.",
         "after": "Status events emitted atomically, delivered at-least-once.",
         "newRisk": "Orders get cancelled and returned — completed steps must be undone correctly."
-      }
+      },
+      "traps": [
+        {
+          "trap": "Assuming the outbox makes the downstream side effect (email, analytics write) exactly-once.",
+          "why": "The relay delivers committed events at-least-once; a redelivered 'shipped' event can send a duplicate email if the consumer doesn't dedupe.",
+          "instead": "Treat the event id as a consumer dedupe key — the outbox guarantees a committed event is eventually published, the consumer guarantees it acts on it once."
+        },
+        {
+          "trap": "Publishing the event after the commit in a separate step (dual write).",
+          "why": "A crash between commit and publish drops the event (shipped, nobody told); a publish that beats a rolled-back txn announces an event that never happened.",
+          "instead": "Write the event row in the same transaction as the transition and let a relay publish it; never cross two systems without atomicity."
+        }
+      ],
+      "flows": [
+        {
+          "name": "Outbox internals: commit -> relay -> broker -> consumer dedupe",
+          "note": "The single 'Outbox' node is really three pieces. The transition and the outbox row commit together in the order store. A separate relay polls unpublished rows and publishes to the broker at-least-once (marking publish_status); consumers read from the broker and dedupe on event_id, so a redelivered event sends at most one email.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "OrderSvc",
+                "label": "Order Service"
+              },
+              {
+                "id": "OutboxTable",
+                "label": "Outbox Table (in Order Store)"
+              },
+              {
+                "id": "Relay",
+                "label": "Outbox Relay"
+              },
+              {
+                "id": "Broker",
+                "label": "Event Broker"
+              },
+              {
+                "id": "Notify",
+                "label": "Notification Consumer"
+              }
+            ],
+            "messages": [
+              {
+                "from": "OrderSvc",
+                "to": "OutboxTable",
+                "arrow": "->>",
+                "label": "commit transition + event row (one txn)"
+              },
+              {
+                "from": "Relay",
+                "to": "OutboxTable",
+                "arrow": "->>",
+                "label": "poll publish_status=pending"
+              },
+              {
+                "from": "Relay",
+                "to": "Broker",
+                "arrow": "->>",
+                "label": "publish (at-least-once)"
+              },
+              {
+                "from": "Relay",
+                "to": "OutboxTable",
+                "arrow": "->>",
+                "label": "mark published (DLQ after N attempts)"
+              },
+              {
+                "from": "Broker",
+                "to": "Notify",
+                "arrow": "->>",
+                "label": "deliver event"
+              },
+              {
+                "from": "Notify",
+                "to": "Notify",
+                "arrow": "->>",
+                "label": "dedupe on event_id, then send once"
+              }
+            ]
+          },
+          "highlight": [
+            "Relay",
+            "Broker"
+          ]
+        }
+      ]
     },
     {
       "id": "returns",
       "title": "7. Cancellations, Returns, and Scale",
       "description": [
-        "Cancellations and returns are compensation flows over the same saga. Cancel before shipping: release the inventory reservation and void/refund the payment. Return after delivery: receive the item, restock inventory, and refund — each step idempotent and recorded as order transitions.",
-        "Timing matters: an order can only be cancelled in cancellable states (not once shipped); returns kick off a reverse flow. The order state machine enforces which compensations are valid from the current state.",
+        "Cancellations and returns are compensation flows over the same saga, and they operate at the line level, not just the whole order. Cancel before shipping: release the inventory reservation and void/refund the payment for the cancelled lines. Return after delivery: check eligibility, receive the item, make a restock decision (restock / discard / refurbish), and refund — each step idempotent and recorded as order transitions.",
+        "Because lines carry their own state, an order can be partially shipped, partially cancelled, and partially returned while still rolling up to a coherent customer-facing summary state (e.g. partially_shipped, partially_cancelled, partially_returned). Refunds are per-line and reference the original payment attempt. Timing matters: a line can only be cancelled in cancellable states (not once shipped); returns kick off a reverse flow. The order state machine enforces which compensations are valid from the current line/order state.",
         "Scale: shard orders by order id (per-order writes serialize locally); the orchestrator is stateless and resumes sagas from the durable order state; the outbox + async consumers scale independently. Everything is auditable via the transition history."
       ],
       "view": {
@@ -1510,15 +2171,33 @@
         ]
       },
       "decisionPrompt": "A delivered order is returned. What gets undone, and how do you avoid double-refunding on a retry?",
+      "concepts": [
+        {
+          "term": "Line-level compensation",
+          "definition": "Cancel/return operate per order line, not only per whole order, so an order can be partially cancelled or returned while other lines proceed.",
+          "whyItMatters": "Real orders span items shipped from different warehouses at different times; whole-order-only compensation can't model partial outcomes.",
+          "example": "Cancel one of three lines: release that line's reservation + refund its amount; the rest still ship. Order rolls up to partially_cancelled.",
+          "group": "Cancellations, Returns, and Scale"
+        },
+        {
+          "term": "Restock disposition",
+          "definition": "On a return, a decision (restock / discard / refurbish) governs whether the returned unit goes back to sellable inventory.",
+          "whyItMatters": "Not every returned item is resellable; refunding without the right disposition either oversells damaged goods or loses good stock.",
+          "example": "Defective return -> refund issued, disposition = discard, inventory NOT incremented.",
+          "group": "Cancellations, Returns, and Scale"
+        }
+      ],
       "patterns": [
         "Compensation on cancel/return",
         "Idempotent transitions"
       ],
       "probeLinks": [
+        "shopify-return-object",
+        "stripe-refunds",
+        "stripe-payout-reconciliation",
         "stripe-idempotency",
-        "debezium-outbox",
-        "dynamodb-transactions",
-        "stripe-payment-intents"
+        "azure-compensating-transaction",
+        "square-books"
       ],
       "whyNow": [
         "Returns/cancellations complete the lifecycle as compensation flows; tying them to the state machine + idempotency shows the full reversible order is correct."
@@ -1536,13 +2215,41 @@
         {
           "issue": "Order-volume spike.",
           "mitigation": "Shard by order id; stateless orchestrator; async outbox consumers."
+        },
+        {
+          "issue": "Hot SKU+warehouse contention (order-id sharding doesn't help — it's a single stock row).",
+          "mitigation": "Per-warehouse stock rows, reservation hold queues, or sharded counters that reconcile; route lines across locations."
+        },
+        {
+          "issue": "Stuck orders (provider outage, parked auth_pending, DLQ'd outbox row).",
+          "mitigation": "Reconciliation worker scans external_operations + support queue with metrics (stuck-saga age, outbox lag) and a manual-repair tool whose every park/replay/refund is recorded in support_actions."
         }
       ],
       "failureDrills": [
         {
           "scenario": "A refund is issued, then the cancel request is retried.",
           "expectedBehavior": "The idempotency key recognizes the completed refund; no second refund occurs.",
-          "mitigation": "Idempotent compensation keyed by order id + step."
+          "mitigation": "Idempotent compensation keyed by order id + step; provider refund reuses its idempotency key."
+        },
+        {
+          "scenario": "Payment authorization times out — unknown whether the charge landed.",
+          "expectedBehavior": "Order parks at auth_pending; system reconciles via webhook/poll on the same provider key before advancing or compensating.",
+          "mitigation": "Track provider intent/auth IDs; never blind-retry an ambiguous charge."
+        },
+        {
+          "scenario": "Capture fails at the packed/ready_to_ship event, or the authorization has expired.",
+          "expectedBehavior": "Re-authorize idempotently and capture; if it can't be collected, hold the package in the warehouse before carrier handoff and park for support — never ship unpaid.",
+          "mitigation": "Auth expiry tracked in payment_attempts; capture runs on the pre-handoff event and is guarded by the state machine."
+        },
+        {
+          "scenario": "A WMS callback (packed/shipped/delivered) is duplicated, unsigned, or arrives out of order.",
+          "expectedBehavior": "Reject events that fail signature verification; dedupe on the WMS event id; apply only valid transitions, ignore stale/duplicate events.",
+          "mitigation": "Signature-verified, idempotent callback handler keyed by event id (webhook_events); guarded state transitions."
+        },
+        {
+          "scenario": "An outbox row fails to publish repeatedly.",
+          "expectedBehavior": "The relay retries with backoff; after N attempts the row is DLQ'd and alerts; no committed event is silently lost.",
+          "mitigation": "publish_status/attempts/next_retry_at on outbox_events + DLQ + outbox-lag alerting."
         }
       ],
       "flows": [
@@ -1626,12 +2333,13 @@
             "Payment"
           ]
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/07-returns.jpg"
     }
   ],
   "finalDesign": {
     "title": "Final Design — Order Management System",
-    "description": "The order service owns a durable lifecycle state machine and orchestrates a saga across inventory (atomic reservation), payment (authorize at order, capture on ship), and fulfillment (route to a warehouse that emits async shipment events). Each step is idempotent and the order state doubles as the saga's resumable ledger; failures trigger compensating actions (release reservation, void payment). State transitions write events via a transactional outbox, delivered at-least-once to notifications and downstream consumers. Cancellations/returns are compensation flows (restock + refund) valid only from appropriate states. Orders shard by id; the orchestrator is stateless and resumes from durable state; everything is auditable via transition history.",
+    "description": "The order service owns a durable lifecycle state machine (with line-level item/shipment state under the aggregate) and orchestrates a saga across inventory (atomic per-SKU+warehouse reservation with TTL), payment (authorize at order, capture on the packed/ready_to_ship event before carrier handoff so a package never leaves unpaid, tracked as payment attempts with provider operation IDs), and fulfillment (route to a warehouse that emits async, deduped, signature-verified shipment events). Each step is idempotent — internal steps keyed by order id + step, external calls reusing provider idempotency keys — and the order state doubles as the saga's resumable ledger; failures trigger compensating actions (release reservation, void payment). Ambiguous external steps (auth/capture/shipment timeouts) are reconciled by a reconciliation worker, not blindly retried, and stuck orders park for support. State transitions write events via a transactional outbox (relay → broker → deduping consumers, with retries/DLQ and lag alerts), delivered at-least-once to notifications and downstream consumers. Cancellations/returns are line-level compensation flows (restock + refund) valid only from appropriate states. Orders shard by id; the orchestrator is stateless and resumes from durable state; everything is auditable via transition history. (Outbox is drawn as a single node but is really table + relay + broker.)",
     "view": {
       "nodes": [
         "Client",
@@ -1645,9 +2353,10 @@
         "Warehouse",
         "Outbox",
         "Notify",
-        "Returns"
+        "Returns",
+        "Reconciler"
       ],
-      "caption": "The storefront orders through the API gateway and order-service orchestrator, which persists to the order store, reserves inventory, charges via payments, drives fulfillment through the warehouse, emits status events via the outbox to notifications, and handles cancellations through the returns service.",
+      "caption": "The storefront orders through the API gateway and order-service orchestrator, which persists to the order store, reserves inventory, charges via payments, drives fulfillment through the warehouse, emits status events via the outbox to notifications, and handles cancellations through the returns service; a reconciliation worker resolves ambiguous external steps, expires holds, and parks stuck orders.",
       "links": [
         "client-lb",
         "lb-order",
@@ -1663,14 +2372,274 @@
         "notify-client",
         "order-returns",
         "returns-inventory",
-        "returns-payment"
+        "returns-payment",
+        "reconciler-db",
+        "reconciler-payment",
+        "reconciler-inventory"
       ],
       "groups": [
         "orchestration",
         "domains",
         "edges"
       ]
-    }
+    },
+    "flows": [
+      {
+        "name": "Happy path: place -> reserve -> authorize -> pack -> capture -> ship -> notify",
+        "note": "The end-to-end success flow. Authorize at placement, capture on the warehouse packed/ready_to_ship event (before carrier handoff), consume the reservation, release to the carrier as shipped, then publish status via the outbox.",
+        "sequence": {
+          "participants": [
+            {
+              "id": "Client"
+            },
+            {
+              "id": "OrderSvc",
+              "label": "Order Service"
+            },
+            {
+              "id": "Inventory",
+              "label": "Inventory"
+            },
+            {
+              "id": "Payment",
+              "label": "Payment"
+            },
+            {
+              "id": "Warehouse",
+              "label": "Warehouse"
+            },
+            {
+              "id": "Outbox",
+              "label": "Outbox"
+            }
+          ],
+          "messages": [
+            {
+              "from": "Client",
+              "to": "OrderSvc",
+              "arrow": "->>",
+              "label": "place order {idemKey}"
+            },
+            {
+              "from": "OrderSvc",
+              "to": "Inventory",
+              "arrow": "->>",
+              "label": "reserve (per SKU+warehouse)"
+            },
+            {
+              "from": "OrderSvc",
+              "to": "Payment",
+              "arrow": "->>",
+              "label": "authorize"
+            },
+            {
+              "from": "OrderSvc",
+              "to": "Warehouse",
+              "arrow": "->>",
+              "label": "fulfill"
+            },
+            {
+              "from": "Warehouse",
+              "to": "OrderSvc",
+              "arrow": "->>",
+              "label": "packed/ready_to_ship {eventId}"
+            },
+            {
+              "from": "OrderSvc",
+              "to": "Payment",
+              "arrow": "->>",
+              "label": "capture {providerKey}"
+            },
+            {
+              "from": "OrderSvc",
+              "to": "Inventory",
+              "arrow": "->>",
+              "label": "consume reservation"
+            },
+            {
+              "from": "OrderSvc",
+              "to": "Warehouse",
+              "arrow": "->>",
+              "label": "release to carrier (shipped)"
+            },
+            {
+              "from": "OrderSvc",
+              "to": "Outbox",
+              "arrow": "->>",
+              "label": "transition + event (same txn)"
+            }
+          ]
+        },
+        "highlight": [
+          "OrderSvc",
+          "Warehouse"
+        ]
+      },
+      {
+        "name": "Payment ambiguity: reconcile, don't retry",
+        "note": "An auth or capture times out — the charge may or may not have landed. The order parks at auth_pending and the reconciliation worker resolves provider state (webhook or poll, same provider key) before advancing, retrying safely, or compensating.",
+        "sequence": {
+          "participants": [
+            {
+              "id": "OrderSvc",
+              "label": "Order Service"
+            },
+            {
+              "id": "Payment",
+              "label": "Payment"
+            },
+            {
+              "id": "Reconciler",
+              "label": "Reconciler"
+            },
+            {
+              "id": "OrderDB",
+              "label": "Order Store"
+            }
+          ],
+          "messages": [
+            {
+              "from": "OrderSvc",
+              "to": "Payment",
+              "arrow": "->>",
+              "label": "authorize/capture {providerKey}"
+            },
+            {
+              "from": "Payment",
+              "to": "OrderSvc",
+              "arrow": "-->>",
+              "label": "timeout (no response)"
+            },
+            {
+              "from": "OrderSvc",
+              "to": "OrderDB",
+              "arrow": "->>",
+              "label": "park at auth_pending"
+            },
+            {
+              "from": "Reconciler",
+              "to": "Payment",
+              "arrow": "->>",
+              "label": "poll state {same providerKey}"
+            },
+            {
+              "type": "alt",
+              "label": "provider confirms charge",
+              "messages": [
+                {
+                  "from": "Reconciler",
+                  "to": "OrderDB",
+                  "arrow": "->>",
+                  "label": "advance -> paid"
+                }
+              ],
+              "else": {
+                "label": "provider has no charge",
+                "messages": [
+                  {
+                    "from": "Reconciler",
+                    "to": "OrderDB",
+                    "arrow": "->>",
+                    "label": "compensate: release reservation, mark failed"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "highlight": [
+          "Reconciler",
+          "Payment"
+        ]
+      },
+      {
+        "name": "Cancel vs return: two branches",
+        "note": "Cancel before ship voids the auth and releases the reservation; return after delivery receives the item, restocks, and refunds — both idempotent.",
+        "sequence": {
+          "participants": [
+            {
+              "id": "Client"
+            },
+            {
+              "id": "OrderSvc",
+              "label": "Order Service"
+            },
+            {
+              "id": "Returns",
+              "label": "Returns"
+            },
+            {
+              "id": "Inventory",
+              "label": "Inventory"
+            },
+            {
+              "id": "Payment",
+              "label": "Payment"
+            }
+          ],
+          "messages": [
+            {
+              "type": "alt",
+              "label": "cancel before ship",
+              "messages": [
+                {
+                  "from": "Client",
+                  "to": "OrderSvc",
+                  "arrow": "->>",
+                  "label": "cancel {idemKey}"
+                },
+                {
+                  "from": "OrderSvc",
+                  "to": "Inventory",
+                  "arrow": "->>",
+                  "label": "release reservation"
+                },
+                {
+                  "from": "OrderSvc",
+                  "to": "Payment",
+                  "arrow": "->>",
+                  "label": "void auth"
+                }
+              ],
+              "else": {
+                "label": "return after delivery",
+                "messages": [
+                  {
+                    "from": "Client",
+                    "to": "OrderSvc",
+                    "arrow": "->>",
+                    "label": "return {lines, idemKey}"
+                  },
+                  {
+                    "from": "OrderSvc",
+                    "to": "Returns",
+                    "arrow": "->>",
+                    "label": "receive + restock decision"
+                  },
+                  {
+                    "from": "Returns",
+                    "to": "Inventory",
+                    "arrow": "->>",
+                    "label": "restock (if restockable)"
+                  },
+                  {
+                    "from": "Returns",
+                    "to": "Payment",
+                    "arrow": "->>",
+                    "label": "refund {providerKey}"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "highlight": [
+          "Returns",
+          "Payment"
+        ]
+      }
+    ],
+    "aiVisual": "assets/generated/ai-visuals/final-design.jpg"
   },
   "satisfies": {
     "functional": [
@@ -1691,7 +2660,7 @@
       },
       {
         "requirement": "Fulfill + ship",
-        "how": "Fulfillment orchestration + capture on ship.",
+        "how": "Fulfillment orchestration; capture on the packed/ready_to_ship event before carrier handoff.",
         "steps": [
           "fulfillment"
         ]
@@ -1744,13 +2713,815 @@
       },
       {
         "requirement": "Scale to millions/day",
-        "how": "Order-id sharding + async outbox consumers.",
+        "how": "Order-id sharding + async outbox consumers; per-warehouse stock relieves hot-SKU contention.",
         "steps": [
+          "returns",
+          "inventory"
+        ]
+      },
+      {
+        "requirement": "Secure & private",
+        "how": "PSP tokenization keeps the PCI boundary at the provider; authn/authz on order access; PII retention/expiry; audited support actions.",
+        "steps": [
+          "saga",
+          "fulfillment"
+        ]
+      },
+      {
+        "requirement": "Observable & operable",
+        "how": "Reconciliation worker + support queue; stuck-saga and outbox-lag metrics, retry/DLQ counts.",
+        "steps": [
+          "events",
           "returns"
         ]
       }
     ]
   },
+  "technologyChoices": [
+    {
+      "concern": "API edge, auth, and request idempotency",
+      "steps": [
+        "naive",
+        "lifecycle",
+        "saga",
+        "returns"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kong",
+          "icon": "assets/tech-icons/kong.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "Keycloak",
+          "icon": "assets/tech-icons/keycloak.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          },
+          {
+            "name": "WAF",
+            "icon": "assets/tech-icons/Arch_AWS-WAF_64.png"
+          },
+          {
+            "name": "Cognito",
+            "icon": "assets/tech-icons/Arch_Amazon-Cognito_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Apigee",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Armor",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Identity Platform",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "API Management",
+            "icon": "assets/tech-icons/10042-icon-service-API-Management-Services.svg"
+          },
+          {
+            "name": "Application Gateway",
+            "icon": "assets/tech-icons/10076-icon-service-Application-Gateways.svg"
+          },
+          {
+            "name": "Microsoft Entra ID",
+            "icon": "assets/tech-icons/10231-icon-service-Entra-ID-Protection.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Putting TLS termination, auth, quotas, request logging, and coarse abuse controls at the edge protects the order service from obvious bad traffic.",
+        "Application-level idempotency still lives in the order store because only the service can validate the request fingerprint and replay the original response."
+      ],
+      "makesIrrelevant": "A managed API edge with auth, WAF, quotas, and request logs removes much of the custom reverse-proxy and rate-limit plumbing."
+    },
+    {
+      "concern": "Order store, transition history, and idempotency records",
+      "steps": [
+        "lifecycle",
+        "saga",
+        "events",
+        "returns"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "MySQL",
+          "icon": "assets/tech-icons/mysql.png"
+        },
+        {
+          "name": "CockroachDB",
+          "icon": "assets/tech-icons/cockroach.png"
+        },
+        {
+          "name": "Citus",
+          "icon": "assets/tech-icons/citus.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Aurora (PostgreSQL/MySQL)",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "RDS",
+            "icon": "assets/tech-icons/Arch_Amazon-RDS_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "AlloyDB",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          },
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A relational store gives simple transactional writes for state, history, idempotency, payment attempts, support actions, and outbox rows in one commit.",
+        "A managed wide-column or document store can auto-shard by order id and support conditional writes, but multi-row invariants and an outbox table become harder to keep atomic.",
+        "Distributed SQL can reduce shard-router work at high scale, but cross-region writes and schema changes are more expensive."
+      ],
+      "makesIrrelevant": "A managed auto-sharding store or distributed SQL system removes much of the hand-built order-id shard map, provided its transaction model fits the outbox and state-machine invariants."
+    },
+    {
+      "concern": "Inventory reservation store and hot-SKU controls",
+      "steps": [
+        "inventory",
+        "saga",
+        "returns"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A row-per-SKU+warehouse relational model gives exact conditional decrements and durable reservation records.",
+        "An in-memory store is fast for hot reservation counters, but the design still needs durable holds, expiry, and restock records.",
+        "Wide-column or key-value stores scale hot partitions better only if keys are designed around SKU, warehouse, and reservation bucket behavior."
+      ],
+      "makesIrrelevant": "A store with native conditional writes and TTL support removes most custom hold-expiry cleanup, but not the hot-SKU queue or bucket policy."
+    },
+    {
+      "concern": "Saga orchestration and durable timers",
+      "steps": [
+        "saga",
+        "fulfillment",
+        "returns"
+      ],
+      "selfHosted": [
+        {
+          "name": "Temporal",
+          "icon": "assets/tech-icons/temporal.png"
+        },
+        {
+          "name": "BullMQ",
+          "icon": "assets/tech-icons/bullmq.png"
+        },
+        {
+          "name": "Apache Airflow",
+          "icon": "assets/tech-icons/airflow.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          },
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Durable Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          },
+          {
+            "name": "Logic Apps",
+            "icon": "assets/tech-icons/10363-icon-service-Logic-Apps-Custom-Connector.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A workflow engine gives durable timers, retries, compensation history, and resume semantics without burying them in ad hoc worker tables.",
+        "A database-backed state machine in the order service is simpler to explain and audit, but the team owns timeout scanning, retry budgets, and stuck-order parking.",
+        "Queues decouple slow external calls from the request path; they do not make inventory, payment, and fulfillment one transaction."
+      ],
+      "makesIrrelevant": "A managed workflow engine can absorb much of the custom retry-timer and resume bookkeeping while preserving explicit compensation steps."
+    },
+    {
+      "concern": "Payment tokenization, PSP calls, and key custody",
+      "steps": [
+        "saga",
+        "fulfillment",
+        "returns"
+      ],
+      "selfHosted": [
+        {
+          "name": "Direct PSP API (Stripe/Adyen/Braintree)",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "HashiCorp Vault",
+          "icon": "assets/tech-icons/hashicorp_vault.png"
+        },
+        {
+          "name": "HSM (PKCS#11)",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "KMS",
+            "icon": "assets/tech-icons/Arch_AWS-Key-Management-Service_64.png"
+          },
+          {
+            "name": "CloudHSM",
+            "icon": "assets/tech-icons/Arch_AWS-CloudHSM_64.png"
+          },
+          {
+            "name": "Secrets Manager",
+            "icon": "assets/tech-icons/Arch_AWS-Secrets-Manager_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud KMS",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          },
+          {
+            "name": "Secret Manager",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          },
+          {
+            "name": "Identity Platform",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Key Vault",
+            "icon": "assets/tech-icons/10245-icon-service-Key-Vaults.svg"
+          },
+          {
+            "name": "Managed HSM",
+            "icon": "assets/tech-icons/02322-icon-service-Dedicated-HSM.svg"
+          },
+          {
+            "name": "Microsoft Entra ID",
+            "icon": "assets/tech-icons/10231-icon-service-Entra-ID-Protection.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A PSP keeps card tokenization, auth/capture/refund APIs, idempotency keys, and many PCI obligations outside the OMS data model.",
+        "Direct acquirer integration gives more control over payment routing and fees, but it moves card data custody, tokenization, and reconciliation evidence in-house.",
+        "Managed KMS or HSM services reduce key-custody work, but webhook signing secrets and provider idempotency keys still need scoped access and rotation."
+      ],
+      "makesIrrelevant": "A PSP plus managed token and key custody keeps raw PAN out of the OMS entirely, shrinking the PCI boundary to provider tokens and webhook secrets."
+    },
+    {
+      "concern": "Fulfillment/WMS integration and webhook intake",
+      "steps": [
+        "saga",
+        "fulfillment"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kong",
+          "icon": "assets/tech-icons/kong.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "NATS (JetStream)",
+          "icon": "assets/tech-icons/nats.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          },
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Apigee",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "API Management",
+            "icon": "assets/tech-icons/10042-icon-service-API-Management-Services.svg"
+          },
+          {
+            "name": "Event Grid",
+            "icon": "assets/tech-icons/10221-icon-service-Event-Grid-Subscriptions.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Webhook intake should durably record provider event ids and signatures before applying a transition, because WMS callbacks can be duplicated, delayed, or out of order.",
+        "Brokered WMS events make replay and backpressure easier, while a direct synchronous callback path is simpler but more fragile during warehouse or carrier incidents."
+      ],
+      "makesIrrelevant": "A managed event-ingestion layer with retries, DLQ, and replay reduces custom webhook receiver, lease, and retry code."
+    },
+    {
+      "concern": "Event outbox transport and downstream fanout",
+      "steps": [
+        "events",
+        "fulfillment",
+        "returns"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Redpanda",
+          "icon": "assets/tech-icons/redpanda.png"
+        },
+        {
+          "name": "RabbitMQ",
+          "icon": "assets/tech-icons/rabbitmq.png"
+        },
+        {
+          "name": "NATS (JetStream)",
+          "icon": "assets/tech-icons/nats.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "MSK",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Streaming-for-Apache-Kafka_64.png"
+          },
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Managed Service for Apache Kafka",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Event Grid",
+            "icon": "assets/tech-icons/10221-icon-service-Event-Grid-Subscriptions.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Polling the outbox table is simple and works with the same database transaction as the order transition.",
+        "A log-based broker gives replay, ordered partitions, and many consumer groups; a queue is simpler for discrete retries and DLQs.",
+        "CDC avoids a poller but couples the relay to the order-store log format and schema evolution."
+      ],
+      "makesIrrelevant": "A managed stream or queue with retention, DLQ, lag metrics, and consumer scaling removes much of the custom broker operations and retry plumbing."
+    },
+    {
+      "concern": "Notification delivery for order status changes",
+      "steps": [
+        "events",
+        "fulfillment",
+        "returns"
+      ],
+      "selfHosted": [
+        {
+          "name": "SendGrid",
+          "icon": "assets/tech-icons/sendgrid.png"
+        },
+        {
+          "name": "Twilio",
+          "icon": "assets/tech-icons/twilio.svg"
+        },
+        {
+          "name": "Postfix",
+          "icon": "assets/tech-icons/postfix.png"
+        },
+        {
+          "name": "FCM (direct)",
+          "icon": "assets/tech-icons/fcm.png"
+        },
+        {
+          "name": "APNs (direct)",
+          "icon": "assets/tech-icons/apns.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SES",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Email-Service_64.png"
+          },
+          {
+            "name": "SNS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Notification-Service_64.png"
+          },
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Run",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Notification Hubs",
+            "icon": "assets/tech-icons/10045-icon-service-Notification-Hubs.svg"
+          },
+          {
+            "name": "Communication Services",
+            "icon": "assets/tech-icons/00968-icon-service-Azure-Communication-Services.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Notification workers must dedupe on the order event id because the outbox and broker deliver at-least-once.",
+        "Provider APIs simplify email/SMS/push deliverability, but they introduce per-channel rate limits, bounce handling, and provider-specific retry behavior.",
+        "A queue between status events and notification sends isolates the OMS from slow or failed customer-message providers."
+      ],
+      "makesIrrelevant": "A managed notification provider removes much of the SMTP, SMS gateway, device-token fanout, and deliverability work, but not event dedupe."
+    },
+    {
+      "concern": "Reconciliation, DLQ, and support repair workers",
+      "steps": [
+        "saga",
+        "events",
+        "returns"
+      ],
+      "selfHosted": [
+        {
+          "name": "Temporal",
+          "icon": "assets/tech-icons/temporal.png"
+        },
+        {
+          "name": "Apache Airflow",
+          "icon": "assets/tech-icons/airflow.png"
+        },
+        {
+          "name": "BullMQ",
+          "icon": "assets/tech-icons/bullmq.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          },
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Durable Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          },
+          {
+            "name": "Logic Apps",
+            "icon": "assets/tech-icons/10363-icon-service-Logic-Apps-Custom-Connector.svg"
+          },
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A reconciler should scan durable external_operations and webhook_events records, not infer ambiguous provider state from memory or request logs.",
+        "Scheduled workers are easy to start with, but workflow engines and managed schedulers make retries, timeouts, and manual replay easier to audit.",
+        "DLQ repair must be idempotent and operator-audited so support fixes do not double-refund, double-capture, or restock twice."
+      ],
+      "makesIrrelevant": "Managed schedulers and queue DLQs remove much of the custom lease, next_retry_at, and dead-letter scanning logic."
+    },
+    {
+      "concern": "Observability, audit logs, and support dashboards",
+      "steps": [
+        "fulfillment",
+        "events",
+        "returns"
+      ],
+      "selfHosted": [
+        {
+          "name": "Prometheus",
+          "icon": "assets/tech-icons/prometheus.png"
+        },
+        {
+          "name": "Grafana",
+          "icon": "assets/tech-icons/grafana.png"
+        },
+        {
+          "name": "Jaeger",
+          "icon": "assets/tech-icons/jaeger.png"
+        },
+        {
+          "name": "OpenSearch",
+          "icon": "assets/tech-icons/opensearch.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "X-Ray",
+            "icon": "assets/tech-icons/Arch_AWS-X-Ray_64.png"
+          },
+          {
+            "name": "Managed Grafana",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Grafana_64.png"
+          },
+          {
+            "name": "OpenSearch Service",
+            "icon": "assets/tech-icons/Arch_Amazon-OpenSearch-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Logging",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Trace",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "BigQuery",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Log Analytics",
+            "icon": "assets/tech-icons/00009-icon-service-Log-Analytics-Workspaces.svg"
+          },
+          {
+            "name": "Application Insights",
+            "icon": "assets/tech-icons/00012-icon-service-Application-Insights.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Metrics expose stuck sagas, outbox lag, retry amplification, PSP/WMS error rates, and notification backlogs before customers report broken orders.",
+        "Traces help correlate one order across API, inventory, payment, WMS, outbox, notification, and reconciliation workers.",
+        "Audit logs and support dashboards must record actor, reason, before/after state, and triggered compensation so manual repair stays reviewable."
+      ],
+      "makesIrrelevant": "Managed observability suites remove much of the log shipping, metric storage, alert routing, and dashboard hosting work, but not the need to define OMS-specific SLOs."
+    }
+  ],
   "interviewScript": [
     {
       "phase": "Scope & requirements",
@@ -1774,7 +3545,7 @@
       "phase": "Deep dive",
       "time": "next 15 min",
       "say": [
-        "Fulfillment orchestration; authorize-at-order / capture-on-ship.",
+        "Fulfillment orchestration; authorize at order, capture before carrier handoff.",
         "Transactional outbox for reliable status events.",
         "Cancellations/returns as compensation; sharding + resume."
       ]
@@ -1801,7 +3572,7 @@
       "level": "Senior",
       "expectations": [
         "Designs the state machine + saga with compensation.",
-        "Inventory reservation + capture-on-ship.",
+        "Inventory reservation + capture before carrier handoff.",
         "Transactional outbox for events."
       ]
     },
@@ -1825,8 +3596,8 @@
     "links": [
       {
         "id": "temporal-saga",
-        "group": "Payments and Commerce",
-        "groupDescription": "Payment correctness, idempotency, ledgers, checkout, orders, and reconciliation references.",
+        "group": "Sagas, Idempotency, and Compensation",
+        "groupDescription": "Retry-safe APIs, long-running workflows, and compensation patterns for cross-service order correctness.",
         "title": "Saga Pattern",
         "url": "https://docs.temporal.io/encyclopedia/saga",
         "source": "Temporal",
@@ -1834,49 +3605,39 @@
         "why": "Clear reference for long-running workflows, compensation, and saga orchestration."
       },
       {
-        "id": "debezium-outbox",
-        "group": "Queues and Streams",
-        "groupDescription": "Messaging, event streaming, delivery semantics, and async processing references.",
-        "title": "Debezium Outbox Event Router",
-        "url": "https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html",
-        "source": "Debezium",
-        "type": "Docs",
-        "why": "Useful implementation reference for transactional outbox and event publishing without dual writes."
+        "id": "aws-idempotent-apis",
+        "group": "Sagas, Idempotency, and Compensation",
+        "groupDescription": "Retry-safe APIs, long-running workflows, and compensation patterns for cross-service order correctness.",
+        "title": "Making retries safe with idempotent APIs",
+        "url": "https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-apis/",
+        "source": "AWS Builders' Library",
+        "type": "Engineering article",
+        "why": "Explains client request tokens, late-arriving retries, parameter mismatch handling, and the server-side atomicity needed for retry-safe mutating order APIs."
       },
       {
-        "id": "kafka-design",
-        "group": "Queues and Streams",
-        "groupDescription": "Messaging, event streaming, delivery semantics, and async processing references.",
-        "title": "Apache Kafka Design",
-        "url": "https://kafka.apache.org/documentation/#design",
-        "source": "Apache Kafka",
-        "type": "Docs",
-        "why": "Explains Kafka's log, partitions, consumer groups, replication, and operational model."
+        "id": "azure-compensating-transaction",
+        "group": "Sagas, Idempotency, and Compensation",
+        "groupDescription": "Retry-safe APIs, long-running workflows, and compensation patterns for cross-service order correctness.",
+        "title": "Compensating Transaction Pattern",
+        "url": "https://learn.microsoft.com/en-us/azure/architecture/patterns/compensating-transaction",
+        "source": "Microsoft Learn",
+        "type": "Pattern",
+        "why": "Shows why compensations need domain-specific undo, durable progress tracking, idempotent retries, and occasional manual intervention."
       },
       {
-        "id": "dynamodb-transactions",
-        "group": "Booking and Contention",
-        "groupDescription": "Inventory reservation, waiting rooms, locks, leases, and contention-management references.",
-        "title": "DynamoDB Transactions",
-        "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html",
-        "source": "AWS",
-        "type": "Docs",
-        "why": "Shows transactional write patterns for high-contention carts, bookings, and order state."
-      },
-      {
-        "id": "stripe-payment-intents",
-        "group": "Payments and Commerce",
-        "groupDescription": "Payment correctness, idempotency, ledgers, checkout, orders, and reconciliation references.",
-        "title": "Payment Intents",
-        "url": "https://docs.stripe.com/payments/payment-intents",
-        "source": "Stripe",
-        "type": "Docs",
-        "why": "Shows payment lifecycle, authorization/capture, retries, and asynchronous confirmation."
+        "id": "microservices-saga",
+        "group": "Sagas, Idempotency, and Compensation",
+        "groupDescription": "Retry-safe APIs, long-running workflows, and compensation patterns for cross-service order correctness.",
+        "title": "Saga Pattern (microservices.io)",
+        "url": "https://microservices.io/patterns/data/saga.html",
+        "source": "Chris Richardson",
+        "type": "Pattern",
+        "why": "Orchestration-vs-choreography saga tradeoffs and compensation, the correctness heart of the OMS."
       },
       {
         "id": "stripe-idempotency",
-        "group": "Payments and Commerce",
-        "groupDescription": "Payment correctness, idempotency, ledgers, checkout, orders, and reconciliation references.",
+        "group": "Sagas, Idempotency, and Compensation",
+        "groupDescription": "Retry-safe APIs, long-running workflows, and compensation patterns for cross-service order correctness.",
         "title": "Idempotent Requests",
         "url": "https://docs.stripe.com/api/idempotent_requests",
         "source": "Stripe",
@@ -1885,18 +3646,206 @@
         "year": "2024"
       },
       {
+        "id": "shopify-inventory-reservations",
+        "group": "Commerce OMS Case Studies",
+        "groupDescription": "Real commerce-system writeups and implementation references for inventory, routing, and checkout fulfillment.",
+        "title": "We replaced Redis with MySQL for inventory reservations—and it scaled",
+        "url": "https://shopify.engineering/scaling-inventory-reservations",
+        "source": "Shopify Engineering",
+        "type": "Case study",
+        "year": "2026",
+        "why": "Production inventory-reservation case study covering no-oversell guarantees, reservation/claim split, SKIP LOCKED, ACID boundaries, contention, and cutover."
+      },
+      {
+        "id": "shopify-order-routing-functions",
+        "group": "Commerce OMS Case Studies",
+        "groupDescription": "Real commerce-system writeups and implementation references for inventory, routing, and checkout fulfillment.",
+        "title": "Creating a Flexible Order Routing System with Shopify Functions",
+        "url": "https://shopify.engineering/creating-a-flexible-order-routing-system-with-shopify-functions",
+        "source": "Shopify Engineering",
+        "type": "Case study",
+        "year": "2023",
+        "why": "Explains production order-routing rules, location ranking, reducer tie-breaking, pipeline decomposition, and extensibility for multi-location fulfillment."
+      },
+      {
+        "id": "commercetools-orders",
+        "group": "Order State, Inventory, and Fulfillment APIs",
+        "groupDescription": "Concrete commerce API models for states, reservations, fulfillment work, routing, and returns.",
+        "title": "Orders",
+        "url": "https://docs.commercetools.com/api/projects/orders",
+        "source": "commercetools",
+        "type": "Docs",
+        "why": "Concrete order API model with order, payment, shipment, delivery, and return states that mirrors the OMS lifecycle and partial-return concerns."
+      },
+      {
+        "id": "commercetools-states",
+        "group": "Order State, Inventory, and Fulfillment APIs",
+        "groupDescription": "Concrete commerce API models for states, reservations, fulfillment work, routing, and returns.",
+        "title": "States",
+        "url": "https://docs.commercetools.com/api/projects/states",
+        "source": "commercetools",
+        "type": "Docs",
+        "why": "Shows explicit finite state machines and validated transitions for orders, line items, payments, and other commerce resources."
+      },
+      {
+        "id": "commercetools-inventory-overview",
+        "group": "Order State, Inventory, and Fulfillment APIs",
+        "groupDescription": "Concrete commerce API models for states, reservations, fulfillment work, routing, and returns.",
+        "title": "Inventory overview",
+        "url": "https://docs.commercetools.com/api/inventory-overview",
+        "source": "commercetools",
+        "type": "Docs",
+        "why": "Useful model for ReserveOnCart/ReserveOnOrder, reservation expiration, release semantics, and the difference between reservation guarantees and eventual inventory views."
+      },
+      {
+        "id": "shopify-fulfillment-order",
+        "group": "Order State, Inventory, and Fulfillment APIs",
+        "groupDescription": "Concrete commerce API models for states, reservations, fulfillment work, routing, and returns.",
+        "title": "FulfillmentOrder",
+        "url": "https://shopify.dev/docs/api/admin-rest/latest/resources/fulfillmentorder",
+        "source": "Shopify.dev",
+        "type": "Docs",
+        "why": "Grounds the fulfillment-work concept: an order can split into fulfillment orders assigned to locations or fulfillment services with their own lifecycle."
+      },
+      {
+        "id": "shopify-order-routing-location-rule",
+        "group": "Order State, Inventory, and Fulfillment APIs",
+        "groupDescription": "Concrete commerce API models for states, reservations, fulfillment work, routing, and returns.",
+        "title": "Order Routing Location Rule Function API",
+        "url": "https://shopify.dev/docs/api/functions/latest/order-routing-location-rule",
+        "source": "Shopify.dev",
+        "type": "Docs",
+        "why": "Shows how routing logic ranks fulfillment locations from order/cart inputs, which is the API-level shape behind multi-warehouse assignment."
+      },
+      {
+        "id": "shopify-return-object",
+        "group": "Order State, Inventory, and Fulfillment APIs",
+        "groupDescription": "Concrete commerce API models for states, reservations, fulfillment work, routing, and returns.",
+        "title": "Return",
+        "url": "https://shopify.dev/docs/api/admin-graphql/latest/objects/return",
+        "source": "Shopify.dev",
+        "type": "Docs",
+        "why": "Models returns as a stateful object tied to an order, line items, refunds, exchanges, reverse fulfillment orders, and reverse deliveries."
+      },
+      {
+        "id": "debezium-outbox",
+        "group": "Events, Outbox, and Storage Consistency",
+        "groupDescription": "Transactional messaging, streams, database isolation, and atomic storage references.",
+        "title": "Debezium Outbox Event Router",
+        "url": "https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html",
+        "source": "Debezium",
+        "type": "Docs",
+        "why": "Useful implementation reference for transactional outbox and event publishing without dual writes."
+      },
+      {
+        "id": "transactional-outbox",
+        "group": "Events, Outbox, and Storage Consistency",
+        "groupDescription": "Transactional messaging, streams, database isolation, and atomic storage references.",
+        "title": "Transactional outbox",
+        "url": "https://microservices.io/patterns/data/transactional-outbox",
+        "source": "Microservices.io",
+        "type": "Pattern",
+        "why": "Defines the core state-plus-event atomicity problem, relay process, ordering concern, and idempotent-consumer requirement behind reliable OMS status events."
+      },
+      {
+        "id": "kafka-design",
+        "group": "Events, Outbox, and Storage Consistency",
+        "groupDescription": "Transactional messaging, streams, database isolation, and atomic storage references.",
+        "title": "Apache Kafka Design",
+        "url": "https://kafka.apache.org/documentation/#design",
+        "source": "Apache Kafka",
+        "type": "Docs",
+        "why": "Explains Kafka's log, partitions, consumer groups, replication, and operational model."
+      },
+      {
+        "id": "dynamodb-transactions",
+        "group": "Events, Outbox, and Storage Consistency",
+        "groupDescription": "Transactional messaging, streams, database isolation, and atomic storage references.",
+        "title": "DynamoDB Transactions",
+        "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html",
+        "source": "AWS",
+        "type": "Docs",
+        "why": "Shows transactional write patterns for high-contention carts, bookings, and order state."
+      },
+      {
+        "id": "stripe-payment-intents",
+        "group": "Payments, Refunds, and Reconciliation",
+        "groupDescription": "Payment lifecycle, capture, webhook, refund, ledger, and reconciliation references.",
+        "title": "Payment Intents",
+        "url": "https://docs.stripe.com/payments/payment-intents",
+        "source": "Stripe",
+        "type": "Docs",
+        "why": "Shows payment lifecycle, authorization/capture, retries, and asynchronous confirmation."
+      },
+      {
+        "id": "stripe-auth-capture",
+        "group": "Payments, Refunds, and Reconciliation",
+        "groupDescription": "Payment lifecycle, capture, webhook, refund, ledger, and reconciliation references.",
+        "title": "Place a hold on a payment method",
+        "url": "https://docs.stripe.com/payments/place-a-hold-on-a-payment-method",
+        "source": "Stripe",
+        "type": "Docs",
+        "why": "Grounds the authorize-now/capture-later flow, capture windows, partial captures, and authorization cancellation used before carrier handoff."
+      },
+      {
         "id": "postgres-isolation",
-        "group": "Booking and Contention",
-        "groupDescription": "Inventory reservation, waiting rooms, locks, leases, and contention-management references.",
+        "group": "Events, Outbox, and Storage Consistency",
+        "groupDescription": "Transactional messaging, streams, database isolation, and atomic storage references.",
         "title": "Transaction Isolation",
         "url": "https://www.postgresql.org/docs/current/transaction-iso.html",
         "source": "PostgreSQL",
         "type": "Docs",
         "why": "Useful for reasoning about locks, serialization anomalies, and inventory correctness."
+      },
+      {
+        "id": "stripe-webhooks",
+        "group": "Payments, Refunds, and Reconciliation",
+        "groupDescription": "Payment lifecycle, capture, webhook, refund, ledger, and reconciliation references.",
+        "title": "Webhook Signatures & Best Practices",
+        "url": "https://docs.stripe.com/webhooks",
+        "source": "Stripe",
+        "type": "Docs",
+        "why": "Shows how to verify, dedupe, and safely retry inbound provider callbacks — the payment/WMS webhook contract in this design."
+      },
+      {
+        "id": "stripe-refunds",
+        "group": "Payments, Refunds, and Reconciliation",
+        "groupDescription": "Payment lifecycle, capture, webhook, refund, ledger, and reconciliation references.",
+        "title": "Refund and cancel payments",
+        "url": "https://docs.stripe.com/refunds",
+        "source": "Stripe",
+        "type": "Docs",
+        "why": "Reference for refund creation, cancellation of uncaptured PaymentIntents, asynchronous refund outcomes, and insufficient-balance edge cases."
+      },
+      {
+        "id": "stripe-payout-reconciliation",
+        "group": "Payments, Refunds, and Reconciliation",
+        "groupDescription": "Payment lifecycle, capture, webhook, refund, ledger, and reconciliation references.",
+        "title": "Payout reconciliation report",
+        "url": "https://docs.stripe.com/reports/payout-reconciliation",
+        "source": "Stripe",
+        "type": "Docs",
+        "why": "Shows how processor payouts are reconciled back to underlying payments, refunds, fees, and balance movements."
+      },
+      {
+        "id": "square-books",
+        "group": "Payments, Refunds, and Reconciliation",
+        "groupDescription": "Payment lifecycle, capture, webhook, refund, ledger, and reconciliation references.",
+        "title": "Books, an immutable double-entry accounting database service",
+        "url": "https://developer.squareup.com/blog/books-an-immutable-double-entry-accounting-database-service/",
+        "source": "Square",
+        "type": "Case study",
+        "year": "2017",
+        "why": "Production ledger design reference for immutable journal entries, cached balances, auditability, and reconciliation-friendly money movement."
       }
     ]
   },
   "assets": {
     "icon": "icon.png"
-  }
+  },
+  "aiVisuals": {
+    "requirements": "assets/generated/ai-visuals/requirements.jpg",
+    "capacity": "assets/generated/ai-visuals/capacity.jpg"
+  },
+  "explainerComic": "assets/generated/comic/interview-comic.jpg"
 }

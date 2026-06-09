@@ -1,6 +1,6 @@
 {
   "title": "Amazon Product Catalog — System Design",
-  "description": "Design the catalog behind a large e-commerce store: browse and search hundreds of millions of products, filter by facets, and render fast product pages — while inventory and prices change constantly. The themes are the read/write (CQRS) split, search + faceting, a denormalized read model, and keeping inventory/price consistent across that split.",
+  "description": "Design the catalog behind a large e-commerce store: browse and search hundreds of millions of products, filter by facets, and render fast product pages — while inventory and prices change constantly. The recurring themes are the read/write (CQRS) split, search and faceting, a denormalized read model, and keeping inventory and price consistent across that split.",
   "highLevelArchitecture": {
     "nodes": [
       {
@@ -102,6 +102,27 @@
           "stateless"
         ],
         "description": "Owns prices/promotions; changes frequently and independently."
+      },
+      {
+        "id": "PriceDB",
+        "label": "Pricing Store",
+        "type": "database",
+        "category": "state",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Authoritative current price/promotion per item, owned by the pricing service."
+      },
+      {
+        "id": "EdgeCache",
+        "label": "Edge / CDN Cache",
+        "type": "cache",
+        "category": "traffic",
+        "traits": [
+          "stateless",
+          "derived"
+        ],
+        "description": "Caches hot product views and popular search results near the shopper; volatile stock/price bypass it."
       },
       {
         "id": "ChangeStream",
@@ -216,10 +237,34 @@
         "label": "live availability"
       },
       {
+        "id": "detail-price",
+        "from": "CatalogSvc",
+        "to": "PriceSvc",
+        "label": "live price"
+      },
+      {
         "id": "inv-db",
         "from": "InvSvc",
         "to": "InvDB",
         "label": "read/write stock"
+      },
+      {
+        "id": "price-db",
+        "from": "PriceSvc",
+        "to": "PriceDB",
+        "label": "read/write price"
+      },
+      {
+        "id": "client-edge",
+        "from": "Client",
+        "to": "EdgeCache",
+        "label": "hot reads (CDN)"
+      },
+      {
+        "id": "edge-lb",
+        "from": "EdgeCache",
+        "to": "LB",
+        "label": "miss → origin"
       }
     ],
     "types": [
@@ -248,7 +293,15 @@
         "nodes": [
           "InvSvc",
           "InvDB",
-          "PriceSvc"
+          "PriceSvc",
+          "PriceDB"
+        ]
+      },
+      {
+        "id": "edge",
+        "label": "Edge / Caching",
+        "nodes": [
+          "EdgeCache"
         ]
       }
     ]
@@ -292,28 +345,53 @@
   "capacity": [
     {
       "label": "Products",
-      "value": "100s of millions",
-      "note": "Sharded catalog + index."
+      "value": "~300M",
+      "note": "~1–2 KB write record each; ~3–5 KB rendered read-model view → ~1–1.5 TB read model, sharded across catalog + index."
+    },
+    {
+      "label": "Shoppers",
+      "value": "~100M DAU",
+      "note": "Peak ~3–4× average; assume ~5 page views per session."
+    },
+    {
+      "label": "Search QPS",
+      "value": "~150k avg / ~500k peak",
+      "note": "Dominant read path; ~10–20 search shards by product, replicated 3× for query volume."
+    },
+    {
+      "label": "Detail QPS",
+      "value": "~300k avg / ~1M peak",
+      "note": "Served from read model + edge cache; target ~90% edge/cache hit so origin sees ~100k."
+    },
+    {
+      "label": "Seller writes",
+      "value": "~1–2k/sec",
+      "note": "Plus bursty bulk imports (millions of rows) that buffer in the change stream."
+    },
+    {
+      "label": "Price/stock events",
+      "value": "~50–100k/sec peak",
+      "note": "Repricing + every order decrement; far outpaces catalog edits — why volatile values are read live, not projected."
     },
     {
       "label": "Read:write",
-      "value": "reads >> writes",
-      "note": "Justifies a read-optimized model."
-    },
-    {
-      "label": "Price changes",
-      "value": "very frequent",
-      "note": "Promotions, repricing; independent of catalog edits."
-    },
-    {
-      "label": "Stock changes",
-      "value": "continuous",
-      "note": "Every order decrements inventory."
+      "value": "~1000:1",
+      "note": "Justifies a read-optimized, independently-scaled read side."
     },
     {
       "label": "Read latency",
       "value": "< 200 ms p99",
       "note": "Search + detail page."
+    },
+    {
+      "label": "Projection lag SLO",
+      "value": "p99 < 5 s",
+      "note": "Seller edit visible in search/detail within seconds; alarm above threshold."
+    },
+    {
+      "label": "Rebuild time",
+      "value": "partial: minutes; full: hours",
+      "note": "Partial reindex by product/category/shard before resorting to a full reproject from the write model."
     }
   ],
   "api": [
@@ -372,7 +450,7 @@
     {
       "method": "GET",
       "path": "/v1/products/{id}",
-      "description": "Get the product detail view; availability/price fetched live for purchase accuracy.",
+      "description": "Get the product detail view; content from the read model, with availability and price fetched live from their owning services for purchase accuracy.",
       "request": "(id in path)",
       "response": "{ \"id\": \"p_9\", \"title\": \"...\", \"price\": \"79.99\", \"inStock\": true }",
       "sequence": {
@@ -391,6 +469,10 @@
           {
             "id": "InvSvc",
             "label": "Inventory Service"
+          },
+          {
+            "id": "PriceSvc",
+            "label": "Pricing Service"
           }
         ],
         "messages": [
@@ -414,6 +496,12 @@
           },
           {
             "from": "CatalogSvc",
+            "to": "PriceSvc",
+            "arrow": "->>",
+            "label": "live price"
+          },
+          {
+            "from": "CatalogSvc",
             "to": "Client",
             "arrow": "-->>",
             "label": "200 product page"
@@ -424,19 +512,23 @@
     {
       "method": "PUT",
       "path": "/v1/products/{id}",
-      "description": "Seller creates/updates a product; emits a change event projected into read model + index.",
-      "request": "{ \"title\": \"...\", \"attrs\": { ... } }",
-      "response": "{ \"version\": 5 }"
+      "description": "Seller creates/updates a product they own; uses optimistic concurrency (If-Match on version) and emits a change event projected into read model + index after validation/moderation.",
+      "request": "Headers: If-Match: \"4\", Idempotency-Key: <uuid>  Body: { \"title\": \"...\", \"attrs\": { ... } }",
+      "response": "{ \"version\": 5, \"status\": \"pending_review\" }  // 412 on version mismatch, 403 if not owner"
     }
   ],
   "dataModel": [
     {
       "name": "products (write model)",
-      "note": "Authoritative normalized product record.",
+      "note": "Authoritative normalized product record, owned by the catalog service. seller_id gates ownership/authorization; version drives optimistic concurrency (If-Match); status gates moderation before it reaches search facets.",
       "fields": [
         {
           "name": "product_id",
           "type": "uuid PK (shard key)"
+        },
+        {
+          "name": "seller_id",
+          "type": "uuid (owner; authorizes writes)"
         },
         {
           "name": "title",
@@ -452,17 +544,29 @@
         },
         {
           "name": "attributes",
-          "type": "json (facetable)"
+          "type": "json (category-scoped, validated → facetable)"
+        },
+        {
+          "name": "attribute_schema_version",
+          "type": "int (which category attribute schema validated against)"
+        },
+        {
+          "name": "status",
+          "type": "enum (draft|pending_review|active|suppressed)"
         },
         {
           "name": "version",
-          "type": "bigint"
+          "type": "bigint (optimistic-concurrency / projection ordering)"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp"
         }
       ]
     },
     {
       "name": "product_view (read model)",
-      "note": "Denormalized, render-ready detail view.",
+      "note": "Denormalized, render-ready detail view. Carries source ownership: catalog content is projected; price/stock here are display-only snapshots of the winning offer, verified live at purchase time. Search filters/sorts on indexed_price_bucket (a coarse, slowly-changing bucket), never on a precise live price.",
       "fields": [
         {
           "name": "product_id",
@@ -470,7 +574,23 @@
         },
         {
           "name": "rendered",
-          "type": "json (title, images, attrs, rating summary)"
+          "type": "json (title, images[], attrs, category path, rating_summary)"
+        },
+        {
+          "name": "winning_offer_snapshot",
+          "type": "json (offer_id, seller_id, display_price, stock_badge — projected; not authoritative for checkout)"
+        },
+        {
+          "name": "indexed_price_bucket",
+          "type": "enum/range (coarse band for price filter/sort facets; debounced so repricing doesn't churn the index)"
+        },
+        {
+          "name": "price_last_projected_at",
+          "type": "timestamp (when display_price/bucket were last refreshed; bounds acceptable staleness)"
+        },
+        {
+          "name": "stock_badge",
+          "type": "enum (in_stock|low|out — approximate)"
         },
         {
           "name": "source_version",
@@ -479,8 +599,44 @@
       ]
     },
     {
+      "name": "category (taxonomy)",
+      "note": "Category hierarchy + per-category attribute/facet schema. Owns which attributes are searchable vs filterable and their normalized value sets.",
+      "fields": [
+        {
+          "name": "category_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "parent_id",
+          "type": "bigint (hierarchy)"
+        },
+        {
+          "name": "facet_schema",
+          "type": "json (attribute → {searchable, filterable, normalized values})"
+        }
+      ]
+    },
+    {
+      "name": "rating_summary",
+      "note": "Derived review/rating rollup, owned by the reviews system and projected into the read model + index for sort-by-rating.",
+      "fields": [
+        {
+          "name": "product_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "avg_rating",
+          "type": "decimal"
+        },
+        {
+          "name": "review_count",
+          "type": "bigint"
+        }
+      ]
+    },
+    {
       "name": "inventory",
-      "note": "Authoritative stock, owned by the inventory service.",
+      "note": "Authoritative stock, owned by the inventory service; read live at purchase decision.",
       "fields": [
         {
           "name": "product_id",
@@ -495,6 +651,1030 @@
           "type": "int"
         }
       ]
+    },
+    {
+      "name": "price / offers",
+      "note": "Authoritative price/promotion, owned by the pricing service; read live for display and verified at checkout via a TTL'd quote. Multi-seller offers and buy-box selection live here; the winning offer is projected into the read model/index for display and bucketed search.",
+      "fields": [
+        {
+          "name": "offer_id",
+          "type": "uuid PK (per seller offer)"
+        },
+        {
+          "name": "product_id",
+          "type": "uuid"
+        },
+        {
+          "name": "seller_id",
+          "type": "uuid (offer owner)"
+        },
+        {
+          "name": "condition",
+          "type": "enum (new|used|refurb)"
+        },
+        {
+          "name": "fulfillment_channel",
+          "type": "enum (e.g. seller|platform-fulfilled)"
+        },
+        {
+          "name": "price",
+          "type": "money"
+        },
+        {
+          "name": "availability",
+          "type": "int / badge (per offer)"
+        },
+        {
+          "name": "is_buy_box_winner",
+          "type": "bool (the offer projected/displayed by default)"
+        },
+        {
+          "name": "promo",
+          "type": "json (optional; effective window)"
+        }
+      ]
+    },
+    {
+      "name": "projection_checkpoint",
+      "note": "Per-projector consumer state, used for idempotent replay and lag detection. Each change event carries event_id + per-product version for ordering and dedupe.",
+      "fields": [
+        {
+          "name": "projector_id",
+          "type": "string PK (read-model | search-index)"
+        },
+        {
+          "name": "shard / partition",
+          "type": "int"
+        },
+        {
+          "name": "last_event_id",
+          "type": "uuid (dedupe key)"
+        },
+        {
+          "name": "committed_offset",
+          "type": "bigint (stream position / CDC LSN)"
+        },
+        {
+          "name": "lag_seconds",
+          "type": "gauge (vs source)"
+        }
+      ]
+    }
+  ],
+  "technologyChoices": [
+    {
+      "concern": "Catalog write store and seller-write concurrency",
+      "steps": [
+        "naive",
+        "cqrs"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "MySQL",
+          "icon": "assets/tech-icons/mysql.png"
+        },
+        {
+          "name": "CockroachDB",
+          "icon": "assets/tech-icons/cockroach.png"
+        },
+        {
+          "name": "Citus",
+          "icon": "assets/tech-icons/citus.png"
+        },
+        {
+          "name": "Apache Cassandra",
+          "icon": "assets/tech-icons/cassandra.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Aurora",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "RDS",
+            "icon": "assets/tech-icons/Arch_Amazon-RDS_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "Keyspaces",
+            "icon": "assets/tech-icons/Arch_Amazon-Keyspaces_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "AlloyDB",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          },
+          {
+            "name": "Azure Database for MySQL",
+            "icon": "assets/tech-icons/10122-icon-service-Azure-Database-MySQL-Server.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A relational store fits seller ownership, category validation, optimistic concurrency, and transactional outbox records.",
+        "Wide-column or distributed SQL stores handle very large product counts and regional scale, but push more query shape into derived read stores.",
+        "The write store is not the browse-serving store; choose it for correctness, ownership, and rebuildability rather than search latency."
+      ],
+      "makesIrrelevant": "A managed relational or distributed store with backups, replicas, and online schema tools removes much of the hand-run database failover and maintenance work from the baseline steps."
+    },
+    {
+      "concern": "Search and facet index",
+      "steps": [
+        "search",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Elasticsearch",
+          "icon": "assets/tech-icons/elasticsearch.png"
+        },
+        {
+          "name": "OpenSearch",
+          "icon": "assets/tech-icons/opensearch.png"
+        },
+        {
+          "name": "Apache Solr",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Apache Lucene",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Vespa",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "OpenSearch Service",
+            "icon": "assets/tech-icons/Arch_Amazon-OpenSearch-Service_64.png"
+          },
+          {
+            "name": "CloudFront",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudFront_64.png"
+          },
+          {
+            "name": "Lambda",
+            "icon": "assets/tech-icons/Arch_AWS-Lambda_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Vertex AI Search",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud Run",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure AI Search",
+            "icon": "assets/tech-icons/10044-icon-service-Cognitive-Search.svg"
+          },
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A dedicated inverted index is the right serving shape for keyword search, relevance ranking, and facet counts over hundreds of millions of products.",
+        "Self-managed search clusters give control over shards, analyzers, and relevance tuning, but the operational burden is high at 500k peak search QPS.",
+        "Managed search reduces cluster work, but relevance features, shard limits, and per-query cost become provider-specific design constraints."
+      ],
+      "makesIrrelevant": "A managed search service with shard scaling, snapshots, and relevance tooling removes most of the custom index-cluster operations from the search step."
+    },
+    {
+      "concern": "Product read model and detail hydration store",
+      "steps": [
+        "readmodel",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "Apache Cassandra",
+          "icon": "assets/tech-icons/cassandra.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "MongoDB",
+          "icon": "assets/tech-icons/mongodb.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          },
+          {
+            "name": "Aurora",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          },
+          {
+            "name": "SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A key-value or wide-column store fits render-ready product views keyed by product_id and absorbs hot detail-page reads.",
+        "Relational storage is easier for ad hoc repair and validation, but it is rarely the best shape for the hottest read path.",
+        "In-memory caches lower p99 for hot products, but the durable read model still needs source_version and replay semantics."
+      ],
+      "makesIrrelevant": "A managed KV or cache with autoscaling, TTL, and multi-AZ replication removes much of the hand-sharding and cache failover work from the read-model step."
+    },
+    {
+      "concern": "Change stream, CDC, and projection fanout",
+      "steps": [
+        "projection",
+        "consistency",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Redpanda",
+          "icon": "assets/tech-icons/redpanda.png"
+        },
+        {
+          "name": "Apache Pulsar",
+          "icon": "assets/tech-icons/pulsar.png"
+        },
+        {
+          "name": "RabbitMQ",
+          "icon": "assets/tech-icons/rabbitmq.png"
+        },
+        {
+          "name": "Debezium",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "NATS (JetStream)",
+          "icon": "assets/tech-icons/nats.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "MSK",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Streaming-for-Apache-Kafka_64.png"
+          },
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          },
+          {
+            "name": "DMS",
+            "icon": "assets/tech-icons/Arch_AWS-Database-Migration-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Managed Service for Apache Kafka",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Datastream",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Event Grid",
+            "icon": "assets/tech-icons/10221-icon-service-Event-Grid-Subscriptions.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A durable log fits product-version ordering, replay, multiple projectors, and bulk-import buffering.",
+        "A queue is simpler for discrete retry and DLQ behavior, but it is weaker when rebuilding read stores from a retained history.",
+        "CDC keeps the outbox close to the authoritative store, while application-published events make the product-change contract explicit."
+      ],
+      "makesIrrelevant": "A managed stream with retention, consumer lag metrics, and native DLQ support removes much of the custom offset, replay, and poison-event plumbing from the projection step."
+    },
+    {
+      "concern": "Indexer/projector compute and backfill workers",
+      "steps": [
+        "projection",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kubernetes",
+          "icon": "assets/tech-icons/kubernetes.png"
+        },
+        {
+          "name": "Apache Flink",
+          "icon": "assets/tech-icons/flink.png"
+        },
+        {
+          "name": "Apache Spark",
+          "icon": "assets/tech-icons/spark.png"
+        },
+        {
+          "name": "Apache Airflow",
+          "icon": "assets/tech-icons/airflow.png"
+        },
+        {
+          "name": "Temporal",
+          "icon": "assets/tech-icons/temporal.png"
+        },
+        {
+          "name": "Celery",
+          "icon": "assets/tech-icons/celery.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "EKS",
+            "icon": "assets/tech-icons/Arch_Amazon-Elastic-Kubernetes-Service_64.png"
+          },
+          {
+            "name": "Fargate",
+            "icon": "assets/tech-icons/Arch_AWS-Fargate_64.png"
+          },
+          {
+            "name": "Lambda",
+            "icon": "assets/tech-icons/Arch_AWS-Lambda_64.png"
+          },
+          {
+            "name": "Managed Service for Apache Flink",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Service-for-Apache-Flink_64.png"
+          },
+          {
+            "name": "AWS Batch",
+            "icon": "assets/tech-icons/Arch_AWS-Batch_64.png"
+          },
+          {
+            "name": "AWS Glue",
+            "icon": "assets/tech-icons/Arch_AWS-Glue_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "GKE",
+            "icon": "assets/tech-icons/Containers-512-color.png"
+          },
+          {
+            "name": "Cloud Run",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          },
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Cloud Composer",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Dataproc",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "AKS",
+            "icon": "assets/tech-icons/10023-icon-service-Kubernetes-Services.svg"
+          },
+          {
+            "name": "Container Apps",
+            "icon": "assets/tech-icons/02989-icon-service-Container-Apps-Environments.svg"
+          },
+          {
+            "name": "Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          },
+          {
+            "name": "Azure Batch",
+            "icon": "assets/tech-icons/10031-icon-service-Batch-Accounts.svg"
+          },
+          {
+            "name": "Azure Databricks",
+            "icon": "assets/tech-icons/10787-icon-service-Azure-Databricks.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Long-running workers are simple for steady projection, while stream processors help with event-time windows, joins, and exactly-once-like sinks.",
+        "Batch engines are better for full reproject and repair, but they should not be the normal path for every seller edit.",
+        "Serverless compute reduces idle cost but needs careful concurrency and retry controls to avoid stampeding the read model or search index."
+      ],
+      "makesIrrelevant": "Managed stream/batch runtimes with autoscaling and checkpointing remove much of the custom worker supervisor, lease, and retry-loop code from rebuild and projection operations."
+    },
+    {
+      "concern": "Authoritative pricing and inventory stores",
+      "steps": [
+        "consistency"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "MySQL",
+          "icon": "assets/tech-icons/mysql.png"
+        },
+        {
+          "name": "CockroachDB",
+          "icon": "assets/tech-icons/cockroach.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Apache Cassandra",
+          "icon": "assets/tech-icons/cassandra.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "Aurora",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          },
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Pricing needs conditional updates, quote TTLs, and promotion windows; inventory needs high-write counters and reservation semantics.",
+        "Relational stores make offer ownership and quote audit easy, while KV or wide-column stores absorb hot SKU updates and regional partitioning better.",
+        "Do not rely on the projected read model for final money or stock decisions; these stores own the live truth."
+      ],
+      "makesIrrelevant": "A managed store with conditional writes, TTL, and multi-region replication removes much of the hand-built quote-expiry and stock-counter failover machinery."
+    },
+    {
+      "concern": "Edge, detail, and query caching",
+      "steps": [
+        "readmodel",
+        "consistency",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Varnish",
+          "icon": "assets/tech-icons/varnish.png"
+        },
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "Apache Traffic Server",
+          "icon": "assets/tech-icons/traffic_server.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "Memcached",
+          "icon": "assets/tech-icons/memcached.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudFront",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudFront_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "Global Accelerator",
+            "icon": "assets/tech-icons/Arch_AWS-Global-Accelerator_64.png"
+          },
+          {
+            "name": "WAF",
+            "icon": "assets/tech-icons/Arch_AWS-WAF_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud CDN",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Load Balancing",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Armor",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Azure CDN",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Application Gateway",
+            "icon": "assets/tech-icons/10076-icon-service-Application-Gateways.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Edge caching absorbs viral products and popular search/category pages, but volatile price and stock must bypass or be refreshed independently.",
+        "Origin-side caches reduce read-model pressure, while CDN caches reduce network distance and gateway load.",
+        "The harder part is invalidation: suppression, moderation, and seller edits need short TTLs or explicit purge paths."
+      ],
+      "makesIrrelevant": "A managed CDN/cache with purge APIs, origin shielding, and WAF integration removes much of the custom hot-product shielding and edge invalidation machinery."
+    },
+    {
+      "concern": "API gateway, load balancing, and traffic protection",
+      "steps": [
+        "naive",
+        "cqrs",
+        "search",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kong",
+          "icon": "assets/tech-icons/kong.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "HAProxy",
+          "icon": "assets/tech-icons/haproxy.png"
+        },
+        {
+          "name": "Traefik",
+          "icon": "assets/tech-icons/traefik.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          },
+          {
+            "name": "ALB",
+            "icon": "assets/tech-icons/Arch_Elastic-Load-Balancing_64.png"
+          },
+          {
+            "name": "CloudFront",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudFront_64.png"
+          },
+          {
+            "name": "WAF",
+            "icon": "assets/tech-icons/Arch_AWS-WAF_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Endpoints",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Apigee",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Load Balancing",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Armor",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "API Management",
+            "icon": "assets/tech-icons/10042-icon-service-API-Management-Services.svg"
+          },
+          {
+            "name": "Application Gateway",
+            "icon": "assets/tech-icons/10076-icon-service-Application-Gateways.svg"
+          },
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Azure Load Balancer",
+            "icon": "assets/tech-icons/10062-icon-service-Load-Balancers.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "The gateway separates shopper search/detail traffic from seller writes and provides request shaping before hitting catalog services.",
+        "Self-hosted gateways give plugin and routing control, but rate limiting, bot defense, and global failover become operational responsibilities.",
+        "Cloud edge gateways integrate CDN/WAF/routing, but their request limits and caching semantics become part of the system design."
+      ],
+      "makesIrrelevant": "A managed gateway with WAF, throttling, and global load balancing removes much of the custom edge-routing and abuse-protection code around the catalog APIs."
+    },
+    {
+      "concern": "Rebuild snapshots, raw assets, and recovery storage",
+      "steps": [
+        "projection",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Ceph",
+          "icon": "assets/tech-icons/ceph.png"
+        },
+        {
+          "name": "HDFS",
+          "icon": "assets/tech-icons/hadoop.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Apache Spark",
+          "icon": "assets/tech-icons/spark.png"
+        },
+        {
+          "name": "Apache Airflow",
+          "icon": "assets/tech-icons/airflow.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "S3",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Storage-Service_64.png"
+          },
+          {
+            "name": "AWS Glue",
+            "icon": "assets/tech-icons/Arch_AWS-Glue_64.png"
+          },
+          {
+            "name": "EMR",
+            "icon": "assets/tech-icons/Arch_Amazon-EMR_64.png"
+          },
+          {
+            "name": "Athena",
+            "icon": "assets/tech-icons/Arch_Amazon-Athena_64.png"
+          },
+          {
+            "name": "DMS",
+            "icon": "assets/tech-icons/Arch_AWS-Database-Migration-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Storage",
+            "icon": "assets/tech-icons/Storage-512-color.png"
+          },
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Dataproc",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "BigQuery",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Datastream",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Blob Storage",
+            "icon": "assets/tech-icons/10781-icon-service-Blob-Page.svg"
+          },
+          {
+            "name": "Azure Data Lake Storage",
+            "icon": "assets/tech-icons/10090-icon-service-Data-Lake-Storage-Gen1.svg"
+          },
+          {
+            "name": "Azure Databricks",
+            "icon": "assets/tech-icons/10787-icon-service-Azure-Databricks.svg"
+          },
+          {
+            "name": "Azure Batch",
+            "icon": "assets/tech-icons/10031-icon-service-Batch-Accounts.svg"
+          },
+          {
+            "name": "Azure Synapse Analytics",
+            "icon": "assets/tech-icons/00606-icon-service-Azure-Synapse-Analytics.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Object storage is the right landing zone for full snapshots, bulk seller imports, replay checkpoints, and rebuild artifacts.",
+        "Batch engines make full reproject and shard repair repeatable, but they should complement the stream rather than replace low-lag projections.",
+        "Keeping immutable rebuild inputs separate from serving stores makes derived-state corruption recoverable."
+      ],
+      "makesIrrelevant": "Managed object storage plus batch data processing removes much of the custom snapshot retention, shard-export, and full-reindex orchestration."
+    },
+    {
+      "concern": "Projection lag, search SLOs, and operational observability",
+      "steps": [
+        "projection",
+        "consistency",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Prometheus",
+          "icon": "assets/tech-icons/prometheus.png"
+        },
+        {
+          "name": "Grafana",
+          "icon": "assets/tech-icons/grafana.png"
+        },
+        {
+          "name": "Jaeger",
+          "icon": "assets/tech-icons/jaeger.png"
+        },
+        {
+          "name": "Elasticsearch",
+          "icon": "assets/tech-icons/elasticsearch.png"
+        },
+        {
+          "name": "Fluentd/Fluent Bit",
+          "icon": "assets/tech-icons/fluentd.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "X-Ray",
+            "icon": "assets/tech-icons/Arch_AWS-X-Ray_64.png"
+          },
+          {
+            "name": "Managed Grafana",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Grafana_64.png"
+          },
+          {
+            "name": "Managed Service for Prometheus",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Service-for-Prometheus_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Logging",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Trace",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Profiler",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Application Insights",
+            "icon": "assets/tech-icons/00012-icon-service-Application-Insights.svg"
+          },
+          {
+            "name": "Log Analytics",
+            "icon": "assets/tech-icons/00009-icon-service-Log-Analytics-Workspaces.svg"
+          },
+          {
+            "name": "Azure Managed Grafana",
+            "icon": "assets/tech-icons/02905-icon-service-Azure-Managed-Grafana.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Projection lag, stream consumer offsets, index freshness, cache hit rate, and live price/inventory call latency are first-class SLO signals.",
+        "Self-hosted observability gives portability and control, but high-cardinality product/category metrics can become expensive quickly.",
+        "Managed observability lowers operations burden, but retention, sampling, and metric cardinality limits must be designed upfront."
+      ],
+      "makesIrrelevant": "Managed metrics, tracing, logs, and dashboards remove much of the custom lag-checker and ad hoc replay-debug tooling around the projection pipeline."
     }
   ],
   "patterns": [
@@ -559,7 +1739,7 @@
       "title": "1. Naive: Query the Normalized Products Table Directly (the baseline)",
       "description": [
         "Start with one normalized products table in a relational database. Product pages are a row lookup (plus a few joins for category/brand), and search is a LIKE/keyword query with WHERE filters over the same table.",
-        "This is fine for a small store and exposes exactly why a catalog needs more. Keyword search and faceting over hundreds of millions of rows can't be served by a SQL LIKE scan at low latency, and assembling a rich product page from many joined tables on every request is too slow under massive read volume. The write-shaped normalized model is simply the wrong shape for read-heavy browse.",
+        "This is fine for a small store, and it exposes exactly why a catalog needs more. At ~300M products and ~150k search QPS, a SQL LIKE scan with per-filter facet aggregations can't meet a < 200 ms p99. And assembling a rich product page from many joined tables, on every one of ~300k detail QPS, is too slow under that read volume. The write-shaped normalized model is simply the wrong shape for read-heavy browse.",
         "So the baseline motivates the rest: split reads from writes (CQRS), build a search/facet index for discovery, and precompute a denormalized read model for fast pages."
       ],
       "view": {
@@ -591,7 +1771,10 @@
         "elasticsearch-docs",
         "lucene-docs",
         "bigtable-paper",
-        "percolator-paper"
+        "percolator-paper",
+        "elastic-aggregations",
+        "opensearch-faceted-search",
+        "azure-cqrs-pattern"
       ],
       "recap": {
         "before": "Nothing.",
@@ -604,7 +1787,8 @@
           "why": "LIKE-based search and facet counts don't scale to hundreds of millions of rows, and per-request joins blow the latency budget.",
           "instead": "Split reads from writes (CQRS): a search/facet index and a denormalized read model derived from the write model."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/01-naive.jpg"
     },
     {
       "id": "cqrs",
@@ -621,7 +1805,7 @@
           "CatalogSvc",
           "CatalogDB"
         ],
-        "caption": "The shopper client's seller writes go through the gateway to the catalog service, which reads and writes the catalog store as the single source of truth.",
+        "caption": "This step establishes the source of truth: seller writes go through the gateway to the catalog service, which owns the catalog store. The derived read model and search index are drawn in the next steps.",
         "links": [
           "client-lb",
           "lb-catalog",
@@ -669,7 +1853,8 @@
             "groups": [
               "write-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-cqrs-opt1.jpg"
         },
         {
           "name": "Single store + read replicas and caching",
@@ -717,7 +1902,8 @@
             "groups": [
               "write-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-cqrs-opt2.jpg"
         }
       ],
       "decisionPrompt": "Why not serve product pages and search directly from the normalized product table?",
@@ -734,7 +1920,12 @@
         "elasticsearch-docs",
         "lucene-docs",
         "bigtable-paper",
-        "percolator-paper"
+        "percolator-paper",
+        "azure-cqrs-pattern",
+        "aws-cqrs-event-sourcing",
+        "dynamo-paper",
+        "dynamodb-data-modeling",
+        "amazon-catalog-bedrock"
       ],
       "patterns": [
         "CQRS (read/write split)",
@@ -755,17 +1946,21 @@
       "description": [
         "Browse and search are the primary entry points. Build an inverted index over product text and attributes; serve keyword queries and rank results (relevance, popularity, rating).",
         "Faceting is the e-commerce twist: alongside results, return counts per filter value (brand, price range, rating) so shoppers can narrow down. The index computes these aggregations as part of the query.",
-        "Shard the index by product; replicate for query volume. Hydrate result cards from the read model (title, image, price) rather than the index itself."
+        "Price in search is a projected snapshot, not the live price. At 50–100k price/stock events per second, indexing every change as a precise sort key would churn the index constantly and still serve stale numbers. So filter and sort on a coarse, debounced indexed_price_bucket (e.g. $25–$50) and display the projected winning-offer price; when the shopper opens the detail page or adds to cart, the live price is refreshed from the Pricing Service.",
+        "Be ready to say what the shopper sees when a sorted or filtered result is re-priced live: the displayed price may differ slightly from the search snapshot, and the authoritative value always comes from the owner at the purchase decision.",
+        "Shard the index by product; replicate for query volume. Hydrate result cards from the read model (title, image, display price) rather than the index itself."
       ],
       "view": {
         "nodes": [
           "Client",
+          "LB",
           "SearchSvc",
           "SearchIdx",
           "ReadModel"
         ],
         "caption": "The search service queries the search/facet index by query and facets, then hydrates matching results from the product read model.",
         "links": [
+          "client-lb",
           "lb-search",
           "search-idx",
           "search-readmodel"
@@ -816,7 +2011,8 @@
             "groups": [
               "read-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-search-opt1.jpg"
         },
         {
           "name": "Database full-text / LIKE search",
@@ -856,7 +2052,8 @@
             "highlight": [
               "CatalogDB"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-search-opt2.jpg"
         },
         {
           "name": "Managed search service",
@@ -897,7 +2094,8 @@
             "groups": [
               "read-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-search-opt3.jpg"
         }
       ],
       "decisionPrompt": "Besides matching results, what does an e-commerce search need to return that a web search doesn't?",
@@ -908,13 +2106,28 @@
           "whyItMatters": "Lets shoppers narrow large result sets — core to product discovery.",
           "example": "'headphones' -> 842 results; facets: Brand{Acme:120,...}, Price{<50:300,...}.",
           "group": "Search and Faceting"
+        },
+        {
+          "term": "Price snapshot vs price authority",
+          "definition": "Search filters/sorts on a coarse, debounced projected price bucket; the authoritative price is read live from the Pricing Service at the purchase decision.",
+          "whyItMatters": "Indexing a fast-changing price as a precise key churns the index and still serves stale numbers; bucketing keeps search fast while live reads keep purchase correct.",
+          "example": "Sort-by-price uses indexed_price_bucket; detail/add-to-cart refreshes the winning offer's live price.",
+          "group": "Search and Faceting"
         }
       ],
       "probeLinks": [
         "elasticsearch-docs",
         "lucene-docs",
         "bigtable-paper",
-        "percolator-paper"
+        "percolator-paper",
+        "elastic-aggregations",
+        "elastic-near-real-time",
+        "opensearch-faceted-search",
+        "amazon-search-ranking",
+        "amazon-xmc-product-search",
+        "amazon-shop-the-look",
+        "ebay-search-architecture",
+        "ebay-buyer-demand-data"
       ],
       "patterns": [
         "Search index + faceting"
@@ -995,17 +2208,20 @@
       "description": [
         "A product page combines data from many places: catalog attributes, images, rating summary, category info. Assembling that per request (fan-out joins) is slow at this scale.",
         "Precompute a denormalized, render-ready product view keyed by product id — a single lookup serves the detail page. The read model carries the source version it reflects, so it's verifiable and rebuildable.",
-        "Search hydrates result cards from the same read model. It's derived state: a cache loss is a rebuild from the write model, not data loss."
+        "Search hydrates result cards from the same read model. It's derived state: a cache loss is a rebuild from the write model, not data loss.",
+        "Note ownership: the rating summary and media/images are projected content summaries owned by the reviews and media systems, not data the catalog service owns — the read model just denormalizes their latest projected values alongside catalog attributes."
       ],
       "view": {
         "nodes": [
           "Client",
+          "LB",
           "CatalogSvc",
           "ReadModel",
           "CatalogDB"
         ],
         "caption": "The catalog service serves product-detail reads from a precomputed denormalized read model while still reading and writing the catalog store.",
         "links": [
+          "client-lb",
           "lb-detail",
           "catalog-readmodel",
           "catalog-db"
@@ -1056,7 +2272,8 @@
               "read-path",
               "write-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-readmodel-opt1.jpg"
         },
         {
           "name": "Lazy cache-on-read (assemble then cache)",
@@ -1102,7 +2319,8 @@
               "read-path",
               "write-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-readmodel-opt2.jpg"
         },
         {
           "name": "Assemble on read from replicas (no read model)",
@@ -1150,7 +2368,8 @@
             "groups": [
               "domains"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-readmodel-opt3.jpg"
         }
       ],
       "decisionPrompt": "A product page needs data from 5 services. How do you render it in one fast lookup?",
@@ -1161,7 +2380,13 @@
         "elasticsearch-docs",
         "lucene-docs",
         "bigtable-paper",
-        "kafka-design"
+        "kafka-design",
+        "azure-cqrs-pattern",
+        "dynamodb-data-modeling",
+        "dynamodb-partition-keys",
+        "airbnb-nebula-search-backends",
+        "amazon-catalog-bedrock",
+        "dynamo-paper"
       ],
       "whyNow": [
         "The denormalized read model is how the detail-page latency target is met; tying it to a source version keeps it trustworthy."
@@ -1182,8 +2407,8 @@
       },
       "flows": [
         {
-          "name": "Product page read: denormalized view + live availability",
-          "note": "Content comes from the read model in one lookup; volatile stock/price is read live from its owning service at the purchase decision.",
+          "name": "Product page read: denormalized view + live availability/price",
+          "note": "Content comes from the read model in one lookup; volatile stock and price are read live from their owning services at the purchase decision rather than trusted from the projected view.",
           "sequence": {
             "participants": [
               {
@@ -1200,6 +2425,10 @@
               {
                 "id": "InvSvc",
                 "label": "Inventory Service"
+              },
+              {
+                "id": "PriceSvc",
+                "label": "Pricing Service"
               }
             ],
             "messages": [
@@ -1220,6 +2449,12 @@
                 "to": "InvSvc",
                 "arrow": "->>",
                 "label": "live availability"
+              },
+              {
+                "from": "CatalogSvc",
+                "to": "PriceSvc",
+                "arrow": "->>",
+                "label": "live price"
               },
               {
                 "from": "CatalogSvc",
@@ -1305,7 +2540,8 @@
               "write-path",
               "read-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-projection-opt1.jpg"
         },
         {
           "name": "Synchronous dual-write from the service",
@@ -1348,7 +2584,8 @@
               "write-path",
               "read-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-projection-opt2.jpg"
         },
         {
           "name": "Periodic batch reindex",
@@ -1390,7 +2627,8 @@
               "write-path",
               "read-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-projection-opt3.jpg"
         }
       ],
       "decisionPrompt": "A seller fixes a typo in a title. How does it reach search results and the product page?",
@@ -1401,7 +2639,15 @@
         "kafka-design",
         "elasticsearch-docs",
         "lucene-docs",
-        "bigtable-paper"
+        "bigtable-paper",
+        "debezium-outbox",
+        "transactional-outbox",
+        "dynamodb-streams",
+        "airbnb-spinaltap",
+        "airbnb-nebula-search-backends",
+        "aws-cqrs-event-sourcing",
+        "elastic-near-real-time",
+        "ebay-search-architecture"
       ],
       "whyNow": [
         "Projection is what keeps the derived read stores correct; making it the single change-stream-driven path is the clean CQRS completion."
@@ -1419,14 +2665,30 @@
         "before": "Stale read stores after edits.",
         "after": "Read model + index updated from a change stream; rebuildable.",
         "newRisk": "Price and stock change far more often and being stale on them causes wrong purchases."
-      }
+      },
+      "deepDives": [
+        {
+          "title": "Projection mechanics: exactly-once-effect, ordering, and recovery",
+          "points": [
+            "Source via transactional outbox / CDC: the event is committed in the same transaction as the write, so there is no dual-write gap. Every event carries an event_id (dedupe key) and the per-product write version.",
+            "The 'change stream' in the diagram is a shared eventing abstraction, not one physical queue: catalog, price, and inventory each emit to their own owner-specific topic (partitioned by product_id), and the projector consumes the relevant topics. Drawing it as one node keeps the concept clear without implying a single shared log.",
+            "Idempotent upserts keyed by product_id and guarded by version — apply only if event.version > stored source_version — so duplicate or out-of-order deliveries are harmless. Partition the stream by product_id so a product's events stay ordered.",
+            "Each projector commits a checkpoint (stream offset / CDC position) per partition; lag is exported per partition against the p99 < 5 s SLO and alarms when breached.",
+            "A poison event that repeatedly fails goes to a dead-letter queue with bounded retry/backoff rather than blocking its partition.",
+            "Recovery is tiered: replay from the last checkpoint for a crashed projector, partial reindex by product / category / shard for a corrupted slice, and a full reproject from the authoritative write model only as a last resort.",
+            "Bulk imports buffer in the stream and are throttled so live-shopper-visible fields stay within the lag SLO."
+          ]
+        }
+      ]
     },
     {
       "id": "consistency",
       "title": "6. Inventory and Price: Freshness Where It Matters",
       "description": [
         "Catalog content tolerating seconds of staleness is fine. Price and availability do not: showing an out-of-stock item as buyable, or a stale price at checkout, is a real defect.",
-        "Treat inventory and pricing as separate services owning their authoritative data. For volatile values, read them live from their owner at decision time (add-to-cart, checkout) rather than trusting a projected snapshot. The read model can show an approximate badge ('in stock') but the purchase path verifies live.",
+        "Treat inventory and pricing as separate services owning their authoritative data in their own stores. For volatile values, read them live from their owner at decision time (add-to-cart, checkout) rather than trusting a projected snapshot. The read model can show an approximate badge ('in stock') and a display price, but the purchase path verifies both live: the catalog detail endpoint calls the pricing and inventory services, and checkout re-verifies an authoritative price quote.",
+        "Scope the offer model. A product can have many seller offers, so the default design projects and displays just one winning offer (the buy-box winner) per product — its display_price and stock_badge are what search and the read model show. Buy-box selection itself is owned by the pricing service, not the catalog. Search price filter and sort therefore operate on the winning offer's bucketed snapshot, while the detail page and checkout resolve the specific selected offer live.",
+        "Define the purchase boundary precisely (checkout stays out of scope). The catalog detail page may refresh live display values, but the cart/checkout service — not the catalog — owns the final purchase decision: it requests an authoritative price quote (a quote_id with a short TTL) and an inventory reservation/hold for the selected offer, and revalidates the quote before order placement. If the quote expires or fails to refresh, the shopper re-prices rather than buying at a stale number. This keeps 'catalog detail page is fresh' distinct from 'checkout correctness'.",
         "This splits consistency by data type: eventually-consistent catalog content via projection, authoritative live reads for money/stock."
       ],
       "view": {
@@ -1435,12 +2697,15 @@
           "InvSvc",
           "InvDB",
           "PriceSvc",
+          "PriceDB",
           "ChangeStream"
         ],
-        "caption": "The catalog service reads live availability from the inventory service (backed by its store) and price from the pricing service, both emitting changes to the change stream.",
+        "caption": "The catalog service reads live availability from the inventory service and live price from the pricing service (each backed by its own store), while both also emit changes to the change stream.",
         "links": [
           "detail-inv",
+          "detail-price",
           "inv-db",
+          "price-db",
           "inv-stream",
           "price-stream"
         ],
@@ -1472,12 +2737,15 @@
               "InvSvc",
               "InvDB",
               "PriceSvc",
+              "PriceDB",
               "ChangeStream"
             ],
-            "caption": "The catalog service reads volatile inventory and price live at decision time while those services also emit changes to the change stream.",
+            "caption": "The catalog service reads volatile inventory and price live at decision time from their owning stores, while those services also emit changes to the change stream.",
             "links": [
               "detail-inv",
+              "detail-price",
               "inv-db",
+              "price-db",
               "inv-stream",
               "price-stream"
             ],
@@ -1488,7 +2756,8 @@
             "groups": [
               "domains"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-consistency-opt1.jpg"
         },
         {
           "name": "Project everything (fully eventual)",
@@ -1527,7 +2796,8 @@
               "domains",
               "read-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-consistency-opt2.jpg"
         },
         {
           "name": "Strong consistency for all product data",
@@ -1565,7 +2835,8 @@
             "groups": [
               "domains"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-consistency-opt3.jpg"
         }
       ],
       "decisionPrompt": "Which product fields can be eventually consistent, and which must be read live at purchase time?",
@@ -1580,7 +2851,13 @@
       ],
       "probeLinks": [
         "kafka-design",
-        "debezium-outbox"
+        "debezium-outbox",
+        "shopify-inventory-reservations",
+        "aws-idempotent-apis",
+        "stripe-idempotency",
+        "aws-timeouts-retries",
+        "transactional-outbox",
+        "dynamodb-streams"
       ],
       "patterns": [
         "Authoritative live read for volatile data",
@@ -1599,6 +2876,29 @@
           "trap": "Serving stock/price from the cached read model.",
           "why": "A stale 'in stock' or old price leads to failed/incorrect purchases.",
           "instead": "Read volatile values live from their owning service at the purchase decision."
+        },
+        {
+          "trap": "Over-projecting price into the search index/read model because it makes browse fast.",
+          "why": "It speeds search/detail but breaks purchase trust — a stale projected price shown at checkout is a real defect. Using a fast-changing price as a hard search facet also churns the index.",
+          "instead": "Keep at most a display price/badge in the projection; verify price live at the purchase decision and treat price facets as bucketed with explicit acceptable staleness."
+        },
+        {
+          "trap": "Letting the catalog service own the final purchase decision (quote + reservation).",
+          "why": "Conflates 'catalog detail page shows fresh values' with 'checkout is correct'. The catalog can refresh display values, but it does not hold inventory or commit a price.",
+          "instead": "Hand off to cart/checkout: it requests an authoritative price quote (quote_id + short TTL) and an inventory reservation/hold for the selected offer, and revalidates before order placement."
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Purchase boundary: quote, reservation, and the offer/buy-box handoff",
+          "points": [
+            "Display vs authoritative: the catalog detail page reads live display values (winning-offer price, stock badge) for accuracy, but those are still display values — they do not commit anything.",
+            "Price quote: when the shopper adds to cart / proceeds to checkout, the cart/checkout service asks the Pricing Service for an authoritative quote scoped to the selected offer — a quote_id with a short TTL (e.g. tens of seconds to minutes). Order placement passes the quote_id and is rejected if it has expired or been superseded, so no order is committed at a stale price.",
+            "Inventory reservation: in parallel the checkout flow requests a reservation/hold on the selected offer's stock from the Inventory Service (a short-lived hold decremented on order, released on timeout/abandonment) so two shoppers can't both buy the last unit.",
+            "Failed refresh: if the quote can't be refreshed or the hold can't be granted, the shopper is re-priced / shown limited availability rather than allowed to complete — the failure surfaces before money moves.",
+            "Offer/buy-box ownership: a product has many seller offers; the Pricing Service owns buy-box selection and projects the winning offer into the read model/index for display and bucketed search. The quote and reservation are always scoped to a specific offer_id, so switching sellers re-quotes.",
+            "Scope boundary: catalog/search/read-model is in scope here; the cart/checkout/order service is the adjacent owner of the final decision and is intentionally out of scope for this catalog case."
+          ]
         }
       ]
     },
@@ -1612,26 +2912,33 @@
       ],
       "view": {
         "nodes": [
+          "Client",
+          "LB",
+          "EdgeCache",
           "SearchSvc",
           "SearchIdx",
           "ReadModel",
           "Indexer",
           "ChangeStream"
         ],
-        "caption": "The search service serves reads from the search index and product read model, both kept fresh by the indexer consuming the change stream.",
+        "caption": "Hot product views and popular search results are served by a fronting edge/CDN cache; on a miss it falls through to the origin gateway, the search index, and the read model, all kept fresh by the indexer consuming the change stream. Volatile stock/price bypass the cache.",
         "links": [
+          "client-edge",
+          "edge-lb",
           "search-idx",
           "search-readmodel",
           "indexer-readmodel",
           "stream-indexer"
         ],
         "highlight": [
+          "EdgeCache",
           "SearchIdx",
           "ReadModel"
         ],
         "groups": [
           "read-path",
-          "write-path"
+          "write-path",
+          "edge"
         ]
       },
       "decisionPrompt": "A deal makes one product go viral. What absorbs the read spike, and what stays authoritative?",
@@ -1642,7 +2949,15 @@
         "elasticsearch-docs",
         "lucene-docs",
         "bigtable-paper",
-        "kafka-design"
+        "kafka-design",
+        "dynamo-paper",
+        "aws-caching-strategies",
+        "dynamodb-partition-keys",
+        "dynamodb-data-modeling",
+        "elastic-near-real-time",
+        "airbnb-nebula-search-backends",
+        "ebay-search-architecture",
+        "amazon-shop-the-look"
       ],
       "recap": {
         "before": "Functional CQRS catalog.",
@@ -1651,30 +2966,51 @@
       },
       "bottlenecks": [
         {
-          "issue": "Hot category/product read spike.",
-          "mitigation": "Edge cache + read replicas + index shard replication."
+          "issue": "Viral product detail page (a deal goes hot).",
+          "mitigation": "Edge/CDN cache absorbs the content read at ~90%+ hit; origin read-model lookup is cheap; only live stock/price calls reach the owning services. Signal: edge hit-rate stays high, origin QPS stays flat."
         },
         {
-          "issue": "Bulk import floods projection.",
-          "mitigation": "Change stream buffers; autoscale projectors; prioritize live-shopper-visible fields."
+          "issue": "Hot category / hot search query.",
+          "mitigation": "Replicate the affected index shard, cache popular query results with a short TTL, and cap facet cardinality. Signal: per-shard query latency stays within budget; cache hit-rate on top queries climbs."
+        },
+        {
+          "issue": "Bulk import floods projection (projector lag spikes).",
+          "mitigation": "Change stream buffers the burst; autoscale projectors; throttle and prioritize live-shopper-visible fields. Signal: per-partition lag gauge returns under the p99 < 5 s SLO."
         }
       ],
       "failureDrills": [
         {
-          "scenario": "The search index is corrupted.",
-          "expectedBehavior": "Rebuild it by reprojecting from the write model / change log; reads degrade gracefully meanwhile.",
-          "mitigation": "Treat index + read model as rebuildable derived state."
+          "scenario": "A search index shard is corrupted.",
+          "expectedBehavior": "Serve from healthy replicas/shards while the bad shard is rebuilt by partial reproject from the write model / change log; affected queries degrade gracefully (reduced recall) rather than erroring.",
+          "mitigation": "Treat index + read model as rebuildable derived state; partial reindex by shard before full reproject."
+        },
+        {
+          "scenario": "Projector lag breaches the SLO during a bulk import.",
+          "expectedBehavior": "Lag alarm fires; live-visible fields are prioritized so detail/search stay fresh enough; volatile stock/price are unaffected because they are read live.",
+          "mitigation": "Autoscale projectors, throttle import ingestion, and let the stream absorb the backlog."
+        },
+        {
+          "scenario": "A poison change event repeatedly fails projection.",
+          "expectedBehavior": "The event is routed to a DLQ after bounded retries so its partition keeps flowing; an operator inspects and replays it after a fix.",
+          "mitigation": "Per-partition DLQ with backoff; idempotent reapply on replay."
+        },
+        {
+          "scenario": "A product is suppressed by moderation but the edge/CDN cache still serves the old page.",
+          "expectedBehavior": "Suppression is a high-priority signal: the projector evicts/marks the read-model entry and the CDN entry is invalidated (targeted purge by product key) rather than waiting for TTL, so the stale page stops serving quickly; the origin returns a suppressed/unavailable response on the next miss.",
+          "mitigation": "Active cache invalidation (purge by key) for suppression/takedown, short TTLs on cached content as a backstop, and never cache the suppressed-state response long."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/07-scale.jpg"
     }
   ],
   "finalDesign": {
     "title": "Final Design — CQRS Product Catalog",
-    "description": "The catalog service owns the normalized write model; a change stream projects edits into a denormalized product read model and a sharded search/facet index (eventually consistent, rebuildable). Shoppers search/filter via the index and hydrate result cards and detail pages from the read model in a single lookup. Inventory and pricing are separate services owning authoritative data; volatile stock/price are read live from them at purchase-decision time while content stays projected. Reads are sharded, replicated, and edge-cached; projection bursts buffer in the stream; all derived stores rebuild from the authoritative write model.",
+    "description": "The catalog service owns the normalized write model; a change stream (transactional outbox/CDC) projects edits into a denormalized product read model and a sharded search/facet index (eventually consistent, rebuildable, p99 < 5 s lag). Shoppers search/filter via the index and hydrate result cards and detail pages from the read model in a single lookup. Search uses a projected, bucketed price snapshot of the winning offer, while the detail page and checkout refresh/verify the live price from the Pricing Service. Inventory and pricing are separate services owning authoritative data in their own stores; volatile stock/price are read live from them at purchase-decision time while content stays projected, and the cart/checkout service (out of scope) holds the final TTL'd price quote and inventory reservation. Hot reads are sharded, replicated, and edge/CDN-cached (the CDN fronts the gateway; volatile values bypass the cache); projection bursts buffer in the stream; all derived stores rebuild from the authoritative write model.",
     "view": {
       "nodes": [
         "Client",
         "LB",
+        "EdgeCache",
         "CatalogSvc",
         "CatalogDB",
         "ReadModel",
@@ -1684,11 +3020,14 @@
         "Indexer",
         "InvSvc",
         "InvDB",
-        "PriceSvc"
+        "PriceSvc",
+        "PriceDB"
       ],
-      "caption": "The shopper client reaches the gateway for catalog detail and search, served from the read model and search index, which the change stream and indexer keep fresh from the catalog store plus inventory and pricing services.",
+      "caption": "The shopper client reaches the gateway for catalog detail and search, served from an edge cache, the read model, and search index — which the change stream and indexer keep fresh from the catalog store — with volatile stock/price read live from the inventory and pricing services.",
       "links": [
         "client-lb",
+        "client-edge",
+        "edge-lb",
         "lb-search",
         "lb-detail",
         "lb-catalog",
@@ -1703,14 +3042,18 @@
         "indexer-readmodel",
         "indexer-searchidx",
         "detail-inv",
-        "inv-db"
+        "detail-price",
+        "inv-db",
+        "price-db"
       ],
       "groups": [
         "read-path",
         "write-path",
-        "domains"
+        "domains",
+        "edge"
       ]
-    }
+    },
+    "aiVisual": "assets/generated/ai-visuals/final-design.jpg"
   },
   "satisfies": {
     "functional": [
@@ -1738,7 +3081,7 @@
       },
       {
         "requirement": "Accurate price/availability",
-        "how": "Live reads from inventory/pricing services.",
+        "how": "Live reads from the inventory and pricing services (each owns its store) at the purchase decision; the winning offer is displayed, and cart/checkout re-verifies an authoritative TTL'd price quote plus an inventory reservation for the selected offer.",
         "steps": [
           "consistency"
         ]
@@ -1752,6 +3095,16 @@
       }
     ],
     "nonFunctional": [
+      {
+        "requirement": "Extremely read-heavy browse/search",
+        "how": "CQRS read/write split serves browse/search from independently-scaled derived stores (search index + read model) instead of the write model.",
+        "steps": [
+          "cqrs",
+          "readmodel",
+          "search",
+          "scale"
+        ]
+      },
       {
         "requirement": "Low read latency",
         "how": "Read model + index + edge caches.",
@@ -1929,10 +3282,246 @@
         "type": "Paper",
         "why": "Useful for incremental indexing and freshness under large-scale updates.",
         "year": "2010"
+      },
+      {
+        "id": "amazon-catalog-bedrock",
+        "group": "Company Implementations",
+        "groupDescription": "Shipped marketplace/catalog/search systems and production case studies.",
+        "title": "How the Amazon.com Catalog Team built self-learning generative AI at scale with Amazon Bedrock",
+        "url": "https://aws.amazon.com/blogs/machine-learning/how-the-amazon-com-catalog-team-built-self-learning-generative-ai-at-scale-with-amazon-bedrock/",
+        "source": "AWS Machine Learning Blog",
+        "type": "Case study",
+        "why": "Shows how Amazon treats catalog attributes and titles as structured source data that feeds search, recommendations, and discovery.",
+        "year": "2026"
+      },
+      {
+        "id": "amazon-search-ranking",
+        "group": "Company Implementations",
+        "groupDescription": "Shipped marketplace/catalog/search systems and production case studies.",
+        "title": "Amazon Search: The joy of ranking products",
+        "url": "https://www.amazon.science/publications/amazon-search-the-joy-of-ranking-products",
+        "source": "Amazon Science",
+        "type": "Paper",
+        "why": "Explains why product search ranking is a revenue-critical system and how relevance moves beyond simple lexical matching.",
+        "year": "2016"
+      },
+      {
+        "id": "amazon-xmc-product-search",
+        "group": "Company Implementations",
+        "groupDescription": "Shipped marketplace/catalog/search systems and production case studies.",
+        "title": "Extreme multi-label learning for semantic matching in product search",
+        "url": "https://www.amazon.science/publications/extreme-multi-label-learning-for-semantic-matching-in-product-search",
+        "source": "Amazon Science",
+        "type": "Paper",
+        "why": "Studies semantic product retrieval over 100M+ products under online latency constraints.",
+        "year": "2021"
+      },
+      {
+        "id": "amazon-shop-the-look",
+        "group": "Company Implementations",
+        "groupDescription": "Shipped marketplace/catalog/search systems and production case studies.",
+        "title": "Amazon Shop the Look: A visual search system for fashion and home",
+        "url": "https://www.amazon.science/publications/amazon-shop-the-look-a-visual-search-system-for-fashion-and-home",
+        "source": "Amazon Science",
+        "type": "Paper",
+        "why": "Covers a deployed visual product-search system with low-latency serving and an offline index-building pipeline for a dynamic catalog.",
+        "year": "2022"
+      },
+      {
+        "id": "ebay-search-architecture",
+        "group": "Company Implementations",
+        "groupDescription": "Shipped marketplace/catalog/search systems and production case studies.",
+        "title": "The Architecture of eBay Search",
+        "url": "https://sigir-ecom.weebly.com/uploads/1/0/2/9/102947274/ebay_search_architecture.pdf",
+        "source": "SIGIR eCom / eBay",
+        "type": "Paper",
+        "why": "Describes item messaging, search-owned document stores, distributed indexing, forward indexes, and ranking features in a large marketplace.",
+        "year": "2017"
+      },
+      {
+        "id": "ebay-buyer-demand-data",
+        "group": "Company Implementations",
+        "groupDescription": "Shipped marketplace/catalog/search systems and production case studies.",
+        "title": "How eBay's Distributed Architecture Surfaces More Item Listings for Buyers",
+        "url": "https://medium.com/ebaytech/how-ebays-distributed-architecture-surfaces-more-item-listings-for-buyers-ba880f54d49f",
+        "source": "eBay Tech Blog",
+        "type": "Case study",
+        "why": "Shows how buyer queries and facet usage become structured item-specific signals that improve catalog quality and seller guidance.",
+        "year": "2021"
+      },
+      {
+        "id": "airbnb-spinaltap",
+        "group": "Company Implementations",
+        "groupDescription": "Shipped marketplace/catalog/search systems and production case studies.",
+        "title": "Capturing Data Evolution in a Service-Oriented Architecture",
+        "url": "https://medium.com/airbnb-engineering/capturing-data-evolution-in-a-service-oriented-architecture-72f7c643ee6f",
+        "source": "Airbnb Engineering",
+        "type": "Case study",
+        "why": "Explains a production CDC platform used for cache invalidation, search indexing, pricing workflows, ordering, and validation.",
+        "year": "2018"
+      },
+      {
+        "id": "airbnb-nebula-search-backends",
+        "group": "Company Implementations",
+        "groupDescription": "Shipped marketplace/catalog/search systems and production case studies.",
+        "title": "Nebula as a Storage Platform to Build Airbnb's Search Backends",
+        "url": "https://medium.com/airbnb-engineering/nebula-as-a-storage-platform-to-build-airbnbs-search-backends-ecc577b05f06",
+        "source": "Airbnb Engineering",
+        "type": "Case study",
+        "why": "Shows how online deltas, offline snapshots, versioned index documents, rollback, and fast search-node bootstrap fit a read-model/search pipeline."
+      },
+      {
+        "id": "elastic-aggregations",
+        "group": "Search and Retrieval",
+        "groupDescription": "Indexing, ranking, crawling, geo search, and vector retrieval references.",
+        "title": "Aggregations",
+        "url": "https://www.elastic.co/docs/explore-analyze/query-filter/aggregations",
+        "source": "Elastic",
+        "type": "Docs",
+        "why": "Reference for bucket and metric aggregations that implement product facets and filter counts."
+      },
+      {
+        "id": "elastic-near-real-time",
+        "group": "Search and Retrieval",
+        "groupDescription": "Indexing, ranking, crawling, geo search, and vector retrieval references.",
+        "title": "Near real-time search",
+        "url": "https://www.elastic.co/docs/manage-data/data-store/near-real-time-search",
+        "source": "Elastic",
+        "type": "Docs",
+        "why": "Explains refresh behavior and why indexed catalog edits become searchable after a bounded delay rather than immediately."
+      },
+      {
+        "id": "opensearch-faceted-search",
+        "group": "Search and Retrieval",
+        "groupDescription": "Indexing, ranking, crawling, geo search, and vector retrieval references.",
+        "title": "Faceted search",
+        "url": "https://docs.opensearch.org/latest/tutorials/faceted-search/",
+        "source": "OpenSearch",
+        "type": "Docs",
+        "why": "Hands-on product-catalog example for facet mappings, hierarchical categories, selected filters, and preserving facet options."
+      },
+      {
+        "id": "azure-cqrs-pattern",
+        "group": "CQRS, Read Models, and Projection",
+        "groupDescription": "Patterns for separating write models from read models and keeping projections fresh.",
+        "title": "CQRS pattern",
+        "url": "https://learn.microsoft.com/en-us/azure/architecture/patterns/cqrs",
+        "source": "Microsoft Learn",
+        "type": "Docs",
+        "why": "Concise architectural reference for separating command and query models, scaling reads independently, and accepting eventual consistency."
+      },
+      {
+        "id": "aws-cqrs-event-sourcing",
+        "group": "CQRS, Read Models, and Projection",
+        "groupDescription": "Patterns for separating write models from read models and keeping projections fresh.",
+        "title": "Decompose monoliths into microservices by using CQRS and event sourcing",
+        "url": "https://docs.aws.amazon.com/prescriptive-guidance/latest/patterns/decompose-monoliths-into-microservices-by-using-cqrs-and-event-sourcing.html",
+        "source": "AWS Prescriptive Guidance",
+        "type": "Docs",
+        "why": "Shows an AWS-flavored CQRS/event-sourcing architecture where write events synchronize an independently scaled query database."
+      },
+      {
+        "id": "transactional-outbox",
+        "group": "CQRS, Read Models, and Projection",
+        "groupDescription": "Patterns for separating write models from read models and keeping projections fresh.",
+        "title": "Pattern: Transactional outbox",
+        "url": "https://microservices.io/patterns/data/transactional-outbox",
+        "source": "Microservices.io",
+        "type": "Explainer",
+        "why": "Defines the no-dual-write pattern for committing catalog changes and publishing projection events atomically."
+      },
+      {
+        "id": "dynamodb-streams",
+        "group": "Queues and Streams",
+        "groupDescription": "Messaging, event streaming, delivery semantics, and async processing references.",
+        "title": "Change data capture for DynamoDB Streams",
+        "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html",
+        "source": "Amazon DynamoDB",
+        "type": "Docs",
+        "why": "Official CDC reference for item-level modifications, ordering per item, stream records, and near-real-time consumers."
+      },
+      {
+        "id": "dynamodb-partition-keys",
+        "group": "Distributed Data",
+        "groupDescription": "Primary papers and docs for storage, replication, partitioning, consistency, and caching.",
+        "title": "Best practices for designing and using partition keys effectively in DynamoDB",
+        "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html",
+        "source": "Amazon DynamoDB",
+        "type": "Docs",
+        "why": "Grounds product-id sharding and hot-key mitigation in official partition-key capacity guidance."
+      },
+      {
+        "id": "dynamodb-data-modeling",
+        "group": "Distributed Data",
+        "groupDescription": "Primary papers and docs for storage, replication, partitioning, consistency, and caching.",
+        "title": "Data modeling building blocks in DynamoDB",
+        "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/data-modeling-blocks.html",
+        "source": "Amazon DynamoDB",
+        "type": "Docs",
+        "why": "Explains composite sort keys, vertical partitioning, item-size limits, and write sharding for high-scale product views."
+      },
+      {
+        "id": "shopify-inventory-reservations",
+        "group": "Inventory, Consistency, and API Safety",
+        "groupDescription": "Freshness, reservations, idempotency, retries, and correctness boundaries for volatile commerce data.",
+        "title": "We replaced Redis with MySQL for inventory reservations - and it scaled",
+        "url": "https://shopify.engineering/scaling-inventory-reservations",
+        "source": "Shopify Engineering",
+        "type": "Case study",
+        "why": "Production inventory-reservation case study that distinguishes fast browse from ACID reserve/claim correctness at checkout.",
+        "year": "2026"
+      },
+      {
+        "id": "aws-idempotent-apis",
+        "group": "Inventory, Consistency, and API Safety",
+        "groupDescription": "Freshness, reservations, idempotency, retries, and correctness boundaries for volatile commerce data.",
+        "title": "Making retries safe with idempotent APIs",
+        "url": "https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-apis/",
+        "source": "Amazon Builders' Library",
+        "type": "Case study",
+        "why": "Explains caller-provided request identifiers, semantic equivalence, and retry safety for mutating seller/catalog operations.",
+        "year": "2021"
+      },
+      {
+        "id": "stripe-idempotency",
+        "group": "Inventory, Consistency, and API Safety",
+        "groupDescription": "Freshness, reservations, idempotency, retries, and correctness boundaries for volatile commerce data.",
+        "title": "Idempotent requests",
+        "url": "https://docs.stripe.com/api/idempotent_requests",
+        "source": "Stripe Docs",
+        "type": "Docs",
+        "why": "Concrete API reference for idempotency keys, response replay, parameter mismatch protection, and retry semantics."
+      },
+      {
+        "id": "aws-caching-strategies",
+        "group": "Caching and Operations",
+        "groupDescription": "Caching, hot paths, retries, and operational controls for read-heavy serving.",
+        "title": "Caching challenges and strategies",
+        "url": "https://aws.amazon.com/builders-library/caching-challenges-and-strategies/",
+        "source": "Amazon Builders' Library",
+        "type": "Case study",
+        "why": "Useful for edge/read-model caching tradeoffs, cache safety, object versioning, poison pills, and operational risks.",
+        "year": "2019"
+      },
+      {
+        "id": "aws-timeouts-retries",
+        "group": "Caching and Operations",
+        "groupDescription": "Caching, hot paths, retries, and operational controls for read-heavy serving.",
+        "title": "Timeouts, retries, and backoff with jitter",
+        "url": "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter",
+        "source": "Amazon Builders' Library",
+        "type": "Case study",
+        "why": "Helps reason about live price/inventory dependency calls, retry storms, backoff, and bounded latency on hot paths.",
+        "year": "2019"
       }
     ]
   },
   "assets": {
     "icon": "icon.png"
-  }
+  },
+  "aiVisuals": {
+    "requirements": "assets/generated/ai-visuals/requirements.jpg",
+    "capacity": "assets/generated/ai-visuals/capacity.jpg"
+  },
+  "explainerComic": "assets/generated/comic/interview-comic.jpg"
 }

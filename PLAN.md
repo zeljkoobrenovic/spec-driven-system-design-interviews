@@ -224,11 +224,22 @@ All fields below are optional except `highLevelArchitecture` and either
 
   // Standalone pattern reference. Renders as a "Pattern Catalog" entry, grouped
   // by `category`. A dataset with patternCatalog[] and NO steps[] is valid — it
-  // is a catalog dataset, not a walkthrough (see data/book/patterns). `usedBy`
-  // are free-text case names (they may live in other datasets).
+  // is a catalog dataset, not a walkthrough (see data/book/patterns).
+  //   - `aliases[]`: case-study tag synonyms that map to this canonical name
+  //     (rendered as "Also called" chips); makes the catalog name the canonical
+  //     vocabulary so case `step.patterns[]` tags can be linked back to it.
+  //   - `pairsWith[]` / `commonlyConfusedWith[]`: other catalog pattern names,
+  //     rendered as relationship chips ("Pairs with" / "Confused with").
+  //   - `usedBy[]`: each entry is either a free-text case name (string) OR an
+  //     object `{ datasetId, label }`; a datasetId makes the chip a link to that
+  //     case study (hash `#<datasetId>`). datasetIds must exist in the group's
+  //     index.json.
   "patternCatalog": [
     { "name": "Idempotency key", "category": "Reliability & correctness",
-      "what": "...", "whenToUse": "...", "tradeoffs": "...", "usedBy": ["Payment System"],
+      "what": "...", "whenToUse": "...", "tradeoffs": "...",
+      "aliases": ["Idempotent confirm"],
+      "pairsWith": ["Deduplication"], "commonlyConfusedWith": ["Deduplication"],
+      "usedBy": [{ "datasetId": "payment-system", "label": "Payment System" }],
       "icon": "assets/icons/patterns/idempotency-key.png" }
   ],
 

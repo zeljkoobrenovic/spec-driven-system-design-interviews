@@ -105,9 +105,29 @@
         "type": "service",
         "category": "compute",
         "traits": [
-          "stateless"
+          "stateful"
         ],
-        "description": "Joins clicks to conversions within a window to credit campaigns."
+        "description": "Joins clicks to conversions within a window to credit campaigns, using recent-click keyed state on the hot path."
+      },
+      {
+        "id": "ClickState",
+        "label": "Click-State Store",
+        "type": "cache",
+        "category": "state",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Keyed, time-windowed state of recent clicks (by user/session/click id) for near-real-time attribution."
+      },
+      {
+        "id": "DLQ",
+        "label": "DLQ / Quarantine",
+        "type": "queue",
+        "category": "async",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Holds invalid, malformed, schema-incompatible, or too-late events for inspection and replay after a fix."
       }
     ],
     "links": [
@@ -163,7 +183,7 @@
         "id": "batch-olap",
         "from": "Batch",
         "to": "OLAP",
-        "label": "overwrite corrected aggregates"
+        "label": "write batch version + settle window"
       },
       {
         "id": "serve-olap",
@@ -178,10 +198,31 @@
         "label": "GET metrics"
       },
       {
-        "id": "attr-raw",
+        "id": "attr-clickstate",
         "from": "AttrSvc",
+        "to": "ClickState",
+        "label": "match recent clicks (hot path)"
+      },
+      {
+        "id": "attr-raw",
+        "from": "Batch",
         "to": "RawStore",
-        "label": "lookup click events"
+        "label": "replay clicks for batch re-attribution"
+      },
+      {
+        "id": "collector-dlq",
+        "from": "Collector",
+        "to": "DLQ",
+        "label": "reject invalid / schema-incompatible"
+      },
+      {
+        "id": "stream-dlq",
+        "from": "Stream",
+        "to": "DLQ",
+        "label": "quarantine unparseable / too-late",
+        "render": {
+          "arrow": "-.-"
+        }
       }
     ],
     "types": [
@@ -200,7 +241,8 @@
         "nodes": [
           "Stream",
           "DedupStore",
-          "AttrSvc"
+          "AttrSvc",
+          "ClickState"
         ]
       },
       {
@@ -228,11 +270,15 @@
   ],
   "capacityDiagram": [
     "graph LR",
-    "  Ev[~1M events/s]",
-    "  Day[Billions/day]",
-    "  Dedup[Exactly-once counts]",
+    "  Ev[~1M events/s peak ~3M]",
+    "  Day[~86B/day ~34 TB raw]",
+    "  Log[~500-1k Kafka partitions]",
+    "  Dedup[~10s GB dedup state/window]",
+    "  Click[~1-2 TB 7d click-state]",
     "  Ev --> Day",
-    "  Day --> Dedup"
+    "  Day --> Log",
+    "  Log --> Dedup",
+    "  Log --> Click"
   ],
   "requirements": {
     "functional": [
@@ -253,37 +299,77 @@
   "capacity": [
     {
       "label": "Events per second",
-      "value": "~1,000,000",
-      "note": "Impressions dominate; clicks are a fraction."
+      "value": "~1M sustained, ~3M peak",
+      "note": "Impressions dominate (~90%); clicks ~1-2%, conversions far rarer. Bursty around large campaigns."
     },
     {
       "label": "Events per day",
-      "value": "billions",
-      "note": "Drives raw-store and log sizing."
+      "value": "~86B/day",
+      "note": "1M/s x 86,400s. Drives log, raw-store, and batch-runtime sizing."
     },
     {
       "label": "Event size",
-      "value": "~hundreds of bytes",
-      "note": "Ad id, user/session, timestamp, context."
+      "value": "~400 bytes avg",
+      "note": "event_id, type, advertiser/campaign/creative ids, user/session, two timestamps, geo/device context."
+    },
+    {
+      "label": "Raw ingest bandwidth",
+      "value": "~400 MB/s (~3.2 Gbps)",
+      "note": "86B x 400B = ~34 TB/day raw, before replication/compression."
+    },
+    {
+      "label": "Replicated log storage",
+      "value": "~100 TB/day, retain 3-7d",
+      "note": "34 TB/day x 3 replicas; ~300-700 TB live log for a 3-7 day replay window."
+    },
+    {
+      "label": "Raw lake storage",
+      "value": "~10-15 TB/day compressed",
+      "note": "34 TB/day raw -> ~3x columnar/Parquet compression; retained months-to-years for billing audit."
+    },
+    {
+      "label": "Kafka partitions",
+      "value": "~500-1,000",
+      "note": "Bandwidth alone is modest: 400 MB/s ÷ ~10-20 MB/s per partition ≈ 20-40 partitions. The driver is event-rate and consumer parallelism: 3M events/s peak ÷ a safe ~10-20k events/s per partition-consumer ≈ 150-300, then ~2-3x peak headroom and per-tenant/hot-key spread → ~500-1,000. Not thousands; thousands would be cargo-culting."
+    },
+    {
+      "label": "Partition key",
+      "value": "salted campaign_id",
+      "note": "campaign_id gives aggregation locality but big campaigns hot-key one partition; salt as campaign_id + bucket (then re-key on aggregate). Attribution needs user/session/click-id locality instead, so the speed layer repartitions by match key (two-stage shuffle) rather than reusing the ingest key."
+    },
+    {
+      "label": "Dedup state",
+      "value": "~10s of GB per window",
+      "note": "Distinct event_ids in the dedup window x ~50-100B/entry; e.g. ~1B ids/window x 64B ~= 64 GB keyed state."
+    },
+    {
+      "label": "Click-state (attribution)",
+      "value": "~hundreds of GB - low TB",
+      "note": "A 7-day attribution window holds every click in keyed state: ~1-2% of 86B events/day are clicks ≈ ~1-1.7B clicks/day x 7d x ~100-200B/entry ≈ ~1-2 TB. This dominates the hot-path state footprint — far larger than the dedup window — so it is sharded by match key and TTL'd at the window edge."
+    },
+    {
+      "label": "Rollup cardinality",
+      "value": "campaign x window x dims",
+      "note": "campaign_id (~1M) x time bucket x a few dims explodes fast; only an allowlist of dimensions is pre-aggregated."
     },
     {
       "label": "Real-time freshness",
       "value": "seconds",
-      "note": "Speed-layer target."
+      "note": "Speed-layer target for open windows."
     },
     {
       "label": "Batch correction",
       "value": "hourly / daily",
-      "note": "Accurate, billing-grade recompute."
+      "note": "Accurate, billing-grade recompute; full-day reprocess must finish well inside the next day."
     }
   ],
   "api": [
     {
       "method": "POST",
       "path": "/v1/events",
-      "description": "Ingest a batch of ad events. Accepted fast and durably; processed downstream.",
-      "request": "{ \"events\": [ { \"type\": \"click\", \"adId\": \"a_9\", \"eventId\": \"e_77\", \"ts\": ... } ] }",
-      "response": "{ \"accepted\": 1 }",
+      "description": "Ingest a batch of typed ad events (impression, click, conversion). Accepted fast and durably; processed downstream. Required fields are per type: impressions/clicks must carry campaign/creative/placement; conversions must carry a usable attribution identity (user_id, session_id, or click_id) plus event_id/schema_version — campaign_id on a conversion is optional and not authoritative, because attribution derives the credited campaign by matching the conversion to a recent click. Returns partial-acceptance details so a bad event in the batch doesn't reject the rest.",
+      "request": "{ \"events\": [ { \"type\": \"impression\", \"event_id\": \"e_77\", \"advertiser_id\": \"adv_2\", \"campaign_id\": \"c_3\", \"creative_id\": \"cr_8\", \"placement_id\": \"p_1\", \"user_id\": \"u_hash_…\", \"event_time\": \"2026-06-09T10:00:00.120Z\", \"schema_version\": 2, \"consent\": { \"ad_measurement\": true }, \"context\": { \"geo\": \"US\", \"device\": \"mobile\" } }, { \"type\": \"click\", \"event_id\": \"e_78\", \"campaign_id\": \"c_3\", \"creative_id\": \"cr_8\", \"click_id\": \"clk_55\", \"user_id\": \"u_hash_…\", \"event_time\": \"2026-06-09T10:00:03.400Z\", \"schema_version\": 2, \"consent\": { \"ad_measurement\": true } }, { \"type\": \"conversion\", \"user_id\": \"u_hash_…\", \"session_id\": \"s_12\", \"click_id\": \"clk_55\", \"event_time\": \"2026-06-09T18:42:00.000Z\", \"conversion_value\": 49.90, \"currency\": \"USD\", \"schema_version\": 2, \"consent\": { \"ad_measurement\": true } } ] }",
+      "response": "{ \"accepted\": 2, \"rejected\": 1, \"rejections\": [ { \"reason\": \"missing_required_field: event_id\", \"type\": \"conversion\" } ] }",
       "sequence": {
         "participants": [
           {
@@ -315,7 +401,7 @@
             "from": "Collector",
             "to": "Log",
             "arrow": "->>",
-            "label": "append (partition by adId)"
+            "label": "append (partition by salted campaign_id)"
           },
           {
             "from": "Collector",
@@ -329,9 +415,9 @@
     {
       "method": "GET",
       "path": "/v1/metrics",
-      "description": "Query aggregated metrics for a campaign over a time range.",
-      "request": "?campaign=c_3&from=...&to=...&groupBy=hour",
-      "response": "{ \"series\": [ { \"t\": ..., \"impressions\": 1200, \"clicks\": 34, \"ctr\": 0.028 } ] }",
+      "description": "Query aggregated metrics for a campaign over a time range. Each bucket carries a freshness/source marker so the dashboard can show whether a window is settled (batch) or still provisional (speed).",
+      "request": "?campaign=c_3&from=...&to=...&groupBy=hour&dimensions=geo",
+      "response": "{ \"series\": [ { \"t\": \"2026-06-09T09:00Z\", \"impressions\": 1200, \"clicks\": 34, \"ctr\": 0.028, \"conversions\": 5, \"attributed_conversions\": 4, \"revenue\": 249.50, \"source\": \"batch\", \"settled\": true, \"version\": 3, \"computed_at\": \"2026-06-10T02:14:00Z\" }, { \"t\": \"2026-06-09T10:00Z\", \"impressions\": 980, \"clicks\": 25, \"ctr\": 0.026, \"conversions\": 2, \"attributed_conversions\": 2, \"revenue\": 99.80, \"source\": \"speed\", \"settled\": false, \"version\": 1, \"computed_at\": \"2026-06-09T10:00:42Z\" } ] }",
       "sequence": {
         "participants": [
           {
@@ -372,31 +458,67 @@
   "dataModel": [
     {
       "name": "raw_event",
-      "note": "Immutable record of one ad event (in the log and data lake).",
+      "note": "Immutable record of one ad event (in the log and data lake). Source of truth for replay and batch recompute.",
       "fields": [
         {
           "name": "event_id",
-          "type": "uuid (idempotency key for dedup)"
+          "type": "uuid (stable, client-generated; idempotency key for dedup)"
         },
         {
           "name": "type",
           "type": "enum(impression, click, conversion)"
         },
         {
-          "name": "ad_id",
-          "type": "string (partition key)"
+          "name": "advertiser_id",
+          "type": "string (tenant)"
         },
         {
           "name": "campaign_id",
-          "type": "string"
+          "type": "string (partition/aggregation key on impressions/clicks; nullable & non-authoritative on conversions — attribution derives the credited campaign)"
+        },
+        {
+          "name": "creative_id",
+          "type": "string (impressions/clicks)"
+        },
+        {
+          "name": "placement_id",
+          "type": "string, nullable (where the ad rendered; impressions/clicks)"
         },
         {
           "name": "user_id",
-          "type": "string"
+          "type": "string (hashed/pseudonymous identity; attribution match key)"
         },
         {
-          "name": "ts",
-          "type": "event timestamp"
+          "name": "session_id / click_id",
+          "type": "string, nullable (attribution match keys; click_id links a conversion to a specific click)"
+        },
+        {
+          "name": "event_time",
+          "type": "timestamp (when it happened on the client)"
+        },
+        {
+          "name": "ingest_time",
+          "type": "timestamp (when the collector appended it) — watermarks use event_time, lag = ingest - event"
+        },
+        {
+          "name": "conversion_value",
+          "type": "decimal, nullable (revenue; conversions only)"
+        },
+        {
+          "name": "currency",
+          "type": "string, nullable (conversions only)"
+        },
+        {
+          "name": "consent_context",
+          "type": "json (ad_measurement/personalization flags; gates attribution + retention)"
+        },
+        {
+          "name": "schema_version",
+          "type": "int (lets parsers evolve; mismatches go to quarantine)"
+        },
+        {
+          "name": "source",
+          "type": "enum(web, app, sdk, server)"
         },
         {
           "name": "context",
@@ -405,34 +527,914 @@
       ]
     },
     {
-      "name": "metric_rollup",
-      "note": "Pre-aggregated metrics in the OLAP store.",
+      "name": "credited_conversion",
+      "note": "Output of attribution: a conversion linked to the click/campaign credited for it. Written explicitly, not implied inside generic OLAP updates.",
       "fields": [
         {
+          "name": "conversion_event_id",
+          "type": "uuid (the converting event)"
+        },
+        {
+          "name": "click_event_id",
+          "type": "uuid, nullable (matched click; null = unattributed)"
+        },
+        {
           "name": "campaign_id",
-          "type": "string"
+          "type": "string (credited campaign)"
         },
         {
-          "name": "window",
-          "type": "time bucket (e.g. minute/hour)"
+          "name": "model",
+          "type": "enum(last_click, first_click, multi_touch)"
         },
         {
-          "name": "dimensions",
-          "type": "geo, device, ..."
+          "name": "credit",
+          "type": "decimal (1.0 for single-touch; fractional for multi-touch)"
         },
         {
-          "name": "impressions",
-          "type": "bigint"
+          "name": "conversion_value",
+          "type": "decimal"
         },
         {
-          "name": "clicks",
-          "type": "bigint"
+          "name": "match_status",
+          "type": "enum(matched, no_match, multiple_candidates, late, consent_limited)"
         },
         {
           "name": "source",
-          "type": "enum(speed, batch) (batch overwrites speed)"
+          "type": "enum(speed, batch) + version (so re-attribution is idempotent)"
         }
       ]
+    },
+    {
+      "name": "metric_rollup",
+      "note": "Pre-aggregated metrics in the OLAP store. Keyed so writes are idempotent and batch can version-overwrite speed without double-counting.",
+      "fields": [
+        {
+          "name": "campaign_id",
+          "type": "string (part of metric_key)"
+        },
+        {
+          "name": "window_start / window_end",
+          "type": "timestamps (the bucket; part of metric_key)"
+        },
+        {
+          "name": "dimensions",
+          "type": "geo, device, ... (allowlisted; part of metric_key)"
+        },
+        {
+          "name": "source",
+          "type": "enum(speed, batch) (part of metric_key; query picks per window)"
+        },
+        {
+          "name": "version",
+          "type": "int (monotonic; a higher batch version supersedes earlier rows)"
+        },
+        {
+          "name": "settled",
+          "type": "bool (true once batch has finalized the window)"
+        },
+        {
+          "name": "impressions / clicks",
+          "type": "bigint"
+        },
+        {
+          "name": "conversions / attributed_conversions",
+          "type": "bigint"
+        },
+        {
+          "name": "spend / revenue",
+          "type": "decimal"
+        },
+        {
+          "name": "computed_at",
+          "type": "timestamp (freshness indicator surfaced to the query API)"
+        }
+      ]
+    }
+  ],
+  "technologyChoices": [
+    {
+      "concern": "Edge event collector, validation, and abuse controls",
+      "steps": [
+        "ingest"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kong",
+          "icon": "assets/tech-icons/kong.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "HAProxy",
+          "icon": "assets/tech-icons/haproxy.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          },
+          {
+            "name": "WAF",
+            "icon": "assets/tech-icons/Arch_AWS-WAF_64.png"
+          },
+          {
+            "name": "Global Accelerator",
+            "icon": "assets/tech-icons/Arch_AWS-Global-Accelerator_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Load Balancing",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Armor",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Run",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "API Management",
+            "icon": "assets/tech-icons/10042-icon-service-API-Management-Services.svg"
+          },
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Application Gateway",
+            "icon": "assets/tech-icons/10076-icon-service-Application-Gateways.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A thin collector behind an API edge can terminate TLS, shape traffic, validate required fields, stamp consent context, and keep the hot path stateless.",
+        "The collector should still own event acceptance semantics: return 202 only after the event is durably appended to the replicated log."
+      ],
+      "makesIrrelevant": "A managed API edge with WAF, quota, request logs, and regional routing removes much of the custom reverse-proxy and edge rate-limit code."
+    },
+    {
+      "concern": "Durable event log and ingestion stream",
+      "steps": [
+        "ingest",
+        "speed",
+        "batch"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Redpanda",
+          "icon": "assets/tech-icons/redpanda.png"
+        },
+        {
+          "name": "Apache Pulsar",
+          "icon": "assets/tech-icons/pulsar.png"
+        },
+        {
+          "name": "NATS (JetStream)",
+          "icon": "assets/tech-icons/nats.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "MSK",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Streaming-for-Apache-Kafka_64.png"
+          },
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "Data Firehose",
+            "icon": "assets/tech-icons/Arch_Amazon-Data-Firehose_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Managed Service for Apache Kafka",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A replayable log fits billions of immutable events, multiple consumer groups, lag monitoring, and batch recovery from a bug.",
+        "A queue is simpler for discrete retries and DLQs, but long replay and partition-local stream processing are weaker."
+      ],
+      "makesIrrelevant": "A managed stream with retention, replication, lag metrics, and autoscaling integration removes most broker operations, partition reassignment, and disk-management work."
+    },
+    {
+      "concern": "Event schemas, compatibility checks, and quarantine",
+      "steps": [
+        "ingest",
+        "speed"
+      ],
+      "selfHosted": [
+        {
+          "name": "Confluent Schema Registry",
+          "icon": "assets/tech-icons/confluent.png"
+        },
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "RabbitMQ",
+          "icon": "assets/tech-icons/rabbitmq.png"
+        },
+        {
+          "name": "OpenSearch",
+          "icon": "assets/tech-icons/opensearch.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "AWS Glue Schema Registry",
+            "icon": "assets/tech-icons/Arch_AWS-Glue_64.png"
+          },
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "OpenSearch Service",
+            "icon": "assets/tech-icons/Arch_Amazon-OpenSearch-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Dataplex Universal Catalog",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "BigQuery",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Log Analytics",
+            "icon": "assets/tech-icons/00009-icon-service-Log-Analytics-Workspaces.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Strict schema validation protects downstream jobs from poison messages, but event producers still need a compatibility story for older SDKs.",
+        "Keeping rejected events searchable makes replay and advertiser support practical without polluting the accepted-event log."
+      ],
+      "makesIrrelevant": "A managed schema registry and DLQ/quarantine path remove the need for a custom schema-version table, ad hoc poison-message topics, and one-off replay scripts."
+    },
+    {
+      "concern": "Immutable raw event lake and replay storage",
+      "steps": [
+        "ingest",
+        "batch"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Hadoop HDFS",
+          "icon": "assets/tech-icons/hadoop.png"
+        },
+        {
+          "name": "Ceph",
+          "icon": "assets/tech-icons/ceph.png"
+        },
+        {
+          "name": "OpenStack Swift",
+          "icon": "assets/tech-icons/openstack.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "S3",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Storage-Service_64.png"
+          },
+          {
+            "name": "AWS Glue Data Catalog",
+            "icon": "assets/tech-icons/Arch_AWS-Glue_64.png"
+          },
+          {
+            "name": "Lake Formation",
+            "icon": "assets/tech-icons/Arch_AWS-Lake-Formation_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Storage",
+            "icon": "assets/tech-icons/Storage-512-color.png"
+          },
+          {
+            "name": "BigLake",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Dataplex Universal Catalog",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Blob Storage",
+            "icon": "assets/tech-icons/10781-icon-service-Blob-Page.svg"
+          },
+          {
+            "name": "Azure Data Lake Storage",
+            "icon": "assets/tech-icons/10090-icon-service-Data-Lake-Storage-Gen1.svg"
+          },
+          {
+            "name": "Azure Synapse Analytics",
+            "icon": "assets/tech-icons/00606-icon-service-Azure-Synapse-Analytics.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Object storage is the right source of truth for months or years of raw events: cheap, durable, partitionable, and independent from the hot log retention window.",
+        "The cost is operational discipline around partition layout, compaction, deletion keys, and table/catalog evolution."
+      ],
+      "makesIrrelevant": "A managed data lake with a catalog and access policy layer removes most hand-maintained file inventory, retention sweep, and raw-event discovery logic."
+    },
+    {
+      "concern": "Stream processing, event-time windows, and watermarks",
+      "steps": [
+        "speed",
+        "dedup",
+        "attribution"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Flink",
+          "icon": "assets/tech-icons/flink.png"
+        },
+        {
+          "name": "Apache Spark",
+          "icon": "assets/tech-icons/spark.png"
+        },
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Redpanda",
+          "icon": "assets/tech-icons/redpanda.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Managed Service for Apache Flink",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Service-for-Apache-Flink_64.png"
+          },
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "EMR",
+            "icon": "assets/tech-icons/Arch_Amazon-EMR_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Dataproc",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Stream Analytics",
+            "icon": "assets/tech-icons/00042-icon-service-Stream-Analytics-Jobs.svg"
+          },
+          {
+            "name": "Azure Databricks",
+            "icon": "assets/tech-icons/10787-icon-service-Azure-Databricks.svg"
+          },
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Flink-style event-time processing is strong for watermarks, keyed state, idempotent sinks, and large attribution windows.",
+        "Spark streaming can share code with batch recompute, but micro-batch latency and state handling must still meet the seconds-fresh dashboard target."
+      ],
+      "makesIrrelevant": "A managed stream processor with checkpoints and state backends removes much of the custom offset, timer, watermark, and restart bookkeeping."
+    },
+    {
+      "concern": "Dedup and recent-click state store",
+      "steps": [
+        "dedup",
+        "attribution"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "Apache Cassandra",
+          "icon": "assets/tech-icons/cassandra.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Table Storage",
+            "icon": "assets/tech-icons/10086-icon-service-Storage-Accounts.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "In-memory state gives fast set-if-not-exists and click lookup, but persistence and failover decide how much dedup/attribution accuracy survives a restart.",
+        "Wide-column or managed KV stores handle multi-day click-state retention better, at the cost of higher per-lookup latency and explicit hot-key design."
+      ],
+      "makesIrrelevant": "A store with conditional writes, TTL, and durable replication removes custom cleanup jobs and most hand-rolled dedup lock tables."
+    },
+    {
+      "concern": "Batch recompute, backfill, and correction jobs",
+      "steps": [
+        "attribution",
+        "batch",
+        "serve"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Spark",
+          "icon": "assets/tech-icons/spark.png"
+        },
+        {
+          "name": "Apache Flink",
+          "icon": "assets/tech-icons/flink.png"
+        },
+        {
+          "name": "Apache Airflow",
+          "icon": "assets/tech-icons/airflow.png"
+        },
+        {
+          "name": "ClickHouse",
+          "icon": "assets/tech-icons/clickhouse.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "EMR",
+            "icon": "assets/tech-icons/Arch_Amazon-EMR_64.png"
+          },
+          {
+            "name": "AWS Glue",
+            "icon": "assets/tech-icons/Arch_AWS-Glue_64.png"
+          },
+          {
+            "name": "Athena",
+            "icon": "assets/tech-icons/Arch_Amazon-Athena_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Dataproc",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "BigQuery",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Cloud Composer",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Databricks",
+            "icon": "assets/tech-icons/10787-icon-service-Azure-Databricks.svg"
+          },
+          {
+            "name": "Azure Synapse Analytics",
+            "icon": "assets/tech-icons/00606-icon-service-Azure-Synapse-Analytics.svg"
+          },
+          {
+            "name": "Azure Batch",
+            "icon": "assets/tech-icons/10031-icon-service-Batch-Accounts.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Batch jobs trade freshness for determinism: they can reread raw events, apply fixed code, re-attribute conversions, and publish a new settled version.",
+        "Using the same engine for stream and batch reduces semantic drift, but operational isolation matters so a backfill cannot starve the live pipeline."
+      ],
+      "makesIrrelevant": "A managed batch platform with autoscaling workers, catalog integration, and job history removes most custom cluster-provisioning and backfill-run bookkeeping."
+    },
+    {
+      "concern": "OLAP metrics store and pre-aggregated rollups",
+      "steps": [
+        "speed",
+        "batch",
+        "serve"
+      ],
+      "selfHosted": [
+        {
+          "name": "ClickHouse",
+          "icon": "assets/tech-icons/clickhouse.png"
+        },
+        {
+          "name": "OpenSearch",
+          "icon": "assets/tech-icons/opensearch.png"
+        },
+        {
+          "name": "Elasticsearch",
+          "icon": "assets/tech-icons/elasticsearch.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Redshift",
+            "icon": "assets/tech-icons/Arch_Amazon-Redshift_64.png"
+          },
+          {
+            "name": "Timestream",
+            "icon": "assets/tech-icons/Arch_Amazon-Timestream_64.png"
+          },
+          {
+            "name": "Athena",
+            "icon": "assets/tech-icons/Arch_Amazon-Athena_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "BigQuery",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Looker",
+            "icon": "assets/tech-icons/BusinessIntelligence-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Synapse Analytics",
+            "icon": "assets/tech-icons/00606-icon-service-Azure-Synapse-Analytics.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Columnar OLAP stores make campaign/time/dimension rollups cheap to scan and aggregate, but they need explicit dimension allowlists and idempotent write keys.",
+        "Search engines can serve exploratory slices and text filters, but billing metrics should still come from versioned aggregate rows."
+      ],
+      "makesIrrelevant": "A managed OLAP warehouse with partitioning, compression, and query governance removes much of the shard-management and aggregate-cache plumbing."
+    },
+    {
+      "concern": "Dashboard query API, result cache, and tenant throttling",
+      "steps": [
+        "serve"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kong",
+          "icon": "assets/tech-icons/kong.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          },
+          {
+            "name": "CloudFront",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudFront_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Endpoints",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud CDN",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "API Management",
+            "icon": "assets/tech-icons/10042-icon-service-API-Management-Services.svg"
+          },
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Caching settled windows and enforcing dimension/query allowlists protects the OLAP store from dashboard fanout and tenant abuse.",
+        "The cache must key on advertiser, metric, dimension set, window, source, version, and settlement state so provisional data never masquerades as final."
+      ],
+      "makesIrrelevant": "Managed API and cache services remove most custom per-tenant throttling, CDN invalidation, and cache-node failover work."
+    },
+    {
+      "concern": "Workflow orchestration and settlement publishing",
+      "steps": [
+        "batch",
+        "serve"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Airflow",
+          "icon": "assets/tech-icons/airflow.png"
+        },
+        {
+          "name": "Temporal",
+          "icon": "assets/tech-icons/temporal.png"
+        },
+        {
+          "name": "Kubernetes",
+          "icon": "assets/tech-icons/kubernetes.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "MWAA",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Workflows-for-Apache-Airflow_64.png"
+          },
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Composer",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Logic Apps",
+            "icon": "assets/tech-icons/10363-icon-service-Logic-Apps-Custom-Connector.svg"
+          },
+          {
+            "name": "Durable Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          },
+          {
+            "name": "Azure Automation",
+            "icon": "assets/tech-icons/00022-icon-service-Automation-Accounts.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A scheduler is enough for periodic recompute, but settlement needs durable run metadata, approvals, retries, and a clear marker that tells serving which version is authoritative.",
+        "Workflow engines make retries and compensation explicit, but the metric rows and invoice references still need immutable version keys."
+      ],
+      "makesIrrelevant": "A managed orchestrator with durable history, schedules, and event triggers removes custom cron coordinators, lock tables, and manual settlement runbooks."
+    },
+    {
+      "concern": "Observability, audit logging, and data quality SLOs",
+      "steps": [
+        "ingest",
+        "speed",
+        "dedup",
+        "attribution",
+        "batch",
+        "serve"
+      ],
+      "selfHosted": [
+        {
+          "name": "Prometheus",
+          "icon": "assets/tech-icons/prometheus.png"
+        },
+        {
+          "name": "Grafana",
+          "icon": "assets/tech-icons/grafana.png"
+        },
+        {
+          "name": "Jaeger",
+          "icon": "assets/tech-icons/jaeger.png"
+        },
+        {
+          "name": "OpenSearch",
+          "icon": "assets/tech-icons/opensearch.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "X-Ray",
+            "icon": "assets/tech-icons/Arch_AWS-X-Ray_64.png"
+          },
+          {
+            "name": "Managed Grafana",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Grafana_64.png"
+          },
+          {
+            "name": "Managed Service for Prometheus",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Service-for-Prometheus_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Logging",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Trace",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Profiler",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Application Insights",
+            "icon": "assets/tech-icons/00012-icon-service-Application-Insights.svg"
+          },
+          {
+            "name": "Log Analytics",
+            "icon": "assets/tech-icons/00009-icon-service-Log-Analytics-Workspaces.svg"
+          },
+          {
+            "name": "Azure Managed Grafana",
+            "icon": "assets/tech-icons/02905-icon-service-Azure-Managed-Grafana.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Throughput alone is not enough: accepted-event loss, consumer lag, watermark delay, duplicate-drop rate, late-event rate, attribution match rate, and batch-settlement freshness need explicit SLOs.",
+        "Audit logs should preserve who changed schemas, replayed events, approved corrections, or published a settlement version."
+      ],
+      "makesIrrelevant": "Managed telemetry with metrics, traces, logs, alerting, and retention controls removes much of the custom dashboard and pipeline-health scraping code."
     }
   ],
   "patterns": [
@@ -497,7 +1499,7 @@
       "title": "1. Naive: Increment a Counter Row Per Event (the baseline)",
       "description": [
         "Start with the simplest thing that works. When an event arrives, the collector synchronously does an UPDATE that increments a counter row in the metrics store (clicks++ for this campaign), and dashboards read those rows directly.",
-        "This is correct at low volume and exposes three problems the rest of the design exists to solve. First, a synchronous increment per event can't keep up with ~1M events/sec — the hot counter rows become a write bottleneck and ingestion stalls or drops events the moment processing falls behind. Second, ingestion is at-least-once: a retried or double-fired event increments the counter twice, so billed clicks are over-counted with no way to tell. Third, once a number is added into a counter the raw event is gone, so a counting bug can never be reprocessed out of history.",
+        "This is correct at low volume and exposes three problems the rest of the design exists to solve. First, a synchronous increment per event can't keep up with ~1M events/sec — and the load isn't even: one popular campaign's row can take tens of thousands of increments/sec — a single hot row that read replicas can't help, because the contention is on writes. The hot counter rows become a write bottleneck and ingestion stalls or drops events the moment processing falls behind. Second, ingestion is at-least-once: a retried or double-fired event increments the counter twice, so billed clicks are over-counted with no way to tell. Third, once a number is added into a counter the raw event is gone, so a counting bug can never be reprocessed out of history.",
         "So the baseline motivates everything that follows: accept events into a durable, replayable log first, count asynchronously with idempotent dedup, and keep the raw events so a batch layer can recompute accurate, billing-grade numbers."
       ],
       "view": {
@@ -523,7 +1525,8 @@
       ],
       "probeLinks": [
         "kafka-design",
-        "prometheus-docs"
+        "prometheus-docs",
+        "iab-click-guidelines"
       ],
       "recap": {
         "before": "Nothing.",
@@ -536,14 +1539,17 @@
           "why": "It bottlenecks at the firehose, double-counts at-least-once retries, and discards the raw events needed to fix history.",
           "instead": "Append events to a durable log, count asynchronously with idempotent dedup, and keep raw events for batch recompute."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/01-naive.jpg"
     },
     {
       "id": "ingest",
       "title": "2. Durable High-Throughput Ingestion",
       "description": [
-        "A lightweight edge collector validates and enriches each event and appends it to a durable, partitioned event log (Kafka-style). The collector does almost no work so it can absorb ~1M events/sec.",
-        "The log decouples producers from consumers: ingestion never blocks on downstream processing, and many consumers can read independently at their own pace. Partition by a key (e.g. ad/campaign id) for parallelism and ordering within a partition.",
+        "A lightweight edge collector validates and enriches each event and appends it to a durable, partitioned event log (Kafka-style). The collector does almost no work so it can absorb ~1M events/sec, batching and compressing appends for throughput.",
+        "Acceptance has a precise boundary: an event is 'accepted' only once it is replicated to the log (acked by a quorum of replicas), not merely received by the collector. The collector returns 202 only after that ack, so a billed event is durable before the client stops retrying. Producers/collectors carry a stable event_id so a producer retry after a lost ack is deduplicated downstream rather than counted twice.",
+        "The log decouples producers from consumers: ingestion never blocks on downstream processing, and many consumers can read independently at their own pace. Partition by a key (e.g. campaign id) for parallelism and ordering within a partition — but large campaigns hot-key a single partition, so salt the key (campaign_id + bucket) or repartition for aggregation, keeping ordering only where it's actually needed.",
+        "Validate schema at the edge and route invalid, malformed, or schema-incompatible events to a DLQ/quarantine rather than dropping them, so they can be fixed and replayed. Rate-limit per advertiser/source to contain abusive or runaway producers.",
         "Also tee the raw events into an immutable data lake — the system of record that makes later reprocessing possible."
       ],
       "view": {
@@ -551,13 +1557,15 @@
           "Client",
           "Collector",
           "Log",
-          "RawStore"
+          "RawStore",
+          "DLQ"
         ],
-        "caption": "The client's events hit the edge collector, which appends them to the Kafka event log that also archives raw events to the data lake.",
+        "caption": "The client's events hit the edge collector, which appends valid events to the Kafka log (archived raw to the data lake) and routes invalid/schema-incompatible events to a DLQ.",
         "links": [
           "client-collector",
           "collector-log",
-          "log-raw"
+          "log-raw",
+          "collector-dlq"
         ],
         "highlight": [
           "Collector",
@@ -567,13 +1575,13 @@
           "ingest"
         ]
       },
-      "decisionPrompt": "Why put a log between the collector and the processors instead of processing events inline?",
+      "decisionPrompt": "Why put a log between the collector and the processors instead of processing events inline, and when exactly is an event 'accepted'?",
       "concepts": [
         {
           "term": "Durable event log",
           "definition": "An append-only, partitioned, replicated, replayable stream of events.",
           "whyItMatters": "Decouples ingestion from processing and enables replay — the backbone of the pipeline.",
-          "example": "Kafka topic partitioned by ad_id, retained for days, consumed by stream + archived to a lake.",
+          "example": "Kafka topic partitioned by salted campaign_id, retained for days, consumed by stream + archived to a lake.",
           "group": "Durable High-Throughput Ingestion"
         }
       ],
@@ -581,7 +1589,13 @@
         "kafka-design",
         "flink-docs",
         "beam-guide",
-        "dataflow-paper"
+        "dataflow-paper",
+        "linkedin-samza",
+        "druid-kafka-ingestion",
+        "iceberg-evolution",
+        "openlineage",
+        "deequ-paper",
+        "iab-gpp"
       ],
       "patterns": [
         "Durable event log (Kafka)"
@@ -591,7 +1605,7 @@
       ],
       "recap": {
         "before": "Nothing.",
-        "after": "Events durably accepted and buffered, decoupled from processing.",
+        "after": "Events durably accepted (replicated to the log) and buffered, decoupled from processing; invalid events quarantined.",
         "newRisk": "Raw events aren't metrics yet — need processing, and counts must handle duplicates."
       },
       "traps": [
@@ -599,29 +1613,43 @@
           "trap": "Doing aggregation synchronously in the collector.",
           "why": "Ties ingestion throughput/availability to processing; a slow consumer drops events.",
           "instead": "Accept fast to a durable log; process asynchronously."
+        },
+        {
+          "trap": "Acking the client before the event is replicated to the log.",
+          "why": "A collector crash after the ack loses an accepted, billable event — durability is a lie.",
+          "instead": "Return 202 only after a quorum ack; rely on the stable event_id to dedup producer retries."
+        },
+        {
+          "trap": "Storing raw identifiers and ignoring consent at ingest.",
+          "why": "Ad events carry PII-adjacent identity; raw events live for months for billing audit. Storing un-minimized data, or joining identity without consent, breaks privacy law and downstream erasure obligations.",
+          "instead": "Minimize at the edge: pseudonymize/hash user ids, drop fields the advertiser may not measure, and stamp a consent flag. Attribution only joins identity when ad_measurement consent is present; non-consented events still count aggregate impressions/clicks but fall back to unattributed. Partition the lake by a deletion key so erasure requests are a partition rewrite, not a full scan."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/02-ingest.jpg"
     },
     {
       "id": "speed",
       "title": "3. Speed Layer: Real-Time Metrics",
       "description": [
         "A stream processor consumes the log continuously and maintains windowed aggregates (clicks/impressions per campaign per minute), writing them to the OLAP store within seconds.",
-        "This is the speed layer: fast and fresh, but approximate — it may miss late-arriving events or contain duplicates not yet reconciled.",
-        "Use tumbling/sliding time windows keyed by campaign+dimensions; emit incremental updates so dashboards move in near-real-time."
+        "Aggregate by event time (when it happened on the client), not processing time (when we saw it) — clients retry and buffer, so events arrive out of order. A watermark tracks how far event time has advanced; a window stays open until the watermark passes its end plus an allowed-lateness grace, then emits. Events later than that are routed to correction/quarantine rather than silently dropped or folded into the wrong window. Introducing event time, watermarks, and a late-arrival policy here is what makes dedup, attribution windows, and 'closed' batch windows coherent downstream.",
+        "This is the speed layer: fast and fresh, but explicitly approximate — it may miss late-arriving events or contain duplicates not yet reconciled; batch is the authority.",
+        "Use tumbling/sliding time windows keyed by campaign+dimensions; write to OLAP as incremental idempotent upserts keyed by (metric_key, window, source, version), not blind increments, so a re-emitted window doesn't double-count."
       ],
       "view": {
         "nodes": [
           "Log",
           "Stream",
           "OLAP",
-          "ServeAPI"
+          "ServeAPI",
+          "DLQ"
         ],
-        "caption": "The stream processor consumes the Kafka log and writes real-time aggregates into the OLAP store, which the dashboard API queries.",
+        "caption": "The stream processor consumes the Kafka log and writes real-time aggregates into the OLAP store the dashboard API queries; events later than the allowed-lateness grace are routed to the DLQ/correction path instead of folded into the wrong window.",
         "links": [
           "log-stream",
           "stream-olap",
-          "serve-olap"
+          "serve-olap",
+          "stream-dlq"
         ],
         "highlight": [
           "Stream"
@@ -639,13 +1667,26 @@
           "whyItMatters": "Turns an unbounded stream into bounded, queryable rollups.",
           "example": "Per-minute click counts per campaign, updated as events arrive.",
           "group": "Speed Layer: Real-Time Metrics"
+        },
+        {
+          "term": "Event time & watermarks",
+          "definition": "Aggregate by when an event happened (event time), and track progress with a watermark that says 'event time has advanced past T'.",
+          "whyItMatters": "Out-of-order, retried events would otherwise land in the wrong window; the watermark decides when a window can close and what counts as 'late'.",
+          "example": "A click stamped 10:00:03 that arrives at 10:00:09 still lands in the 10:00 window; one arriving past the allowed-lateness grace is sent to correction.",
+          "group": "Speed Layer: Real-Time Metrics"
         }
       ],
       "probeLinks": [
         "kafka-design",
         "flink-docs",
         "beam-guide",
-        "dataflow-paper"
+        "dataflow-paper",
+        "flink-streaming-analytics",
+        "flink-fault-tolerance",
+        "millwheel-paper",
+        "uber-ad-flink-pinot",
+        "linkedin-samza",
+        "netflix-mantis"
       ],
       "patterns": [
         "Stream processing (speed layer)"
@@ -657,15 +1698,17 @@
         "before": "Only raw events.",
         "after": "Seconds-fresh approximate metrics queryable now.",
         "newRisk": "Retries/duplicates over-count; late events are missed — correctness needs more."
-      }
+      },
+      "aiVisual": "assets/generated/ai-visuals/steps/03-speed.jpg"
     },
     {
       "id": "dedup",
       "title": "4. Deduplicate for Correct Counts",
       "description": [
         "Ingestion is at-least-once: network retries and client re-fires mean the same event can appear multiple times. Counting naively over-counts clicks — and clicks are billed.",
-        "Give each event a stable event id. The stream processor checks a dedup store (a seen-id set, often a Bloom filter or RocksDB-backed keyed state) and ignores ids it has already counted — effectively-once counting.",
-        "Bound the dedup window (you can't remember every id forever); the batch layer provides the exact, full-history dedup as the backstop."
+        "Give each event a stable event id. The stream processor checks a dedup store (a RocksDB-backed keyed seen-set, or a Bloom filter for the approximate variant) and ignores ids it has already counted. Be precise about the guarantee: this is exactly-once within the bounded dedup window, not global exactness. End-to-end correctness needs more than the dedup store — it also depends on the processor committing the log offset, the dedup state, and the OLAP write together so a crash can't double-count.",
+        "Crash recovery: keyed state and consumed offsets are checkpointed together; on restart the processor resumes from the last checkpoint and replays the log forward. Because OLAP writes are idempotent upserts keyed by (metric_key, window, source, version), replaying the same events after a crash re-applies the same rows instead of incrementing again — so 'count once' survives a failure, not just a happy path.",
+        "Bound the dedup window (you can't remember every id forever) — its size sets the keyed-state cost (distinct ids in the window x ~50-100B/entry, tens of GB at this scale). The batch layer provides the exact, full-history dedup as the backstop for duplicates older than the window."
       ],
       "view": {
         "nodes": [
@@ -720,7 +1763,8 @@
             "groups": [
               "speed-layer"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-dedup-opt1.jpg"
         },
         {
           "name": "Probabilistic dedup (Bloom filter)",
@@ -758,7 +1802,8 @@
             "highlight": [
               "Bloom"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-dedup-opt2.jpg"
         },
         {
           "name": "No real-time dedup; rely on batch only",
@@ -787,24 +1832,31 @@
             "highlight": [
               "Stream"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-dedup-opt3.jpg"
         }
       ],
       "decisionPrompt": "A click event is delivered twice. How do you make sure the advertiser is billed once?",
       "concepts": [
         {
           "term": "Idempotent dedup",
-          "definition": "Skip events whose id has already been processed.",
-          "whyItMatters": "Converts at-least-once delivery into correct, exactly-once counts.",
-          "example": "Bloom filter of seen event ids per window; a repeat id is dropped.",
+          "definition": "Skip events whose id has already been processed, within a bounded window.",
+          "whyItMatters": "Converts at-least-once delivery into exactly-once counts within the dedup window; combined with idempotent OLAP writes and checkpointed offsets, it survives crashes. Global exactness is the batch layer's job.",
+          "example": "Checkpointed keyed seen-set of event ids per window; a repeat id is dropped, and a crash-replay re-upserts the same rows rather than re-incrementing.",
           "group": "Deduplicate for Correct Counts"
         }
       ],
       "probeLinks": [
         "kafka-design",
+        "kafka-semantics",
         "flink-docs",
         "beam-guide",
-        "dataflow-paper"
+        "dataflow-paper",
+        "flink-fault-tolerance",
+        "millwheel-paper",
+        "uber-ad-flink-pinot",
+        "iab-click-guidelines",
+        "iab-ivt-guidelines"
       ],
       "patterns": [
         "Idempotent dedup"
@@ -814,14 +1866,19 @@
       ],
       "recap": {
         "before": "Counts inflated by duplicates.",
-        "after": "Effectively-once counts in real time.",
-        "newRisk": "Approximate dedup over a window isn't perfect; conversions span events — need attribution and an exact backstop."
+        "after": "Exactly-once counts within the dedup window, crash-safe via checkpointed state + idempotent OLAP writes.",
+        "newRisk": "Window-bounded, not global; conversions span events — need attribution and the batch exact backstop."
       },
       "traps": [
         {
           "trap": "Assuming the message bus gives exactly-once for free.",
           "why": "Most pipelines are at-least-once at the edges; producers retry.",
           "instead": "Make counting idempotent on a stable event id; reconcile exactly in batch."
+        },
+        {
+          "trap": "Treating dedup as the only thing that protects billed counts.",
+          "why": "Dedup removes accidental retries, but bots, click spam, and click farms are distinct events with valid ids — they pass dedup and inflate billed clicks. Invalid traffic can also be confirmed after a window already settled.",
+          "instead": "Add an invalid-traffic filter alongside dedup (rate/velocity per device/IP, suspicious patterns, known-bot lists): flag-and-exclude in the speed layer, re-score in batch, and emit a post-settlement invalid-traffic adjustment (a negative correction version) advertisers can see, rather than silently editing a settled number."
         }
       ],
       "flows": [
@@ -874,7 +1931,7 @@
                     "from": "Stream",
                     "to": "OLAP",
                     "arrow": "->>",
-                    "label": "increment windowed count"
+                    "label": "idempotent upsert: window aggregate (source=speed, version)"
                   }
                 ],
                 "else": {
@@ -909,24 +1966,27 @@
       "title": "5. Attribution: Credit Clicks for Conversions",
       "description": [
         "Advertisers care about conversions (a purchase), which happen later than and separately from the click. Attribution joins a conversion back to the click/campaign that drove it, within an attribution window (e.g. 7 days).",
-        "This is a stateful, time-windowed join across event types and time — heavier than counting. The stream layer can do near-real-time attribution for recent windows; longer windows and corrections are done in batch over raw events.",
-        "Define the model explicitly (last-click, first-click, multi-touch) — it changes who gets credit and the numbers advertisers see."
+        "Define the matching key and identity up front: a conversion is matched to recent clicks by user/session/click id, and only when consent permits ad measurement. On the hot path the attribution service holds recent clicks in a keyed, time-windowed click-state store and matches an incoming conversion in near real time — it does not do a per-conversion lookup into the raw object store, which is a batch/backfill path, not seconds-latency serving.",
+        "Size the state deliberately: holding 7 days of clicks is the dominant hot-path footprint — ~1-1.7B clicks/day x 7d x ~100-200B/entry ≈ ~1-2 TB, far larger than the dedup window's tens of GB. It is sharded by match key, TTL'd at the window edge, and spilled to RocksDB rather than kept purely in RAM. Shorten the window and you shrink state but miss more late conversions (which batch then recovers); lengthen it and the hot path gets expensive.",
+        "Define the model explicitly (last-click, first-click, multi-touch) — it changes who gets credit and the numbers advertisers see. Write the result as an explicit credited_conversion record (not an implied OLAP increment) so re-attribution is idempotent.",
+        "Handle the edge cases: no matching click (record as unattributed), multiple candidate clicks (the model breaks the tie), a conversion later than the in-memory window (batch re-attribution corrects it), an attribution-model change (re-run over raw, don't mutate live state), and consent-limited identity (fall back to unattributed)."
       ],
       "view": {
         "nodes": [
           "Stream",
           "AttrSvc",
-          "RawStore",
+          "ClickState",
           "OLAP"
         ],
-        "caption": "The stream processor calls the attribution service, which joins clicks to conversions by reading click events from the raw store, then writes credited results to OLAP.",
+        "caption": "The stream processor calls the attribution service, which matches each conversion against recent clicks in the keyed click-state store, then writes credited results to OLAP. Raw-store reads are reserved for batch re-attribution.",
         "links": [
           "stream-attr",
-          "attr-raw",
+          "attr-clickstate",
           "stream-olap"
         ],
         "highlight": [
-          "AttrSvc"
+          "AttrSvc",
+          "ClickState"
         ],
         "groups": [
           "speed-layer"
@@ -935,10 +1995,10 @@
       "options": [
         {
           "name": "Stateful streaming windowed join (default)",
-          "description": "The stream layer holds recent clicks in keyed, time-windowed state and joins each incoming conversion to its matching click in near real time.",
+          "description": "The attribution service holds recent clicks in a keyed, time-windowed click-state store and matches each incoming conversion to its click in near real time — no per-conversion raw-store lookup on the hot path.",
           "pros": [
             "Near-real-time: a conversion is credited to its click within seconds, not the next batch run.",
-            "Keyed, time-windowed state in the stream layer joins conversions to recent clicks directly.",
+            "Keyed, time-windowed click state matches conversions to recent clicks with an in-process/local lookup, not a data-lake scan.",
             "Dashboards show fresh ROI/conversion numbers for open windows."
           ],
           "cons": [
@@ -950,22 +2010,24 @@
             "nodes": [
               "Stream",
               "AttrSvc",
-              "RawStore",
+              "ClickState",
               "OLAP"
             ],
-            "caption": "The attribution service performs a windowed click-to-conversion join, reading prior click events from the raw store, while the stream writes aggregates to OLAP.",
+            "caption": "The attribution service performs a windowed click-to-conversion join against recent-click keyed state, while the stream writes credited aggregates to OLAP.",
             "links": [
               "stream-attr",
-              "attr-raw",
+              "attr-clickstate",
               "stream-olap"
             ],
             "highlight": [
-              "AttrSvc"
+              "AttrSvc",
+              "ClickState"
             ],
             "groups": [
               "speed-layer"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-attribution-opt1.jpg"
         },
         {
           "name": "Batch-only attribution over raw events",
@@ -1005,7 +2067,8 @@
             "highlight": [
               "Batch"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-attribution-opt2.jpg"
         }
       ],
       "decisionPrompt": "A user clicks an ad Monday and buys Thursday. How do you credit the campaign, and what's the state cost?",
@@ -1022,7 +2085,12 @@
         "kafka-design",
         "flink-docs",
         "beam-guide",
-        "dataflow-paper"
+        "dataflow-paper",
+        "flink-streaming-analytics",
+        "uber-ad-flink-pinot",
+        "google-conversion-windows",
+        "google-ads-attribution-reports",
+        "iab-gpp"
       ],
       "patterns": [
         "Windowed attribution"
@@ -1041,8 +2109,9 @@
       "title": "6. Batch Layer: Accurate, Reprocessable Metrics",
       "description": [
         "Periodically reprocess the immutable raw events end-to-end to produce billing-grade metrics: full dedup, complete attribution windows, and late-arriving events all included.",
-        "Batch results overwrite the speed layer's approximate numbers for the same windows (lambda-architecture reconciliation): real-time numbers are provisional, batch numbers are authoritative.",
-        "Because the raw events are immutable and replayable, a processing bug is fixed by re-running batch over history — no data loss, just recompute."
+        "Batch results overwrite the speed layer's approximate numbers for the same windows (lambda-architecture reconciliation): real-time numbers are provisional, batch numbers are authoritative. 'Overwrite' is precise: batch writes metric rows keyed by (metric_key, window, source=batch, version), validates them (totals within sanity bounds vs the prior version), and only then publishes a settlement marker for the window. The query layer reads the marker to switch a window from speed to batch — it never mixes stale and fresh rows mid-flight.",
+        "Size the run: a full day is ~10-15 TB compressed (~34 TB raw) over ~86B events, so a daily reprocess must finish well inside the next day (single-digit hours on a scaled cluster) to keep settlement caught up; a multi-day backfill after a bug fix can run far longer and must not block the nightly close. Isolate replays from live serving: a backfill writes new versioned rows (or a shadow table) on a separate compute pool and is promoted atomically by bumping the settled version, so a long recompute can't corrupt the numbers advertisers are currently reading, and the nightly settlement job keeps running alongside it.",
+        "Because the raw events are immutable and replayable, a processing bug is fixed by re-running batch over history — no data loss, just recompute — and the audit trail (which version produced which billed number) is preserved."
       ],
       "view": {
         "nodes": [
@@ -1051,7 +2120,7 @@
           "OLAP",
           "ServeAPI"
         ],
-        "caption": "The batch processor replays the raw event store to recompute and overwrite corrected aggregates in the OLAP store the dashboard API serves.",
+        "caption": "The batch processor replays the raw event store to recompute corrected aggregates, writes them as a new batch version in the OLAP store, and settles the window the dashboard API serves.",
         "links": [
           "log-batch",
           "batch-olap",
@@ -1067,15 +2136,15 @@
       "options": [
         {
           "name": "Lambda: separate batch + speed layers (default)",
-          "description": "A streaming speed layer serves fresh provisional metrics while a separate batch layer recomputes the same metrics from raw events and overwrites them.",
+          "description": "A streaming speed layer serves fresh provisional metrics while a separate batch layer recomputes the same metrics from raw events, writes a higher batch version, and publishes a settlement marker that supersedes the speed rows.",
           "pros": [
-            "Speed layer gives fresh provisional numbers; batch overwrites them with billing-grade accuracy.",
+            "Speed layer gives fresh provisional numbers; batch writes a billing-grade version and settles the window.",
             "A processing bug is fixed by re-running batch over immutable raw events — no data lost.",
             "Each layer is tuned independently: stream for latency, batch for completeness."
           ],
           "cons": [
             "Two codebases compute the same metrics, so logic can drift between speed and batch.",
-            "Serving must reconcile two sources and hide the seam where batch overwrites speed.",
+            "Serving must reconcile two sources and hide the seam where the settled batch version supersedes speed.",
             "Operational overhead of running and monitoring both a streaming and a batch stack."
           ],
           "view": {
@@ -1085,7 +2154,7 @@
               "OLAP",
               "ServeAPI"
             ],
-            "caption": "The batch processor reprocesses the raw store and overwrites corrected aggregates in OLAP, running alongside the speed layer that serves the dashboard API.",
+            "caption": "The batch processor reprocesses the raw store, writes a new versioned batch rollup in OLAP, and settles the window, running alongside the speed layer that serves the dashboard API.",
             "links": [
               "log-batch",
               "batch-olap",
@@ -1097,7 +2166,8 @@
             "groups": [
               "batch-layer"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-batch-opt1.jpg"
         },
         {
           "name": "Kappa: single replayable stream layer",
@@ -1131,7 +2201,8 @@
             "groups": [
               "speed-layer"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-batch-opt2.jpg"
         }
       ],
       "decisionPrompt": "You discover the click counter double-counted a class of events for a week. How do you fix history?",
@@ -1140,7 +2211,7 @@
           "term": "Lambda / kappa reconciliation",
           "definition": "Pair a fast approximate stream layer with an accurate batch (or replay) layer that corrects it.",
           "whyItMatters": "Delivers both freshness and correctness, and makes bugs recoverable.",
-          "example": "Batch overwrites today's hourly rollups once the day is complete.",
+          "example": "Once a day is complete, batch writes a higher-versioned rollup and publishes a settlement marker that supersedes the speed rows.",
           "group": "Batch Layer: Accurate, Reprocessable Metrics"
         }
       ],
@@ -1148,7 +2219,12 @@
         "kafka-design",
         "flink-docs",
         "beam-guide",
-        "dataflow-paper"
+        "dataflow-paper",
+        "millwheel-paper",
+        "iceberg-evolution",
+        "openlineage",
+        "deequ-paper",
+        "linkedin-pinot"
       ],
       "patterns": [
         "Batch reprocessing (batch layer)"
@@ -1161,6 +2237,13 @@
         "after": "Authoritative batch metrics; history is recomputable.",
         "newRisk": "Two sources for the same metric — queries must know which to trust; serving must hide the seam."
       },
+      "traps": [
+        {
+          "trap": "Mutating settled numbers in place when a recompute changes a billed figure.",
+          "why": "Advertisers were already invoiced from a specific version. Silently overwriting it destroys the audit trail and surprises billing — they can't see what changed or why.",
+          "instead": "Keep every version immutable and append corrections as a new version. Record which metric version produced each invoice, who approved a correction, and surface the delta (old → new, reason) to the advertiser rather than letting the number quietly drift."
+        }
+      ],
       "failureDrills": [
         {
           "scenario": "The stream processor crashes and loses in-memory windows.",
@@ -1204,13 +2287,19 @@
                 "from": "Batch",
                 "to": "OLAP",
                 "arrow": "->>",
-                "label": "overwrite rollups (source=batch, authoritative)"
+                "label": "write batch version (source=batch, version+1)"
+              },
+              {
+                "from": "Batch",
+                "to": "Batch",
+                "arrow": "->>",
+                "label": "validate totals vs prior version"
               },
               {
                 "from": "Batch",
                 "to": "OLAP",
                 "arrow": "-->>",
-                "label": "closed window settled"
+                "label": "publish settlement marker (window settled)"
               }
             ]
           },
@@ -1225,8 +2314,8 @@
       "title": "7. Serve: Pre-Aggregation and Query",
       "description": [
         "Dashboards can't scan billions of raw events per query. Store pre-aggregated rollups by time bucket and dimension in an OLAP/columnar store; queries read materialized aggregates and are fast.",
-        "The query API merges the two sources cleanly: serve batch (authoritative) numbers for closed windows and speed-layer (provisional) numbers for the current, still-open window — so users see fresh data that later settles to exact.",
-        "Roll up at multiple granularities (minute -> hour -> day) and pre-compute common dimension slices to keep queries cheap."
+        "Make the merge deterministic with the row-key/source/version model: each rollup row is keyed by (metric_key, window, source, version) and the per-window settlement marker tells the query API which source to trust. For settled windows it returns the batch rows (authoritative); for the current open window it returns speed rows (provisional) — and it stamps each bucket with a source/settled/computed_at freshness marker so the UI can show 'finalizing' vs 'final' instead of silently contradicting itself when numbers settle.",
+        "Bound cost and cardinality: pre-aggregate only an allowlist of dimensions; reject or down-sample queries that slice by un-allowlisted high-cardinality dimensions, falling back to a slower raw/columnar scan with a row/time limit. Roll up at multiple granularities (minute -> hour -> day) and enforce per-query limits (max range, max group-by cardinality) so one advertiser's broad slice can't melt the serving tier."
       ],
       "view": {
         "nodes": [
@@ -1263,8 +2352,15 @@
         }
       ],
       "probeLinks": [
-        "kafka-design",
-        "prometheus-docs"
+        "druid-paper",
+        "snowflake-paper",
+        "prometheus-docs",
+        "linkedin-pinot",
+        "pinterest-druid-ads",
+        "uber-ad-flink-pinot",
+        "uber-pinot-ingestion",
+        "druid-kafka-ingestion",
+        "pinot-docs"
       ],
       "patterns": [
         "Pre-aggregation / rollups"
@@ -1280,11 +2376,15 @@
       "bottlenecks": [
         {
           "issue": "High-cardinality dimension combinations blow up rollup storage.",
-          "mitigation": "Pre-compute only common slices; compute rare ones on demand from raw."
+          "mitigation": "Pre-compute only an allowlist of slices; compute rare ones on demand from raw with row/time limits."
         },
         {
           "issue": "A hot partition (huge campaign) lags the stream.",
-          "mitigation": "Repartition / scale consumers; the log absorbs the backlog."
+          "mitigation": "Salt the key / repartition / scale consumers; the log absorbs the backlog while consumer lag is monitored."
+        },
+        {
+          "issue": "Operators can't see when numbers are wrong or stale.",
+          "mitigation": "Monitor consumer lag, accepted-vs-rejected (DLQ) rate, duplicate rate, watermark lag, batch-correction delta (batch vs speed), OLAP ingest lag, and per-query freshness; alert on each."
         }
       ],
       "flows": [
@@ -1355,12 +2455,13 @@
             "OLAP"
           ]
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/07-serve.jpg"
     }
   ],
   "finalDesign": {
     "title": "Final Design — Lambda Analytics Pipeline",
-    "description": "A thin collector accepts events fast into a durable partitioned log, which is both consumed by a stream processor (dedup via event-id seen-set, windowed aggregation and near-real-time attribution -> OLAP) and archived raw to a data lake. A batch layer periodically reprocesses the immutable raw events for exact, fully-attributed, billing-grade metrics that overwrite the provisional speed-layer rollups. A query API serves pre-aggregated rollups, merging authoritative batch numbers for closed windows with provisional stream numbers for the open window. Replayable raw events make any bug recoverable by recompute.",
+    "description": "A thin collector accepts events fast into a durable partitioned log — an event is 'accepted' only once it is replicated to the log, not when the collector receives it — and rejects invalid/schema-incompatible events to a DLQ. The log is consumed by a stream processor (idempotent dedup via checkpointed keyed state, windowed aggregation, and near-real-time attribution against a recent-click state store -> OLAP) and archived raw to a data lake. Metric rows are written idempotently keyed by (metric_key, window, source, version); the batch layer periodically reprocesses the immutable raw events for exact, fully-attributed, billing-grade metrics that version-overwrite the provisional speed rows, then publishes a settlement marker per closed window. A query API picks batch rows for settled windows and speed rows for the open window, surfacing a freshness/source marker. Replayable raw events make any bug recoverable by recompute, with backfills isolated from live serving. Billing-domain controls are first-class, not afterthoughts: an invalid-traffic filter runs alongside dedup (with post-settlement adjustments as new correction versions), consent and PII-minimization at the edge gate whether identity can be attributed and how long raw events are retained, every billed number traces to an immutable metric version with an audit/correction trail, and the operations posture monitors consumer lag, DLQ/duplicate/watermark-lag rates, batch-vs-speed correction delta, and per-query freshness.",
     "view": {
       "nodes": [
         "Client",
@@ -1370,22 +2471,27 @@
         "Stream",
         "DedupStore",
         "AttrSvc",
+        "ClickState",
+        "DLQ",
         "Batch",
         "OLAP",
         "ServeAPI",
         "Dashboard"
       ],
-      "caption": "The ad client emits events through the collector and Kafka log into both the speed (stream + dedup + attribution) and batch layers, which write the OLAP store that the dashboard API serves.",
+      "caption": "The ad client emits events through the collector and Kafka log into both the speed (stream + dedup + attribution over recent-click state) and batch layers, which write the OLAP store that the dashboard API serves; invalid events at the edge and too-late events in the stream go to a DLQ/quarantine.",
       "links": [
         "client-collector",
         "collector-log",
+        "collector-dlq",
         "log-raw",
         "log-stream",
         "stream-dedup",
         "stream-attr",
-        "attr-raw",
+        "attr-clickstate",
         "stream-olap",
+        "stream-dlq",
         "log-batch",
+        "attr-raw",
         "batch-olap",
         "serve-olap",
         "dashboard-serve"
@@ -1395,7 +2501,8 @@
         "speed-layer",
         "batch-layer"
       ]
-    }
+    },
+    "aiVisual": "assets/generated/ai-visuals/final-design.jpg"
   },
   "satisfies": {
     "functional": [
@@ -1422,7 +2529,7 @@
       },
       {
         "requirement": "Conversion attribution",
-        "how": "Windowed click->conversion join.",
+        "how": "Windowed click->conversion join over recent-click keyed state (hot path); batch re-attribution over raw for long windows/corrections.",
         "steps": [
           "attribution"
         ]
@@ -1446,14 +2553,14 @@
       },
       {
         "requirement": "Never lose events",
-        "how": "Durable replicated log + immutable data lake.",
+        "how": "Accepted only when quorum-replicated to the log; immutable data lake; invalid events quarantined to a DLQ, not dropped.",
         "steps": [
           "ingest"
         ]
       },
       {
         "requirement": "Correct counts",
-        "how": "Idempotent dedup in stream + exact dedup in batch.",
+        "how": "Idempotent dedup + idempotent OLAP upserts (metric_key, window, source, version) with checkpointed offsets in stream; exact, version-overwritten dedup in batch.",
         "steps": [
           "dedup",
           "batch"
@@ -1541,10 +2648,13 @@
   ],
   "followUps": [
     "Lambda vs kappa (replay-only) architecture — when would you drop the batch layer?",
-    "How do you handle very late-arriving events (days late)?",
+    "How do you handle very late-arriving events (days late) past the watermark and dedup window?",
     "How would you support exactly-once end to end, and what does it cost?",
     "How do you bound rollup storage as advertisers slice by many dimensions?",
-    "How would you detect and handle click fraud in this pipeline?"
+    "How would you detect and handle invalid traffic / click fraud (bots, click spam, suspicious IP/device patterns) as a scoped pipeline branch?",
+    "How do you evolve the event schema and replay quarantined events after a parser fix without double-counting?",
+    "What privacy controls apply — PII minimization, user-id hashing, consent filtering, retention windows, and deletion/erasure handling — and how do they shape raw-event storage and query access?",
+    "How do you support a billing dispute: audit trail of which metric version produced a billed number, and a correction workflow after recompute?"
   ],
   "toProbeFurther": {
     "links": [
@@ -1610,14 +2720,15 @@
         "why": "Concrete time-series monitoring architecture and data model."
       },
       {
-        "id": "google-routes",
-        "group": "Location and Marketplace",
-        "groupDescription": "Geospatial indexing, routing, dispatch, and marketplace operations references.",
-        "title": "Routes API Documentation",
-        "url": "https://developers.google.com/maps/documentation/routes",
-        "source": "Google Maps Platform",
-        "type": "Docs",
-        "why": "Concrete route computation API reference for routing, ETA, waypoints, and traffic-aware paths."
+        "id": "druid-paper",
+        "group": "Data and Observability",
+        "groupDescription": "Metrics, tracing, logs, analytics, data pipelines, warehouses, and orchestration references.",
+        "title": "Druid: A Real-time Analytical Data Store",
+        "url": "https://static.druid.apache.org/docs/druid.pdf",
+        "source": "Metamarkets",
+        "type": "Paper",
+        "why": "Column-oriented OLAP store built for ad-analytics: real-time ingestion, time-partitioned rollups, and fast slice-and-dice queries — the serving layer of this pipeline.",
+        "year": "2014"
       },
       {
         "id": "snowflake-paper",
@@ -1629,10 +2740,212 @@
         "type": "Paper",
         "why": "Production warehouse architecture with storage/compute separation and elastic execution.",
         "year": "2016"
+      },
+      {
+        "id": "linkedin-pinot",
+        "group": "Production Analytics Case Studies",
+        "groupDescription": "Company case studies for event streams, real-time OLAP, and dashboard-serving decisions.",
+        "title": "Real-time Analytics at Massive Scale with Pinot",
+        "url": "https://engineering.linkedin.com/analytics/real-time-analytics-massive-scale-pinot",
+        "source": "LinkedIn Engineering",
+        "type": "Case study",
+        "why": "Shows why LinkedIn moved from generic stores to a Kafka plus Hadoop plus Pinot architecture for low-latency, high-QPS analytics products.",
+        "year": "2014"
+      },
+      {
+        "id": "pinterest-druid-ads",
+        "group": "Production Analytics Case Studies",
+        "groupDescription": "Company case studies for event streams, real-time OLAP, and dashboard-serving decisions.",
+        "title": "Powering Pinterest Ads Analytics with Apache Druid",
+        "url": "https://medium.com/pinterest-engineering/powering-pinterest-ads-analytics-with-apache-druid-51aa6ffb97c1",
+        "source": "Pinterest Engineering",
+        "type": "Case study",
+        "why": "A direct ad-reporting case study covering Druid ingestion, automatic versioning, pre-aggregation, hot/cold tiers, and query short-circuiting.",
+        "year": "2020"
+      },
+      {
+        "id": "uber-ad-flink-pinot",
+        "group": "Production Analytics Case Studies",
+        "groupDescription": "Company case studies for event streams, real-time OLAP, and dashboard-serving decisions.",
+        "title": "Real-Time Exactly-Once Ad Event Processing with Apache Flink, Kafka, and Pinot",
+        "url": "https://www.uber.com/en-FI/blog/real-time-exactly-once-ad-event-processing/",
+        "source": "Uber Engineering",
+        "type": "Case study",
+        "why": "Maps almost one-to-one to this interview: ad clicks/impressions, aggregation, attribution, deduplication, Flink checkpoints, Kafka transactions, Pinot upserts, and Hive backfill.",
+        "year": "2021"
+      },
+      {
+        "id": "uber-pinot-ingestion",
+        "group": "Production Analytics Case Studies",
+        "groupDescription": "Company case studies for event streams, real-time OLAP, and dashboard-serving decisions.",
+        "title": "Pinot Real-Time Ingestion with Cloud Segment Storage",
+        "url": "https://www.uber.com/en-US/blog/pinot-real-time-ingestion/",
+        "source": "Uber Engineering",
+        "type": "Case study",
+        "why": "Explains operational lessons from making Pinot real-time ingestion work with cloud deep storage and failure-prone distributed commit paths.",
+        "year": "2021"
+      },
+      {
+        "id": "linkedin-samza",
+        "group": "Production Analytics Case Studies",
+        "groupDescription": "Company case studies for event streams, real-time OLAP, and dashboard-serving decisions.",
+        "title": "Apache Samza: LinkedIn's Real-time Stream Processing Framework",
+        "url": "https://engineering.linkedin.com/data-streams/apache-samza-linkedins-real-time-stream-processing-framework",
+        "source": "LinkedIn Engineering",
+        "type": "Case study",
+        "why": "Describes LinkedIn's Kafka-backed transition to real-time multi-subscriber feeds mirrored into Hadoop for offline processing.",
+        "year": "2013"
+      },
+      {
+        "id": "netflix-mantis",
+        "group": "Production Analytics Case Studies",
+        "groupDescription": "Company case studies for event streams, real-time OLAP, and dashboard-serving decisions.",
+        "title": "Mantis",
+        "url": "https://netflix.github.io/mantis/",
+        "source": "Netflix",
+        "type": "Docs",
+        "why": "Gives a production-shaped stream-processing-as-a-service model for real-time operational insight over raw events."
+      },
+      {
+        "id": "millwheel-paper",
+        "group": "Streaming Semantics and Correctness",
+        "groupDescription": "Event time, watermarking, checkpointing, state, and exactly-once/at-least-once tradeoffs.",
+        "title": "MillWheel: Fault-Tolerant Stream Processing at Internet Scale",
+        "url": "https://research.google/pubs/millwheel-fault-tolerant-stream-processing-at-internet-scale/",
+        "source": "Google Research",
+        "type": "Paper",
+        "why": "Foundational production stream-processing paper for persistent state, logical time, fault tolerance, and low-latency processing.",
+        "year": "2013"
+      },
+      {
+        "id": "flink-streaming-analytics",
+        "group": "Streaming Semantics and Correctness",
+        "groupDescription": "Event time, watermarking, checkpointing, state, and exactly-once/at-least-once tradeoffs.",
+        "title": "Streaming Analytics",
+        "url": "https://nightlies.apache.org/flink/flink-docs-release-2.2/docs/learn-flink/streaming_analytics/",
+        "source": "Apache Flink",
+        "type": "Docs",
+        "why": "Concrete reference for event time, watermarks, late events, and windows, which are central to real-time click metrics and attribution."
+      },
+      {
+        "id": "flink-fault-tolerance",
+        "group": "Streaming Semantics and Correctness",
+        "groupDescription": "Event time, watermarking, checkpointing, state, and exactly-once/at-least-once tradeoffs.",
+        "title": "Fault Tolerance via State Snapshots",
+        "url": "https://nightlies.apache.org/flink/flink-docs-master/docs/learn-flink/fault_tolerance/",
+        "source": "Apache Flink",
+        "type": "Docs",
+        "why": "Explains checkpoints, state backends, and why end-to-end exactly-once requires replayable sources plus transactional or idempotent sinks."
+      },
+      {
+        "id": "druid-kafka-ingestion",
+        "group": "OLAP Serving and Real-Time Ingestion",
+        "groupDescription": "Serving-store references for streaming ingestion, pre-aggregation, and low-latency dashboard queries.",
+        "title": "Apache Kafka Ingestion",
+        "url": "https://druid.apache.org/docs/latest/ingestion/kafka-ingestion/",
+        "source": "Apache Druid",
+        "type": "Docs",
+        "why": "Details Druid's Kafka supervisor model, partition/offset ingestion, and exactly-once streaming ingestion into analytical segments."
+      },
+      {
+        "id": "pinot-docs",
+        "group": "OLAP Serving and Real-Time Ingestion",
+        "groupDescription": "Serving-store references for streaming ingestion, pre-aggregation, and low-latency dashboard queries.",
+        "title": "Apache Pinot Introduction",
+        "url": "https://docs.pinot.apache.org/",
+        "source": "Apache Pinot",
+        "type": "Docs",
+        "why": "Summarizes Pinot's real-time OLAP model for user-facing analytics, high-dimensional events, and low-latency queries."
+      },
+      {
+        "id": "iceberg-evolution",
+        "group": "Data Lake, Quality, and Lineage",
+        "groupDescription": "References for replayable raw storage, schema/partition evolution, data-quality gates, and audit lineage.",
+        "title": "Evolution",
+        "url": "https://iceberg.apache.org/docs/1.9.0/evolution/",
+        "source": "Apache Iceberg",
+        "type": "Docs",
+        "why": "Useful for raw-event lake design: schema and partition evolution without rewriting historical data or breaking correctness."
+      },
+      {
+        "id": "openlineage",
+        "group": "Data Lake, Quality, and Lineage",
+        "groupDescription": "References for replayable raw storage, schema/partition evolution, data-quality gates, and audit lineage.",
+        "title": "OpenLineage",
+        "url": "https://openlineage.io/",
+        "source": "OpenLineage",
+        "type": "Docs",
+        "why": "Provides a standard model for capturing dataset, job, and run lineage so recomputes, corrections, and report impact are auditable."
+      },
+      {
+        "id": "deequ-paper",
+        "group": "Data Lake, Quality, and Lineage",
+        "groupDescription": "References for replayable raw storage, schema/partition evolution, data-quality gates, and audit lineage.",
+        "title": "Unit Testing Data with Deequ",
+        "url": "https://www.amazon.science/publications/unit-testing-data-with-deequ",
+        "source": "Amazon Science",
+        "type": "Paper",
+        "why": "Shows how to express data-quality assumptions as checks over large datasets before bad events flow into dashboards or billing.",
+        "year": "2019"
+      },
+      {
+        "id": "iab-click-guidelines",
+        "group": "Ad Measurement, Attribution, and Privacy",
+        "groupDescription": "Industry measurement rules, invalid-traffic filtering, attribution windows, and consent signals.",
+        "title": "Click Measurement Guidelines",
+        "url": "https://www.iab.com/guidelines/click-measurement-guidelines/",
+        "source": "IAB",
+        "type": "Guidelines",
+        "why": "Defines ad-click counting, validity, filtration, auditing, and reporting concerns that shape what the pipeline must count and expose."
+      },
+      {
+        "id": "iab-ivt-guidelines",
+        "group": "Ad Measurement, Attribution, and Privacy",
+        "groupDescription": "Industry measurement rules, invalid-traffic filtering, attribution windows, and consent signals.",
+        "title": "MRC Invalid Traffic (IVT) Detection and Filtration Guidelines Addendum",
+        "url": "https://www.iab.com/guidelines/mrc-invalid-traffic-ivt-detection-and-filtration-guidelines-addendum/",
+        "source": "IAB / MRC",
+        "type": "Guidelines",
+        "why": "Grounds the invalid-traffic branch: detection, filtration, and post-settlement correction are separate from retry deduplication."
+      },
+      {
+        "id": "iab-gpp",
+        "group": "Ad Measurement, Attribution, and Privacy",
+        "groupDescription": "Industry measurement rules, invalid-traffic filtering, attribution windows, and consent signals.",
+        "title": "Global Privacy Platform: Explained",
+        "url": "https://iabtechlab.com/global-privacy-platform-explained/",
+        "source": "IAB Tech Lab",
+        "type": "Explainer",
+        "why": "Explains how ad-tech participants can pass user privacy consent and choice signals through the digital advertising supply chain."
+      },
+      {
+        "id": "google-conversion-windows",
+        "group": "Ad Measurement, Attribution, and Privacy",
+        "groupDescription": "Industry measurement rules, invalid-traffic filtering, attribution windows, and consent signals.",
+        "title": "About Conversion Windows",
+        "url": "https://support.google.com/google-ads/answer/3123169?hl=en",
+        "source": "Google Ads Help",
+        "type": "Docs",
+        "why": "Defines conversion windows and click-through lookback behavior, which maps to the attribution window state and batch recompute design."
+      },
+      {
+        "id": "google-ads-attribution-reports",
+        "group": "Ad Measurement, Attribution, and Privacy",
+        "groupDescription": "Industry measurement rules, invalid-traffic filtering, attribution windows, and consent signals.",
+        "title": "About Attribution Reports",
+        "url": "https://support.google.com/google-ads/answer/1722023?hl=en",
+        "source": "Google Ads Help",
+        "type": "Docs",
+        "why": "Clarifies conversion paths, lookback windows, attribution reports, and why query users need to understand attribution-model effects."
       }
     ]
   },
   "assets": {
     "icon": "icon.png"
-  }
+  },
+  "aiVisuals": {
+    "requirements": "assets/generated/ai-visuals/requirements.jpg",
+    "capacity": "assets/generated/ai-visuals/capacity.jpg"
+  },
+  "explainerComic": "assets/generated/comic/interview-comic.jpg"
 }

@@ -278,43 +278,69 @@
       "High recall on fraud without too many false positives (block real users).",
       "Adapt quickly: attackers change tactics, so rules/models must update fast.",
       "Auditable/explainable decisions (why was this blocked?).",
-      "Resilient: a scoring outage degrades to a safe default, not an outage of the host action."
+      "Resilient: a scoring outage degrades per a per-action fallback policy (not one universal 'fail open'), never an outage of the host action.",
+      "Privacy & abuse-resistant: tokenized identifiers, retention limits by record type, analyst RBAC, internal-only reason codes, and defenses against API probing and event/label poisoning."
     ]
   },
   "capacity": [
     {
-      "label": "Event volume",
-      "value": "very high",
-      "note": "Every login/payment/signup is an event."
+      "label": "Decision QPS",
+      "value": "~5k/sec peak",
+      "note": "Assume ~5k risk decisions/sec at peak (logins + payments + signups), ~1.5k average. High-value payments are ~10% of that; the latency budget and fleet are sized to peak."
+    },
+    {
+      "label": "Event write amplification",
+      "value": "~2-4 events / decision",
+      "note": "Each decision emits the action event plus follow-up outcome events (auth result, challenge result, settlement) -> ~10-20k events/sec into the stream. Sizes stream partitions and aggregator parallelism."
+    },
+    {
+      "label": "Feature reads / score",
+      "value": "~10-30 features",
+      "note": "Each score reads counters/reputation for several entities (user, device, IP, card) -> ~50-150k feature reads/sec. Must come from an in-memory store (<5ms) to fit the budget."
+    },
+    {
+      "label": "Feature update rate",
+      "value": "~10-20k writes/sec",
+      "note": "The aggregator writes updated counters per event. Hot keys (shared IP, popular merchant, attack device) concentrate writes -> partition by entity and shard hot keys."
     },
     {
       "label": "Decision latency",
-      "value": "tens of ms",
-      "note": "Inline on the critical path."
+      "value": "p99 ~50ms",
+      "note": "Inline on checkout. Rough budget: rules ~5ms, feature reads ~10ms, model ~15ms, graph features (precomputed) ~5ms, overhead ~15ms. Graph traversal is never done inline."
     },
     {
       "label": "Feature freshness",
       "value": "seconds",
-      "note": "Velocity must reflect just-happened activity."
+      "note": "Velocity counters must reflect just-happened activity; stream->aggregate->store lag is targeted at 1-3s."
     },
     {
-      "label": "Review fraction",
-      "value": "small",
-      "note": "Only ambiguous cases go to humans."
+      "label": "Graph edge growth",
+      "value": "~10-20k edges/sec",
+      "note": "Each event may add user-device/IP/card links; the graph is large and append-heavy. Edge features are materialized offline, not traversed inline."
+    },
+    {
+      "label": "Review queue arrival",
+      "value": "~1-3% of decisions",
+      "note": "~50-150 cases/sec at peak go to async review. Analyst throughput (cases/analyst/hour) bounds the challenge/review band width and the backlog SLA."
     },
     {
       "label": "Label lag",
       "value": "hours-weeks",
-      "note": "Chargebacks/confirmations arrive late."
+      "note": "Analyst labels arrive in minutes-hours; chargebacks land 1-6 weeks later. Point-in-time joins must rejoin to decision-time feature snapshots."
+    },
+    {
+      "label": "Audit retention",
+      "value": "~1-2 KB/decision, 12-24 mo",
+      "note": "Each decision stores score, reasons, versions, and entity refs. ~5k/sec x 1-2KB -> ~0.5-1 TB/day; retained 12-24 months for disputes/regulators -> compress and tier to cold storage."
     }
   ],
   "api": [
     {
       "method": "POST",
       "path": "/v1/risk/decision",
-      "description": "Score an action and return a decision synchronously.",
-      "request": "{ \"action\": \"payment\", \"userId\": \"u_4\", \"deviceId\": \"d_9\", \"amount\": 200, \"ip\": \"...\" }",
-      "response": "{ \"decision\": \"challenge\", \"score\": 0.72, \"reasons\": [\"new_device\", \"velocity\"] }",
+      "description": "Score an action and return a decision synchronously. The caller supplies a stable actionId and an idempotencyKey so retries replay the original decision; same key + same payload returns the original decision, same key + different payload is rejected (409).",
+      "request": "{ \"actionId\": \"a_7\", \"idempotencyKey\": \"a_7:try1\", \"action\": \"payment\", \"eventTime\": \"2026-06-09T12:00:01Z\", \"entityIds\": { \"userId\": \"u_4\", \"deviceId\": \"d_9\", \"ip\": \"203.0.113.7\", \"cardToken\": \"tok_…\" }, \"amount\": 200, \"policyContext\": { \"surface\": \"checkout\" } }",
+      "response": "{ \"decisionId\": \"dec_91\", \"decision\": \"challenge\", \"score\": 0.72, \"reasons\": [\"new_device\", \"velocity\"], \"policyVersion\": \"p_2026_06\", \"modelVersion\": \"m_42\", \"fallbackMode\": \"none\", \"challengeId\": \"ch_3\" }",
       "sequence": {
         "participants": [
           {
@@ -374,30 +400,45 @@
     {
       "method": "POST",
       "path": "/v1/events",
-      "description": "Report an action/outcome event (feeds features and offline analysis).",
-      "request": "{ \"type\": \"login\", \"userId\": \"u_4\", \"deviceId\": \"d_9\", \"result\": \"success\" }",
-      "response": "{ \"ok\": true }"
+      "description": "Report an action/outcome event (feeds features and offline analysis). dedupeKey makes ingestion idempotent so retried/replayed events don't double-count velocity counters; eventTime (when it happened) is separate from server ingestTime (when it arrived) for late/out-of-order handling. This is also how a caller closes a workflow: lifecycle outcomes carry the decisionId and a type of challenge_passed / challenge_failed / review_resolved / payment_reversed / chargeback so the engine can complete the challenge_attempt or review_case, emit the matching label, and refresh velocity/reputation features.",
+      "request": "{ \"eventId\": \"evt_72\", \"dedupeKey\": \"ch_3:result\", \"type\": \"challenge_passed\", \"actionId\": \"a_7\", \"decisionId\": \"dec_91\", \"challengeId\": \"ch_3\", \"eventTime\": \"2026-06-09T12:00:40Z\", \"entityIds\": { \"userId\": \"u_4\", \"deviceId\": \"d_9\" } }",
+      "response": "{ \"ok\": true, \"deduped\": false }"
     },
     {
       "method": "POST",
       "path": "/v1/labels",
-      "description": "Record a confirmed outcome (fraud/legit, chargeback) for training.",
-      "request": "{ \"actionId\": \"a_7\", \"label\": \"fraud\", \"source\": \"chargeback\" }",
-      "response": "{ \"ok\": true }"
+      "description": "Record a confirmed outcome (fraud/legit, chargeback) for training. Joins to the exact decision via decisionId and to its decision-time feature snapshot; source carries a trust level so the trainer can weight/quarantine low-trust labels.",
+      "request": "{ \"actionId\": \"a_7\", \"decisionId\": \"dec_91\", \"label\": \"fraud\", \"source\": \"chargeback\", \"sourceTrust\": \"high\", \"labeledAt\": \"2026-06-30T09:00:00Z\" }",
+      "response": "{ \"ok\": true, \"labelId\": \"lbl_8\" }"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/risk/cases/{caseId}",
+      "description": "Observe an async workflow opened by a decision. A challenge decision returns a challengeId and a review decision returns a reviewCaseId; both are queryable here so the caller knows whether to hold the action, when a challenge expires, and the final outcome. Terminal resolutions (challenge_passed/failed, review fraud/legit/reversed/refunded) emit the matching label and, where relevant, drive a reversal/refund. Callers that prefer push can register a webhook instead of polling.",
+      "request": "GET /v1/risk/cases/ch_3",
+      "response": "{ \"caseId\": \"ch_3\", \"kind\": \"challenge\", \"decisionId\": \"dec_91\", \"state\": \"issued\", \"method\": \"3ds\", \"holdAction\": true, \"expiresAt\": \"2026-06-09T12:05:00Z\", \"resolution\": null, \"labelId\": null }"
     }
   ],
   "dataModel": [
     {
       "name": "decisions",
-      "note": "Audit record of each decision + the signals behind it.",
+      "note": "Audit record of each decision + the signals behind it. The join anchor for events, labels, and review cases.",
       "fields": [
         {
-          "name": "action_id",
+          "name": "decision_id",
           "type": "uuid PK"
         },
         {
+          "name": "action_id",
+          "type": "uuid (caller-supplied, unique per action)"
+        },
+        {
+          "name": "idempotency_key",
+          "type": "string unique (retries replay this row)"
+        },
+        {
           "name": "entity_ids",
-          "type": "user/device/ip/card"
+          "type": "user/device/ip/card (tokenized)"
         },
         {
           "name": "score",
@@ -409,11 +450,207 @@
         },
         {
           "name": "reasons",
-          "type": "json (rule/feature attributions)"
+          "type": "json (internal rule/feature attributions)"
+        },
+        {
+          "name": "feature_snapshot_ref",
+          "type": "fk -> feature_snapshots (point-in-time)"
+        },
+        {
+          "name": "policy_version",
+          "type": "string (threshold/ruleset policy)"
         },
         {
           "name": "model_version",
           "type": "string"
+        },
+        {
+          "name": "fallback_mode",
+          "type": "enum(none, rules_only, default)"
+        },
+        {
+          "name": "decided_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "events",
+      "note": "Append-only log of action/outcome events; source of all features.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "dedupe_key",
+          "type": "string unique (idempotent ingest)"
+        },
+        {
+          "name": "action_id",
+          "type": "uuid (links to the decision)"
+        },
+        {
+          "name": "type",
+          "type": "enum(login, payment, signup, auth_result, …)"
+        },
+        {
+          "name": "entity_ids",
+          "type": "user/device/ip/card (tokenized)"
+        },
+        {
+          "name": "event_time",
+          "type": "timestamp (when it happened)"
+        },
+        {
+          "name": "ingest_time",
+          "type": "timestamp (when it arrived)"
+        }
+      ]
+    },
+    {
+      "name": "feature_snapshots",
+      "note": "Decision-time feature values referenced by each decision; enables point-in-time training joins.",
+      "fields": [
+        {
+          "name": "snapshot_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "decision_id",
+          "type": "fk -> decisions"
+        },
+        {
+          "name": "feature_values",
+          "type": "map (definition_id -> value as served)"
+        },
+        {
+          "name": "feature_set_version",
+          "type": "string (definitions used)"
+        }
+      ]
+    },
+    {
+      "name": "graph_edges",
+      "note": "Entity link graph; edge features are materialized offline, never traversed inline.",
+      "fields": [
+        {
+          "name": "from_entity",
+          "type": "type:id (user/device/ip/card)"
+        },
+        {
+          "name": "to_entity",
+          "type": "type:id"
+        },
+        {
+          "name": "edge_type",
+          "type": "enum(shared_device, shared_ip, shared_card, …)"
+        },
+        {
+          "name": "confidence",
+          "type": "float"
+        },
+        {
+          "name": "first_seen / last_seen",
+          "type": "timestamp (drives edge expiry)"
+        },
+        {
+          "name": "source_event_id",
+          "type": "uuid"
+        }
+      ]
+    },
+    {
+      "name": "review_cases",
+      "note": "Lifecycle of a flagged case; state machine new -> assigned -> resolved.",
+      "fields": [
+        {
+          "name": "case_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "action_id / decision_id",
+          "type": "fk -> decisions"
+        },
+        {
+          "name": "state",
+          "type": "enum(new, assigned, resolved, appealed)"
+        },
+        {
+          "name": "priority",
+          "type": "int (risk x value)"
+        },
+        {
+          "name": "assigned_to",
+          "type": "analyst_id"
+        },
+        {
+          "name": "evidence_ref",
+          "type": "snapshot of signals + graph at flag time"
+        },
+        {
+          "name": "due_at / resolved_at",
+          "type": "timestamp (SLA)"
+        },
+        {
+          "name": "resolution",
+          "type": "enum(fraud, legit, reversed, refunded)"
+        },
+        {
+          "name": "label_id",
+          "type": "fk -> labels (emitted on resolve)"
+        }
+      ]
+    },
+    {
+      "name": "challenge_attempts",
+      "note": "Outcome record of an inline step-up challenge.",
+      "fields": [
+        {
+          "name": "challenge_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "decision_id",
+          "type": "fk -> decisions"
+        },
+        {
+          "name": "method",
+          "type": "enum(otp, 3ds, id_check)"
+        },
+        {
+          "name": "status",
+          "type": "enum(issued, passed, failed, expired)"
+        },
+        {
+          "name": "attempts / expires_at",
+          "type": "int / timestamp"
+        }
+      ]
+    },
+    {
+      "name": "rulesets / decision_policies / model_versions",
+      "note": "Versioned governance for what was in effect at decision time and how it rolled out.",
+      "fields": [
+        {
+          "name": "ruleset_version",
+          "type": "string (active rules + author + approved_by)"
+        },
+        {
+          "name": "policy_version",
+          "type": "string (per-action thresholds / cost matrix)"
+        },
+        {
+          "name": "model_version",
+          "type": "string (registry entry + validation metrics)"
+        },
+        {
+          "name": "rollout_state",
+          "type": "enum(shadow, canary, champion, retired)"
+        },
+        {
+          "name": "rollback_to",
+          "type": "version ref"
         }
       ]
     },
@@ -437,11 +674,15 @@
     },
     {
       "name": "labels",
-      "note": "Confirmed outcomes for supervised training.",
+      "note": "Confirmed outcomes for supervised training; joins back to the exact decision + feature snapshot.",
       "fields": [
         {
-          "name": "action_id",
-          "type": "uuid"
+          "name": "label_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "action_id / decision_id",
+          "type": "uuid (join to decision + snapshot)"
         },
         {
           "name": "label",
@@ -452,10 +693,1009 @@
           "type": "enum(chargeback, analyst, user_report)"
         },
         {
+          "name": "source_trust",
+          "type": "enum(high, medium, low) — weighting/quarantine"
+        },
+        {
           "name": "labeled_at",
           "type": "timestamp"
         }
       ]
+    }
+  ],
+  "technologyChoices": [
+    {
+      "concern": "Inline risk API edge controls",
+      "steps": [
+        "naive",
+        "decision",
+        "serving"
+      ],
+      "selfHosted": [
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Kong",
+          "icon": "assets/tech-icons/kong.png"
+        },
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "Kubernetes",
+          "icon": "assets/tech-icons/kubernetes.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          },
+          {
+            "name": "ALB",
+            "icon": "assets/tech-icons/Arch_Elastic-Load-Balancing_64.png"
+          },
+          {
+            "name": "WAF",
+            "icon": "assets/tech-icons/Arch_AWS-WAF_64.png"
+          },
+          {
+            "name": "EKS",
+            "icon": "assets/tech-icons/Arch_Amazon-Elastic-Kubernetes-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Apigee",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Load Balancing",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Armor",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "GKE",
+            "icon": "assets/tech-icons/Containers-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "API Management",
+            "icon": "assets/tech-icons/10042-icon-service-API-Management-Services.svg"
+          },
+          {
+            "name": "Application Gateway",
+            "icon": "assets/tech-icons/10076-icon-service-Application-Gateways.svg"
+          },
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "AKS",
+            "icon": "assets/tech-icons/10023-icon-service-Kubernetes-Services.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A small stateless risk service behind Envoy/Kong keeps p99 latency and caller-specific behavior under your control.",
+        "A managed gateway/WAF gives throttling, auth integration, TLS termination, and edge request logging with less custom middleware."
+      ],
+      "makesIrrelevant": "A managed edge with per-caller quotas and WAF rules removes much of the custom API probing and rate-limit code from the RiskAPI fleet."
+    },
+    {
+      "concern": "Rules and decision-policy management",
+      "steps": [
+        "naive",
+        "decision",
+        "decision-tiers",
+        "serving"
+      ],
+      "selfHosted": [
+        {
+          "name": "Drools",
+          "icon": "assets/tech-icons/drools.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "GitHub",
+          "icon": "assets/tech-icons/github.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "AppConfig",
+            "icon": "assets/tech-icons/Arch_AWS-AppConfig_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "Lambda",
+            "icon": "assets/tech-icons/Arch_AWS-Lambda_64.png"
+          },
+          {
+            "name": "CloudTrail",
+            "icon": "assets/tech-icons/Arch_AWS-CloudTrail_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Firebase Remote Config",
+            "icon": "assets/tech-icons/DevOps-512-color.png"
+          },
+          {
+            "name": "Firestore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud Run",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          },
+          {
+            "name": "Cloud Logging",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure App Configuration",
+            "icon": "assets/tech-icons/10219-icon-service-App-Configuration.svg"
+          },
+          {
+            "name": "Azure Policy",
+            "icon": "assets/tech-icons/10316-icon-service-Policy.svg"
+          },
+          {
+            "name": "Azure Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          },
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A rules engine or rules-as-code flow keeps decisions explainable and lets analysts ship emergency rules quickly.",
+        "Remote configuration is simpler for thresholds and tier bands, but weaker for complex rule authoring and approval workflows."
+      ],
+      "makesIrrelevant": "Versioned policy/config storage removes hard-coded thresholds and many emergency application deploys."
+    },
+    {
+      "concern": "Low-latency online feature store",
+      "steps": [
+        "features",
+        "decision",
+        "serving"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "Dragonfly",
+          "icon": "assets/tech-icons/dragonfly.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        },
+        {
+          "name": "Apache Cassandra",
+          "icon": "assets/tech-icons/cassandra.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "Keyspaces",
+            "icon": "assets/tech-icons/Arch_Amazon-Keyspaces_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Firestore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Table Storage",
+            "icon": "assets/tech-icons/10086-icon-service-Storage-Accounts.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "In-memory stores fit the sub-5ms feature-read budget but need careful persistence and failover choices.",
+        "Wide-column or durable KV stores handle high write rates and longer retention, at higher read latency and cost."
+      ],
+      "makesIrrelevant": "A managed Redis/KV store with TTL, conditional writes, and replication removes much of the custom shard failover and expiry machinery."
+    },
+    {
+      "concern": "Event stream and idempotent ingestion log",
+      "steps": [
+        "features",
+        "graph",
+        "feedback",
+        "serving"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Redpanda",
+          "icon": "assets/tech-icons/redpanda.png"
+        },
+        {
+          "name": "Apache Pulsar",
+          "icon": "assets/tech-icons/pulsar.png"
+        },
+        {
+          "name": "NATS (JetStream)",
+          "icon": "assets/tech-icons/nats.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "MSK",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Streaming-for-Apache-Kafka_64.png"
+          },
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Managed Service for Apache Kafka",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A durable log is the right default for replay, feature recompute, graph updates, and multiple downstream consumers.",
+        "A queue is simpler for isolated async work, but weaker for long replay and point-in-time backfills."
+      ],
+      "makesIrrelevant": "A managed stream with retention, lag metrics, and native dead-letter handling removes most broker operations from the feature pipeline."
+    },
+    {
+      "concern": "Streaming feature aggregation",
+      "steps": [
+        "features",
+        "graph",
+        "serving"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Flink",
+          "icon": "assets/tech-icons/flink.png"
+        },
+        {
+          "name": "Apache Spark",
+          "icon": "assets/tech-icons/spark.png"
+        },
+        {
+          "name": "Kafka Streams",
+          "icon": "assets/tech-icons/kafka.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Managed Service for Apache Flink",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Service-for-Apache-Flink_64.png"
+          },
+          {
+            "name": "EMR",
+            "icon": "assets/tech-icons/Arch_Amazon-EMR_64.png"
+          },
+          {
+            "name": "AWS Glue",
+            "icon": "assets/tech-icons/Arch_AWS-Glue_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Dataproc",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Cloud Composer",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Stream Analytics",
+            "icon": "assets/tech-icons/00042-icon-service-Stream-Analytics-Jobs.svg"
+          },
+          {
+            "name": "Azure Databricks",
+            "icon": "assets/tech-icons/10787-icon-service-Azure-Databricks.svg"
+          },
+          {
+            "name": "Azure Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Flink-style processors give event-time windows, watermarks, checkpoints, and exactly-once sinks for velocity counters.",
+        "Serverless or batch-oriented processors reduce operations, but make hot-key mitigation and second-fresh updates harder to control."
+      ],
+      "makesIrrelevant": "Managed streaming with checkpoints and autoscaling removes many custom watermark, retry, and consumer-rebalance jobs."
+    },
+    {
+      "concern": "Entity graph and ring-feature store",
+      "steps": [
+        "graph",
+        "features",
+        "serving"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL (adjacency tables)",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "MongoDB",
+          "icon": "assets/tech-icons/mongodb.png"
+        },
+        {
+          "name": "OpenSearch",
+          "icon": "assets/tech-icons/opensearch.png"
+        },
+        {
+          "name": "Apache Cassandra",
+          "icon": "assets/tech-icons/cassandra.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Neptune",
+            "icon": "assets/tech-icons/Arch_Amazon-Neptune_64.png"
+          },
+          {
+            "name": "DocumentDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DocumentDB_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Firestore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Graph-native storage is useful for analyst exploration and offline ring mining.",
+        "For the inline path, wide-column/document stores plus precomputed ring features are usually safer than live traversal."
+      ],
+      "makesIrrelevant": "Materializing graph features into the online feature store makes inline graph traversal unnecessary."
+    },
+    {
+      "concern": "Model serving and bounded risk scoring",
+      "steps": [
+        "decision",
+        "feedback",
+        "serving"
+      ],
+      "selfHosted": [
+        {
+          "name": "TensorFlow Serving",
+          "icon": "assets/tech-icons/tensorflow.png"
+        },
+        {
+          "name": "Kubernetes",
+          "icon": "assets/tech-icons/kubernetes.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Docker",
+          "icon": "assets/tech-icons/docker.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SageMaker",
+            "icon": "assets/tech-icons/Arch_Amazon-SageMaker-AI_64.png"
+          },
+          {
+            "name": "ECS",
+            "icon": "assets/tech-icons/Arch_Amazon-Elastic-Container-Service_64.png"
+          },
+          {
+            "name": "EKS",
+            "icon": "assets/tech-icons/Arch_Amazon-Elastic-Kubernetes-Service_64.png"
+          },
+          {
+            "name": "Lambda",
+            "icon": "assets/tech-icons/Arch_AWS-Lambda_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Vertex AI",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          },
+          {
+            "name": "Cloud Run",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          },
+          {
+            "name": "GKE",
+            "icon": "assets/tech-icons/Containers-512-color.png"
+          },
+          {
+            "name": "Cloud Functions",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Machine Learning",
+            "icon": "assets/tech-icons/10166-icon-service-Machine-Learning.svg"
+          },
+          {
+            "name": "Container Apps",
+            "icon": "assets/tech-icons/02989-icon-service-Container-Apps-Environments.svg"
+          },
+          {
+            "name": "AKS",
+            "icon": "assets/tech-icons/10023-icon-service-Kubernetes-Services.svg"
+          },
+          {
+            "name": "Azure Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Self-managed model serving gives tight control over p99 latency, feature fetches, and canary routing.",
+        "Managed ML endpoints simplify packaging, registry integration, autoscaling, and rollback, but add provider-specific latency and deployment semantics."
+      ],
+      "makesIrrelevant": "A managed endpoint with registry, canary, and rollback support removes much of the bespoke model deployment service."
+    },
+    {
+      "concern": "Review queue and case workflow",
+      "steps": [
+        "review",
+        "decision-tiers",
+        "feedback"
+      ],
+      "selfHosted": [
+        {
+          "name": "Temporal",
+          "icon": "assets/tech-icons/temporal.png"
+        },
+        {
+          "name": "RabbitMQ",
+          "icon": "assets/tech-icons/rabbitmq.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Keycloak",
+          "icon": "assets/tech-icons/keycloak.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          },
+          {
+            "name": "Cognito",
+            "icon": "assets/tech-icons/Arch_Amazon-Cognito_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Identity Platform",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Durable Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          },
+          {
+            "name": "Logic Apps",
+            "icon": "assets/tech-icons/10363-icon-service-Logic-Apps-Custom-Connector.svg"
+          },
+          {
+            "name": "Microsoft Entra ID",
+            "icon": "assets/tech-icons/10231-icon-service-Entra-ID-Protection.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A workflow engine is useful when challenge/review states, retries, holds, expirations, and appeals become first-class product flows.",
+        "A simple queue plus database state is cheaper at first, but pushes leases, idempotency, and retries into application code."
+      ],
+      "makesIrrelevant": "Managed queue/workflow services remove much of the custom lease, retry, dead-letter, and state-transition plumbing."
+    },
+    {
+      "concern": "Label store, training pipeline, and point-in-time joins",
+      "steps": [
+        "feedback",
+        "features",
+        "decision"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Spark",
+          "icon": "assets/tech-icons/spark.png"
+        },
+        {
+          "name": "Apache Airflow",
+          "icon": "assets/tech-icons/airflow.png"
+        },
+        {
+          "name": "DVC",
+          "icon": "assets/tech-icons/dvc.png"
+        },
+        {
+          "name": "ClickHouse",
+          "icon": "assets/tech-icons/clickhouse.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SageMaker",
+            "icon": "assets/tech-icons/Arch_Amazon-SageMaker-AI_64.png"
+          },
+          {
+            "name": "EMR",
+            "icon": "assets/tech-icons/Arch_Amazon-EMR_64.png"
+          },
+          {
+            "name": "AWS Glue",
+            "icon": "assets/tech-icons/Arch_AWS-Glue_64.png"
+          },
+          {
+            "name": "S3",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Storage-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Vertex AI",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          },
+          {
+            "name": "Dataproc",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "BigQuery",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Cloud Storage",
+            "icon": "assets/tech-icons/Storage-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Machine Learning",
+            "icon": "assets/tech-icons/10166-icon-service-Machine-Learning.svg"
+          },
+          {
+            "name": "Azure Databricks",
+            "icon": "assets/tech-icons/10787-icon-service-Azure-Databricks.svg"
+          },
+          {
+            "name": "Azure Synapse Analytics",
+            "icon": "assets/tech-icons/00606-icon-service-Azure-Synapse-Analytics.svg"
+          },
+          {
+            "name": "Blob Storage",
+            "icon": "assets/tech-icons/10781-icon-service-Blob-Page.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Point-in-time feature joins prevent training leakage and keep delayed chargebacks tied to decision-time snapshots.",
+        "Managed warehouses and ML platforms are usually cheaper for long label lag than keeping all training state in operational databases."
+      ],
+      "makesIrrelevant": "A managed ML/lakehouse stack removes much of the ad hoc feature export, training orchestration, and artifact publishing code."
+    },
+    {
+      "concern": "Decision audit, evidence search, and retention tiers",
+      "steps": [
+        "naive",
+        "decision",
+        "features",
+        "feedback",
+        "serving"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "ClickHouse",
+          "icon": "assets/tech-icons/clickhouse.png"
+        },
+        {
+          "name": "OpenSearch",
+          "icon": "assets/tech-icons/opensearch.png"
+        },
+        {
+          "name": "Apache Hadoop HDFS",
+          "icon": "assets/tech-icons/hadoop.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "OpenSearch Service",
+            "icon": "assets/tech-icons/Arch_Amazon-OpenSearch-Service_64.png"
+          },
+          {
+            "name": "S3",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Storage-Service_64.png"
+          },
+          {
+            "name": "S3 Glacier",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Storage-Service-Glacier_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "BigQuery",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Cloud Storage",
+            "icon": "assets/tech-icons/Storage-512-color.png"
+          },
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Log Analytics",
+            "icon": "assets/tech-icons/00009-icon-service-Log-Analytics-Workspaces.svg"
+          },
+          {
+            "name": "Blob Storage",
+            "icon": "assets/tech-icons/10781-icon-service-Blob-Page.svg"
+          },
+          {
+            "name": "Azure Data Lake Storage",
+            "icon": "assets/tech-icons/10090-icon-service-Data-Lake-Storage-Gen1.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Hot decision records need low-latency lookup for retries, disputes, and case evidence.",
+        "Cold append-only storage is the economical place for 12-24 months of compressed audit records and training backfills."
+      ],
+      "makesIrrelevant": "Object storage with lifecycle tiering removes the need to keep every decision and event in the hot serving database."
+    },
+    {
+      "concern": "Versioned rollout and governance for rules, models, and policies",
+      "steps": [
+        "decision",
+        "decision-tiers",
+        "feedback",
+        "serving"
+      ],
+      "selfHosted": [
+        {
+          "name": "GitHub",
+          "icon": "assets/tech-icons/github.png"
+        },
+        {
+          "name": "Argo CD",
+          "icon": "assets/tech-icons/argocd.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "DVC",
+          "icon": "assets/tech-icons/dvc.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SageMaker",
+            "icon": "assets/tech-icons/Arch_Amazon-SageMaker-AI_64.png"
+          },
+          {
+            "name": "AppConfig",
+            "icon": "assets/tech-icons/Arch_AWS-AppConfig_64.png"
+          },
+          {
+            "name": "CodeDeploy",
+            "icon": "assets/tech-icons/Arch_AWS-CodeDeploy_64.png"
+          },
+          {
+            "name": "CloudTrail",
+            "icon": "assets/tech-icons/Arch_AWS-CloudTrail_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Vertex AI",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          },
+          {
+            "name": "Firebase Remote Config",
+            "icon": "assets/tech-icons/DevOps-512-color.png"
+          },
+          {
+            "name": "Cloud Deploy",
+            "icon": "assets/tech-icons/DevOps-512-color.png"
+          },
+          {
+            "name": "Dataplex Universal Catalog",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Machine Learning",
+            "icon": "assets/tech-icons/10166-icon-service-Machine-Learning.svg"
+          },
+          {
+            "name": "Azure App Configuration",
+            "icon": "assets/tech-icons/10219-icon-service-App-Configuration.svg"
+          },
+          {
+            "name": "Azure DevOps",
+            "icon": "assets/tech-icons/03393-icon-service-Managed-DevOps-Pools.svg"
+          },
+          {
+            "name": "Azure Policy",
+            "icon": "assets/tech-icons/10316-icon-service-Policy.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Rules, thresholds, feature definitions, and models need immutable versions because every decision can be disputed later.",
+        "Feature flags and canaries enable shadow/champion-challenger rollout, but require rollback discipline and complete audit trails."
+      ],
+      "makesIrrelevant": "A shared registry/config plane removes hand-built version tables for many rollout and approval workflows."
+    },
+    {
+      "concern": "Observability and adversarial operations",
+      "steps": [
+        "features",
+        "feedback",
+        "serving"
+      ],
+      "selfHosted": [
+        {
+          "name": "Prometheus",
+          "icon": "assets/tech-icons/prometheus.png"
+        },
+        {
+          "name": "Grafana",
+          "icon": "assets/tech-icons/grafana.png"
+        },
+        {
+          "name": "Jaeger",
+          "icon": "assets/tech-icons/jaeger.png"
+        },
+        {
+          "name": "Fluentd/Fluent Bit",
+          "icon": "assets/tech-icons/fluentd.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "X-Ray",
+            "icon": "assets/tech-icons/Arch_AWS-X-Ray_64.png"
+          },
+          {
+            "name": "Managed Grafana",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Grafana_64.png"
+          },
+          {
+            "name": "Managed Service for Prometheus",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Service-for-Prometheus_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Trace",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Logging",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Profiler",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Application Insights",
+            "icon": "assets/tech-icons/00012-icon-service-Application-Insights.svg"
+          },
+          {
+            "name": "Azure Managed Grafana",
+            "icon": "assets/tech-icons/02905-icon-service-Azure-Managed-Grafana.svg"
+          },
+          {
+            "name": "Log Analytics",
+            "icon": "assets/tech-icons/00009-icon-service-Log-Analytics-Workspaces.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "The platform must alert on p99 score latency, feature age, stream lag, fallback rate, review backlog, label drift, and poisoning probes.",
+        "Managed telemetry reduces ingestion and storage operations, while self-hosted stacks provide more control over retention and sensitive signal redaction."
+      ],
+      "makesIrrelevant": "Managed telemetry with alert rules removes custom health scripts, but not domain-specific fraud dashboards and drift monitors."
     }
   ],
   "patterns": [
@@ -521,6 +1761,7 @@
       "description": [
         "Start with the simplest thing that works. The calling service has a handful of hard-coded checks inline: is this card on a blocklist? Is the amount over $X? Is the IP in a banned country? If any fires, block; otherwise allow.",
         "This is cheap, fast, and explainable — and it exposes the problems the rest of the design exists to solve. Static rules only catch fraud you already wrote a rule for: they miss fuzzy, novel, and coordinated fraud (a ring of fresh accounts each individually clean, a fraudster just under the amount threshold). They are crude — a single $X cutoff blocks legitimate big spenders (false positives) while letting smart fraud through. And because the rules are hard-coded in the app, adapting to a new attack means a code change and deploy, far too slow against an adversary that changes tactics daily.",
+        "Even this baseline grows obligations the moment it becomes a shared risk service rather than inline code: callers will retry it, so the same action scored twice must return the same decision (idempotency, not a fresh roll), and every decision needs an audit record (what fired, when, for whom) for disputes and debugging. That's why the decision API later carries an actionId, an idempotencyKey, and a durable decisionId — the baseline already needs them.",
         "So the baseline motivates everything that follows: add an ML model that scores fuzzy risk from fresh behavioral features, link entities to catch rings, route ambiguous cases to humans, and feed confirmed outcomes back to keep learning."
       ],
       "view": {
@@ -543,8 +1784,9 @@
         "Establishing the static-rules baseline first makes it obvious why fuzzy ML scoring, fresh features, graph signals, and a feedback loop are needed — every later step removes a specific blind spot from here."
       ],
       "probeLinks": [
-        "uber-michelangelo",
-        "feast-docs"
+        "stripe-radar-rules",
+        "google-rules-ml",
+        "owasp-automated-threats"
       ],
       "recap": {
         "before": "Nothing.",
@@ -556,8 +1798,14 @@
           "trap": "Relying only on a few static if-rules baked into the application.",
           "why": "They catch only known patterns, cause false positives with crude cutoffs, and can't adapt to a fast-moving adversary.",
           "instead": "Combine rules with an ML score over fresh features, add graph signals, and close a feedback loop that retrains."
+        },
+        {
+          "trap": "Treating each retried request as a brand-new action with no record of the decision.",
+          "why": "Inline callers retry; without a stable action id / idempotency key the same attempt looks like several, double-counts velocity, and leaves no auditable record of why it was blocked.",
+          "instead": "Give every action a stable id + idempotency key from the start and persist an audit record of each decision — even the naive baseline should be replay-safe and explainable."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/01-naive.jpg"
     },
     {
       "id": "decision",
@@ -565,7 +1813,8 @@
       "description": [
         "Risk is asked inline on a user action (checkout, login), so it must answer in tens of ms with a decision: allow, block, challenge (step-up auth), or send to review. The risk API combines two engines.",
         "A rules engine handles fast, deterministic checks (blocklists, hard velocity limits, impossible-travel) — cheap, explainable, and instantly updatable. An ML model returns a risk score from features for the fuzzy cases rules can't capture.",
-        "Combine them: hard rules can short-circuit (block known-bad immediately); otherwise the score plus rule signals map to a decision with thresholds. Every decision records its reasons for auditability."
+        "Combine them: hard rules can short-circuit (block known-bad immediately); otherwise the score plus rule signals map to a decision with thresholds. The model depends on fresh behavioral features — assume they exist for now; Step 3 designs how we keep them fresh.",
+        "Every decision persists an auditable record: a decisionId, the reasons, and the exact versions in effect — ruleset version, model version, and threshold/policy version — plus internal reason codes kept separate from the vague message shown to the user. Those versions are what later let a chargeback or dispute be replayed against exactly what the engine saw."
       ],
       "view": {
         "nodes": [
@@ -624,7 +1873,8 @@
             "groups": [
               "decision"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-decision-opt1.jpg"
         },
         {
           "name": "Rules engine only",
@@ -653,7 +1903,8 @@
             "highlight": [
               "Rules"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-decision-opt2.jpg"
         },
         {
           "name": "ML model only",
@@ -682,7 +1933,8 @@
             "highlight": [
               "Model"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-decision-opt3.jpg"
         }
       ],
       "decisionPrompt": "Why combine a rules engine with an ML model instead of using only one?",
@@ -693,12 +1945,21 @@
           "whyItMatters": "Rules give instant, explainable control; ML generalizes — together they cover more with fewer gaps.",
           "example": "Rule blocks a known-bad card instantly; model flags a subtle anomaly.",
           "group": "Inline Decisioning: Rules + ML"
+        },
+        {
+          "term": "Decision idempotency & policy versioning",
+          "definition": "A stable action id + idempotency key replays the original decision on retry; the audit record pins the ruleset/model/policy versions in effect.",
+          "whyItMatters": "Retries don't double-count or create conflicting decisions, and a later dispute can be replayed against exactly what the engine saw.",
+          "example": "Same idempotencyKey -> original decision returned; record shows policy p_2026_06, model m_42.",
+          "group": "Inline Decisioning: Rules + ML"
         }
       ],
       "probeLinks": [
+        "stripe-radar",
+        "stripe-radar-built",
         "uber-michelangelo",
-        "feast-docs",
-        "kafka-design"
+        "google-rules-ml",
+        "feast-docs"
       ],
       "patterns": [
         "Inline rules + ML decisioning"
@@ -819,8 +2080,10 @@
       "title": "3. Streaming Velocity Features",
       "description": [
         "Most fraud signal is behavioral and recent: 'this card tried 20 merchants in 5 minutes', 'this IP created 100 accounts today'. These velocity/aggregate features must be fresh (seconds), so compute them in near-real-time.",
-        "Every action emits an event to a stream; a streaming aggregator maintains per-entity counters (per user/device/IP/card, per window) and reputation, writing them to a low-latency feature store the model/rules read at decision time.",
-        "Online/offline parity matters: the same feature definitions used at scoring must be used in training, or the model sees different inputs than it learned on."
+        "Every action emits an event to a stream; a streaming aggregator maintains per-entity counters (per user/device/IP/card, per window) and reputation, writing them to a low-latency feature store the model/rules read at decision time. At ~10-20k events/sec this is the work-driving path: partition the stream by entity type + entity hash (so order is preserved per entity), and split known hot keys (a shared IP, a popular merchant, an attack device) into sub-partitions so one entity can't bottleneck a partition. Concretely, ~10-20k events/sec at a few thousand events/sec per consumer is on the order of dozens of partitions with consumer parallelism to match, plus headroom for replay/backfill after an outage.",
+        "Size the feature store from the read path, not the write path: ~50-150k reads/sec against ~10-30 features/score means the hot set must be in memory and replicated. Shard by entity key and add read replicas per shard so hot entities (a shared IP, a viral merchant) don't hotspot a single node; replicas also absorb the read fan-out and give failover. This is why graph traversal is materialized out — it would multiply this read load by the neighborhood size.",
+        "Counters are only trustworthy if ingestion is clean. Events carry an eventId + dedupeKey so retried/replayed events are dropped (otherwise a single retried login inflates velocity and poisons the score), and an eventTime separate from ingestTime so the aggregator can window on when things happened and tolerate late/out-of-order arrivals (watermarks, bounded lateness) rather than miscounting a burst.",
+        "Online/offline parity matters: the same feature definitions used at scoring must be used in training, or the model sees different inputs than it learned on. The exact values served are captured in a decision-time feature snapshot so later labels can be joined point-in-time."
       ],
       "view": {
         "nodes": [
@@ -828,9 +2091,10 @@
           "EventLog",
           "AggSvc",
           "Features",
+          "Rules",
           "Model"
         ],
-        "caption": "Actions emit events to the event stream, which the streaming aggregator consumes to update the feature store that the model reads.",
+        "caption": "Actions emit events to the event stream, which the streaming aggregator consumes to update the feature store that both the rules engine and the model read.",
         "links": [
           "caller-eventlog",
           "eventlog-agg",
@@ -884,7 +2148,8 @@
               "signals",
               "decision"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-features-opt1.jpg"
         },
         {
           "name": "Batch-computed features (hourly/daily)",
@@ -928,7 +2193,8 @@
             "highlight": [
               "BatchJob"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-features-opt2.jpg"
         },
         {
           "name": "On-demand feature computation at decision time",
@@ -963,7 +2229,8 @@
             "highlight": [
               "EventLog"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-features-opt3.jpg"
         }
       ],
       "decisionPrompt": "How does the model know this card was used at 20 merchants in the last 5 minutes, within a 20ms budget?",
@@ -974,13 +2241,22 @@
           "whyItMatters": "Catches bursty/coordinated abuse that static features miss; must be fresh and fast to read.",
           "example": "payments_last_5m for a card, served from the feature store in <5ms.",
           "group": "Streaming Velocity Features"
+        },
+        {
+          "term": "Event-time processing & feature snapshots",
+          "definition": "Window on when an event happened (with dedupe + bounded lateness), and capture the exact feature values served at decision time.",
+          "whyItMatters": "Deduped event-time counters resist replay/poisoning, and snapshots let late labels be joined point-in-time without leakage.",
+          "example": "Late login windowed by eventTime; decision dec_91's snapshot stores the counters it scored on.",
+          "group": "Streaming Velocity Features"
         }
       ],
       "probeLinks": [
-        "uber-michelangelo",
+        "stripe-shepherd",
+        "feast-docs",
+        "flink-docs",
         "kafka-design",
-        "stripe-radar",
-        "feast-docs"
+        "uber-realtime-data",
+        "scarff-streaming-fraud"
       ],
       "patterns": [
         "Streaming velocity features"
@@ -988,9 +2264,23 @@
       "whyNow": [
         "Fresh behavioral features are what make fraud detection work; the stream->aggregate->feature-store path is the standard mechanism."
       ],
+      "traps": [
+        {
+          "trap": "Counting raw events without a dedupe key.",
+          "why": "Inline callers retry; a single replayed action inflates velocity counters and can flip the score — and is an easy poisoning vector for attackers who replay benign-looking events.",
+          "instead": "Deduplicate on an event/dedupe key at ingest, and window on event time (not ingest time) with bounded lateness."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "An action is retried and emits the same event twice (or an attacker replays events).",
+          "expectedBehavior": "The second event is deduped on its dedupe key, so counters are unaffected and the score isn't poisoned.",
+          "mitigation": "Idempotent ingest (dedupe key) + event-time windowing with watermarks for late/out-of-order events."
+        }
+      ],
       "recap": {
         "before": "Decision with weak inputs.",
-        "after": "Fresh velocity/reputation features feeding rules + model.",
+        "after": "Fresh, dedup'd velocity/reputation features feeding rules + model.",
         "newRisk": "Sophisticated fraud is coordinated across many entities — single-entity features miss rings."
       }
     },
@@ -1000,6 +2290,8 @@
       "description": [
         "Fraud rings share resources: many 'users' on one device, many cards behind one IP, recycled phone numbers. Single-entity features can't see this; an entity link graph connecting users/devices/cards/IPs/addresses can.",
         "The aggregator maintains these links from events; graph features (cluster size, shared-device count, connection to known-bad entities) feed the model. A new account linked to a known fraud cluster is high-risk even with a clean individual history.",
+        "Keep the inline path cheap: do not traverse the graph at decision time. Edges are written offline/near-real-time (~10-20k/sec), and graph features are materialized into the same feature store the model reads in <5ms — the decision reads a precomputed cluster-size/known-bad-distance value, never a live multi-hop query. Edges carry a confidence and first/last-seen so stale links can expire (a device reassigned by an ISP shouldn't link strangers forever), and shared identifiers are tokenized for privacy.",
+        "Because the features are materialized, expiry has to actively invalidate them, not just stop traversing. When an edge ages out or its confidence decays, the affected entities' graph features must be recomputed and rewritten, or the feature store keeps serving an inflated cluster size long after the link is gone — a classic stale shared-IP/device false positive. So edge expiry triggers re-materialization for the touched neighborhood (event-driven on expiry, with a periodic sweep as a backstop), the same way new edges do.",
         "Graph signals are powerful for catching organized abuse and bot rings that look individually benign — a key differentiator from per-event scoring."
       ],
       "view": {
@@ -1033,9 +2325,10 @@
         }
       ],
       "probeLinks": [
-        "uber-michelangelo",
-        "feast-docs",
-        "kafka-design"
+        "amazon-neptune-fraud-graphs",
+        "aws-neptune-graphstorm-fraud",
+        "nvidia-gnn-fraud",
+        "linkedin-abusive-sequences"
       ],
       "patterns": [
         "Entity link graph"
@@ -1047,14 +2340,18 @@
         "before": "Per-entity signals only.",
         "after": "Ring/cluster detection via the entity graph.",
         "newRisk": "Not every case is clear-cut — ambiguous ones need a path beyond instant allow/block."
-      }
+      },
+      "aiVisual": "assets/generated/ai-visuals/steps/04-graph.jpg"
     },
     {
       "id": "review",
       "title": "5. Sync vs Async: Block, Challenge, Review",
       "description": [
         "Not every decision should be a hard inline allow/block. Block only high-confidence fraud (false positives block real customers); for medium risk, issue a step-up challenge (2FA, ID check) inline; for ambiguous cases, allow-but-flag and send to async human review rather than guessing.",
-        "Analysts work a review queue with the decision's signals and the entity graph, then label the outcome. This human-in-the-loop both resolves hard cases and generates high-quality labels.",
+        "A review queue is not just a queue — each case is a small state machine: created with an evidence snapshot (the signals + graph as they were at flag time), prioritized by risk x value, assigned to an analyst, worked under an SLA (due_at), and resolved (fraud / legit / reversed / refunded). The resolution emits a label and any customer action (hold, refund, clawback); appeals/disputes reopen the case. Analyst access is RBAC-gated and every action is audit-logged.",
+        "Make the workflow observable to the caller, not just internal. The decision response carries a challengeId or reviewCaseId; the caller polls GET /v1/risk/cases/{id} (or gets a webhook) to learn whether to hold the action, when a challenge expires, and the final resolution. Completion flows back the other way as an event: challenge_passed / challenge_failed and review_resolved / payment_reversed POST to /v1/events with the decisionId, which closes the challenge_attempt or review_case, emits the matching label, and refreshes features — so the lifecycle is fully traceable end to end.",
+        "Review capacity is a hard constraint, not a queue depth. At ~1-3% of decisions, peak review arrival is ~50-150 cases/sec — far beyond what any analyst team can clear (a few cases/analyst/hour means even a large team handles tens of cases/sec at most). So the review band is sized to staffing, not the other way around: prioritize by risk x value and work the top of the queue first, auto-resolve or hold the long tail by policy when the backlog SLA is at risk, and throttle the allow-but-flag band (raise its threshold) when the backlog ages. The decision_policies thresholds are tuned with this analyst budget in view, which is why a threshold tweak that quietly doubles the backlog must be caught.",
+        "Outcomes feed training, but only the resolved label and decision-time features become a training label — analyst-only investigative evidence is not leaked into the model or back to the customer. Whether 'allow-but-flag' is even acceptable depends on the action: fine for a low-value payment or login, but high-value payments may need to hold/challenge rather than complete-then-review.",
         "This sync/async split balances latency, recall, and false positives: instant for the obvious, challenge for the uncertain, async review for the genuinely ambiguous."
       ],
       "view": {
@@ -1112,7 +2409,8 @@
             "groups": [
               "feedback"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-review-opt1.jpg"
         },
         {
           "name": "Binary allow/block inline only",
@@ -1139,7 +2437,8 @@
             "highlight": [
               "RiskAPI"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-review-opt2.jpg"
         },
         {
           "name": "Allow-but-flag everything to async review",
@@ -1174,7 +2473,8 @@
             "highlight": [
               "CaseQ"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-review-opt3.jpg"
         }
       ],
       "decisionPrompt": "A charge scores 0.6 — not clearly fraud, not clearly legit. What do you do with it?",
@@ -1188,8 +2488,11 @@
         }
       ],
       "probeLinks": [
-        "uber-michelangelo",
-        "kafka-design"
+        "uber-radar",
+        "stripe-radar",
+        "stripe-radar-rules",
+        "temporal-docs",
+        "linkedin-abuse-scale"
       ],
       "patterns": [
         "Sync-vs-async decisioning",
@@ -1256,7 +2559,7 @@
                       "from": "RiskAPI",
                       "to": "Caller",
                       "arrow": "-->>",
-                      "label": "allow (provisional) / challenge"
+                      "label": "challenge or allow-and-flag"
                     },
                     {
                       "from": "RiskAPI",
@@ -1295,7 +2598,7 @@
       "description": [
         "Not every score should be a hard allow/block — the tiers and their thresholds are a deliberate design. Block only high-confidence fraud (false positives turn away real customers and revenue). For the uncertain middle, issue a step-up challenge (2FA, ID check) inline so a legit user can prove themselves. For genuinely ambiguous cases, allow-but-flag to async review rather than guessing.",
         "Thresholds are tuned against the business cost matrix: the cost of a false positive (blocked good user) vs a false negative (missed fraud) is rarely symmetric, and it differs by action (a $5 charge vs a $5,000 one). Calibrate the score and set per-action thresholds accordingly.",
-        "These cutoffs are not static — they're monitored and adjusted as fraud patterns and approval/chargeback rates shift, which is why the feedback loop (next step) matters."
+        "These cutoffs are not static — they're monitored and adjusted as fraud patterns and approval/chargeback rates shift, which is why the feedback loop (next step) matters. Treat the thresholds as a versioned decision_policies record: changes are auditable, rolled out safely (canary a new policy before making it champion, with a rollback), and measured by approval rate, challenge completion rate, fraud loss, false-positive rate, and review-queue load — so a threshold tweak that quietly doubles the analyst backlog is caught. The active policyVersion is returned on every decision and stored on its audit record, so any decision can be replayed against the exact thresholds that produced it (and a bad rollout can be attributed precisely)."
       ],
       "view": {
         "nodes": [
@@ -1321,6 +2624,9 @@
         }
       ],
       "probeLinks": [
+        "stripe-radar-rules",
+        "uber-radar",
+        "google-rules-ml",
         "sre-monitoring"
       ],
       "traps": [
@@ -1334,15 +2640,17 @@
         "before": "Decisions are block-or-allow.",
         "after": "Calibrated block/challenge/review tiers tuned to per-action costs.",
         "newRisk": "Thresholds drift as fraud adapts — they need monitoring and the feedback loop."
-      }
+      },
+      "aiVisual": "assets/generated/ai-visuals/steps/06-decision-tiers.jpg"
     },
     {
       "id": "feedback",
       "title": "6. The Feedback Loop: Labels and Retraining",
       "description": [
         "Adversaries evolve, so the system must learn. Confirmed outcomes — chargebacks (fraud), analyst labels, user reports — flow into a label store. These labels train the next model version.",
-        "Label lag is the catch: a chargeback may arrive weeks after the charge, so training must align labels to the features as they were at decision time (point-in-time correctness), not current values. The decision audit record captures the features/score used, enabling this.",
-        "Offline training produces new model versions; deploy gradually (shadow/champion-challenger) and monitor for drift. Rules can be updated instantly for emerging patterns while the model retrains on the slower cadence."
+        "Label lag is the catch: a chargeback may arrive weeks after the charge, so training must align labels to the features as they were at decision time (point-in-time correctness), not current values. The per-decision feature snapshot captures the features/score used, enabling this. Labels also differ in trust: analyst labels are high-confidence but few, chargebacks are authoritative but slow, user reports are noisy — carry a source-trust level so the trainer can weight or quarantine low-trust (and potentially poisoned) labels.",
+        "Guard against leakage: train on the resolved label and the decision-time feature snapshot only. Analyst-only investigative evidence (notes, signals an analyst pulled after the fact, anything not available at scoring) must not become a feature — it leaks the future into training and inflates offline metrics that collapse in production. The point-in-time join is precisely what enforces this: it can only see what the feature store served at decision time.",
+        "Offline training publishes a versioned model into a registry with its validation metrics, feature-set compatibility, rollout state (shadow -> canary -> champion), and a rollback path. Deploy gradually (shadow/champion-challenger), monitor for drift, and roll back to the prior champion on regression. Rules can be updated instantly for emerging patterns while the model retrains on the slower cadence."
       ],
       "view": {
         "nodes": [
@@ -1374,11 +2682,23 @@
           "whyItMatters": "Avoids training leakage and reflects what the model actually saw.",
           "example": "Chargeback label joined to the action's snapshot features from 3 weeks ago.",
           "group": "The Feedback Loop: Labels and Retraining"
+        },
+        {
+          "term": "Model registry & label-source trust",
+          "definition": "Publish each model with validation metrics + rollout state (shadow/canary/champion) and a rollback path; weight labels by how trustworthy their source is.",
+          "whyItMatters": "Safe rollout/rollback prevents a bad model from going wide, and trust weighting blunts noisy or poisoned labels.",
+          "example": "m_43 canaried before champion; user-report labels weighted below chargebacks.",
+          "group": "The Feedback Loop: Labels and Retraining"
         }
       ],
       "probeLinks": [
-        "uber-michelangelo",
-        "feast-docs"
+        "feast-docs",
+        "stripe-shepherd",
+        "google-rules-ml",
+        "ml-test-score",
+        "hidden-ml-debt",
+        "credit-card-fraud-survey",
+        "scarff-streaming-fraud"
       ],
       "patterns": [
         "Feedback loop / retraining"
@@ -1390,15 +2710,19 @@
         "before": "Static models.",
         "after": "Outcomes -> point-in-time labels -> retrained models; rules updated instantly.",
         "newRisk": "Inline scoring is on the critical path — it must be fast and fail safe at high volume."
-      }
+      },
+      "aiVisual": "assets/generated/ai-visuals/steps/07-feedback.jpg"
     },
     {
       "id": "serving",
       "title": "7. Latency, Failure Modes, and Adversarial Robustness",
       "description": [
         "Scoring is inline, so guard the latency budget: feature reads from an in-memory store, a bounded model, rules short-circuiting cheap cases, and caching repeated entity lookups. Heavy graph computation runs offline/near-real-time, not inline.",
-        "Fail safe: if the model or feature store is slow/down, fall back to rules-only (or a conservative default) rather than blocking the host action entirely — a risk-engine outage shouldn't take down checkout. Decisions are logged for audit and dispute resolution.",
-        "Adversarial robustness: don't leak why something was blocked to attackers (vague user messaging, detailed internal reasons), monitor for probing, and keep rules fast-updatable to respond to new attacks faster than retraining allows."
+        "Budget the tail explicitly: p95 ~35ms and p99 ~50ms, sliced as rules ~5ms, feature reads ~10ms, model ~15ms, precomputed graph features ~5ms, overhead ~15ms. Alert on the fallback rate and on feature staleness, not just on errors.",
+        "Fail safe is per-action, not one universal 'fail open'. If the model or feature store is slow/down, degrade by action and risk rather than blocking the host action entirely — a risk-engine outage shouldn't take down checkout, but it also shouldn't wave through a $5,000 payment. A fallback matrix: a login can challenge (step-up), a small payment can allow-with-flag, a high-value payment requires step-up or review, account creation rate-limits. Every fallback decision logs its reason (model_timeout / feature_timeout / stale_features) and records that the model/features were missing, so the audit trail is honest.",
+        "The audit trail itself needs sizing: ~5k decisions/sec x ~1-2 KB is ~0.5-1 TB/day, retained 12-24 months for disputes and regulators. That's too much to keep hot, so tier it — recent decisions (the dispute/chargeback window, weeks) stay in a queryable hot store indexed by decision_id and entity, and older records compress and roll to cold object storage that's still retrievable for an audit but not on the live query path. The feature_snapshots and labels that training joins against follow the same hot/cold split.",
+        "Privacy is per record type, not one blanket rule, because this system holds sensitive linkage data (user-device-IP-card relationships, review evidence, chargebacks). A workable retention/access matrix: decisions retained 12-24 months (dispute/audit) with internal access; raw events tiered and compacted after weeks; graph_edges expire by edge type and confidence (a stale shared-IP edge is a false-positive source); review evidence is restricted to analyst RBAC and never trains the model; labels are kept for the model audit horizon; card/IP identifiers are tokenized or salted everywhere, not stored raw; and attacker-facing reason strings are stored separately from the internal explanations so the obscured customer message can never leak the real rule. Deletion requests are honored against the raw-PII stores while the tokenized, non-identifying decision/audit records are retained for compliance.",
+        "Adversarial robustness: keep internal reason codes internal — show the user vague messaging while logging detailed reasons for analysts/disputes, so attackers can't reverse-engineer the rules. Rate-limit and monitor the scoring API for probing, defend the event/label pipeline against poisoning (dedupe, source-trust weighting, drift monitors), and keep rules fast-updatable to respond to new attacks faster than retraining allows."
       ],
       "view": {
         "nodes": [
@@ -1428,9 +2752,11 @@
       ],
       "probeLinks": [
         "uber-michelangelo",
-        "feast-docs",
-        "kafka-design",
-        "sre-monitoring"
+        "linkedin-abuse-scale",
+        "opentelemetry-docs",
+        "sre-monitoring",
+        "nist-adversarial-ml",
+        "owasp-automated-threats"
       ],
       "recap": {
         "before": "Functional decisioning.",
@@ -1440,24 +2766,33 @@
       "bottlenecks": [
         {
           "issue": "Feature/model latency on the critical path.",
-          "mitigation": "In-memory features, bounded model, rule short-circuits, caching."
+          "mitigation": "In-memory features, bounded model, rule short-circuits, caching; p99 ~50ms budget with per-stage slices."
         },
         {
           "issue": "Scoring outage.",
-          "mitigation": "Fail open to rules-only / conservative default; never hard-fail the host action."
+          "mitigation": "Per-action fallback matrix (challenge / allow-with-flag / step-up / rate-limit) instead of one universal fail-open; never hard-fail the host action; alert on fallback rate."
+        },
+        {
+          "issue": "Hot keys (shared IP, popular merchant, attack device).",
+          "mitigation": "Partition features/stream by entity and shard hot keys so one entity can't bottleneck a partition."
         }
       ],
       "failureDrills": [
         {
-          "scenario": "The ML model service is unavailable.",
-          "expectedBehavior": "Decisioning falls back to the rules engine (and a safe default), keeping the host action working.",
-          "mitigation": "Rules-only fallback + conservative default + alerting."
+          "scenario": "The ML model or feature store times out during a high-value payment.",
+          "expectedBehavior": "Per the fallback matrix it does NOT silently allow: it requires step-up or routes to review, while a low-value action may allow-with-flag — host action stays up either way.",
+          "mitigation": "Per-action fallback matrix + conservative default; log fallback reason; alert on fallback rate and feature staleness."
+        },
+        {
+          "scenario": "An attacker probes the scoring API to reverse-engineer rules, or replays events to poison features/labels.",
+          "expectedBehavior": "User-facing messaging stays vague (no internal reason codes leak); probing is rate-limited and alerted; dedupe + source-trust weighting + drift monitors blunt poisoning.",
+          "mitigation": "Internal-only reason codes, API rate limits, event dedupe, label source-trust, drift/poisoning monitors."
         }
       ],
       "flows": [
         {
-          "name": "Fail open to rules-only on scoring outage",
-          "note": "If the model or feature store times out, the risk API degrades to a rules-only conservative decision rather than failing the host action.",
+          "name": "Per-action fallback on scoring outage",
+          "note": "If the model or feature store times out, the risk API degrades per the fallback matrix — rules-only for low-risk, step-up/review for high-value — rather than failing the host action or blindly allowing.",
           "sequence": {
             "participants": [
               {
@@ -1514,19 +2849,19 @@
                       "from": "RiskAPI",
                       "to": "Rules",
                       "arrow": "->>",
-                      "label": "rules-only fallback"
+                      "label": "fallback by action/risk"
                     },
                     {
                       "from": "Rules",
                       "to": "RiskAPI",
                       "arrow": "-->>",
-                      "label": "conservative decision"
+                      "label": "rules-only / step-up / review"
                     },
                     {
                       "from": "RiskAPI",
                       "to": "Caller",
                       "arrow": "-->>",
-                      "label": "decision (host action stays up)"
+                      "label": "decision + fallback reason (host action stays up)"
                     }
                   ]
                 }
@@ -1538,12 +2873,13 @@
             "Rules"
           ]
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/08-serving.jpg"
     }
   ],
   "finalDesign": {
     "title": "Final Design — Real-Time Risk Engine",
-    "description": "Callers ask the risk API inline; it combines a rules engine (fast, explainable, instantly updatable) with an ML model that scores using fresh features. Every action streams events to a near-real-time aggregator that maintains velocity/reputation features (online/offline parity) and an entity link graph for ring detection. Decisions are tiered — block confident fraud, challenge medium risk inline, allow-and-flag ambiguous cases to an analyst review queue whose labels (plus chargebacks) train the next model with point-in-time correctness. Scoring runs within a tight latency budget and fails open to rules-only on model/feature outage, with all decisions audited and attacker-facing reasons obscured.",
+    "description": "Callers ask the risk API inline with a stable action id + idempotency key so retries replay the original decision; it combines a rules engine (fast, explainable, instantly updatable) with an ML model that scores using fresh features. Every action streams dedup'd events to a near-real-time aggregator that maintains velocity/reputation features (online/offline parity) and an entity link graph for ring detection — graph features are materialized offline, never traversed inline. Decisions are tiered — block confident fraud, challenge medium risk inline, allow-and-flag ambiguous cases to an analyst review queue (a case state machine with priority, SLA, evidence snapshot, and audit trail) whose labels (plus chargebacks, weighted by source trust) train the next model with point-in-time correctness against a per-decision feature snapshot. A challenge or review is observable to the caller: the decision returns a challengeId or reviewCaseId, status is queryable (poll or webhook), and completion flows back as an outcome event that closes the case and emits the label. State ownership is explicit: the event log owns raw events, the feature store owns served features + snapshots, the graph owns entity links, review_cases own review state, and versioned rulesets/decision_policies/model_versions own rollout. Scoring runs within a tight p99 budget and degrades per a per-action fallback matrix (challenge / allow-with-flag / step-up / rate-limit) on model/feature outage — not one universal fail-open — with all decisions audited, identifiers tokenized, and attacker-facing reasons obscured.",
     "view": {
       "nodes": [
         "Caller",
@@ -1582,7 +2918,8 @@
         "signals",
         "feedback"
       ]
-    }
+    },
+    "aiVisual": "assets/generated/ai-visuals/final-design.jpg"
   },
   "satisfies": {
     "functional": [
@@ -1654,8 +2991,16 @@
       },
       {
         "requirement": "Fail safe",
-        "how": "Rules-only fallback on scoring outage.",
+        "how": "Per-action fallback matrix on scoring outage (not universal fail-open).",
         "steps": [
+          "serving"
+        ]
+      },
+      {
+        "requirement": "Privacy & abuse-resistant",
+        "how": "Tokenized identifiers, internal-only reason codes, API rate-limits, event dedupe, label source-trust, drift/poisoning monitors.",
+        "steps": [
+          "features",
           "serving"
         ]
       }
@@ -1686,7 +3031,7 @@
       "say": [
         "Tiered decisions: block/challenge/review.",
         "Feedback loop with point-in-time labeling.",
-        "Latency budget, fail-open fallback, adversarial concerns."
+        "Latency budget, per-action fallback matrix, adversarial concerns."
       ]
     },
     {
@@ -1720,7 +3065,7 @@
       "level": "Staff",
       "expectations": [
         "Reasons about point-in-time labeling and label lag.",
-        "Designs entity-graph features and fail-open fallback.",
+        "Designs entity-graph features and a per-action fallback matrix, reasoning about per-action degradation, feature staleness, fallback-rate alerting, and audit records when the model/features are missing.",
         "Discusses false-positive cost, adversarial adaptation, and drift precisely."
       ]
     }
@@ -1730,84 +3075,309 @@
     "How do you keep false positives low without letting fraud through?",
     "How would you detect and respond to a new attack faster than retraining allows?",
     "How do you build entity-graph features without blowing the latency budget?",
-    "How do you measure the engine's effectiveness (and not just block rate)?"
+    "How do you measure the engine's effectiveness (and not just block rate)? Think fraud loss, false-positive rate, challenge completion, approval rate, review backlog age, and fallback rate.",
+    "Inline callers retry — how do you keep retries from double-counting velocity or creating conflicting decisions?",
+    "An attacker replays events or floods the scoring API — how do you defend features/labels from poisoning and resist probing?",
+    "When the model or feature store is down on a high-value payment, what should happen — and why isn't 'fail open' the right answer everywhere?",
+    "Review arrives at ~50-150 cases/sec but analysts clear far fewer — how do you size the review band, prioritize, and throttle the allow-but-flag tier when the backlog ages?",
+    "After a stream outage or a feature-definition change, how do you replay/backfill features without double-counting velocity or corrupting point-in-time training joins?",
+    "Shared-IP/device edges go stale and cause false positives — how do you expire edges and invalidate the materialized graph features that were derived from them?",
+    "A bad model or policy rollout is hurting approvals right now — what's the emergency rollback path, and how fast can you revert thresholds/rules versus the model?"
   ],
   "toProbeFurther": {
     "links": [
       {
         "id": "stripe-radar",
-        "group": "Security and Identity",
-        "groupDescription": "Authentication, authorization, policy, abuse, and identity standards.",
-        "title": "Stripe Radar",
+        "group": "Production Fraud and Abuse Systems",
+        "groupDescription": "Real shipped systems and architecture writeups for inline risk scoring, fraud response, and anti-abuse defenses.",
+        "title": "Radar",
         "url": "https://docs.stripe.com/radar",
         "source": "Stripe",
         "type": "Docs",
-        "why": "Applied fraud and risk-scoring reference for payments and abuse detection."
+        "why": "Shows a production fraud product organized around real-time AI risk evaluation, rules, reviews, analytics, and fraud strategy controls."
       },
       {
-        "id": "feast-docs",
-        "group": "AI and ML Systems",
-        "groupDescription": "Feature stores, model serving, RAG, recommendation, and ML operations references.",
-        "title": "Feast: The Open Source Feature Store",
-        "url": "https://docs.feast.dev/",
-        "source": "Feast",
-        "type": "Docs",
-        "why": "Feature-store reference for offline/online parity, point-in-time joins, and serving features."
+        "id": "stripe-radar-built",
+        "group": "Production Fraud and Abuse Systems",
+        "groupDescription": "Real shipped systems and architecture writeups for inline risk scoring, fraud response, and anti-abuse defenses.",
+        "title": "How we built it: Stripe Radar",
+        "url": "https://stripe.com/blog/how-we-built-it-stripe-radar",
+        "source": "Stripe",
+        "type": "Case study",
+        "why": "Explains how Stripe evolved Radar's ML architecture, feature engineering, and risk explanations for payment fraud.",
+        "year": "2023"
+      },
+      {
+        "id": "stripe-shepherd",
+        "group": "Production Fraud and Abuse Systems",
+        "groupDescription": "Real shipped systems and architecture writeups for inline risk scoring, fraud response, and anti-abuse defenses.",
+        "title": "Shepherd: How Stripe adapted Chronon to scale ML feature development",
+        "url": "https://stripe.com/blog/shepherd-how-stripe-adapted-chronon-to-scale-ml-feature-development",
+        "source": "Stripe",
+        "type": "Case study",
+        "why": "Deep dive on Stripe's fraud feature platform, including streaming freshness, online/offline consistency, and training-serving skew controls.",
+        "year": "2024"
+      },
+      {
+        "id": "uber-radar",
+        "group": "Production Fraud and Abuse Systems",
+        "groupDescription": "Real shipped systems and architecture writeups for inline risk scoring, fraud response, and anti-abuse defenses.",
+        "title": "Project RADAR: Intelligent Early Fraud Detection System with Humans in the Loop",
+        "url": "https://www.uber.com/ie/en/blog/project-radar-intelligent-early-fraud-detection/",
+        "source": "Uber Engineering",
+        "type": "Case study",
+        "why": "Production case study for anomaly-triggered fraud rules, analyst approval, short-lived mitigations, and human-in-the-loop review.",
+        "year": "2022"
       },
       {
         "id": "uber-michelangelo",
-        "group": "AI and ML Systems",
-        "groupDescription": "Feature stores, model serving, RAG, recommendation, and ML operations references.",
+        "group": "Production Fraud and Abuse Systems",
+        "groupDescription": "Real shipped systems and architecture writeups for inline risk scoring, fraud response, and anti-abuse defenses.",
         "title": "Meet Michelangelo: Uber's Machine Learning Platform",
         "url": "https://www.uber.com/en-DE/blog/michelangelo-machine-learning-platform/",
         "source": "Uber Engineering",
         "type": "Case study",
-        "why": "Production ML platform covering features, training, model management, serving, and monitoring.",
+        "why": "Production ML platform covering feature pipelines, online serving, model repositories, evaluation, deployment, and monitoring.",
         "year": "2017"
       },
       {
+        "id": "linkedin-abuse-scale",
+        "group": "Production Fraud and Abuse Systems",
+        "groupDescription": "Real shipped systems and architecture writeups for inline risk scoring, fraud response, and anti-abuse defenses.",
+        "title": "Defending Against Abuse at LinkedIn's Scale",
+        "url": "https://www.linkedin.com/blog/engineering/trust-and-safety/defending-against-abuse-at-linkedins-scale",
+        "source": "LinkedIn Engineering",
+        "type": "Case study",
+        "why": "Describes real-time abuse scoring, latency constraints, velocity features, downstream failures, and abuse protection at very high throughput."
+      },
+      {
+        "id": "linkedin-abusive-sequences",
+        "group": "Production Fraud and Abuse Systems",
+        "groupDescription": "Real shipped systems and architecture writeups for inline risk scoring, fraud response, and anti-abuse defenses.",
+        "title": "Using deep learning to detect abusive sequences of member activity",
+        "url": "https://engineering.linkedin.com/content/engineering/en-us/blog/2021/using-deep-learning-to-detect-abusive-sequences-of-member-activi",
+        "source": "LinkedIn Engineering",
+        "type": "Case study",
+        "why": "Shows how behavior sequences can detect scraping and account abuse patterns that handcrafted counters can miss.",
+        "year": "2021"
+      },
+      {
+        "id": "linkedin-behavior-analytics",
+        "group": "Production Fraud and Abuse Systems",
+        "groupDescription": "Real shipped systems and architecture writeups for inline risk scoring, fraud response, and anti-abuse defenses.",
+        "title": "Leveraging behavior analytic computation for anti-abuse defenses",
+        "url": "https://www.linkedin.com/blog/engineering/trust-and-safety/leveraging-behavior-analytic-computation-for-anti-abuse-defenses",
+        "source": "LinkedIn Engineering",
+        "type": "Case study",
+        "why": "Useful for robust behavioral features, label expansion, and fast response to evolving automated abuse.",
+        "year": "2021"
+      },
+      {
+        "id": "feast-docs",
+        "group": "Streaming Features and Feature Stores",
+        "groupDescription": "References for event streams, fresh velocity counters, online/offline parity, and point-in-time training joins.",
+        "title": "Feature retrieval",
+        "url": "https://docs.feast.dev/getting-started/concepts/feature-retrieval",
+        "source": "Feast",
+        "type": "Docs",
+        "why": "Feature-store reference for online feature retrieval, feature services, and historical retrieval used by training data generation."
+      },
+      {
+        "id": "feast-point-in-time",
+        "group": "Streaming Features and Feature Stores",
+        "groupDescription": "References for event streams, fresh velocity counters, online/offline parity, and point-in-time training joins.",
+        "title": "Point-in-time joins",
+        "url": "https://docs.feast.dev/getting-started/concepts/point-in-time-joins",
+        "source": "Feast",
+        "type": "Docs",
+        "why": "Explains point-in-time correct joins, which are essential when delayed chargebacks must join to decision-time feature values."
+      },
+      {
+        "id": "flink-docs",
+        "group": "Streaming Features and Feature Stores",
+        "groupDescription": "References for event streams, fresh velocity counters, online/offline parity, and point-in-time training joins.",
+        "title": "Timely Stream Processing",
+        "url": "https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/",
+        "source": "Apache Flink",
+        "type": "Docs",
+        "why": "Reference for event time, processing time, watermarks, lateness, and deterministic windowed velocity features."
+      },
+      {
         "id": "kafka-design",
-        "group": "Queues and Streams",
-        "groupDescription": "Messaging, event streaming, delivery semantics, and async processing references.",
+        "group": "Streaming Features and Feature Stores",
+        "groupDescription": "References for event streams, fresh velocity counters, online/offline parity, and point-in-time training joins.",
         "title": "Apache Kafka Design",
         "url": "https://kafka.apache.org/documentation/#design",
         "source": "Apache Kafka",
         "type": "Docs",
-        "why": "Explains Kafka's log, partitions, consumer groups, replication, and operational model."
+        "why": "Explains the durable log, partitions, consumer groups, replication, and delivery semantics behind replayable event ingestion."
       },
       {
-        "id": "flink-docs",
-        "group": "Data and Observability",
-        "groupDescription": "Metrics, tracing, logs, analytics, data pipelines, warehouses, and orchestration references.",
-        "title": "Apache Flink",
-        "url": "https://flink.apache.org/",
-        "source": "Apache Flink",
-        "type": "Docs",
-        "why": "Stateful stream-processing reference for event time, checkpoints, and exactly-once state."
+        "id": "uber-realtime-data",
+        "group": "Streaming Features and Feature Stores",
+        "groupDescription": "References for event streams, fresh velocity counters, online/offline parity, and point-in-time training joins.",
+        "title": "Real-time Data Infrastructure at Uber",
+        "url": "https://arxiv.org/abs/2104.00087",
+        "source": "Uber",
+        "type": "Paper",
+        "why": "Architecture paper for large-scale real-time data processing, including seconds-level decisions and fraud-detection use cases.",
+        "year": "2021"
       },
       {
-        "id": "opentelemetry-docs",
-        "group": "Data and Observability",
-        "groupDescription": "Metrics, tracing, logs, analytics, data pipelines, warehouses, and orchestration references.",
-        "title": "OpenTelemetry Documentation",
-        "url": "https://opentelemetry.io/docs/",
-        "source": "OpenTelemetry",
+        "id": "scarff-streaming-fraud",
+        "group": "Streaming Features and Feature Stores",
+        "groupDescription": "References for event streams, fresh velocity counters, online/offline parity, and point-in-time training joins.",
+        "title": "SCARFF: a Scalable Framework for Streaming Credit Card Fraud Detection with Spark",
+        "url": "https://arxiv.org/abs/1709.08920",
+        "source": "Information Fusion",
+        "type": "Paper",
+        "why": "Streaming fraud-detection framework that explicitly discusses imbalance, nonstationarity, feedback latency, Kafka, Spark, and Cassandra.",
+        "year": "2017"
+      },
+      {
+        "id": "amazon-neptune-fraud-graphs",
+        "group": "Graph and Ring Detection",
+        "groupDescription": "Graph databases, GNN workflows, and graph-based fraud-detection references for coordinated abuse.",
+        "title": "Graph and AI",
+        "url": "https://aws.amazon.com/neptune/graph-and-ai/",
+        "source": "AWS",
         "type": "Docs",
-        "why": "Instrumentation standard for traces, metrics, logs, context propagation, and exporters."
+        "why": "Introduces fraud graphs for connected entities, shared identifiers, fraud rings, account takeover, and graph traversal use cases."
+      },
+      {
+        "id": "aws-neptune-graphstorm-fraud",
+        "group": "Graph and Ring Detection",
+        "groupDescription": "Graph databases, GNN workflows, and graph-based fraud-detection references for coordinated abuse.",
+        "title": "Use Graph Machine Learning to detect fraud with Amazon Neptune Analytics and GraphStorm",
+        "url": "https://aws.amazon.com/blogs/database/use-graph-machine-learning-to-detect-fraud-with-amazon-neptune-analytics-and-graphstorm/",
+        "source": "AWS Database Blog",
+        "type": "Tutorial",
+        "why": "Hands-on graph ML workflow that converts transaction tables into a heterogeneous fraud graph and trains with GraphStorm.",
+        "year": "2025"
+      },
+      {
+        "id": "nvidia-gnn-fraud",
+        "group": "Graph and Ring Detection",
+        "groupDescription": "Graph databases, GNN workflows, and graph-based fraud-detection references for coordinated abuse.",
+        "title": "Optimizing Fraud Detection in Financial Services with Graph Neural Networks and NVIDIA GPUs",
+        "url": "https://developer.nvidia.com/blog/optimizing-fraud-detection-in-financial-services-with-graph-neural-networks-and-nvidia-gpus/",
+        "source": "NVIDIA Technical Blog",
+        "type": "Tutorial",
+        "why": "Explains why graph context catches coordinated fraud, how to model transactions as graphs, and how to train GNN embeddings for downstream scoring.",
+        "year": "2022"
+      },
+      {
+        "id": "credit-card-fraud-survey",
+        "group": "Feedback, Evaluation, and ML Operations",
+        "groupDescription": "Production ML guidance for metrics, monitoring, model rollout, label lag, and technical debt.",
+        "title": "Credit card fraud detection using machine learning: A survey",
+        "url": "https://arxiv.org/abs/2010.06479",
+        "source": "arXiv",
+        "type": "Paper",
+        "why": "Survey covering fraud-specific issues such as class imbalance, metric choice, concept drift, sequential behavior, and feature aggregation.",
+        "year": "2020"
+      },
+      {
+        "id": "google-rules-ml",
+        "group": "Feedback, Evaluation, and ML Operations",
+        "groupDescription": "Production ML guidance for metrics, monitoring, model rollout, label lag, and technical debt.",
+        "title": "Rules of Machine Learning",
+        "url": "https://developers.google.com/machine-learning/guides/rules-of-ml",
+        "source": "Google",
+        "type": "Guide",
+        "why": "Practical ML engineering guidance for starting with heuristics, defining metrics, avoiding skew, monitoring freshness, and adding features deliberately."
+      },
+      {
+        "id": "ml-test-score",
+        "group": "Feedback, Evaluation, and ML Operations",
+        "groupDescription": "Production ML guidance for metrics, monitoring, model rollout, label lag, and technical debt.",
+        "title": "The ML Test Score: A Rubric for ML Production Readiness and Technical Debt Reduction",
+        "url": "https://research.google/pubs/the-ml-test-score-a-rubric-for-ml-production-readiness-and-technical-debt-reduction/",
+        "source": "Google Research",
+        "type": "Paper",
+        "why": "Checklist-style production ML reference for tests, monitoring, deployment readiness, and technical debt reduction.",
+        "year": "2017"
+      },
+      {
+        "id": "hidden-ml-debt",
+        "group": "Feedback, Evaluation, and ML Operations",
+        "groupDescription": "Production ML guidance for metrics, monitoring, model rollout, label lag, and technical debt.",
+        "title": "Hidden Technical Debt in Machine Learning Systems",
+        "url": "https://papers.nips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html",
+        "source": "NeurIPS",
+        "type": "Paper",
+        "why": "Classic paper on feedback loops, data dependencies, configuration debt, and changing external conditions in production ML systems.",
+        "year": "2015"
       },
       {
         "id": "sre-monitoring",
-        "group": "Foundations",
-        "groupDescription": "Core system design references for scalability, reliability, and operating distributed services.",
+        "group": "Feedback, Evaluation, and ML Operations",
+        "groupDescription": "Production ML guidance for metrics, monitoring, model rollout, label lag, and technical debt.",
         "title": "Monitoring Distributed Systems",
         "url": "https://sre.google/sre-book/monitoring-distributed-systems/",
         "source": "Google SRE",
         "type": "Book chapter",
-        "why": "Grounds monitoring and alerting decisions in user-visible reliability signals."
+        "why": "Grounds alerting and monitoring decisions in user-visible reliability signals rather than raw subsystem noise."
+      },
+      {
+        "id": "opentelemetry-docs",
+        "group": "Feedback, Evaluation, and ML Operations",
+        "groupDescription": "Production ML guidance for metrics, monitoring, model rollout, label lag, and technical debt.",
+        "title": "OpenTelemetry Documentation",
+        "url": "https://opentelemetry.io/docs/",
+        "source": "OpenTelemetry",
+        "type": "Docs",
+        "why": "Instrumentation standard for traces, metrics, logs, context propagation, and exporters across risk API and model-serving paths."
+      },
+      {
+        "id": "stripe-radar-rules",
+        "group": "Adversarial Abuse, Review, and Resilience",
+        "groupDescription": "Resources for attacker behavior, human review workflows, observability, and adversarial ML risk.",
+        "title": "Fraud prevention rules",
+        "url": "https://docs.stripe.com/radar/rules",
+        "source": "Stripe",
+        "type": "Docs",
+        "why": "Concrete reference for risk rules that allow, block, review, or request 3DS while balancing false positives and conversion."
+      },
+      {
+        "id": "temporal-docs",
+        "group": "Adversarial Abuse, Review, and Resilience",
+        "groupDescription": "Resources for attacker behavior, human review workflows, observability, and adversarial ML risk.",
+        "title": "What is Temporal?",
+        "url": "https://docs.temporal.io/temporal",
+        "source": "Temporal",
+        "type": "Docs",
+        "why": "Durable workflow reference for long-running review/challenge cases, retries, timers, state, and recovery from failures."
+      },
+      {
+        "id": "owasp-automated-threats",
+        "group": "Adversarial Abuse, Review, and Resilience",
+        "groupDescription": "Resources for attacker behavior, human review workflows, observability, and adversarial ML risk.",
+        "title": "Automated Threats to Web Applications",
+        "url": "https://owasp.org/www-project-automated-threats-to-web-applications/",
+        "source": "OWASP",
+        "type": "Reference",
+        "why": "Threat taxonomy for automation, credential attacks, scraping, probing, abuse throttling, and attacker-facing controls."
+      },
+      {
+        "id": "nist-adversarial-ml",
+        "group": "Adversarial Abuse, Review, and Resilience",
+        "groupDescription": "Resources for attacker behavior, human review workflows, observability, and adversarial ML risk.",
+        "title": "Adversarial Machine Learning: A Taxonomy and Terminology of Attacks and Mitigations",
+        "url": "https://csrc.nist.gov/pubs/ai/100/2/e2025/final",
+        "source": "NIST",
+        "type": "Report",
+        "why": "Current terminology for data poisoning, evasion, attacker goals, mitigations, and AI-system security risk management.",
+        "year": "2025"
       }
     ]
   },
   "assets": {
     "icon": "icon.png"
-  }
+  },
+  "aiVisuals": {
+    "requirements": "assets/generated/ai-visuals/requirements.jpg",
+    "capacity": "assets/generated/ai-visuals/capacity.jpg"
+  },
+  "explainerComic": "assets/generated/comic/interview-comic.jpg"
 }

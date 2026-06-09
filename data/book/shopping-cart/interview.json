@@ -442,6 +442,12 @@
         "label": "cart"
       },
       {
+        "id": "cart-router",
+        "from": "Cart",
+        "to": "Router",
+        "label": "cart ops"
+      },
+      {
         "id": "cart-sharda",
         "from": "Cart",
         "to": "ShardA"
@@ -507,7 +513,7 @@
       "Track order lifecycle (placed, paid, fulfilled, cancelled) and allow cancellation."
     ],
     "nonFunctional": [
-      "Never oversell limited inventory; never charge without an order.",
+      "Never oversell limited inventory; never leave a charge without a recoverable order or compensation record.",
       "Idempotent checkout so retries don't double-order or double-charge.",
       "Cart operations are fast and highly available (browsing must feel instant).",
       "Order processing is durable and recoverable across service failures.",
@@ -519,27 +525,32 @@
     {
       "label": "Cart operations",
       "value": "~50k/s",
-      "note": "Add/update/view is frequent and latency-sensitive; availability over strict consistency."
+      "note": "Add/update/view; latency-sensitive, favoring availability over strict consistency. ~2KB/cart x 300M active carts ≈ 600GB working set — enough to spread across a sharded, RAM-class KV store."
     },
     {
       "label": "Checkouts",
       "value": "~2k/s peak",
-      "note": "Far rarer than cart ops but correctness-critical (money + inventory)."
+      "note": "~25x rarer than cart ops but correctness-critical. Each writes 1 order + N reservations + 1 outbox event ≈ 5-10 CP writes, so ~10-20k order-side writes/s at peak."
     },
     {
       "label": "Active carts",
       "value": "100s of millions",
-      "note": "Most never convert; carts must be cheap to store and expire."
+      "note": "Most never convert; a ~7-day TTL bounds storage and expires abandoned carts cheaply."
     },
     {
       "label": "Inventory contention",
-      "value": "high on hot items",
-      "note": "Limited-stock or flash-sale items concentrate checkout contention."
+      "value": "hot SKU 100s-1000s/s",
+      "note": "Flash-sale items concentrate writes on one row; CAS holds keep it lock-free, but a hot SKU may need admission control / sharded counters."
+    },
+    {
+      "label": "Idempotency + outbox",
+      "value": "retain keys 24-72h",
+      "note": "~2k keys/s x 72h ≈ 0.5B rows to retain then prune; outbox throughput tracks checkout + state-transition rate (~5-10k events/s)."
     },
     {
       "label": "Order durability",
-      "value": "no loss after placement",
-      "note": "An accepted order survives service/region failure."
+      "value": "no loss; RPO≈0",
+      "note": "Synchronously-replicated CP order DB; single-writer region for orders/checkout with active-active AP carts, outbox replayed after failover."
     },
     {
       "label": "Read:write",
@@ -551,7 +562,7 @@
     {
       "method": "PUT",
       "path": "/v1/carts/{id}/items",
-      "description": "Add or update a cart line item. Highly available; eventual consistency is fine.",
+      "description": "Add or update a cart line item. Cart is scoped to the authenticated user/session (ownership enforced server-side — no IDOR). Highly available; eventual consistency is fine. Concurrent multi-device edits reconcile by last-write-wins per line (or a cart version), so confirmed mutations are not silently lost.",
       "request": "{ \"sku\": \"sku_9\", \"qty\": 2 }",
       "response": "200 OK { \"cart\": { \"items\": [ { \"sku\": \"sku_9\", \"qty\": 2 } ], \"subtotal\": 4000 } }"
     },
@@ -565,9 +576,9 @@
     {
       "method": "POST",
       "path": "/v1/checkout",
-      "description": "Convert a cart to an order: reserve inventory, charge payment, create the order. Idempotency-Key required.",
+      "description": "Convert a cart to an order: reserve inventory, create a PENDING_PAYMENT order, authorize/capture payment, mark PAID. Idempotency-Key required; a repeat with the same key returns the original result, a repeat with a different payload is rejected 422, and a still-running attempt returns 409 in_progress.",
       "request": "Idempotency-Key: co_7f\n{ \"cart_id\": \"c_3\", \"payment_source\": \"tok_visa\", \"address_id\": \"a_1\" }",
-      "response": "201 Created { \"order_id\": \"o_5\", \"status\": \"placed\" } — or 409 if an item is out of stock",
+      "response": "201 Created { \"order_id\": \"o_5\", \"status\": \"paid\" } — or 409 if a checkout for this key is still in_progress, or 409 if an item is out of stock",
       "sequence": {
         "participants": [
           {
@@ -612,13 +623,19 @@
                 "from": "I",
                 "to": "K",
                 "arrow": "-->>",
-                "label": "reserved"
+                "label": "reserved (TTL hold)"
+              },
+              {
+                "from": "K",
+                "to": "O",
+                "arrow": "->>",
+                "label": "create order PENDING_PAYMENT (frozen price, reservation ids)"
               },
               {
                 "from": "K",
                 "to": "P",
                 "arrow": "->>",
-                "label": "charge (idempotent)"
+                "label": "authorize+capture (key = order id)"
               },
               {
                 "from": "P",
@@ -630,13 +647,13 @@
                 "from": "K",
                 "to": "O",
                 "arrow": "->>",
-                "label": "create order (placed->paid)"
+                "label": "mark PAID + confirm holds (emit order.paid via outbox)"
               },
               {
                 "from": "K",
                 "to": "C",
                 "arrow": "-->>",
-                "label": "201 order"
+                "label": "201 order (paid)"
               }
             ],
             "else": {
@@ -663,9 +680,9 @@
     {
       "method": "POST",
       "path": "/v1/orders/{id}/cancel",
-      "description": "Cancel an order; compensates (refund, release inventory) per its current state.",
+      "description": "Cancel an order; compensates per its current state — pending_payment releases holds and voids any auth, paid (not fulfilled) voids/refunds and releases, fulfilled routes to a return/refund flow. Rejected (409) if the order is in a non-cancellable state.",
       "request": "{ \"reason\": \"customer_request\" }",
-      "response": "200 OK { \"status\": \"cancelled\" }"
+      "response": "200 OK { \"status\": \"cancelled\" } — or 409 if the order can no longer be cancelled"
     }
   ],
   "dataModel": [
@@ -683,7 +700,11 @@
         },
         {
           "name": "items",
-          "type": "jsonb (sku, qty)"
+          "type": "jsonb (sku, qty, updated_at per line for LWW merge)"
+        },
+        {
+          "name": "version",
+          "type": "int (multi-device merge)"
         },
         {
           "name": "updated_at",
@@ -697,7 +718,7 @@
     },
     {
       "name": "orders",
-      "note": "The durable record of a placed order and its lifecycle state.",
+      "note": "The durable record of an order and its lifecycle state. Created PENDING_PAYMENT before capture so a charge always has a recoverable record. Line items snapshot the frozen price.",
       "fields": [
         {
           "name": "order_id",
@@ -709,37 +730,193 @@
         },
         {
           "name": "items",
-          "type": "jsonb (sku, qty, price)"
+          "type": "jsonb (sku, qty, unit_price, currency, discount, tax, promo_ids, coupon_code)"
+        },
+        {
+          "name": "total",
+          "type": "bigint (frozen at checkout)"
+        },
+        {
+          "name": "currency",
+          "type": "char(3)"
+        },
+        {
+          "name": "price_quote_id",
+          "type": "uuid (quote frozen into the order)"
+        },
+        {
+          "name": "status",
+          "type": "enum(pending_payment, paid, fulfillment_requested, fulfilled, cancel_requested, cancelled, failed)"
+        },
+        {
+          "name": "payment_ref",
+          "type": "varchar (gateway charge/intent id)"
+        },
+        {
+          "name": "payment_status",
+          "type": "enum(none, authorized, captured, voided, refunded)"
+        }
+      ]
+    },
+    {
+      "name": "order_events",
+      "note": "Append-only history of order state transitions for audit and recovery; one row per legal transition.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "order_id",
+          "type": "uuid (aggregate id)"
+        },
+        {
+          "name": "type",
+          "type": "varchar (order.created, order.paid, order.fulfilled, order.cancelled, ...)"
+        },
+        {
+          "name": "from_status",
+          "type": "varchar"
+        },
+        {
+          "name": "to_status",
+          "type": "varchar"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "outbox_events",
+      "note": "Events written in the same transaction as the order state change; a relay publishes them to the queue exactly once relative to the commit. Consumers dedupe on event_id.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid PK (consumer dedupe key)"
+        },
+        {
+          "name": "aggregate_id",
+          "type": "uuid (order_id)"
+        },
+        {
+          "name": "type",
+          "type": "varchar (order.paid, order.cancelled, ...)"
+        },
+        {
+          "name": "payload",
+          "type": "jsonb"
+        },
+        {
+          "name": "status",
+          "type": "enum(pending, published)"
+        },
+        {
+          "name": "attempts",
+          "type": "int"
+        },
+        {
+          "name": "published_at",
+          "type": "timestamptz null"
+        }
+      ]
+    },
+    {
+      "name": "price_quotes",
+      "note": "An immutable, server-computed price snapshot for a cart, frozen at checkout and referenced by orders.price_quote_id. Captures the rule versions used so an audit can reproduce the total, and a short expiry bounds how long a quote can back a checkout.",
+      "fields": [
+        {
+          "name": "quote_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "cart_id",
+          "type": "uuid"
+        },
+        {
+          "name": "lines",
+          "type": "jsonb (sku, qty, unit_price, discount, tax)"
         },
         {
           "name": "total",
           "type": "bigint"
         },
         {
-          "name": "status",
-          "type": "enum(placed, paid, fulfilled, cancelled, failed)"
+          "name": "currency",
+          "type": "char(3)"
         },
         {
-          "name": "payment_ref",
+          "name": "promo_rule_version",
+          "type": "varchar (promotion rule set used)"
+        },
+        {
+          "name": "tax_rule_version",
+          "type": "varchar (tax table/source used)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamptz (quote validity window)"
+        }
+      ]
+    },
+    {
+      "name": "coupon_redemptions",
+      "note": "Authoritative ledger that enforces per-coupon and per-user usage limits. Unique on (coupon_code, order_id) so a retried checkout reuses its redemption; the Promotion service owns redemption idempotency and limit checks at checkout. If a checkout fails, its redemption is released so the limit isn't consumed.",
+      "fields": [
+        {
+          "name": "redemption_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "coupon_code",
           "type": "varchar"
+        },
+        {
+          "name": "user_id",
+          "type": "uuid"
+        },
+        {
+          "name": "order_id",
+          "type": "uuid (unique with coupon_code)"
+        },
+        {
+          "name": "status",
+          "type": "enum(reserved, confirmed, released)"
+        },
+        {
+          "name": "redeemed_at",
+          "type": "timestamptz"
         }
       ]
     },
     {
       "name": "inventory",
-      "note": "Authoritative stock per SKU, with reserved vs available, for oversell prevention.",
+      "note": "Authoritative stock per SKU. The invariant available + reserved + sold = stock_on_hand holds at all times: a hold moves a unit available -> reserved (CAS), confirmation moves reserved -> sold, release/expiry moves reserved -> available. stock_on_hand only changes on receiving/adjustment; sold is reconciled against immutable paid order lines.",
       "fields": [
         {
           "name": "sku",
           "type": "varchar PK"
         },
         {
+          "name": "stock_on_hand",
+          "type": "int (physical units; changes only on receiving/adjustment)"
+        },
+        {
           "name": "available",
-          "type": "int"
+          "type": "int (free to reserve)"
         },
         {
           "name": "reserved",
-          "type": "int"
+          "type": "int (held by in-flight checkouts)"
+        },
+        {
+          "name": "sold",
+          "type": "int (confirmed; reconciled against immutable paid order lines)"
         },
         {
           "name": "version",
@@ -749,15 +926,19 @@
     },
     {
       "name": "reservations",
-      "note": "Short-lived holds on inventory created at checkout; expire if checkout doesn't complete.",
+      "note": "Short-lived holds on inventory created at checkout; confirmed on payment, released on failure/expiry. Unique on (checkout_id, sku) so a retried checkout reuses its hold instead of double-reserving.",
       "fields": [
         {
           "name": "reservation_id",
           "type": "uuid PK"
         },
         {
+          "name": "checkout_id",
+          "type": "uuid (unique with sku)"
+        },
+        {
           "name": "order_id",
-          "type": "uuid"
+          "type": "uuid null (set once order created)"
         },
         {
           "name": "sku",
@@ -768,6 +949,14 @@
           "type": "int"
         },
         {
+          "name": "status",
+          "type": "enum(held, confirmed, released, expired)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz"
+        },
+        {
           "name": "expires_at",
           "type": "timestamptz"
         }
@@ -775,25 +964,909 @@
     },
     {
       "name": "idempotency_keys",
-      "note": "Dedupes retried checkouts; stores the first result.",
+      "note": "Dedupes retried checkouts; stores the first result. Retained for a bounded window (e.g. 24–72h). A repeat with the same key + matching request_hash replays the stored response; a mismatching hash is rejected (422). Terminal failures (out of stock, validation error, permanent payment decline) are also stored as completed with their error response and a null order_id, so a retry replays the failure instead of re-running the saga.",
       "fields": [
         {
           "name": "key",
           "type": "varchar PK"
         },
         {
+          "name": "request_hash",
+          "type": "varchar (detects payload mismatch on reuse)"
+        },
+        {
           "name": "order_id",
-          "type": "uuid"
+          "type": "uuid null (null when the checkout completed without creating an order — e.g. out of stock)"
         },
         {
           "name": "status",
           "type": "enum(in_progress, completed)"
         },
         {
+          "name": "outcome",
+          "type": "enum(success, out_of_stock, validation_failed, payment_failed) null (set when completed)"
+        },
+        {
           "name": "response",
-          "type": "jsonb"
+          "type": "jsonb (stored success or error response replayed on retry)"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamptz (retention window)"
         }
       ]
+    },
+    {
+      "name": "payment_attempts",
+      "note": "Durable record of every authorize/capture/void/refund attempt against the gateway, so a retry or lost response reconciles against the attempt rather than re-charging. One row per attempt; the latest row carries the gateway intent and response.",
+      "fields": [
+        {
+          "name": "attempt_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "order_id",
+          "type": "uuid (fk orders)"
+        },
+        {
+          "name": "gateway_intent_id",
+          "type": "varchar (gateway PaymentIntent/charge id)"
+        },
+        {
+          "name": "idempotency_key",
+          "type": "varchar (sent to gateway; derived from order id)"
+        },
+        {
+          "name": "amount",
+          "type": "bigint"
+        },
+        {
+          "name": "currency",
+          "type": "char(3)"
+        },
+        {
+          "name": "kind",
+          "type": "enum(authorize, capture, void, refund)"
+        },
+        {
+          "name": "status",
+          "type": "enum(pending, succeeded, failed)"
+        },
+        {
+          "name": "failure_code",
+          "type": "varchar null (gateway decline/error code)"
+        },
+        {
+          "name": "last_gateway_response",
+          "type": "jsonb (raw gateway result for audit/reconciliation)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "payment_webhook_events",
+      "note": "Dedupe log of inbound gateway webhooks, keyed by the gateway's event id, so a redelivered payment_intent.succeeded is processed exactly once. The reconciler also reads this to advance stale PENDING_PAYMENT orders.",
+      "fields": [
+        {
+          "name": "gateway_event_id",
+          "type": "varchar PK (gateway-assigned event id)"
+        },
+        {
+          "name": "type",
+          "type": "varchar (payment_intent.succeeded, charge.refunded, ...)"
+        },
+        {
+          "name": "order_id",
+          "type": "uuid null (resolved from intent)"
+        },
+        {
+          "name": "payload",
+          "type": "jsonb"
+        },
+        {
+          "name": "processed_at",
+          "type": "timestamptz null (set once applied)"
+        },
+        {
+          "name": "received_at",
+          "type": "timestamptz"
+        }
+      ]
+    }
+  ],
+  "technologyChoices": [
+    {
+      "concern": "API edge, session ownership, and checkout idempotency",
+      "steps": [
+        "naive-cart",
+        "cart-store",
+        "checkout-saga",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kong",
+          "icon": "assets/tech-icons/kong.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "Keycloak",
+          "icon": "assets/tech-icons/keycloak.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          },
+          {
+            "name": "WAF",
+            "icon": "assets/tech-icons/Arch_AWS-WAF_64.png"
+          },
+          {
+            "name": "Cognito",
+            "icon": "assets/tech-icons/Arch_Amazon-Cognito_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Apigee",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Armor",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Identity Platform",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "API Management",
+            "icon": "assets/tech-icons/10042-icon-service-API-Management-Services.svg"
+          },
+          {
+            "name": "Application Gateway",
+            "icon": "assets/tech-icons/10076-icon-service-Application-Gateways.svg"
+          },
+          {
+            "name": "Microsoft Entra ID",
+            "icon": "assets/tech-icons/10231-icon-service-Entra-ID-Protection.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "The edge terminates TLS, validates shopper/session identity, applies coarse quotas, and gives every checkout request a traceable request id.",
+        "Cart ownership and checkout idempotency still belong in application state because only the services can validate cart tokens, request fingerprints, and replayed outcomes."
+      ],
+      "makesIrrelevant": "A managed API edge with auth, WAF, quotas, and request logs removes most custom reverse-proxy and coarse abuse-control plumbing."
+    },
+    {
+      "concern": "Cart store, TTLs, and shard routing",
+      "steps": [
+        "cart-store",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "Cassandra",
+          "icon": "assets/tech-icons/cassandra.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Firestore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Azure SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A separate AP-leaning cart store keeps high-volume add/update/view traffic away from the correctness-critical order and inventory databases.",
+        "Native TTL support makes abandoned cart cleanup cheap, but the checkout boundary must still re-read price and stock from authoritative systems.",
+        "Sharding by user or cart id gives locality for multi-device cart edits; it does not solve hot-SKU inventory contention."
+      ],
+      "makesIrrelevant": "A managed key-value store with TTLs, conditional updates, and automatic partition management removes most custom cart-shard operations."
+    },
+    {
+      "concern": "Pricing, promotion rules, and frozen quotes",
+      "steps": [
+        "pricing",
+        "checkout-saga"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "OpenSearch",
+          "icon": "assets/tech-icons/opensearch.png"
+        },
+        {
+          "name": "Apache Flink",
+          "icon": "assets/tech-icons/flink.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Aurora (PostgreSQL/MySQL)",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "OpenSearch Service",
+            "icon": "assets/tech-icons/Arch_Amazon-OpenSearch-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "BigQuery",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Promotion and tax rules need an authoritative versioned store so a checkout can freeze the exact quote used by the order.",
+        "Caches are useful for cart-page estimates and read-heavy rule lookups, but the final checkout total must be recomputed server-side.",
+        "Streaming or analytics systems help audit promotion usage and tax changes, but they should not be the synchronous source of truth for checkout."
+      ],
+      "makesIrrelevant": "A managed rule/quote store with versioning and cache integration reduces custom promotion cache invalidation and quote-expiry jobs."
+    },
+    {
+      "concern": "Inventory reservation store and hot-SKU controls",
+      "steps": [
+        "inventory",
+        "checkout-saga",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A relational inventory row plus reservation table is easiest to audit and reconcile against orders and warehouse state.",
+        "A key-value store with conditional writes and TTLs can absorb high reservation traffic, but it still needs durable holds and clear expiry semantics.",
+        "Hot SKUs may need admission queues or sharded reservation buckets even when the normal SKU path uses simple CAS updates."
+      ],
+      "makesIrrelevant": "A store with native conditional writes, TTL expiry, and per-key metrics removes most custom hold-expiry cleanup, but not flash-sale admission policy."
+    },
+    {
+      "concern": "Checkout saga orchestration and durable timers",
+      "steps": [
+        "checkout-saga",
+        "inventory",
+        "order-state"
+      ],
+      "selfHosted": [
+        {
+          "name": "Temporal",
+          "icon": "assets/tech-icons/temporal.png"
+        },
+        {
+          "name": "BullMQ",
+          "icon": "assets/tech-icons/bullmq.png"
+        },
+        {
+          "name": "Apache Airflow",
+          "icon": "assets/tech-icons/airflow.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          },
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Durable Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          },
+          {
+            "name": "Logic Apps",
+            "icon": "assets/tech-icons/10363-icon-service-Logic-Apps-Custom-Connector.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A workflow engine gives durable timers, retries, compensation history, and resume semantics for the reserve-order-pay-confirm sequence.",
+        "A database-backed state machine is simpler to audit and keeps checkout logic explicit, but the team owns timeout scanning and stuck-order repair.",
+        "Queues decouple slow payment or inventory calls from the request path; they do not make the cross-service checkout transaction atomic."
+      ],
+      "makesIrrelevant": "A managed workflow engine can absorb much of the custom retry-timer, lease, and resume bookkeeping while preserving explicit compensation steps."
+    },
+    {
+      "concern": "Order store, state transitions, and idempotency records",
+      "steps": [
+        "checkout-saga",
+        "order-state",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "MySQL",
+          "icon": "assets/tech-icons/mysql.png"
+        },
+        {
+          "name": "CockroachDB",
+          "icon": "assets/tech-icons/cockroach.png"
+        },
+        {
+          "name": "Citus",
+          "icon": "assets/tech-icons/citus.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Aurora (PostgreSQL/MySQL)",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "RDS",
+            "icon": "assets/tech-icons/Arch_Amazon-RDS_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "AlloyDB",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          },
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A relational store gives one transaction for order state, transition history, payment attempts, idempotency records, and outbox rows.",
+        "Distributed SQL or conditional-write KV can scale order partitions, but multi-row invariants and outbox atomicity must be checked carefully.",
+        "Keeping cart writes out of this store protects the money path from browsing traffic."
+      ],
+      "makesIrrelevant": "A managed distributed SQL database can remove much of the hand-built order shard map if its latency and transaction model fit checkout."
+    },
+    {
+      "concern": "Payment gateway integration, webhook inbox, and secrets",
+      "steps": [
+        "checkout-saga",
+        "order-state"
+      ],
+      "selfHosted": [
+        {
+          "name": "HashiCorp Vault",
+          "icon": "assets/tech-icons/hashicorp_vault.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Kong",
+          "icon": "assets/tech-icons/kong.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "KMS",
+            "icon": "assets/tech-icons/Arch_AWS-Key-Management-Service_64.png"
+          },
+          {
+            "name": "Secrets Manager",
+            "icon": "assets/tech-icons/Arch_AWS-Secrets-Manager_64.png"
+          },
+          {
+            "name": "CloudHSM",
+            "icon": "assets/tech-icons/Arch_AWS-CloudHSM_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud KMS",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          },
+          {
+            "name": "Secret Manager",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          },
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Key Vault",
+            "icon": "assets/tech-icons/10245-icon-service-Key-Vaults.svg"
+          },
+          {
+            "name": "Managed HSM",
+            "icon": "assets/tech-icons/02322-icon-service-Dedicated-HSM.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Payment provider tokens and webhook signing secrets need scoped storage, rotation, and audit trails outside normal application config.",
+        "A durable webhook inbox keyed by provider event id makes delayed or duplicated payment callbacks replayable and idempotent.",
+        "Keeping raw card data out of the cart/order system shrinks the PCI boundary, but gateway idempotency keys and reconciliation evidence still need first-class records."
+      ],
+      "makesIrrelevant": "Managed key custody and secret rotation remove most custom vault operation, while a durable inbox removes ad hoc webhook retry ledgers."
+    },
+    {
+      "concern": "Transactional outbox transport and fulfillment fanout",
+      "steps": [
+        "order-state",
+        "checkout-saga"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Redpanda",
+          "icon": "assets/tech-icons/redpanda.png"
+        },
+        {
+          "name": "RabbitMQ",
+          "icon": "assets/tech-icons/rabbitmq.png"
+        },
+        {
+          "name": "NATS (JetStream)",
+          "icon": "assets/tech-icons/nats.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "MSK",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Streaming-for-Apache-Kafka_64.png"
+          },
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Managed Service for Apache Kafka",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          },
+          {
+            "name": "Event Grid",
+            "icon": "assets/tech-icons/10221-icon-service-Event-Grid-Subscriptions.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "The outbox table keeps order state and emitted events atomic; the broker only carries events after the database commit.",
+        "A log-style stream fits replay and multiple consumers, while a queue is simpler for fulfillment jobs, visibility timeouts, and DLQs.",
+        "Consumers must dedupe on event id because the outbox relay and broker delivery are at-least-once."
+      ],
+      "makesIrrelevant": "A managed stream or queue with retention, DLQ, lag metrics, and consumer scaling removes most broker operations and retry plumbing."
+    },
+    {
+      "concern": "Reconciliation, DLQ, and support repair workers",
+      "steps": [
+        "checkout-saga",
+        "inventory",
+        "order-state"
+      ],
+      "selfHosted": [
+        {
+          "name": "Temporal",
+          "icon": "assets/tech-icons/temporal.png"
+        },
+        {
+          "name": "Apache Airflow",
+          "icon": "assets/tech-icons/airflow.png"
+        },
+        {
+          "name": "BullMQ",
+          "icon": "assets/tech-icons/bullmq.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          },
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Durable Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          },
+          {
+            "name": "Logic Apps",
+            "icon": "assets/tech-icons/10363-icon-service-Logic-Apps-Custom-Connector.svg"
+          },
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Repair workers should scan durable payment attempts, webhook inbox rows, reservations, and order states rather than infer state from request logs.",
+        "Scheduled jobs are easy to start with, but workflow engines make retries, timeouts, parking lots, and manual replay easier to audit.",
+        "Support actions must be idempotent and actor-audited so repairs do not double-refund, double-confirm stock, or ship twice."
+      ],
+      "makesIrrelevant": "Managed schedulers, queue DLQs, and workflow history remove much of the custom lease, next_retry_at, and replay UI plumbing."
+    },
+    {
+      "concern": "Observability, audit logs, and commerce SLOs",
+      "steps": [
+        "cart-store",
+        "inventory",
+        "checkout-saga",
+        "order-state",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Prometheus",
+          "icon": "assets/tech-icons/prometheus.png"
+        },
+        {
+          "name": "Grafana",
+          "icon": "assets/tech-icons/grafana.png"
+        },
+        {
+          "name": "Jaeger",
+          "icon": "assets/tech-icons/jaeger.png"
+        },
+        {
+          "name": "OpenSearch",
+          "icon": "assets/tech-icons/opensearch.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "X-Ray",
+            "icon": "assets/tech-icons/Arch_AWS-X-Ray_64.png"
+          },
+          {
+            "name": "Managed Grafana",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Grafana_64.png"
+          },
+          {
+            "name": "OpenSearch Service",
+            "icon": "assets/tech-icons/Arch_Amazon-OpenSearch-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Logging",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Trace",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "BigQuery",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Log Analytics",
+            "icon": "assets/tech-icons/00009-icon-service-Log-Analytics-Workspaces.svg"
+          },
+          {
+            "name": "Application Insights",
+            "icon": "assets/tech-icons/00012-icon-service-Application-Insights.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Cart latency, reservation failures, stale holds, checkout saga age, outbox lag, payment webhook lag, and fulfillment DLQ depth need separate SLOs.",
+        "Distributed traces help support follow one checkout across API, cart, pricing, inventory, payment, order, outbox, and fulfillment components.",
+        "Audit logs must record manual repair actor, reason, before/after state, and compensation outcome."
+      ],
+      "makesIrrelevant": "Managed observability suites remove much of the log shipping, metric storage, alert routing, and dashboard hosting work, but not the need to define commerce-specific SLOs."
     }
   ],
   "patterns": [
@@ -883,7 +1956,7 @@
     {
       "id": "naive-cart",
       "title": "1. Naive Cart & Buy (the baseline)",
-      "description": "Start simple: a cart held in memory/session, and a 'buy' that decrements stock and records an order in one request. It works for one shopper; it loses carts on restart and, worse, treats a multi-service checkout (inventory + payment + order) as if it were one atomic step — which it can't be.",
+      "description": "Start simple: a cart held in memory/session, and a 'buy' that decrements stock and records an order in one request. It works for one shopper; it loses carts on restart and, worse, treats a multi-service checkout (inventory + payment + order) as if it were one atomic step — which it can't be. The worst case isn't a failed request the shopper can retry; it's a crash mid-checkout that moves money or holds stock with no recoverable local record.",
       "patterns": [
         "Synchronous request/response"
       ],
@@ -891,6 +1964,10 @@
         "dynamodb-transactions",
         "stripe-payment-intents",
         "stripe-idempotency",
+        "amazon-idempotent-apis",
+        "helland-distributed-transactions",
+        "microservices-saga",
+        "microservices-transactional-outbox",
         "debezium-outbox"
       ],
       "decisionPrompt": "Checkout must reserve stock, charge a card, and create an order across three services. What goes wrong treating that as one transaction?",
@@ -944,7 +2021,7 @@
           "Catalog",
           "OrderDB"
         ],
-        "caption": "The shopper app sends add/buy to the Commerce API, which reads the Catalog / Products and decrements and records the order in the Orders DB.",
+        "caption": "The shopper app sends add/buy to the Commerce API, which reads the Catalog / Products, then decrements stock and records the order in the Orders DB — all in one request.",
         "links": [
           "client-api-add-buy",
           "api-catalog",
@@ -956,17 +2033,23 @@
           "Catalog",
           "OrderDB"
         ]
-      }
+      },
+      "aiVisual": "assets/generated/ai-visuals/steps/01-naive-cart.jpg"
     },
     {
       "id": "cart-store",
       "title": "2. Persistent Cart Store",
-      "description": "Move carts to a fast, highly-available store keyed by user (or session for guests), so they survive across devices and restarts. Carts favor availability over strict consistency, expire when abandoned, and merge a guest cart into the user's on login.",
+      "description": "Move carts to a fast, highly-available store keyed by user (or session for guests), so they survive across devices and restarts. Carts favor availability over strict consistency, expire when abandoned, and merge a guest cart into the user's account cart on login.",
       "patterns": [
         "Session vs persistent cart"
       ],
       "probeLinks": [
-        "debezium-outbox"
+        "redis-cache",
+        "akka-shopping-cart",
+        "woocommerce-cart-checkout-blocks",
+        "commercetools-carts-orders",
+        "broadleaf-subsecond-carts",
+        "dynamodb-transactions"
       ],
       "decisionPrompt": "A guest fills a cart, then logs in. What happens to their items, and where does the cart live?",
       "concepts": [
@@ -980,6 +2063,12 @@
           "term": "Guest-to-user merge",
           "definition": "Combining a session cart with the account cart on login.",
           "whyItMatters": "Preserves intent across the auth boundary.",
+          "group": "Persistent Cart Store"
+        },
+        {
+          "term": "Multi-device merge / versioning",
+          "definition": "Reconciling concurrent edits from multiple devices via last-write-wins per line or a cart version.",
+          "whyItMatters": "Confirmed cart mutations shouldn't be silently lost when two devices edit at once.",
           "group": "Persistent Cart Store"
         }
       ],
@@ -1006,7 +2095,8 @@
             "highlight": [
               "CartStore"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-cart-store-opt1.jpg"
         },
         {
           "name": "Cart rows in the primary SQL DB",
@@ -1030,7 +2120,8 @@
             "highlight": [
               "OrderDB"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-cart-store-opt2.jpg"
         }
       ],
       "traps": [
@@ -1043,13 +2134,18 @@
           "trap": "Trusting cart prices/availability as authoritative",
           "why": "Carts are stale and AP-leaning; stock and price can change before checkout.",
           "instead": "Treat cart contents as intent; re-validate price and stock at checkout."
+        },
+        {
+          "trap": "Using a guessable guest cart id as the only ownership check",
+          "why": "If the cart id is just a path parameter, anyone who guesses or scrapes it can read or edit someone else's cart.",
+          "instead": "Mint an unguessable guest cart token bound to the session/device, and enforce ownership server-side rather than from the URL."
         }
       ],
       "failureDrills": [
         {
           "scenario": "A cart-store replica is briefly unavailable.",
-          "expectedBehavior": "Adding to cart still mostly works.",
-          "mitigation": "AP store with failover; occasional lost write is acceptable and recoverable at checkout."
+          "expectedBehavior": "Adding to cart still works; the shopper isn't blocked.",
+          "mitigation": "AP store with failover: writes are retried and reconciled, and stale replicas are acceptable for reads (checkout revalidates price/stock) — but a confirmed cart mutation should not simply vanish, so writes use last-write-wins-per-line or a cart version."
         }
       ],
       "interviewerSignals": {
@@ -1097,7 +2193,9 @@
         "Pricing at the right moment"
       ],
       "probeLinks": [
-        "debezium-outbox",
+        "stripe-tax",
+        "commercetools-carts-orders",
+        "broadleaf-subsecond-carts",
         "postgres-isolation"
       ],
       "decisionPrompt": "A coupon expires between adding to cart and checkout. What price does the shopper pay?",
@@ -1120,8 +2218,9 @@
           "title": "Where pricing happens",
           "points": [
             "Show indicative pricing on cart view (cheap, cached promotion rules).",
-            "Re-evaluate authoritatively at checkout and freeze the line prices into the order.",
-            "Validate coupon eligibility/limits server-side at checkout, not just on display."
+            "Re-evaluate authoritatively at checkout and freeze the result into an immutable price_quotes snapshot referenced by the order, capturing the promotion and tax rule versions so the total is reproducible in an audit.",
+            "Validate coupon eligibility/limits server-side at checkout, not just on display: the Promotion service records a coupon_redemptions row (reserved -> confirmed on payment, released on failure) keyed per user/coupon/order, so usage limits hold under retries.",
+            "Because the quote and redemption are keyed to the checkout, a retried checkout reuses them rather than re-pricing or double-consuming a coupon."
           ]
         }
       ],
@@ -1211,7 +2310,8 @@
               "Pricing",
               "Promo"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-pricing-opt1.jpg"
         },
         {
           "name": "Lock price at add-to-cart",
@@ -1249,7 +2349,8 @@
             "highlight": [
               "CartStore"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-pricing-opt2.jpg"
         },
         {
           "name": "Lock price with short TTL",
@@ -1285,14 +2386,15 @@
             "highlight": [
               "CartStore"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-pricing-opt3.jpg"
         }
       ]
     },
     {
       "id": "inventory",
       "title": "4. Inventory Reservation & Oversell Prevention",
-      "description": "Make 'never oversell' a hard invariant. At checkout, reserve each item with an atomic decrement-if-available (optimistic CAS) creating a short-lived reservation; the reservation expires if checkout doesn't complete. Inventory is the authoritative source of truth.",
+      "description": "Make 'never oversell' a hard invariant. At checkout, a single conditional write creates a short-lived hold only if enough stock remains (atomic CAS), decrementing available and incrementing reserved together; the hold has a TTL and auto-releases if checkout doesn't complete. Payment success confirms the hold as sold; failure or expiry releases it. The invariant is available + reserved + sold = stock_on_hand, and inventory is the authoritative source of truth.",
       "patterns": [
         "Inventory reservation + TTL",
         "Optimistic concurrency (CAS)"
@@ -1300,6 +2402,9 @@
       "probeLinks": [
         "postgres-isolation",
         "dynamodb-transactions",
+        "shopify-inventory-reservations",
+        "redis-inventory-reservation",
+        "shopify-flash-sale",
         "debezium-outbox"
       ],
       "decisionPrompt": "The last unit of a hot item is in two shoppers' checkouts at once. How do you ensure only one gets it?",
@@ -1315,6 +2420,17 @@
           "definition": "Atomically reduce stock only if enough remains.",
           "whyItMatters": "Concurrent checkouts can't both claim the last unit.",
           "group": "Inventory Reservation & Oversell Prevention"
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "The invariant and its counter transitions",
+          "points": [
+            "available + reserved + sold = stock_on_hand is maintained by every state change moving a unit between two counters, never creating or destroying one: a hold moves available -> reserved, confirmation moves reserved -> sold, release/expiry moves reserved -> available.",
+            "stock_on_hand only changes on physical events (receiving, damage/adjustment); a checkout never touches it, so the sum is preserved by construction.",
+            "sold is the count of confirmed reservations and is reconcilable against immutable paid order lines: a periodic job compares sold against SUM(qty) over paid orders per SKU and flags drift.",
+            "A sweeper expires holds past their TTL (reserved -> available) so an abandoned or crashed checkout never strands stock; a reconciler audits available/reserved/sold against reservations and paid order lines, and against the warehouse system of record."
+          ]
         }
       ],
       "flows": [
@@ -1382,12 +2498,18 @@
           "scenario": "Checkout reserves stock then crashes before paying.",
           "expectedBehavior": "The reserved unit returns to available shortly.",
           "mitigation": "Reservation TTL expires and releases; the order saga compensates."
+        },
+        {
+          "scenario": "A flash sale drives one hot SKU to thousands of reservation writes/second, melting the single inventory row.",
+          "expectedBehavior": "Reservations stay correct (no oversell) and the system sheds or queues excess load instead of collapsing.",
+          "mitigation": "First line is admission control: a per-SKU token bucket / virtual waiting room admits only as many concurrent checkouts as there is stock plus a margin, so the CAS row sees bounded write pressure. If a single row is still the ceiling, split the SKU's stock into N sharded reservation buckets (each its own CAS row) and settle against the total; or pin the hot SKU to a single-writer partition that batches decrements. All options keep the available + reserved + sold invariant — they only change where the CAS contention lands."
         }
       ],
       "interviewerSignals": {
         "strong": [
           "Uses atomic CAS reservations with TTL; separates reserved from sold.",
-          "Inventory is authoritative."
+          "Inventory is authoritative.",
+          "Has a first production answer for a hot-SKU flash sale (admission control / sharded reservation buckets)."
         ],
         "weak": [
           "Read-modify-write on stock.",
@@ -1396,8 +2518,8 @@
       },
       "recap": {
         "before": "Concurrent checkouts could oversell.",
-        "after": "Atomic reservations with TTL make oversell impossible while checkout is in flight.",
-        "newRisk": "Reservations must be released on failure/expiry — handled by the saga."
+        "after": "One CAS-protected conditional write creates a TTL hold (available -> reserved), making oversell impossible while checkout is in flight; the invariant available + reserved + sold = stock_on_hand is maintained.",
+        "newRisk": "Holds must be confirmed (reserved -> sold) on payment and released on failure/expiry — handled by the saga plus a sweeper/reconciler for stale holds."
       },
       "whyNow": [
         "Inventory correctness must be solid before orchestrating the full checkout."
@@ -1421,47 +2543,17 @@
       },
       "options": [
         {
-          "name": "CAS decrement of available (default)",
-          "description": "Checkout reserves stock with an atomic compare-and-set decrement of the available count, so exactly one of two racers wins the last unit without locking.",
+          "name": "CAS-protected hold with TTL (default)",
+          "description": "Checkout issues one conditional write that creates a short-lived hold only if available >= qty, atomically decrementing available and incrementing reserved together. The hold has a TTL and auto-releases on expiry; payment success confirms it (reserved -> sold), failure or expiry releases it (reserved -> available). Combines optimistic CAS for oversell safety with a TTL hold for abandoned-checkout recovery.",
           "pros": [
-            "A compare-and-set on the available count atomically lets exactly one of two racers win the last unit.",
-            "O(1) and lock-free, so it survives the hot-item burst without row-lock contention.",
-            "Simple to reason about: the count is the source of truth."
+            "The conditional write is atomic, so exactly one of two racers wins the last unit without locking.",
+            "Distinguishes available / reserved / sold and auto-releases on TTL, so abandoned checkouts free stock instead of stranding it.",
+            "Lock-free and O(1), so it survives the hot-item burst without row-lock contention; the invariant available + reserved + sold = stock_on_hand stays explicit."
           ],
           "cons": [
-            "Decrement-on-checkout means an abandoned checkout strands the unit until released.",
-            "A single hot SKU is still a write hotspot to scale.",
-            "Needs reconciliation if the fast counter and durable store can diverge."
-          ],
-          "view": {
-            "nodes": [
-              "Checkout",
-              "Inventory",
-              "InvStore"
-            ],
-            "caption": "The Checkout Orchestrator reserves via the Inventory Service, which atomically CAS-decrements the available count in the Inventory DB so only one racer wins the last unit.",
-            "links": [
-              "checkout-inventory-reserve",
-              "inventory-invstore-cas-decrement-available"
-            ],
-            "highlight": [
-              "Inventory",
-              "InvStore"
-            ]
-          }
-        },
-        {
-          "name": "Reservation hold with TTL",
-          "description": "Checkout creates a short-lived reservation row that holds the unit for the checkout window and auto-releases on TTL; available reads subtract active holds.",
-          "pros": [
-            "Reserves the unit for the checkout window and auto-releases on TTL, so abandoned checkouts free stock.",
-            "Distinguishes 'reserved' from 'sold', giving accurate availability during long checkouts.",
-            "Two shoppers can't both hold the last unit — the second sees zero available."
-          ],
-          "cons": [
-            "Adds a holds table plus an expiry sweeper to operate.",
-            "Available reads must subtract active holds, complicating the query.",
-            "TTL tuning trades shopper grace time against over-protecting stock."
+            "Adds a holds table plus an expiry sweeper/reconciler to operate.",
+            "Available reads must account for active holds.",
+            "A single hot SKU is still a write hotspot to scale; TTL tuning trades shopper grace time against over-protecting stock."
           ],
           "view": {
             "nodes": [
@@ -1472,15 +2564,49 @@
                 "label": "Inventory + Holds (TTL)"
               }
             ],
-            "caption": "The Checkout Orchestrator reserves via the Inventory Service, which writes a short-lived TTL hold into the Inventory + Holds store that auto-releases.",
+            "caption": "The Checkout Orchestrator reserves via the Inventory Service, which runs one CAS conditional write — decrement available, create a TTL hold — in the Inventory + Holds store, so only one racer wins the last unit and abandoned holds auto-release.",
             "links": [
               "checkout-inventory-reserve",
+              "inventory-invstore-cas-decrement-available",
               "inventory-invstore-hold-w-ttl"
             ],
             "highlight": [
+              "Inventory",
               "InvStore"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-inventory-opt1.jpg"
+        },
+        {
+          "name": "Plain CAS decrement of available (no hold)",
+          "description": "Checkout reserves stock with an atomic compare-and-set decrement of the available count only, with no separate hold record — the unit is taken the moment checkout starts.",
+          "pros": [
+            "Simplest oversell guard: a compare-and-set on the available count, O(1) and lock-free.",
+            "The single count is the source of truth — easy to reason about.",
+            "No holds table or sweeper to operate."
+          ],
+          "cons": [
+            "Decrement-on-checkout strands the unit until something releases it — an abandoned checkout shrinks available with no TTL to recover it.",
+            "Can't distinguish 'reserved' from 'sold', so availability is wrong during long checkouts.",
+            "Needs reconciliation if the fast counter and durable store diverge."
+          ],
+          "view": {
+            "nodes": [
+              "Checkout",
+              "Inventory",
+              "InvStore"
+            ],
+            "caption": "The Checkout Orchestrator reserves via the Inventory Service, which atomically CAS-decrements the available count in the Inventory DB with no separate hold record.",
+            "links": [
+              "checkout-inventory-reserve",
+              "inventory-invstore-cas-decrement-available"
+            ],
+            "highlight": [
+              "Inventory",
+              "InvStore"
+            ]
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-inventory-opt2.jpg"
         },
         {
           "name": "Pessimistic row lock",
@@ -1516,23 +2642,30 @@
             "highlight": [
               "InvStore"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-inventory-opt3.jpg"
         }
       ]
     },
     {
       "id": "checkout-saga",
       "title": "5. Checkout as a Saga (idempotent)",
-      "description": "Orchestrate checkout as a saga: reserve inventory -> charge payment -> create order, with compensations on failure (release reservation, refund). An idempotency key makes the whole flow safe to retry, so a shopper is never double-charged or double-ordered.",
+      "description": "Orchestrate checkout as a saga: reserve inventory -> create a durable PENDING_PAYMENT order (frozen price + reservation ids) -> authorize/capture payment using the order id as the gateway idempotency key -> mark the order PAID and confirm the holds, with compensations on failure (void/refund, release reservation, mark the order FAILED). Creating the order before money moves means there is always a durable local record to reconcile against, and an idempotency key makes the whole flow safe to retry so a shopper is never double-charged or double-ordered.",
       "patterns": [
         "Saga / orchestration",
         "Idempotency key"
       ],
       "probeLinks": [
         "stripe-idempotency",
-        "dynamodb-transactions",
+        "amazon-idempotent-apis",
         "stripe-payment-intents",
-        "debezium-outbox"
+        "stripe-paymentintents-lifecycle",
+        "stripe-webhooks",
+        "temporal-saga",
+        "microservices-saga",
+        "helland-distributed-transactions",
+        "aws-retries-backoff-jitter",
+        "dynamodb-transactions"
       ],
       "decisionPrompt": "Payment succeeds but order creation fails. What happens to the money and the reserved stock?",
       "concepts": [
@@ -1544,15 +2677,32 @@
         },
         {
           "term": "Compensation",
-          "definition": "Undo actions (refund, release reservation) for completed steps when the saga aborts.",
+          "definition": "Undo actions (void/refund, release reservation, mark order FAILED) for completed steps when the saga aborts.",
           "whyItMatters": "Restores consistency after partial failure.",
           "group": "Checkout as a Saga (idempotent)"
+        },
+        {
+          "term": "Authorize vs capture",
+          "definition": "Authorization reserves funds on the card; capture actually moves them. Void cancels an uncaptured auth; refund reverses a capture.",
+          "whyItMatters": "Separating them lets the saga hold money tentatively and release it cheaply (void) when a later step fails, instead of always refunding.",
+          "group": "Checkout as a Saga (idempotent)"
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Payment lifecycle and reconciliation",
+          "points": [
+            "Order before money: create a durable PENDING_PAYMENT order with the frozen price and reservation ids, then authorize/capture — so a capture always has a local record to reconcile against.",
+            "Each gateway call writes a durable payment_attempts row (gateway intent id, idempotency key, amount, kind, status, last response), so a retry or lost response reconciles against the attempt rather than re-charging. Use the order id as the gateway idempotency key so a retried charge can never double-bill; distinguish authorize, capture, void, and refund explicitly.",
+            "Payments can confirm asynchronously: an order may sit PENDING until a webhook arrives. Inbound webhooks are deduped in payment_webhook_events keyed by the gateway event id, so a redelivery is applied once. A reconciliation job sweeps stale PENDING_PAYMENT orders and incomplete attempts, reading gateway state to either complete (mark PAID) or compensate (release + FAILED).",
+            "Idempotency keys are retained for a bounded window (e.g. 24–72h); a repeat with the same key replays the stored result — including terminal failures stored with a null order_id — and a repeat with a different payload is rejected rather than silently re-run."
+          ]
         }
       ],
       "flows": [
         {
-          "name": "Payment ok but order-create fails -> compensate",
-          "note": "Refund and release so no money or stock is stranded.",
+          "name": "Order is PENDING but payment fails -> compensate",
+          "note": "The durable PENDING_PAYMENT order exists before capture, so on payment failure the saga voids/refunds, releases the hold, and marks the order FAILED — no money or stock is stranded, and there is always a local record to reconcile.",
           "sequence": {
             "participants": [
               {
@@ -1564,12 +2714,12 @@
                 "label": "Inventory"
               },
               {
-                "id": "P",
-                "label": "Payment"
-              },
-              {
                 "id": "O",
                 "label": "Order"
+              },
+              {
+                "id": "P",
+                "label": "Payment"
               }
             ],
             "messages": [
@@ -1577,43 +2727,43 @@
                 "from": "K",
                 "to": "I",
                 "arrow": "->>",
-                "label": "reserve"
-              },
-              {
-                "from": "K",
-                "to": "P",
-                "arrow": "->>",
-                "label": "charge"
-              },
-              {
-                "from": "P",
-                "to": "K",
-                "arrow": "-->>",
-                "label": "captured"
+                "label": "reserve (TTL hold)"
               },
               {
                 "from": "K",
                 "to": "O",
                 "arrow": "->>",
-                "label": "create order"
-              },
-              {
-                "from": "O",
-                "to": "K",
-                "arrow": "-->>",
-                "label": "failure"
+                "label": "create order PENDING_PAYMENT"
               },
               {
                 "from": "K",
                 "to": "P",
                 "arrow": "->>",
-                "label": "refund (compensate)"
+                "label": "authorize+capture (key = order id)"
+              },
+              {
+                "from": "P",
+                "to": "K",
+                "arrow": "-->>",
+                "label": "declined / timeout"
+              },
+              {
+                "from": "K",
+                "to": "P",
+                "arrow": "->>",
+                "label": "void/refund if captured (compensate)"
               },
               {
                 "from": "K",
                 "to": "I",
                 "arrow": "->>",
                 "label": "release reservation"
+              },
+              {
+                "from": "K",
+                "to": "O",
+                "arrow": "->>",
+                "label": "mark order FAILED"
               }
             ]
           }
@@ -1621,14 +2771,19 @@
       ],
       "traps": [
         {
+          "trap": "Capturing payment before any durable order exists",
+          "why": "If the order write then fails, you have moved money with no local record — reconciliation and support are blind, and 'refund compensates' is not the same as never entering the bad state.",
+          "instead": "Create a durable PENDING_PAYMENT order (frozen price + reservation ids) before capture, so a charge always has a recoverable order to reconcile against."
+        },
+        {
           "trap": "No compensation when a later step fails",
-          "why": "Payment without an order strands the shopper's money and the reserved stock.",
-          "instead": "On failure, run compensations: refund the charge and release the reservation."
+          "why": "A failed step strands the shopper's money and the reserved stock.",
+          "instead": "On failure, run compensations: void/refund the charge, release the reservation, and mark the order FAILED."
         },
         {
           "trap": "Non-idempotent checkout",
           "why": "A retried request re-reserves, re-charges, or re-orders.",
-          "instead": "Idempotency key: a repeat returns the original result without re-running steps."
+          "instead": "Idempotency key: a repeat returns the original result without re-running steps; reuse the order id as the gateway key so the charge itself is idempotent."
         }
       ],
       "failureDrills": [
@@ -1636,6 +2791,11 @@
           "scenario": "The shopper double-clicks 'place order'.",
           "expectedBehavior": "Exactly one order and one charge.",
           "mitigation": "Idempotency key dedupes the second request to the same in-progress/completed result."
+        },
+        {
+          "scenario": "The gateway captures payment but the response is lost before the order is marked PAID.",
+          "expectedBehavior": "The order eventually reaches PAID exactly once; no second charge.",
+          "mitigation": "The order id keys the gateway charge, so a retry is deduped; an async webhook and a reconciliation sweep of stale PENDING orders complete the transition."
         }
       ],
       "interviewerSignals": {
@@ -1650,8 +2810,8 @@
       },
       "recap": {
         "before": "Multi-service checkout couldn't be atomic or safely retried.",
-        "after": "A compensating, idempotent saga gives all-or-nothing checkout.",
-        "newRisk": "Saga + compensation logic is complex; every step must be idempotent."
+        "after": "A compensating, idempotent saga gives all-or-nothing checkout, with a durable PENDING_PAYMENT order created before capture so money is never stranded without a recoverable record.",
+        "newRisk": "Saga + compensation logic is complex; every step must be idempotent, and a webhook/reconciler must close the gap between gateway state and order state."
       },
       "whyNow": [
         "The saga ties inventory, payment, and orders into a correct checkout."
@@ -1665,7 +2825,7 @@
           "Payment",
           "Order"
         ],
-        "caption": "The shopper app sends checkout plus an idempotency key to the Checkout Orchestrator, which dedupes via the Idempotency Store, then reserves inventory, charges the Payment System, and creates the order.",
+        "caption": "The shopper app sends checkout plus an idempotency key to the Checkout Orchestrator, which dedupes via the Idempotency Store, then runs the saga in order: reserve inventory -> create a durable PENDING_PAYMENT order -> authorize/capture payment -> mark PAID and confirm the holds.",
         "links": [
           "client-checkout-checkout-key",
           "checkout-idem-dedupe",
@@ -1681,15 +2841,15 @@
       "options": [
         {
           "name": "Idempotent orchestrated saga (default)",
-          "description": "A central orchestrator drives reserve-inventory then charge-payment then create-order, deduping retries with a client idempotency key and running compensations on failure.",
+          "description": "A central orchestrator drives reserve-inventory then create a durable PENDING_PAYMENT order then authorize/capture payment then mark PAID, deduping retries with a client idempotency key (using the order id as the gateway key) and running compensations (void/refund, release, mark FAILED) on failure. An asynchronous payment webhook reconciles any capture whose response was lost.",
           "pros": [
-            "A client-supplied idempotency key dedupes retries, so a dropped response never double-charges or double-reserves.",
-            "The checkout orchestrator drives reserve -> charge -> create-order and compensates on failure (release stock, refund).",
-            "Centralized state makes 'payment succeeded but order failed' recoverable and auditable."
+            "A client-supplied idempotency key dedupes retries, so a dropped response never double-charges or double-reserves; the order id keys the gateway charge so the payment side is idempotent too.",
+            "The order exists (PENDING_PAYMENT) before money moves, so there is always a durable local record — capture is never stranded without a recoverable order.",
+            "Centralized state makes every partial-failure branch recoverable and auditable; a reconciliation job and payment webhook close any gap between gateway state and order state."
           ],
           "cons": [
-            "Compensation is eventually consistent: a brief window where money is captured but no order exists.",
-            "Requires an idempotency store and careful per-step idempotency.",
+            "Compensation is eventually consistent: a brief window where a capture has happened but the order is still PENDING — closed by the webhook/reconciler.",
+            "Requires an idempotency store (with a retention window) and careful per-step idempotency, plus payload-mismatch handling on key reuse.",
             "The orchestrator concentrates logic and must itself be reliable."
           ],
           "view": {
@@ -1701,7 +2861,7 @@
               "Payment",
               "Order"
             ],
-            "caption": "The Checkout Orchestrator dedupes the idempotency key against the Idempotency Store, then drives reserve at the Inventory Service, charge at the Payment System, and create at the Order Service.",
+            "caption": "The Checkout Orchestrator dedupes the idempotency key against the Idempotency Store, then drives the saga in order: reserve at the Inventory Service -> create a PENDING_PAYMENT order at the Order Service -> authorize/capture at the Payment System -> mark PAID and confirm the holds.",
             "links": [
               "client-checkout-checkout-key",
               "checkout-idem-dedupe",
@@ -1713,7 +2873,8 @@
               "Checkout",
               "Idem"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-checkout-saga-opt1.jpg"
         },
         {
           "name": "Choreographed saga (events)",
@@ -1762,7 +2923,8 @@
             "highlight": [
               "Outbox"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-checkout-saga-opt2.jpg"
         },
         {
           "name": "Synchronous two-phase commit",
@@ -1808,20 +2970,24 @@
             "highlight": [
               "Checkout"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-checkout-saga-opt3.jpg"
         }
       ]
     },
     {
       "id": "order-state",
       "title": "6. Order State Machine & Fulfillment",
-      "description": "Model the order as a state machine (placed -> paid -> fulfilled / cancelled) with guarded transitions. State changes emit events via a transactional outbox to fulfillment, notifications, and analytics — reliably and without dual writes.",
+      "description": "Model the order as a state machine — pending_payment -> paid -> fulfillment_requested -> fulfilled, with cancel_requested/cancelled and failed branches — and only allow legal transitions. Each transition is recorded in order_events and emits an outbox event in the same transaction; a relay publishes to a queue so idempotent consumers (keyed by event id) act exactly once. Cancellation compensates by current state: pending_payment releases holds, paid (not fulfilled) voids/refunds and releases, fulfilled becomes a return/refund flow rather than a simple cancel.",
       "patterns": [
         "Order state machine",
         "Transactional outbox"
       ],
       "probeLinks": [
         "stripe-idempotency",
+        "stripe-paymentintents-lifecycle",
+        "commercetools-states",
+        "microservices-transactional-outbox",
         "debezium-outbox"
       ],
       "decisionPrompt": "How do you reliably tell the warehouse to ship, exactly once, when an order is paid?",
@@ -1837,6 +3003,17 @@
           "definition": "Events written in the same transaction as the state change, relayed to a queue.",
           "whyItMatters": "Guarantees a 'paid' event is published iff the state committed — no lost or phantom ships.",
           "group": "Order State Machine & Fulfillment"
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Legal transitions and cancellation matrix",
+          "points": [
+            "States: pending_payment -> paid -> fulfillment_requested -> fulfilled; pending_payment/paid can branch to cancel_requested -> cancelled; pending_payment can go to failed. Anything else is rejected.",
+            "Each transition writes an order_events row and an outbox_events row in the same transaction; the transition owner is the service that holds that state (checkout for pending->paid, fulfillment for ->fulfilled).",
+            "Cancel by current state: pending_payment releases holds and voids any auth; paid-but-not-fulfilled voids/refunds and releases; fulfilled is out of scope for cancel — it routes to a return/refund flow.",
+            "Consumers dedupe on event_id — each downstream service owns a small processed-events table keyed by event_id — so a redelivered order.paid ships once; guarded transitions stop a cancelled order from later being fulfilled or a fulfilled order from being silently cancelled."
+          ]
         }
       ],
       "options": [
@@ -1864,7 +3041,8 @@
             "highlight": [
               "Outbox"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-order-state-opt1.jpg"
         },
         {
           "name": "Directly call fulfillment from checkout",
@@ -1888,7 +3066,8 @@
             "highlight": [
               "Fulfillment"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-order-state-opt2.jpg"
         }
       ],
       "traps": [
@@ -2020,6 +3199,14 @@
         "Workload partitioning",
         "Optimistic concurrency (CAS)"
       ],
+      "probeLinks": [
+        "dynamodb-transactions",
+        "shopify-flash-sale",
+        "shopify-inventory-reservations",
+        "aws-retries-backoff-jitter",
+        "broadleaf-subsecond-carts",
+        "redis-cache"
+      ],
       "decisionPrompt": "Carts get 25x the traffic of checkouts but need weaker guarantees. Why scale them differently?",
       "concepts": [
         {
@@ -2060,7 +3247,8 @@
             "highlight": [
               "ShardA"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/07-scale-opt1.jpg"
         },
         {
           "name": "One shared SQL DB for carts and orders",
@@ -2081,7 +3269,8 @@
             "links": [
               "api-orderdb"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/07-scale-opt2.jpg"
         }
       ],
       "deepDives": [
@@ -2090,7 +3279,7 @@
           "points": [
             "Cart is intent (AP); at checkout, re-read authoritative price and reserve authoritative stock (CP).",
             "Shard carts by user for locality; expire abandoned carts to bound storage.",
-            "Hot inventory items still concentrate contention — that's handled by CAS reservations, not sharding."
+            "Sharding the cart store does nothing for a hot SKU — that contention lands on one inventory row and is handled at the inventory layer (CAS holds, then admission control or sharded reservation buckets from Step 4), not by cart sharding."
           ]
         }
       ],
@@ -2149,7 +3338,7 @@
   ],
   "finalDesign": {
     "title": "Final Design",
-    "description": "End-to-end: carts live in a sharded, available, expiring KV store (intent only); a pricing service computes promotions, re-validated and frozen at checkout; checkout runs as an idempotent saga that reserves inventory via atomic CAS holds with TTL, charges payment, and creates an order, compensating on any failure; the order is a guarded state machine emitting events via a transactional outbox to fulfillment; carts (AP) and orders/inventory (CP) scale as separate systems.",
+    "description": "End-to-end: carts live in a sharded, available, expiring KV store (intent only) behind the Cart Service; a pricing service computes promotions, re-validated and frozen at checkout; checkout runs as an idempotent saga that reserves inventory via CAS-protected TTL holds, creates a durable PENDING_PAYMENT order, charges payment (order id as the gateway key), then marks it PAID — compensating on any failure and reconciling via webhook; the order is a guarded state machine recording transitions and emitting events via a transactional outbox to fulfillment; carts (AP) and orders/inventory (CP) scale as separate systems.",
     "view": {
       "nodes": [
         "Client",
@@ -2171,13 +3360,13 @@
         "Queue",
         "Fulfillment"
       ],
-      "caption": "The shopper app hits the Commerce API, which shards carts via the Shard Router (Cart Shards A/B) and prices them via Pricing & Promotions; the Checkout Orchestrator dedupes against the Idempotency Store, reserves inventory, charges payment, and creates orders, whose state changes flow through the Outbox and Order Event Queue to the Fulfillment Service.",
+      "caption": "The shopper app hits the Commerce API, which routes cart ops to the Cart Service; the Cart Service shards carts via the Shard Router (Cart Shards A/B), and Pricing & Promotions prices them; the Checkout Orchestrator dedupes against the Idempotency Store, reserves inventory, creates the order, charges payment, and marks it paid, whose state changes flow through the Outbox and Order Event Queue to the Fulfillment Service.",
       "links": [
         "client-api",
-        "api-router-cart",
+        "api-cart",
+        "cart-router",
         "router-sharda",
         "router-shardb",
-        "cart-sharda",
         "api-pricing",
         "pricing-promo",
         "api-checkout-checkout",
@@ -2191,7 +3380,8 @@
         "outbox-queue",
         "queue-fulfillment"
       ]
-    }
+    },
+    "aiVisual": "assets/generated/ai-visuals/final-design.jpg"
   },
   "satisfies": {
     "functional": [
@@ -2218,7 +3408,7 @@
       },
       {
         "requirement": "Check out to an order",
-        "how": "Idempotent saga: reserve -> charge -> create order.",
+        "how": "Idempotent saga: reserve -> create PENDING_PAYMENT order -> authorize/capture -> mark PAID and confirm holds.",
         "steps": [
           "checkout-saga",
           "inventory"
@@ -2234,8 +3424,8 @@
     ],
     "nonFunctional": [
       {
-        "requirement": "Never oversell / never charge without order",
-        "how": "Atomic CAS reservations + compensating saga.",
+        "requirement": "Never oversell / no charge without a recoverable order",
+        "how": "CAS-protected TTL reservations; a durable PENDING_PAYMENT order created before capture; compensating saga with webhook/reconciler.",
         "steps": [
           "inventory",
           "checkout-saga"
@@ -2421,10 +3611,181 @@
         "source": "Redis",
         "type": "Docs",
         "why": "Shows cache invalidation and coherence mechanics for low-latency read paths."
+      },
+      {
+        "id": "stripe-webhooks",
+        "group": "Payments and Commerce",
+        "groupDescription": "Payment correctness, idempotency, ledgers, checkout, orders, and reconciliation references.",
+        "title": "Receiving Webhooks",
+        "url": "https://docs.stripe.com/webhooks",
+        "source": "Stripe",
+        "type": "Docs",
+        "why": "Shows asynchronous payment confirmation, event ids for dedupe, and delivery/retry semantics behind the reconciler."
+      },
+      {
+        "id": "stripe-tax",
+        "group": "Payments and Commerce",
+        "groupDescription": "Payment correctness, idempotency, ledgers, checkout, orders, and reconciliation references.",
+        "title": "Tax Calculation",
+        "url": "https://docs.stripe.com/tax/calculating",
+        "source": "Stripe",
+        "type": "Docs",
+        "why": "Concrete example of computing authoritative tax at checkout and freezing it into the order/quote."
+      },
+      {
+        "id": "shopify-flash-sale",
+        "group": "Booking and Contention",
+        "groupDescription": "Inventory reservation, waiting rooms, locks, leases, and contention-management references.",
+        "title": "Surviving Flash Sales",
+        "url": "https://shopify.engineering/surviving-flashes-of-high-write-traffic",
+        "source": "Shopify",
+        "type": "Engineering blog",
+        "why": "Real account of admission control and high write-contention handling for hot inventory under flash-sale load."
+      },
+      {
+        "id": "shopify-inventory-reservations",
+        "group": "Booking and Contention",
+        "groupDescription": "Inventory reservation, waiting rooms, locks, leases, and contention-management references.",
+        "title": "We replaced Redis with MySQL for inventory reservations—and it scaled",
+        "url": "https://shopify.engineering/scaling-inventory-reservations",
+        "source": "Shopify",
+        "type": "Engineering blog",
+        "year": "2026",
+        "why": "Production checkout case study for short inventory holds, SKIP LOCKED, lock ordering, and keeping reservations atomic with the inventory ledger."
+      },
+      {
+        "id": "redis-inventory-reservation",
+        "group": "Booking and Contention",
+        "groupDescription": "Inventory reservation, waiting rooms, locks, leases, and contention-management references.",
+        "title": "Reserve inventory in real time with Redis using WATCH, MULTI, and audit streams",
+        "url": "https://redis.io/tutorials/inventory-reservation-in-real-time-with-redis/",
+        "source": "Redis",
+        "type": "Tutorial",
+        "year": "2026",
+        "why": "Hands-on reference for Redis-based stock holds, confirm/release flows, expired-hold recovery, and reservation audit streams."
+      },
+      {
+        "id": "amazon-idempotent-apis",
+        "group": "Reliability and Operations",
+        "groupDescription": "Retries, idempotent APIs, backoff, overload protection, and recovery practices for checkout paths.",
+        "title": "Making retries safe with idempotent APIs",
+        "url": "https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-apis/",
+        "source": "Amazon Builders' Library",
+        "type": "Article",
+        "year": "2021",
+        "why": "Explains caller-provided request tokens, semantic equivalence, payload mismatch handling, and bounded idempotency retention."
+      },
+      {
+        "id": "aws-retries-backoff-jitter",
+        "group": "Reliability and Operations",
+        "groupDescription": "Retries, idempotent APIs, backoff, overload protection, and recovery practices for checkout paths.",
+        "title": "Timeouts, retries, and backoff with jitter",
+        "url": "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/",
+        "source": "Amazon Builders' Library",
+        "type": "Article",
+        "why": "Useful for setting checkout dependency timeouts, preventing retry storms, and smoothing flash-sale recovery traffic."
+      },
+      {
+        "id": "microservices-saga",
+        "group": "Sagas and Distributed Transactions",
+        "groupDescription": "Foundational and pattern references for cross-service checkout workflows, compensations, and alternatives to 2PC.",
+        "title": "Pattern: Saga",
+        "url": "https://microservices.io/patterns/data/saga.html",
+        "source": "Microservices.io",
+        "type": "Pattern",
+        "why": "Defines choreography vs orchestration, compensating transactions, saga isolation gaps, and the need for atomic event publishing."
+      },
+      {
+        "id": "helland-distributed-transactions",
+        "group": "Sagas and Distributed Transactions",
+        "groupDescription": "Foundational and pattern references for cross-service checkout workflows, compensations, and alternatives to 2PC.",
+        "title": "Life Beyond Distributed Transactions",
+        "url": "https://queue.acm.org/detail.cfm?id=3025012",
+        "source": "ACM Queue",
+        "type": "Article",
+        "year": "2016",
+        "why": "Frames order and inventory interactions as workflow with per-entity state when one distributed transaction is unavailable."
+      },
+      {
+        "id": "microservices-transactional-outbox",
+        "group": "Queues and Streams",
+        "groupDescription": "Messaging, event streaming, delivery semantics, and async processing references.",
+        "title": "Pattern: Transactional outbox",
+        "url": "https://microservices.io/patterns/data/transactional-outbox",
+        "source": "Microservices.io",
+        "type": "Pattern",
+        "why": "Explains the database-plus-message dual-write problem and why order state changes should first persist events in an outbox."
+      },
+      {
+        "id": "akka-shopping-cart",
+        "group": "Commerce Implementations",
+        "groupDescription": "Commerce platform docs and implementation notes for carts, checkout, pricing, orders, and fulfillment.",
+        "title": "Shopping Cart example architecture",
+        "url": "https://doc.akka.io/libraries/guide/microservices-tutorial/overview.html",
+        "source": "Akka",
+        "type": "Tutorial",
+        "why": "Concrete shopping-cart microservice walkthrough with cart, order, analytics, gRPC, and Kafka service boundaries."
+      },
+      {
+        "id": "woocommerce-cart-checkout-blocks",
+        "group": "Commerce Implementations",
+        "groupDescription": "Commerce platform docs and implementation notes for carts, checkout, pricing, orders, and fulfillment.",
+        "title": "Getting to Know Woo: Understanding the Architecture of Cart and Checkout Blocks",
+        "url": "https://developer.woocommerce.com/2023/09/18/architecture-of-cart-and-checkout-blocks/",
+        "source": "WooCommerce Developer Blog",
+        "type": "Engineering blog",
+        "year": "2023",
+        "why": "Shows how a real commerce frontend coordinates cart/checkout state through parent blocks and the server-side Store API."
+      },
+      {
+        "id": "commercetools-carts-orders",
+        "group": "Commerce Implementations",
+        "groupDescription": "Commerce platform docs and implementation notes for carts, checkout, pricing, orders, and fulfillment.",
+        "title": "Carts and Orders overview",
+        "url": "https://docs.commercetools.com/api/carts-orders-overview",
+        "source": "commercetools",
+        "type": "Docs",
+        "why": "Detailed domain model for carts, line-item snapshots, anonymous checkout, cart merge, price recalculation, and freezing carts before order creation."
+      },
+      {
+        "id": "commercetools-states",
+        "group": "Commerce Implementations",
+        "groupDescription": "Commerce platform docs and implementation notes for carts, checkout, pricing, orders, and fulfillment.",
+        "title": "States",
+        "url": "https://docs.commercetools.com/api/projects/states",
+        "source": "commercetools",
+        "type": "Docs",
+        "why": "Reference for modeling order, payment, line-item, and custom workflows as finite state machines with validated transitions."
+      },
+      {
+        "id": "stripe-paymentintents-lifecycle",
+        "group": "Payments and Commerce",
+        "groupDescription": "Payment correctness, idempotency, ledgers, checkout, orders, and reconciliation references.",
+        "title": "How PaymentIntents and SetupIntents work",
+        "url": "https://docs.stripe.com/payments/paymentintents/lifecycle",
+        "source": "Stripe",
+        "type": "Docs",
+        "why": "Shows payment states such as requires action, processing, succeeded, and canceled for designing order/payment reconciliation."
+      },
+      {
+        "id": "broadleaf-subsecond-carts",
+        "group": "Commerce Implementations",
+        "groupDescription": "Commerce platform docs and implementation notes for carts, checkout, pricing, orders, and fulfillment.",
+        "title": "Engineering Sub-Second Carts: Broadleaf's Performance Architecture",
+        "url": "https://broadleafcommerce.com/blog/engineering-sub-second-carts-broadleafs-performance-architecture/",
+        "source": "Broadleaf",
+        "type": "Engineering blog",
+        "year": "2025",
+        "why": "Implementation note on cart orchestration, batched data hydration, delegated pricing/inventory providers, async post-checkout events, and stale-price validation."
       }
     ]
   },
   "assets": {
     "icon": "icon.png"
-  }
+  },
+  "aiVisuals": {
+    "requirements": "assets/generated/ai-visuals/requirements.jpg",
+    "capacity": "assets/generated/ai-visuals/capacity.jpg"
+  },
+  "explainerComic": "assets/generated/comic/interview-comic.jpg"
 }

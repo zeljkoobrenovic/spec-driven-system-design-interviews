@@ -474,9 +474,18 @@ when absent, so the `examples` datasets are unaffected):
 - `levelVariants` (dataset) → Wrap-up "By Level" entry. Each
   `{ level, expectations }`.
 - `patternCatalog` (dataset) → standalone "Pattern Catalog" entry, grouped by
-  `category`. Each `{ name, category?, what, whenToUse?, tradeoffs?, usedBy? }`.
-  **A dataset with `patternCatalog` and no `steps` is valid** (a catalog, not a
-  walkthrough) — `validateDataset` requires `steps[]` *or* `patternCatalog[]`.
+  `category`. Each `{ name, category?, what, whenToUse?, tradeoffs?, aliases?,
+  pairsWith?, commonlyConfusedWith?, usedBy? }`. **A dataset with
+  `patternCatalog` and no `steps` is valid** (a catalog, not a walkthrough) —
+  `validateDataset` requires `steps[]` *or* `patternCatalog[]`. The catalog name
+  is the **canonical vocabulary**: `aliases[]` lists case-study `step.patterns[]`
+  synonyms that map to it (rendered as "Also called" chips), and `pairsWith[]` /
+  `commonlyConfusedWith[]` are other catalog names rendered as relationship chips
+  ("Pairs with" / "Confused with") — keep those references pointing at real
+  catalog `name`s. `usedBy[]` entries are either a free-text case name (string)
+  **or** an object `{ datasetId, label }`; a `datasetId` turns the chip into a
+  link to that case study (`#<datasetId>`), so it must resolve in the group's
+  `index.json`.
 - Generated visual assets are optional and path-based, relative to the dataset
   directory. Top-level `assets` stores `icon`; pattern/concept objects use
   `icon` (small inline icons). **AI Visuals** are full diagram-replacement

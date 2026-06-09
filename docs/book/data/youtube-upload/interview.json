@@ -135,6 +135,12 @@
         "label": "store source"
       },
       {
+        "id": "naive-serve",
+        "from": "RawStore",
+        "to": "Viewer",
+        "label": "serve original file"
+      },
+      {
         "id": "upload-meta",
         "from": "UploadSvc",
         "to": "MetaSvc",
@@ -192,7 +198,10 @@
         "id": "play-cdn",
         "from": "PlaySvc",
         "to": "CDN",
-        "label": "signed segment URLs"
+        "label": "mints segment tokens (control plane)",
+        "render": {
+          "arrow": "-.-"
+        }
       },
       {
         "id": "viewer-cdn",
@@ -275,43 +284,116 @@
       "Processing is async — upload returns fast; playback becomes available when renditions are ready.",
       "Durable storage of source and renditions.",
       "Low-latency, high-throughput playback globally (CDN).",
-      "Scale ingestion (hundreds of hours uploaded per minute) and serving (billions of watch hours) independently."
+      "Scale ingestion (hundreds of hours uploaded per minute) and serving (billions of watch hours) independently.",
+      "Access control on playback: public, unlisted, private, and geo-restricted videos enforced without breaking CDN cacheability.",
+      "Out of scope but acknowledged: content validation/moderation (malware scan, policy, copyright matching) as a pre-publish hook; operational SLOs (playback start latency, rebuffering ratio, transcode latency, upload success rate)."
     ]
   },
   "capacity": [
     {
-      "label": "Upload rate",
-      "value": "100s of hours/min",
-      "note": "Drives transcode fleet size."
+      "label": "Upload ingress",
+      "value": "~300 hr/min → ~0.5 GB/s (assumes ~13 Mbps source)",
+      "note": "Assumption: ~100 MB per source-minute ≈ 13 Mbps average source bitrate — varies widely (4K HDR is multiples higher, 480p talking-head far lower). 300 hr/min ≈ 5 hr/s × ~6 GB/hr ≈ 0.5 GB/s sustained. Motivates resumable chunked upload (step 2); size headroom for bitrate spread."
     },
     {
-      "label": "Renditions per video",
-      "value": "~5-8",
-      "note": "240p..4K x codecs; multiplies storage + compute."
+      "label": "Transcode multiplier",
+      "value": "~5-8x compute-hours per source-hour (ladder-dependent)",
+      "note": "Assumption: a 5-8 rung ladder (240p..4K × codecs), each roughly real-time-ish to encode on the target hardware. The multiplier swings with codec choice (AV1/VP9 are far costlier than H.264) and how many rungs you ship. One uploaded hour ≈ several compute-hours → segment-parallel fanout (step 4)."
     },
     {
-      "label": "Source file size",
-      "value": "MBs to many GB",
-      "note": "Requires chunked, resumable upload."
+      "label": "Worker fleet / backlog",
+      "value": "thousands of cores; queue depth = burst buffer",
+      "note": "300 src-hr/min × ~6x ≈ 1800 transcode-hr/min ≈ 30 transcode-hr/s of work; spikes buffer as queue depth and autoscale the fleet (steps 3, 7)."
     },
     {
-      "label": "Concurrent viewers",
-      "value": "millions",
-      "note": "Served from CDN edge, not origin."
+      "label": "Storage growth",
+      "value": "source + ~0.5-1x for renditions (≈1.5-2x source total)",
+      "note": "Assumption: immutable source dominates; an efficient segmented ladder adds ~0.5-1x on top, but this is highly sensitive to codec efficiency, rung count, and retention policy (drop rarely-watched rungs and it shrinks). Petabytes/day of net growth → cost tiering (step 7)."
+    },
+    {
+      "label": "CDN edge QPS",
+      "value": "millions of segment req/s; hit ratio >95% (assumed)",
+      "note": "Assumption: 2-6s segments, so each viewer pulls ~1 segment every few seconds; millions of concurrent viewers ⇒ millions of fetches/sec. The >95% edge-hit assumption holds for head content but degrades for cold/long-tail catalogs — sizes origin-miss bandwidth below (step 5)."
+    },
+    {
+      "label": "Origin miss bandwidth",
+      "value": "<5% of edge traffic (assumes >95% hit), skewed to long tail",
+      "note": "Assumption: directly the complement of the edge hit ratio above — a 95% hit ratio means ~5% reaches origin, but a colder catalog or a thundering-herd premiere pushes it higher. Hot videos cache; cold/long-tail content drives origin pulls. Sizes origin-shield and pre-warm decisions (step 5)."
+    },
+    {
+      "label": "View-event throughput",
+      "value": "~100k-1M view events/sec at peak (heartbeat-rate dependent)",
+      "note": "Assumption: the range depends on how often the player emits (one start event vs periodic watch heartbeats) and concurrent-viewer count. Either way it's far higher than the metadata write rate — must be aggregated async, not a synchronous counter increment (step 6)."
     },
     {
       "label": "Read:write",
-      "value": "watch >> upload",
-      "note": "CDN absorbs the read fanout."
+      "value": "watch >> upload (orders of magnitude)",
+      "note": "Read fanout lives in the CDN; metadata writes (status, view-count deltas) stay small."
     }
   ],
   "api": [
     {
       "method": "POST",
       "path": "/v1/uploads",
-      "description": "Start a resumable upload session; returns an upload URL the client streams chunks to.",
-      "request": "{ \"filename\": \"clip.mov\", \"size\": 4200000000 }",
-      "response": "{ \"uploadId\": \"u_9\", \"uploadUrl\": \"...\" }",
+      "description": "Start a resumable upload session only — no bytes are transferred here. Idempotency-Key header dedupes retried session creates; returns the session handle and chunk part size. The video is created in 'uploading' state; transcode is not enqueued until POST /complete.",
+      "request": "Idempotency-Key: k_abc\n{ \"filename\": \"clip.mov\", \"size\": 4200000000, \"contentType\": \"video/quicktime\" }",
+      "response": "201 Created\n{ \"uploadId\": \"u_9\", \"videoId\": \"v_3\", \"partSize\": 8388608, \"expiresAt\": \"2026-06-09T12:00:00Z\" }",
+      "sequence": {
+        "participants": [
+          {
+            "id": "Creator"
+          },
+          {
+            "id": "UploadSvc",
+            "label": "Upload Service"
+          },
+          {
+            "id": "MetaSvc",
+            "label": "Metadata Service"
+          }
+        ],
+        "messages": [
+          {
+            "from": "Creator",
+            "to": "UploadSvc",
+            "arrow": "->>",
+            "label": "start upload session (idempotency-keyed)"
+          },
+          {
+            "from": "UploadSvc",
+            "to": "MetaSvc",
+            "arrow": "->>",
+            "label": "create video (uploading) + upload_session row"
+          },
+          {
+            "from": "UploadSvc",
+            "to": "Creator",
+            "arrow": "-->>",
+            "label": "201 { uploadId, videoId, partSize, expiresAt }"
+          }
+        ]
+      }
+    },
+    {
+      "method": "PUT",
+      "path": "/v1/uploads/{uploadId}/parts/{partNumber}",
+      "description": "Upload one chunk. Content-Range gives the byte offset; the server stores the part, records its checksum/ETag, and is idempotent on re-sent parts (same partNumber + checksum is a no-op).",
+      "request": "Content-Range: bytes 25165824-33554431/4200000000\nContent-MD5: <checksum>\n<chunk bytes>",
+      "response": "{ \"partNumber\": 4, \"etag\": \"e_4\", \"receivedBytes\": 33554432 }"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/uploads/{uploadId}",
+      "description": "Resume probe: returns how much the server has and which parts it holds, so the client knows where to continue after an interruption. 409 if client- and server-side total_bytes disagree.",
+      "request": "(uploadId in path)",
+      "response": "{ \"status\": \"in_progress\", \"receivedBytes\": 33554432, \"totalBytes\": 4200000000, \"parts\": [{ \"partNumber\": 1, \"etag\": \"e_1\" }], \"partSize\": 8388608 }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/uploads/{uploadId}/complete",
+      "description": "Finalize the upload — this is where the upload lifecycle completes and processing begins. The client sends the ordered part list; the server verifies all parts and total length, assembles/commits the immutable source object, flips the video from 'uploading' to 'processing', and enqueues transcode jobs. Idempotent — a retried complete returns the same videoId. The '202 processing' lives here, after the bytes are safely committed, not on session start.",
+      "request": "{ \"parts\": [{ \"partNumber\": 1, \"etag\": \"e_1\" }, { \"partNumber\": 2, \"etag\": \"e_2\" }] }",
+      "response": "202 Accepted\n{ \"videoId\": \"v_3\", \"status\": \"processing\", \"sourceKey\": \"raw/v_3/source.mov\" }",
       "sequence": {
         "participants": [
           {
@@ -339,31 +421,25 @@
             "from": "Creator",
             "to": "UploadSvc",
             "arrow": "->>",
-            "label": "start upload"
-          },
-          {
-            "from": "Creator",
-            "to": "UploadSvc",
-            "arrow": "->>",
-            "label": "PUT chunks (resumable)"
+            "label": "complete (ordered part list)"
           },
           {
             "from": "UploadSvc",
             "to": "RawStore",
             "arrow": "->>",
-            "label": "store source"
+            "label": "verify parts → assemble/commit immutable source"
           },
           {
             "from": "UploadSvc",
             "to": "MetaSvc",
             "arrow": "->>",
-            "label": "create video (processing)"
+            "label": "flip video uploading → processing"
           },
           {
             "from": "MetaSvc",
             "to": "JobQ",
             "arrow": "->>",
-            "label": "enqueue transcode jobs"
+            "label": "enqueue transcode jobs (per rendition)"
           },
           {
             "from": "UploadSvc",
@@ -377,9 +453,9 @@
     {
       "method": "GET",
       "path": "/v1/videos/{id}/playback",
-      "description": "Get the adaptive-streaming manifest and signed segment URLs for a ready video.",
-      "request": "(id in path)",
-      "response": "{ \"manifestUrl\": \"...\", \"renditions\": [\"240p\",\"720p\",\"1080p\"] }",
+      "description": "Control plane: the playback service authorizes the viewer (handles private/unlisted/geo), then returns the manifest plus short-TTL tokenized segment URLs (or a signed cookie). The player fetches segments directly from the CDN — the playback service is never in the segment data path.",
+      "request": "(id in path; viewer auth in header)",
+      "response": "{ \"manifestUrl\": \"https://cdn/.../master.m3u8?token=...\", \"renditions\": [\"240p\",\"720p\",\"1080p\"], \"tokenTtlSeconds\": 300 }",
       "sequence": {
         "participants": [
           {
@@ -415,13 +491,13 @@
             "from": "PlaySvc",
             "to": "Viewer",
             "arrow": "-->>",
-            "label": "manifest + signed CDN URLs"
+            "label": "authorize → manifest + tokenized URLs"
           },
           {
             "from": "Viewer",
             "to": "CDN",
             "arrow": "->>",
-            "label": "fetch segments (adaptive)"
+            "label": "fetch segments directly (adaptive)"
           }
         ]
       }
@@ -429,9 +505,16 @@
     {
       "method": "GET",
       "path": "/v1/videos/{id}/status",
-      "description": "Creator polls processing status.",
+      "description": "Creator polls processing status. Status distinguishes uploading, processing, ready_to_watch (at least one rendition playable), fully_processed (whole ladder done), and failed; per-rendition state surfaces a single failed rendition without blocking the others.",
       "request": "(id in path)",
-      "response": "{ \"status\": \"processing\", \"ready\": [\"240p\",\"480p\"] }"
+      "response": "{ \"status\": \"ready_to_watch\", \"renditions\": [{ \"rendition\": \"240p\", \"state\": \"ready\" }, { \"rendition\": \"1080p\", \"state\": \"pending\" }, { \"rendition\": \"4k\", \"state\": \"failed\" }] }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/videos/{id}/views",
+      "description": "Ingest a view event (fire-and-forget, batched by the player). The pipeline dedupes by (video, session) within a window and only counts once watched_seconds passes the threshold; request_id makes retries idempotent.",
+      "request": "{ \"sessionId\": \"s_42\", \"playbackStart\": \"2026-06-09T11:00:00Z\", \"watchedSeconds\": 31, \"requestId\": \"r_88\" }",
+      "response": "202 Accepted"
     }
   ],
   "dataModel": [
@@ -449,7 +532,19 @@
         },
         {
           "name": "status",
-          "type": "enum(uploading, processing, ready, failed)"
+          "type": "enum(uploading, processing, ready_to_watch, fully_processed, failed)"
+        },
+        {
+          "name": "visibility",
+          "type": "enum(public, unlisted, private)"
+        },
+        {
+          "name": "geo_policy_id",
+          "type": "fk → access_policies (null = no geo restriction)"
+        },
+        {
+          "name": "moderation_state",
+          "type": "enum(pending, approved, blocked) — publish gate"
         },
         {
           "name": "source_key",
@@ -466,8 +561,38 @@
       ]
     },
     {
+      "name": "access_policies",
+      "note": "Playback authorization state the playback service reads before minting a token: geo allow/deny lists and, for private videos, the share ACL. A private video requires an authorization check against creator-owned ACL entries; public/unlisted skip the ACL check.",
+      "fields": [
+        {
+          "name": "policy_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "video_id",
+          "type": "uuid"
+        },
+        {
+          "name": "geo_allow",
+          "type": "country-code list (null = all)"
+        },
+        {
+          "name": "geo_deny",
+          "type": "country-code list"
+        },
+        {
+          "name": "acl_subject_id",
+          "type": "bigint (user/group granted access; private videos only)"
+        },
+        {
+          "name": "acl_role",
+          "type": "enum(viewer) — share grant"
+        }
+      ]
+    },
+    {
       "name": "renditions",
-      "note": "One row per encoded rendition of a video.",
+      "note": "One row per encoded rendition of a video. manifest_key is the manifest root (HLS/DASH) from which the individual segment objects are derived — segments are addressed relative to that manifest, so no per-segment row is needed.",
       "fields": [
         {
           "name": "video_id",
@@ -489,7 +614,7 @@
     },
     {
       "name": "upload_sessions",
-      "note": "Resumable-upload bookkeeping.",
+      "note": "Resumable-upload bookkeeping; one row per in-flight upload.",
       "fields": [
         {
           "name": "upload_id",
@@ -500,14 +625,871 @@
           "type": "uuid"
         },
         {
+          "name": "owner_id",
+          "type": "bigint"
+        },
+        {
+          "name": "idempotency_key",
+          "type": "text (dedupes session create)"
+        },
+        {
+          "name": "status",
+          "type": "enum(in_progress, completed, expired, aborted)"
+        },
+        {
+          "name": "part_size",
+          "type": "int (bytes)"
+        },
+        {
           "name": "received_bytes",
           "type": "bigint (resume offset)"
         },
         {
           "name": "total_bytes",
           "type": "bigint"
+        },
+        {
+          "name": "source_key",
+          "type": "committed raw object key (set on complete)"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamp (GC abandoned sessions)"
+        },
+        {
+          "name": "created_at / updated_at",
+          "type": "timestamp"
         }
       ]
+    },
+    {
+      "name": "upload_parts",
+      "note": "One row per uploaded chunk, for resume reconciliation and idempotent re-sends.",
+      "fields": [
+        {
+          "name": "upload_id",
+          "type": "uuid (PK part 1)"
+        },
+        {
+          "name": "part_number",
+          "type": "int (PK part 2)"
+        },
+        {
+          "name": "byte_offset",
+          "type": "bigint"
+        },
+        {
+          "name": "size",
+          "type": "int"
+        },
+        {
+          "name": "checksum_etag",
+          "type": "text (dedupes a re-sent identical part)"
+        },
+        {
+          "name": "received_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "rendition_tasks",
+      "note": "Per-segment transcode work and the durable source of truth for the fanout (in MetaDB). Workers claim a row by atomic CAS on (state, lease_until); JobQ messages are only scheduling wake-ups, so duplicate deliveries and crashes are reconciled against this table, not the queue.",
+      "fields": [
+        {
+          "name": "task_id",
+          "type": "(video_id, rendition, segment_id) PK"
+        },
+        {
+          "name": "state",
+          "type": "enum(pending, leased, done, failed, dead_letter)"
+        },
+        {
+          "name": "attempt",
+          "type": "int"
+        },
+        {
+          "name": "lease_until",
+          "type": "timestamp (reclaim if worker dies)"
+        },
+        {
+          "name": "input_keyframe_range",
+          "type": "source byte/keyframe range to encode"
+        },
+        {
+          "name": "output_key",
+          "type": "deterministic key (idempotent re-run overwrites)"
+        },
+        {
+          "name": "checksum",
+          "type": "text (validate stitched output)"
+        },
+        {
+          "name": "error_code",
+          "type": "text (set on failure / dead-letter)"
+        },
+        {
+          "name": "created_at / updated_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "view_events",
+      "note": "Raw ingested view events (short-retention); aggregated into videos.view_count. Authoritative analytics/monetization keep their own longer-retention store.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid (= request_id, idempotent)"
+        },
+        {
+          "name": "video_id",
+          "type": "uuid"
+        },
+        {
+          "name": "session_id",
+          "type": "text (dedup key with video_id)"
+        },
+        {
+          "name": "playback_start",
+          "type": "timestamp"
+        },
+        {
+          "name": "watched_seconds",
+          "type": "int (threshold gate)"
+        },
+        {
+          "name": "event_time",
+          "type": "timestamp (windowing / late-arrival)"
+        }
+      ]
+    }
+  ],
+  "technologyChoices": [
+    {
+      "concern": "Upload ingress, resumable sessions, and admission control",
+      "steps": [
+        "upload",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "NGINX",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Kong",
+          "icon": "assets/tech-icons/kong.png"
+        },
+        {
+          "name": "tusd",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          },
+          {
+            "name": "ALB",
+            "icon": "assets/tech-icons/Arch_Elastic-Load-Balancing_64.png"
+          },
+          {
+            "name": "S3 multipart upload",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Storage-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Load Balancing",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Endpoints",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Storage resumable uploads",
+            "icon": "assets/tech-icons/Storage-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "API Management",
+            "icon": "assets/tech-icons/10042-icon-service-API-Management-Services.svg"
+          },
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Blob Storage",
+            "icon": "assets/tech-icons/10781-icon-service-Blob-Page.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Proxying uploads through the application edge gives tight quota, auth, checksum, and resume control but burns expensive app bandwidth on multi-GB files.",
+        "Direct-to-object-storage multipart/resumable upload with signed session tokens removes most application bandwidth, but the token broker must encode policy, part size, expiry, and idempotency rules correctly."
+      ],
+      "makesIrrelevant": "A managed object-store upload protocol with signed URLs removes the need to keep long-lived upload connections open through the upload service."
+    },
+    {
+      "concern": "Raw source and rendition object storage",
+      "steps": [
+        "upload",
+        "transcode",
+        "stream",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Ceph",
+          "icon": "assets/tech-icons/ceph.png"
+        },
+        {
+          "name": "MinIO",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "OpenStack Swift",
+          "icon": "assets/tech-icons/openstack.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "S3",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Storage-Service_64.png"
+          },
+          {
+            "name": "S3 Glacier",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Storage-Service-Glacier_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Storage",
+            "icon": "assets/tech-icons/Storage-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Blob Storage",
+            "icon": "assets/tech-icons/10781-icon-service-Blob-Page.svg"
+          },
+          {
+            "name": "Azure Data Lake Storage",
+            "icon": "assets/tech-icons/10090-icon-service-Data-Lake-Storage-Gen1.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Object storage is the natural fit for immutable source masters, manifests, and segment objects because it is durable, cheap, and CDN-friendly.",
+        "Keeping source masters in a colder tier lowers cost but slows re-transcode and disaster recovery workflows."
+      ],
+      "makesIrrelevant": "Lifecycle policies and cross-region replication remove much of the hand-built archival, retention, and copy-job machinery."
+    },
+    {
+      "concern": "Video metadata, upload sessions, and policy state",
+      "steps": [
+        "upload",
+        "stream",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "MySQL",
+          "icon": "assets/tech-icons/mysql.png"
+        },
+        {
+          "name": "Apache Cassandra",
+          "icon": "assets/tech-icons/cassandra.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "Aurora",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "Keyspaces",
+            "icon": "assets/tech-icons/Arch_Amazon-Keyspaces_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          },
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Relational stores make video status, upload session reconciliation, and access-policy updates easy to reason about.",
+        "Wide-column or managed NoSQL stores absorb hot upload-session and status-write volume better, but push more joins and consistency checks into service logic."
+      ],
+      "makesIrrelevant": "A managed autoscaling store with conditional writes and TTLs removes most manual sharding and cleanup work for upload_sessions and upload_parts."
+    },
+    {
+      "concern": "Transcode job queue and task wake-ups",
+      "steps": [
+        "pipeline",
+        "transcode",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "RabbitMQ",
+          "icon": "assets/tech-icons/rabbitmq.png"
+        },
+        {
+          "name": "Redpanda",
+          "icon": "assets/tech-icons/redpanda.png"
+        },
+        {
+          "name": "NATS (JetStream)",
+          "icon": "assets/tech-icons/nats.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "MSK",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Streaming-for-Apache-Kafka_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Managed Service for Apache Kafka",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Queue Storage",
+            "icon": "assets/tech-icons/10840-icon-service-Storage-Queue.svg"
+          },
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A durable queue is enough when messages are wake-ups and rendition_tasks in MetaDB owns task state, leases, retries, and dead-letter decisions.",
+        "A log or stream is better when many downstream consumers need replay of video lifecycle events, but it adds partition and retention management."
+      ],
+      "makesIrrelevant": "Managed queues with DLQ, visibility timeout, and consumer autoscaling remove much of the broker operations burden from step 3."
+    },
+    {
+      "concern": "Transcode orchestration and compute fleet",
+      "steps": [
+        "transcode",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "FFmpeg",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Temporal",
+          "icon": "assets/tech-icons/temporal.png"
+        },
+        {
+          "name": "Kubernetes Jobs",
+          "icon": "assets/tech-icons/kubernetes.png"
+        },
+        {
+          "name": "Argo Workflows",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "AWS Batch",
+            "icon": "assets/tech-icons/Arch_AWS-Batch_64.png"
+          },
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          },
+          {
+            "name": "EKS",
+            "icon": "assets/tech-icons/Arch_Amazon-Elastic-Kubernetes-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Transcoder API",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "GKE",
+            "icon": "assets/tech-icons/Containers-512-color.png"
+          },
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Batch",
+            "icon": "assets/tech-icons/10031-icon-service-Batch-Accounts.svg"
+          },
+          {
+            "name": "Durable Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          },
+          {
+            "name": "AKS",
+            "icon": "assets/tech-icons/10023-icon-service-Kubernetes-Services.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Self-hosted FFmpeg on a container fleet gives precise control over codecs, per-title ladders, and GPU/CPU scheduling.",
+        "Managed batch/workflow/transcoder services reduce fleet and retry plumbing, but can constrain codec features, job packing, and per-video optimization."
+      ],
+      "makesIrrelevant": "A managed transcoder or workflow engine removes much of the custom lease renewal, retry orchestration, and fanout scheduling code."
+    },
+    {
+      "concern": "Packaging, manifests, and adaptive streaming formats",
+      "steps": [
+        "transcode",
+        "stream"
+      ],
+      "selfHosted": [
+        {
+          "name": "FFmpeg",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Shaka Packager",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "GPAC",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "NGINX",
+          "icon": "assets/tech-icons/nginx.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "MediaConvert",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "MediaPackage",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "CloudFront",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudFront_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Transcoder API",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Media CDN",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud CDN",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Media Services",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Azure CDN",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Owning the packaging toolchain makes HLS/DASH manifest versioning, segment duration, codec ladders, and backward-compatible re-packaging explicit.",
+        "Managed media packaging gets a standard ABR pipeline running quickly, but may hide details that matter for long-tail storage cost and player compatibility."
+      ],
+      "makesIrrelevant": "A managed packaging service removes much of the custom manifest generation and segment-layout glue."
+    },
+    {
+      "concern": "CDN edge delivery, origin shield, and signed playback tokens",
+      "steps": [
+        "stream",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Varnish",
+          "icon": "assets/tech-icons/varnish.png"
+        },
+        {
+          "name": "Apache Traffic Server",
+          "icon": "assets/tech-icons/traffic_server.png"
+        },
+        {
+          "name": "NGINX",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudFront",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudFront_64.png"
+          },
+          {
+            "name": "Global Accelerator",
+            "icon": "assets/tech-icons/Arch_AWS-Global-Accelerator_64.png"
+          },
+          {
+            "name": "WAF",
+            "icon": "assets/tech-icons/Arch_AWS-WAF_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud CDN",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Media CDN",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Armor",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure CDN",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Application Gateway",
+            "icon": "assets/tech-icons/10076-icon-service-Application-Gateways.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Managed CDNs provide global cache footprint, origin shield, TLS, and signed URL support without owning edge hardware.",
+        "Self-hosted edge caches can reduce cost at extreme scale or inside ISP peering, but operationally shift cache fill, purge, routing, and abuse protection onto the platform team."
+      ],
+      "makesIrrelevant": "High CDN hit ratio and origin shield make the playback service and object store irrelevant to most segment requests."
+    },
+    {
+      "concern": "Playback authorization, signed URLs, and key management",
+      "steps": [
+        "stream",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "JWT (signed)",
+          "icon": "assets/tech-icons/jwt.png"
+        },
+        {
+          "name": "Keycloak",
+          "icon": "assets/tech-icons/keycloak.png"
+        },
+        {
+          "name": "HashiCorp Vault",
+          "icon": "assets/tech-icons/hashicorp_vault.png"
+        },
+        {
+          "name": "Open Policy Agent",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Cognito",
+            "icon": "assets/tech-icons/Arch_Amazon-Cognito_64.png"
+          },
+          {
+            "name": "KMS",
+            "icon": "assets/tech-icons/Arch_AWS-Key-Management-Service_64.png"
+          },
+          {
+            "name": "Secrets Manager",
+            "icon": "assets/tech-icons/Arch_AWS-Secrets-Manager_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Identity Platform",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          },
+          {
+            "name": "Cloud KMS",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          },
+          {
+            "name": "Secret Manager",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Microsoft Entra ID",
+            "icon": "assets/tech-icons/10231-icon-service-Entra-ID-Protection.svg"
+          },
+          {
+            "name": "Key Vault",
+            "icon": "assets/tech-icons/10245-icon-service-Key-Vaults.svg"
+          },
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Short-TTL signed URLs keep private and geo-restricted videos cacheable because the CDN validates the token while the playback service stays in the control plane.",
+        "Central policy engines simplify private-share and geo checks, but token keys and revocation paths become operationally critical."
+      ],
+      "makesIrrelevant": "Edge-token validation removes the need to route every segment fetch through the playback service."
+    },
+    {
+      "concern": "View-event stream processing and approximate counters",
+      "steps": [
+        "views",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Apache Flink",
+          "icon": "assets/tech-icons/flink.png"
+        },
+        {
+          "name": "ClickHouse",
+          "icon": "assets/tech-icons/clickhouse.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "Managed Service for Apache Flink",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Service-for-Apache-Flink_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          },
+          {
+            "name": "Stream Analytics",
+            "icon": "assets/tech-icons/00042-icon-service-Stream-Analytics-Jobs.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Streaming aggregation handles high-volume view starts and heartbeats with dedup windows, late arrivals, and eventual public count updates.",
+        "A dedicated analytical store is better for authoritative monetization and fraud analysis, while a hot KV/counter store is enough for user-facing approximate counts."
+      ],
+      "makesIrrelevant": "A managed stream processor with checkpoints and windowing removes most custom consumer offset, replay, and late-event bookkeeping."
+    },
+    {
+      "concern": "Observability, QoE analytics, and cost telemetry",
+      "steps": [
+        "stream",
+        "views",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Prometheus",
+          "icon": "assets/tech-icons/prometheus.png"
+        },
+        {
+          "name": "Grafana",
+          "icon": "assets/tech-icons/grafana.png"
+        },
+        {
+          "name": "OpenTelemetry",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "ClickHouse",
+          "icon": "assets/tech-icons/clickhouse.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "Managed Grafana",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Grafana_64.png"
+          },
+          {
+            "name": "Athena",
+            "icon": "assets/tech-icons/Arch_Amazon-Athena_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "BigQuery",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Looker",
+            "icon": "assets/tech-icons/BusinessIntelligence-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Application Insights",
+            "icon": "assets/tech-icons/00012-icon-service-Application-Insights.svg"
+          },
+          {
+            "name": "Log Analytics",
+            "icon": "assets/tech-icons/00009-icon-service-Log-Analytics-Workspaces.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "System metrics catch queue age, worker saturation, origin misses, and upload errors; QoE telemetry catches startup latency and rebuffering that infrastructure health can miss.",
+        "Columnar analytics are the right back end for per-ISP, per-codec, and per-CDN cost/performance analysis, but are not a replacement for low-latency alerting."
+      ],
+      "makesIrrelevant": "Managed metrics, tracing, and log pipelines remove much of the custom collection and retention infrastructure."
     }
   ],
   "patterns": [
@@ -582,10 +1564,11 @@
           "RawStore",
           "Viewer"
         ],
-        "caption": "The creator does a resumable upload to the upload service, which stores the source file in the raw upload store.",
+        "caption": "The creator uploads to the upload service, which stores one source file in the raw upload store; viewers are handed that exact original file to play — no transcoding, no CDN.",
         "links": [
           "creator-upload",
-          "upload-raw"
+          "upload-raw",
+          "naive-serve"
         ],
         "highlight": [
           "UploadSvc",
@@ -597,10 +1580,12 @@
         "Establishing the one-shot baseline first makes it obvious why upload must be resumable, why processing must produce multiple renditions asynchronously, and why serving must go through a CDN — each later step removes a specific failure from here."
       ],
       "probeLinks": [
-        "s3-multipart",
+        "youtube-upload-settings",
         "apple-hls",
+        "hls-rfc",
         "dash-if",
-        "netflix-vmaf"
+        "netflix-vmaf",
+        "meta-video-encoding"
       ],
       "recap": {
         "before": "Nothing.",
@@ -613,15 +1598,17 @@
           "why": "A single failed request wastes a multi-GB transfer, a lone rendition rebuffers on weak networks, and the origin melts under viewer fanout.",
           "instead": "Resumable chunked upload, async transcode into a rendition ladder, adaptive streaming, and CDN delivery."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/01-naive.jpg"
     },
     {
       "id": "upload",
       "title": "2. Resumable Chunked Upload",
       "description": [
-        "Source files can be many GB and connections drop. Start an upload session and accept the file in chunks tracked by byte offset, so a dropped connection resumes from the last received chunk instead of restarting.",
-        "Store the source in durable object storage and create a video record in 'uploading' state. The upload service does no processing — it just gets bytes safely to storage.",
-        "Validate format/size early; reject obviously bad uploads before storing."
+        "Source files can be many GB and connections drop. Start an upload session (idempotency-keyed so a retried create doesn't fork a second session) and accept the file as fixed-size parts tracked by byte offset, so a dropped connection resumes from the last received part instead of restarting.",
+        "The session is a small state machine: each PUT part records its offset, size, and a checksum/ETag; a re-sent identical part is a no-op (idempotent), and the server reconciles received_bytes from the parts it actually holds. To resume, the client does GET /uploads/{id} to read the server's offset and part list, then continues from there. If client and server disagree on total_bytes, return 409 rather than silently corrupting the assembly.",
+        "Only on POST /complete does the server verify all parts and total length, commit the immutable source object, flip the video to 'processing', and enqueue transcode jobs — so processing never starts on a half-uploaded file. Sessions carry expires_at so abandoned uploads are garbage-collected.",
+        "Store the source in durable object storage and create the video record in 'uploading' state. The upload service does no processing — it just gets bytes safely to storage. Validate format/size early; reject obviously bad uploads before storing."
       ],
       "view": {
         "nodes": [
@@ -640,7 +1627,9 @@
         ],
         "highlight": [
           "UploadSvc",
-          "RawStore"
+          "RawStore",
+          "MetaSvc",
+          "MetaDB"
         ],
         "groups": [
           "ingest"
@@ -657,10 +1646,11 @@
         }
       ],
       "probeLinks": [
-        "netflix-vmaf",
         "s3-multipart",
-        "ffmpeg-docs",
-        "apple-hls"
+        "gcs-resumable",
+        "tus-protocol",
+        "mux-direct-uploads",
+        "cloudflare-stream-uploads"
       ],
       "patterns": [
         "Resumable chunked upload"
@@ -679,15 +1669,16 @@
           "why": "A single failure wastes the entire transfer and ties up a connection for minutes.",
           "instead": "Chunked, resumable upload with an offset-tracked session."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/02-upload.jpg"
     },
     {
       "id": "pipeline",
       "title": "3. Decouple Processing with a Job Queue",
       "description": [
-        "Transcoding is CPU/GPU-heavy and slow — it must not block the upload response. Once the source is stored, enqueue processing jobs and return immediately; the video stays 'processing' until renditions are ready.",
-        "A queue decouples ingestion rate from processing capacity: upload spikes buffer in the queue, and the worker fleet scales independently.",
-        "Update video status as renditions complete so creators see progress and playback unlocks per-rendition."
+        "Transcoding is CPU/GPU-heavy and slow — it must not block the upload response. Jobs are enqueued only after the upload is committed (the /complete step), not when the first chunks land, so workers never run against a half-uploaded source. Once committed, enqueue and return immediately; the video stays 'processing' until renditions are ready.",
+        "A queue decouples ingestion rate from processing capacity: upload spikes buffer as queue depth (the backpressure signal that later autoscales the fleet), and the worker fleet scales independently.",
+        "Update video status as renditions complete so creators see progress and playback unlocks per-rendition. Treat the queue as a wake-up signal and the task table as the source of truth (made concrete in step 4): if the metadata write succeeds but the queue publish fails, a reconciler re-enqueues from videos in 'processing' whose rendition_tasks rows have no live lease, so a video can't get stuck never-processed even though a lost queue message would otherwise strand it."
       ],
       "view": {
         "nodes": [
@@ -714,10 +1705,10 @@
         "Async processing pipeline"
       ],
       "probeLinks": [
-        "s3-multipart",
-        "ffmpeg-docs",
-        "netflix-vmaf",
-        "apple-hls"
+        "kafka-design",
+        "aws-vod-architecture",
+        "netflix-cosmos-pipeline",
+        "borg-paper"
       ],
       "whyNow": [
         "The async-pipeline decision shapes the whole architecture; it's what lets ingestion and processing scale separately."
@@ -735,15 +1726,19 @@
         "before": "Synchronous, blocking processing.",
         "after": "Upload returns fast; processing scales behind a queue.",
         "newRisk": "Each video needs many renditions — the processing work multiplies."
-      }
+      },
+      "aiVisual": "assets/generated/ai-visuals/steps/03-pipeline.jpg"
     },
     {
       "id": "transcode",
       "title": "4. Transcode Fanout into Renditions",
       "description": [
         "Each source is transcoded into several renditions (e.g. 240p..4K, multiple codecs). Fan these out as independent parallel jobs so a video becomes available rendition-by-rendition.",
-        "For long videos, split the source into segments and transcode segments in parallel, then stitch — cutting wall-clock time for a single big upload.",
-        "Workers read the source, encode, write renditions to durable storage, and mark each rendition ready in metadata. Jobs are idempotent and retryable so a worker crash just re-runs that job."
+        "For long videos, split the source on keyframe boundaries into segments and transcode segments in parallel, then stitch — cutting wall-clock time for a single big upload.",
+        "The task state is what makes this a pipeline rather than 'put it in a queue'. Be explicit about ownership: the rendition_tasks table in MetaDB is the durable source of truth, and JobQ messages are only scheduling wake-ups. Each unit of work is a rendition_tasks row keyed by (video_id, rendition, segment_id) with state, attempt count, and a lease_until.",
+        "Claiming is an atomic compare-and-set on the row: a worker woken by a queue message sets state pending→leased and lease_until=now+T, and whoever wins the CAS owns it — so duplicate queue deliveries are harmless and the loser just drops its message. If the owner crashes, the lease expires and any worker can re-claim the row the same way; that the queue message was already consumed doesn't matter, because the row, not the message, holds the truth. Output keys are deterministic (derived from the task id), so a re-run overwrites the same object idempotently and partial output from the dead attempt is harmless.",
+        "On success the worker sets state=done and acks the message; after a max attempt count a task moves to dead_letter rather than retrying forever. A coordinator (the metadata service here) tracks the per-rendition task set, validates the stitched checksum, and only marks a rendition ready when all its segments are done.",
+        "Workers read the source, encode, write renditions to durable storage, and update task/rendition state in metadata."
       ],
       "view": {
         "nodes": [
@@ -774,7 +1769,7 @@
           "description": "The source is split on keyframe boundaries into segments transcoded in parallel by many workers, with a coordinator tracking tasks and stitching the segments back together.",
           "pros": [
             "Split the source into segments and transcode them in parallel across many workers, cutting a 3-hour 4K job's wall-clock time dramatically.",
-            "Scales horizontally - add workers to go faster, bounded only by fleet size.",
+            "Scales horizontally — add workers to go faster, bounded only by fleet size.",
             "Each rendition's segments are produced independently and assembled, fitting segmented streaming formats."
           ],
           "cons": [
@@ -804,7 +1799,8 @@
             "groups": [
               "ingest"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-transcode-opt1.jpg"
         },
         {
           "name": "One worker transcodes the whole file per rendition",
@@ -815,7 +1811,7 @@
             "Still parallel across renditions (360p/720p/1080p as separate tasks)."
           ],
           "cons": [
-            "Wall-clock time is bounded by transcoding the full file once - slow for a 3-hour 4K source.",
+            "Wall-clock time is bounded by transcoding the full file once — slow for a 3-hour 4K source.",
             "A single failed worker restarts the entire rendition from scratch.",
             "Doesn't use idle fleet capacity to speed up one large video."
           ],
@@ -843,7 +1839,8 @@
             "groups": [
               "ingest"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-transcode-opt2.jpg"
         },
         {
           "name": "Tiered: fast low-res first, full ladder later",
@@ -883,7 +1880,8 @@
             "groups": [
               "ingest"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-transcode-opt3.jpg"
         }
       ],
       "decisionPrompt": "A 3-hour 4K video must process quickly. How do you cut the wall-clock transcode time?",
@@ -897,10 +1895,13 @@
         }
       ],
       "probeLinks": [
-        "s3-multipart",
         "ffmpeg-docs",
+        "youtube-vcu-blog",
+        "google-vcu-paper",
+        "meta-video-encoding",
+        "instagram-video-compute",
         "netflix-vmaf",
-        "apple-hls"
+        "netflix-cosmos-pipeline"
       ],
       "patterns": [
         "Transcode fanout"
@@ -916,8 +1917,13 @@
       "failureDrills": [
         {
           "scenario": "A transcode worker crashes mid-job.",
-          "expectedBehavior": "The job returns to the queue and another worker re-runs it; the partial output is discarded.",
-          "mitigation": "Idempotent jobs keyed by (video, rendition, segment); at-least-once queue."
+          "expectedBehavior": "The lease on its rendition_tasks row expires; another worker re-claims the row via the same atomic CAS and re-runs. The deterministic output key means the re-run overwrites the dead attempt's partial output, so nothing is double-counted.",
+          "mitigation": "Lease held on the rendition_tasks row in MetaDB (queue messages are only wake-ups); atomic CAS claim + lease_until reclaim; idempotent tasks keyed by (video, rendition, segment) with deterministic output keys."
+        },
+        {
+          "scenario": "One segment keeps failing (e.g. a corrupt source region).",
+          "expectedBehavior": "After max attempts the task moves to dead_letter with an error_code; the rendition is marked failed without blocking other renditions, and an operator/alert is notified.",
+          "mitigation": "Per-task attempt cap → dead-letter; per-rendition state so one failure doesn't fail the whole video."
         }
       ],
       "flows": [
@@ -984,6 +1990,89 @@
             "JobQ",
             "Workers"
           ]
+        },
+        {
+          "name": "Worker crash -> lease reclaim -> retry / dead-letter",
+          "note": "A queue message wakes a worker, which claims the rendition_tasks row in MetaDB via an atomic CAS lease (the row, not the queue message, is the source of truth). If the worker dies, the lease expires and another worker re-claims the row and re-runs idempotently; a task that keeps failing past its attempt cap is dead-lettered and its rendition marked failed without blocking others.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "JobQ",
+                "label": "Job Queue (wake-up)"
+              },
+              {
+                "id": "Workers",
+                "label": "Transcode Workers"
+              },
+              {
+                "id": "MetaSvc",
+                "label": "Metadata (coordinator)"
+              },
+              {
+                "id": "RenditionStore",
+                "label": "Rendition Store"
+              }
+            ],
+            "messages": [
+              {
+                "from": "JobQ",
+                "to": "Workers",
+                "arrow": "->>",
+                "label": "wake-up message"
+              },
+              {
+                "from": "Workers",
+                "to": "MetaSvc",
+                "arrow": "->>",
+                "label": "CAS claim rendition_tasks row (pending→leased, lease_until=T)"
+              },
+              {
+                "type": "alt",
+                "label": "worker crashes before done",
+                "messages": [
+                  {
+                    "from": "Workers",
+                    "to": "MetaSvc",
+                    "arrow": "->>",
+                    "label": "lease expires → another worker re-CAS-claims the row"
+                  },
+                  {
+                    "from": "Workers",
+                    "to": "RenditionStore",
+                    "arrow": "->>",
+                    "label": "re-run → overwrite deterministic output key"
+                  },
+                  {
+                    "from": "Workers",
+                    "to": "MetaSvc",
+                    "arrow": "->>",
+                    "label": "set state=done (attempt++), ack message"
+                  }
+                ],
+                "else": {
+                  "label": "task exceeds attempt cap",
+                  "messages": [
+                    {
+                      "from": "Workers",
+                      "to": "MetaSvc",
+                      "arrow": "->>",
+                      "label": "set state=dead_letter; mark rendition failed"
+                    }
+                  ]
+                }
+              },
+              {
+                "from": "MetaSvc",
+                "to": "MetaSvc",
+                "arrow": "->>",
+                "label": "all segments done → validate checksum, mark rendition ready"
+              }
+            ]
+          },
+          "highlight": [
+            "Workers",
+            "MetaSvc"
+          ]
         }
       ]
     },
@@ -992,7 +2081,8 @@
       "title": "5. Adaptive Bitrate Streaming via CDN",
       "description": [
         "Renditions are segmented (a few seconds each) with an HLS/DASH manifest listing the available qualities. The player downloads the manifest, then fetches segments, switching rendition up/down to match the viewer's bandwidth.",
-        "Serve segments from a CDN, not the origin: the CDN caches them near viewers and absorbs the massive read fanout. The playback service returns the manifest and signed, time-limited segment URLs.",
+        "Keep the control plane and data plane separate. The playback service is control plane: it authorizes the viewer by reading the video's visibility and access_policies (public/unlisted/private, geo allow/deny lists, and — for private videos — a check against the creator-owned share ACL) before returning the manifest plus short-TTL signed segment URLs or a signed cookie. It is never on the per-segment hot path. The player then fetches segments directly from the CDN; the CDN caches them near viewers and origin-fetches from the rendition store only on a miss. So a single playback request hits the service once, but the millions of segment fetches never touch it.",
+        "CDN specifics that make this work: the cache key is the rendition+segment path (the signing token is excluded from the key, so signed-but-equivalent requests still share a cache entry); segments are immutable so TTLs are long, while manifests get short TTLs; an origin shield tier collapses many edge misses into one origin fetch for long-tail content. Private/unlisted videos stay cacheable without leaking because access is gated by the short-lived token the service mints per authorized viewer — the bytes are public-cacheable but only reachable with a valid token, and tokens expire fast enough that a leaked URL is low-value.",
         "This is the metadata/blob/CDN split: small manifest/metadata from the service, large segments from object storage via CDN edge."
       ],
       "view": {
@@ -1003,7 +2093,7 @@
           "CDN",
           "RenditionStore"
         ],
-        "caption": "The viewer requests playback from the playback service, which fetches the manifest from metadata and hands back signed CDN URLs; the viewer pulls segments from the streaming CDN, which origin-fetches from the rendition store.",
+        "caption": "Control plane: the viewer requests playback once from the playback service, which fetches the manifest from metadata and returns short-TTL tokenized URLs. Data plane: the viewer then pulls segments directly from the streaming CDN, which origin-fetches from the rendition store only on a miss — the playback service is never in the segment path.",
         "links": [
           "viewer-play",
           "play-meta",
@@ -1058,18 +2148,19 @@
               "serve",
               "ingest"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-stream-opt1.jpg"
         },
         {
           "name": "Proactively push popular content to edges",
           "description": "A popularity predictor pre-warms expected-hot videos into edge caches ahead of demand, so even the first viewers get a cache hit with no origin-pull stall.",
           "pros": [
-            "Pre-warm new/expected-viral videos to edge caches so even the first viewers get a cache hit - no origin-pull stall.",
+            "Pre-warm new/expected-viral videos to edge caches so even the first viewers get a cache hit — no origin-pull stall.",
             "Smooths origin load for predictable spikes (premieres, trending creators).",
             "Best first-play experience for content you know will be hot."
           ],
           "cons": [
-            "Wasteful for the long tail - most videos never get enough views to justify pushing everywhere.",
+            "Wasteful for the long tail — most videos never get enough views to justify pushing everywhere.",
             "Needs a popularity predictor and push pipeline to decide what/where to warm.",
             "Edge storage is finite, so aggressive pushing evicts other hot content."
           ],
@@ -1098,18 +2189,19 @@
               "serve",
               "ingest"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-stream-opt2.jpg"
         },
         {
           "name": "Progressive download (single file, no ABR)",
           "description": "A single MP4 per video is served via byte-range requests with no manifests, segments, or rendition ladder, and the player cannot switch quality mid-stream.",
           "pros": [
-            "Serve one MP4 via byte-range requests - simplest possible playback path.",
+            "Serve one MP4 via byte-range requests — simplest possible playback path.",
             "No manifests, segmenting, or rendition ladder to manage.",
             "Fine for short clips on stable connections."
           ],
           "cons": [
-            "No mid-stream quality switch, so a bandwidth drop causes rebuffering - fails the core requirement.",
+            "No mid-stream quality switch, so a bandwidth drop causes rebuffering — fails the core requirement.",
             "Picking one bitrate punishes either mobile (too high) or desktop (too low).",
             "Seeking and CDN caching are coarser than with small segments."
           ],
@@ -1135,7 +2227,8 @@
               "serve",
               "ingest"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-stream-opt3.jpg"
         }
       ],
       "decisionPrompt": "A viewer's bandwidth drops mid-video. How does playback stay smooth?",
@@ -1150,9 +2243,11 @@
       ],
       "probeLinks": [
         "apple-hls",
+        "hls-rfc",
         "dash-if",
-        "netflix-vmaf",
-        "s3-multipart"
+        "media-cdn-overview",
+        "media-cdn-signed-requests",
+        "netflix-open-connect"
       ],
       "patterns": [
         "Adaptive bitrate streaming",
@@ -1260,8 +2355,9 @@
       "title": "6. View Counting at Scale",
       "description": [
         "A synchronous counter increment per view would hammer the database for popular videos. Instead, emit view events into an async pipeline that dedups and aggregates them into counts.",
-        "Dedup per (video, viewer/session) within a window to avoid inflating counts from replays/refreshes; aggregate and periodically write the count back to video metadata.",
-        "Counts are eventually consistent — acceptable for a view counter — and the pipeline absorbs spikes from viral videos."
+        "Define what a view actually is. A view event is (video_id, session/device, playback_start, watched_seconds, event_time, request_id). A view is only counted once watched_seconds crosses a threshold (e.g. 30s, or % of a short clip) — that prevents accidental autoplay/refresh inflation. Dedup per (video, session) within a window so replays and refreshes don't double-count; request_id makes retried ingests idempotent. Events are windowed by event_time, and the pipeline tolerates late arrivals (a watermark + grace period) before sealing a window.",
+        "Add bot/fraud filtering before counting: drop events failing simple signals (no engagement, datacenter IPs, impossible rates). The public display count is eventually consistent and approximate — acceptable for a view counter — and the pipeline absorbs spikes from viral videos.",
+        "Separate the public count from authoritative counts. Recommendations, abuse detection, and especially monetization/ads need stricter, audited, longer-retention records and may apply different validity rules — so the fast approximate public counter and the slower exact analytics/monetization pipeline are deliberately different paths, even if both start from the same event stream."
       ],
       "view": {
         "nodes": [
@@ -1290,7 +2386,7 @@
           "description": "View events flow into a pipeline that aggregates per video over a time window and writes periodic count deltas, collapsing the firehose into a few writes per minute.",
           "pros": [
             "View events flow into a pipeline that aggregates per video over a window and writes periodic deltas, so 1M views/min becomes a few writes/min.",
-            "Decouples the spike from the database - the view pipeline absorbs the firehose.",
+            "Decouples the spike from the database — the view pipeline absorbs the firehose.",
             "Naturally supports dedup and bot filtering before counting."
           ],
           "cons": [
@@ -1318,13 +2414,14 @@
               "serve",
               "ingest"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-views-opt1.jpg"
         },
         {
           "name": "Increment a counter row per view",
           "description": "Each view issues one UPDATE that increments a counter row stored next to the video metadata, keeping the displayed count exact and always current.",
           "pros": [
-            "Trivially exact and always up to date - one UPDATE per view.",
+            "Trivially exact and always up to date — one UPDATE per view.",
             "No pipeline to build; the count lives right next to the video metadata.",
             "Fine for low-traffic videos."
           ],
@@ -1355,7 +2452,8 @@
               "serve",
               "ingest"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-views-opt2.jpg"
         },
         {
           "name": "Sharded/approximate counters",
@@ -1391,7 +2489,8 @@
               "serve",
               "ingest"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-views-opt3.jpg"
         }
       ],
       "decisionPrompt": "A video goes viral with 1M views/min. Why not increment a counter row per view?",
@@ -1399,10 +2498,10 @@
         "Async approximate counting"
       ],
       "probeLinks": [
-        "s3-multipart",
-        "ffmpeg-docs",
-        "apple-hls",
-        "dash-if"
+        "kafka-design",
+        "dataflow-model",
+        "dataflow-streaming",
+        "beam-programming-guide"
       ],
       "whyNow": [
         "View counting is the classic high-volume-counter subproblem; framing it as a dedup'd async pipeline is the expected answer."
@@ -1420,14 +2519,80 @@
         "before": "Synchronous counter hotspot.",
         "after": "Spike-tolerant, dedup'd, eventually-consistent counts.",
         "newRisk": "Storage cost of source + many renditions, and processing reliability at fleet scale."
-      }
+      },
+      "flows": [
+        {
+          "name": "View ingest -> dedup/window -> count writeback",
+          "note": "View events are fire-and-forget into the pipeline, which dedups per (video, session), gates on the watched-seconds threshold, windows by event_time, and writes periodic count deltas back to metadata. The public approximate counter is written from the fast path; authoritative analytics/monetization branch off the same event stream into a separate, stricter, longer-retention store.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Viewer"
+              },
+              {
+                "id": "ViewPipe",
+                "label": "View-Count Pipeline"
+              },
+              {
+                "id": "MetaSvc",
+                "label": "Metadata Service"
+              },
+              {
+                "id": "MetaDB",
+                "label": "Metadata Store"
+              },
+              {
+                "id": "Analytics",
+                "label": "Analytics / Monetization"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Viewer",
+                "to": "ViewPipe",
+                "arrow": "->>",
+                "label": "view event (session, watched_seconds, request_id)"
+              },
+              {
+                "from": "ViewPipe",
+                "to": "ViewPipe",
+                "arrow": "->>",
+                "label": "bot/fraud filter → dedup (video, session) → threshold gate → window by event_time"
+              },
+              {
+                "from": "ViewPipe",
+                "to": "MetaSvc",
+                "arrow": "->>",
+                "label": "periodic count delta (approximate, public)"
+              },
+              {
+                "from": "MetaSvc",
+                "to": "MetaDB",
+                "arrow": "->>",
+                "label": "apply delta to view_count"
+              },
+              {
+                "from": "ViewPipe",
+                "to": "Analytics",
+                "arrow": "->>",
+                "label": "raw events → authoritative, audited, long-retention"
+              }
+            ]
+          },
+          "highlight": [
+            "ViewPipe"
+          ]
+        }
+      ]
     },
     {
       "id": "scale",
       "title": "7. Storage, Cost, and Reliability at Scale",
       "description": [
+        "This step synthesizes the reliability and cost mechanisms introduced where they belong (resumable session GC in step 2, the lease/retry/dead-letter task state in step 4, cache/TTL in step 5, dedup/late-event handling in step 6) into the operating picture.",
         "Storage is dominated by sources + renditions. Keep the immutable source (for re-transcode if codecs change), use cheaper/colder storage tiers for old or rarely-watched content, and consider dropping rarely-used renditions.",
-        "Make the pipeline reliable end to end: idempotent retryable jobs, dead-letter for repeatedly-failing videos, and per-rendition status so a single failed rendition doesn't block the others.",
+        "Make the pipeline reliable end to end: idempotent retryable tasks, dead-letter for repeatedly-failing segments, and per-rendition status so a single failed rendition doesn't block the others.",
+        "Observe it where users feel it: queue age / transcode backlog, transcode latency percentiles, per-rendition failure rate, playback start latency and rebuffering ratio, CDN hit ratio and origin egress, and upload completion rate. These are the SLO signals that drive autoscaling and alerting.",
         "Scale ingestion (upload + transcode fleet) and serving (CDN + playback) independently, since their load profiles differ."
       ],
       "view": {
@@ -1456,10 +2621,12 @@
         "Closing on storage/cost/reliability shows the pipeline is operable and economical, not just functional."
       ],
       "probeLinks": [
-        "s3-multipart",
-        "ffmpeg-docs",
-        "netflix-vmaf",
-        "apple-hls"
+        "sre-monitoring",
+        "borg-paper",
+        "google-vcu-paper",
+        "instagram-video-compute",
+        "media-cdn-overview",
+        "aws-vod-architecture"
       ],
       "recap": {
         "before": "Functional pipeline.",
@@ -1475,12 +2642,13 @@
           "issue": "Rendition storage cost grows unbounded.",
           "mitigation": "Cold-tier old content; lazily generate rare renditions on demand."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/07-scale.jpg"
     }
   ],
   "finalDesign": {
     "title": "Final Design — Video Upload & Streaming Pipeline",
-    "description": "Creators upload sources via resumable chunked upload to durable storage; the metadata service creates the video as 'processing' and enqueues transcode jobs. Workers fan out renditions (segment-parallel for long videos), write segmented HLS/DASH output to the rendition store, and mark renditions ready. Viewers get a manifest + signed URLs from the playback service and stream adaptively from the CDN. View events flow through an async dedup'd counting pipeline. Source + renditions are cost-tiered; ingestion and serving scale independently; jobs are idempotent and retryable.",
+    "description": "Creators upload sources via resumable chunked upload (session + part state, committed on /complete) to durable storage; the metadata service creates the video as 'processing' and enqueues transcode jobs. Workers fan out renditions (segment-parallel for long videos) over lease-based, idempotent, dead-letterable tasks whose source of truth is the rendition_tasks table in MetaDB (queue messages are only wake-ups; workers claim rows by atomic CAS), write segmented HLS/DASH output to the rendition store, and a coordinator validates and marks renditions ready. The playback service is control plane only: it authorizes the viewer against the video's visibility + access_policies (public/unlisted/private, geo, share ACL) and returns a manifest plus short-TTL tokenized URLs; viewers then stream segments directly from the CDN (origin-shielded over the rendition store) — the service is never on the segment hot path. View events flow through an async, deduped, threshold-gated counting pipeline, with the public approximate counter kept separate from authoritative analytics/monetization records. The state surfaces that make this real: upload session/part state, transcode task/coordinator state, manifest/segment metadata, view-event aggregation state, and operational SLO monitoring. Source + renditions are cost-tiered; ingestion and serving scale independently.",
     "view": {
       "nodes": [
         "Creator",
@@ -1519,7 +2687,8 @@
         "ingest",
         "serve"
       ]
-    }
+    },
+    "aiVisual": "assets/generated/ai-visuals/final-design.jpg"
   },
   "satisfies": {
     "functional": [
@@ -1589,6 +2758,14 @@
         "how": "CDN edge delivery + adaptive bitrate.",
         "steps": [
           "stream"
+        ]
+      },
+      {
+        "requirement": "Access control on playback",
+        "how": "The playback service reads visibility + access_policies (geo allow/deny, private-share ACL) before authorizing, then mints a short-TTL token so segments stay CDN-cacheable; bytes are reachable only with a valid token.",
+        "steps": [
+          "stream",
+          "upload"
         ]
       },
       {
@@ -1675,89 +2852,282 @@
     "links": [
       {
         "id": "s3-multipart",
-        "group": "Distributed Data",
-        "groupDescription": "Primary papers and docs for storage, replication, partitioning, consistency, and caching.",
+        "group": "Upload Protocols and Object Storage",
+        "groupDescription": "Large-object upload mechanics, resumability, integrity, and direct-to-storage ingest patterns.",
         "title": "Multipart Upload Overview",
         "url": "https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html",
         "source": "AWS",
         "type": "Docs",
-        "why": "Concrete mechanics for resumable large uploads and chunked object writes."
+        "why": "Concrete mechanics for multi-part object writes, retries, checksums, and completing a large upload only after all parts are present."
+      },
+      {
+        "id": "gcs-resumable",
+        "group": "Upload Protocols and Object Storage",
+        "groupDescription": "Large-object upload mechanics, resumability, integrity, and direct-to-storage ingest patterns.",
+        "title": "Resumable Uploads",
+        "url": "https://docs.cloud.google.com/storage/docs/resumable-uploads",
+        "source": "Google Cloud",
+        "type": "Docs",
+        "why": "Shows how a resumable object-store session persists offsets after failures, which maps directly to the upload session and resume-probe design."
+      },
+      {
+        "id": "tus-protocol",
+        "group": "Upload Protocols and Object Storage",
+        "groupDescription": "Large-object upload mechanics, resumability, integrity, and direct-to-storage ingest patterns.",
+        "title": "Resumable Upload Protocol 1.0.x",
+        "url": "https://tus.io/protocols/resumable-upload",
+        "source": "tus",
+        "type": "Spec",
+        "why": "A vendor-neutral HTTP protocol for upload creation, offset probes, PATCH resumes, checksums, expiration, and concatenation.",
+        "year": "2016"
+      },
+      {
+        "id": "youtube-upload-settings",
+        "group": "Upload Protocols and Object Storage",
+        "groupDescription": "Large-object upload mechanics, resumability, integrity, and direct-to-storage ingest patterns.",
+        "title": "YouTube Recommended Upload Encoding Settings",
+        "url": "https://support.google.com/youtube/answer/1722171?hl=en",
+        "source": "YouTube Help",
+        "type": "Docs",
+        "why": "Creator-facing evidence that even source uploads have strict container, codec, frame-rate, bitrate, and color-space constraints before transcoding."
       },
       {
         "id": "ffmpeg-docs",
-        "group": "Media and Realtime",
-        "groupDescription": "Production references for realtime messaging, collaboration, media storage, and streaming delivery.",
+        "group": "Video Processing and Encoding at Scale",
+        "groupDescription": "Production encoding systems, quality metrics, codec tradeoffs, and compute-efficiency case studies.",
         "title": "FFmpeg Documentation",
         "url": "https://ffmpeg.org/documentation.html",
         "source": "FFmpeg",
         "type": "Docs",
-        "why": "Concrete tooling reference for transcoding pipelines, codecs, and media processing."
+        "why": "Concrete tooling reference for decode, filter, encode, mux, segmentation, and codec settings in a transcode worker."
       },
       {
-        "id": "apple-hls",
-        "group": "Media and Realtime",
-        "groupDescription": "Production references for realtime messaging, collaboration, media storage, and streaming delivery.",
-        "title": "HTTP Live Streaming",
-        "url": "https://developer.apple.com/streaming/",
-        "source": "Apple",
-        "type": "Docs",
-        "why": "Reference for adaptive streaming manifests, segments, and playback delivery."
+        "id": "youtube-vcu-blog",
+        "group": "Video Processing and Encoding at Scale",
+        "groupDescription": "Production encoding systems, quality metrics, codec tradeoffs, and compute-efficiency case studies.",
+        "title": "Reimagining Video Infrastructure to Empower YouTube",
+        "url": "https://blog.youtube/inside-youtube/new-era-video-infrastructure/",
+        "source": "YouTube Blog",
+        "type": "Case study",
+        "why": "Primary YouTube engineering narrative for warehouse-scale transcoding and why custom acceleration becomes attractive at video-platform scale.",
+        "year": "2021"
       },
       {
-        "id": "dash-if",
-        "group": "Media and Realtime",
-        "groupDescription": "Production references for realtime messaging, collaboration, media storage, and streaming delivery.",
-        "title": "MPEG-DASH Industry Forum",
-        "url": "https://dashif.org/",
-        "source": "DASH-IF",
-        "type": "Docs",
-        "why": "Reference for DASH adaptive streaming interoperability and player/server concerns."
+        "id": "google-vcu-paper",
+        "group": "Video Processing and Encoding at Scale",
+        "groupDescription": "Production encoding systems, quality metrics, codec tradeoffs, and compute-efficiency case studies.",
+        "title": "Warehouse-Scale Video Acceleration: Co-design and Deployment in the Wild",
+        "url": "https://research.google/pubs/warehouse-scale-video-acceleration-co-design-and-deployment-in-the-wild/",
+        "source": "Google Research",
+        "type": "Paper",
+        "why": "Details the data-center-scale VCU design, software/hardware co-design tradeoffs, efficiency gains, and failure-management implications.",
+        "year": "2021"
+      },
+      {
+        "id": "netflix-cosmos-pipeline",
+        "group": "Video Processing and Encoding at Scale",
+        "groupDescription": "Production encoding systems, quality metrics, codec tradeoffs, and compute-efficiency case studies.",
+        "title": "Rebuilding Netflix Video Processing Pipeline with Microservices",
+        "url": "https://netflixtechblog.com/rebuilding-netflix-video-processing-pipeline-with-microservices-4e5e6310e359",
+        "source": "Netflix TechBlog",
+        "type": "Case study",
+        "why": "Explains chunk-based encoding, media pipeline service boundaries, asynchronous workflows, and why monolithic video pipelines become hard to evolve.",
+        "year": "2024"
+      },
+      {
+        "id": "meta-video-encoding",
+        "group": "Video Processing and Encoding at Scale",
+        "groupDescription": "Production encoding systems, quality metrics, codec tradeoffs, and compute-efficiency case studies.",
+        "title": "How Facebook Encodes Your Videos",
+        "url": "https://engineering.fb.com/2021/04/05/video-engineering/how-facebook-encodes-your-videos/",
+        "source": "Engineering at Meta",
+        "type": "Case study",
+        "why": "Shows ABR encoding ladders, codec compute tradeoffs, priority queues, and benefit-cost scheduling for hundreds of millions of uploaded videos.",
+        "year": "2021"
+      },
+      {
+        "id": "instagram-video-compute",
+        "group": "Video Processing and Encoding at Scale",
+        "groupDescription": "Production encoding systems, quality metrics, codec tradeoffs, and compute-efficiency case studies.",
+        "title": "Reducing Instagram's Basic Video Compute Time by 94 Percent",
+        "url": "https://engineering.fb.com/2022/11/04/video-engineering/instagram-video-processing-encoding-reduction/",
+        "source": "Engineering at Meta",
+        "type": "Case study",
+        "why": "A production example of reducing baseline encoding compute while preserving room for advanced encodes, useful for cost-tiering discussion.",
+        "year": "2022"
       },
       {
         "id": "netflix-vmaf",
-        "group": "Media and Realtime",
-        "groupDescription": "Production references for realtime messaging, collaboration, media storage, and streaming delivery.",
+        "group": "Video Processing and Encoding at Scale",
+        "groupDescription": "Production encoding systems, quality metrics, codec tradeoffs, and compute-efficiency case studies.",
         "title": "Toward a Practical Perceptual Video Quality Metric",
         "url": "https://netflixtechblog.com/toward-a-practical-perceptual-video-quality-metric-653f208b9652",
         "source": "Netflix TechBlog",
         "type": "Case study",
-        "why": "Useful for video quality measurement, encoding validation, and playback tradeoffs.",
+        "why": "Useful for measuring encoding quality and deciding whether a cheaper rendition or codec still meets viewer-perceived quality goals.",
         "year": "2016"
       },
       {
+        "id": "apple-hls",
+        "group": "Adaptive Streaming and CDN Delivery",
+        "groupDescription": "HLS/DASH packaging, edge delivery, origin shielding, and access-control mechanisms for video segments.",
+        "title": "HTTP Live Streaming",
+        "url": "https://developer.apple.com/streaming/",
+        "source": "Apple Developer",
+        "type": "Docs",
+        "why": "Reference entry point for HLS manifests, media segments, validation tools, and Apple-device playback constraints."
+      },
+      {
+        "id": "hls-rfc",
+        "group": "Adaptive Streaming and CDN Delivery",
+        "groupDescription": "HLS/DASH packaging, edge delivery, origin shielding, and access-control mechanisms for video segments.",
+        "title": "RFC 8216: HTTP Live Streaming",
+        "url": "https://www.rfc-editor.org/info/rfc8216/",
+        "source": "RFC Editor",
+        "type": "Spec",
+        "why": "Canonical HLS protocol reference for playlists, variant streams, media segments, and encryption tags.",
+        "year": "2017"
+      },
+      {
+        "id": "dash-if",
+        "group": "Adaptive Streaming and CDN Delivery",
+        "groupDescription": "HLS/DASH packaging, edge delivery, origin shielding, and access-control mechanisms for video segments.",
+        "title": "DASH-IF Interoperability: Guidelines for Implementations",
+        "url": "https://dashif.org/docs/DASH-IF-IOP-v4.2-clean.htm",
+        "source": "DASH-IF",
+        "type": "Spec",
+        "why": "Practical DASH interoperability guidance for MPD manifests, segment addressing, codecs, and player/server compatibility."
+      },
+      {
+        "id": "media-cdn-overview",
+        "group": "Adaptive Streaming and CDN Delivery",
+        "groupDescription": "HLS/DASH packaging, edge delivery, origin shielding, and access-control mechanisms for video segments.",
+        "title": "Media CDN Overview",
+        "url": "https://docs.cloud.google.com/media-cdn/docs/overview",
+        "source": "Google Cloud",
+        "type": "Docs",
+        "why": "Grounds the edge-delivery design in a media-specialized CDN optimized for high-throughput video and large file egress."
+      },
+      {
+        "id": "media-cdn-signed-requests",
+        "group": "Adaptive Streaming and CDN Delivery",
+        "groupDescription": "HLS/DASH packaging, edge delivery, origin shielding, and access-control mechanisms for video segments.",
+        "title": "Use Signed Requests",
+        "url": "https://cloud.google.com/media-cdn/docs/signed-requests",
+        "source": "Google Cloud",
+        "type": "Docs",
+        "why": "Shows how signed URLs/tokens enforce private or geo-restricted playback while preserving CDN delivery for manifests and segments."
+      },
+      {
+        "id": "netflix-open-connect",
+        "group": "Adaptive Streaming and CDN Delivery",
+        "groupDescription": "HLS/DASH packaging, edge delivery, origin shielding, and access-control mechanisms for video segments.",
+        "title": "Netflix Open Connect",
+        "url": "https://openconnect.netflix.com/en/",
+        "source": "Netflix",
+        "type": "Docs",
+        "why": "Primary reference for ISP-embedded edge caches, origin offload, and why large video platforms separate control plane from segment delivery."
+      },
+      {
         "id": "kafka-design",
-        "group": "Queues and Streams",
-        "groupDescription": "Messaging, event streaming, delivery semantics, and async processing references.",
+        "group": "Queues, Streaming, and View Counting",
+        "groupDescription": "Asynchronous processing, event-time aggregation, late data, and deduplicated counters.",
         "title": "Apache Kafka Design",
         "url": "https://kafka.apache.org/documentation/#design",
         "source": "Apache Kafka",
         "type": "Docs",
-        "why": "Explains Kafka's log, partitions, consumer groups, replication, and operational model."
+        "why": "Explains the partitioned log, consumer groups, replication, and delivery model behind async job queues and event pipelines."
+      },
+      {
+        "id": "dataflow-model",
+        "group": "Queues, Streaming, and View Counting",
+        "groupDescription": "Asynchronous processing, event-time aggregation, late data, and deduplicated counters.",
+        "title": "The Dataflow Model",
+        "url": "https://research.google/pubs/the-dataflow-model-a-practical-approach-to-balancing-correctness-latency-and-cost-in-massive-scale-unbounded-out-of-order-data-processing/",
+        "source": "Google Research",
+        "type": "Paper",
+        "why": "A foundational paper for event-time windows, watermarks, late data, and correctness/latency/cost tradeoffs in view-count aggregation.",
+        "year": "2015"
+      },
+      {
+        "id": "dataflow-streaming",
+        "group": "Queues, Streaming, and View Counting",
+        "groupDescription": "Asynchronous processing, event-time aggregation, late data, and deduplicated counters.",
+        "title": "Streaming Pipelines",
+        "url": "https://docs.cloud.google.com/dataflow/docs/concepts/streaming-pipelines",
+        "source": "Google Cloud",
+        "type": "Docs",
+        "why": "Operational reference for streaming pipelines, event timestamps, watermarks, late data, and low-latency processing behavior."
+      },
+      {
+        "id": "beam-programming-guide",
+        "group": "Queues, Streaming, and View Counting",
+        "groupDescription": "Asynchronous processing, event-time aggregation, late data, and deduplicated counters.",
+        "title": "Apache Beam Programming Guide",
+        "url": "https://beam.apache.org/documentation/programming-guide/",
+        "source": "Apache Beam",
+        "type": "Docs",
+        "why": "Practical implementation reference for windows, triggers, allowed lateness, state, timers, and metrics in a counting pipeline."
       },
       {
         "id": "borg-paper",
-        "group": "AI and ML Systems",
-        "groupDescription": "Feature stores, model serving, RAG, recommendation, and ML operations references.",
+        "group": "Operations and Reliability",
+        "groupDescription": "Scheduling, monitoring, and reliability practices for large compute and media-serving fleets.",
         "title": "Large-scale Cluster Management at Google with Borg",
         "url": "https://research.google/pubs/large-scale-cluster-management-at-google-with-borg/",
         "source": "Google Research",
         "type": "Paper",
-        "why": "Production cluster scheduler reference for placement, quotas, priorities, and reliability.",
+        "why": "Production cluster scheduler reference for placement, quotas, priorities, batch jobs, and reliable fleet utilization.",
         "year": "2015"
       },
       {
         "id": "sre-monitoring",
-        "group": "Foundations",
-        "groupDescription": "Core system design references for scalability, reliability, and operating distributed services.",
+        "group": "Operations and Reliability",
+        "groupDescription": "Scheduling, monitoring, and reliability practices for large compute and media-serving fleets.",
         "title": "Monitoring Distributed Systems",
         "url": "https://sre.google/sre-book/monitoring-distributed-systems/",
         "source": "Google SRE",
         "type": "Book chapter",
-        "why": "Grounds monitoring and alerting decisions in user-visible reliability signals."
+        "why": "Grounds monitoring and alerting decisions in user-visible reliability signals such as latency, errors, saturation, and freshness."
+      },
+      {
+        "id": "aws-vod-architecture",
+        "group": "Managed Media Pipelines",
+        "groupDescription": "Reference architectures and hosted APIs that expose end-to-end video ingest, transcode, and delivery tradeoffs.",
+        "title": "Architecture Overview - Video on Demand on AWS",
+        "url": "https://docs.aws.amazon.com/solutions/latest/video-on-demand-on-aws/architecture-overview.html",
+        "source": "AWS",
+        "type": "Reference architecture",
+        "why": "Concrete managed workflow using S3, Step Functions, MediaConvert, metadata storage, notifications, and CloudFront delivery."
+      },
+      {
+        "id": "mux-direct-uploads",
+        "group": "Managed Media Pipelines",
+        "groupDescription": "Reference architectures and hosted APIs that expose end-to-end video ingest, transcode, and delivery tradeoffs.",
+        "title": "Upload Files Directly",
+        "url": "https://www.mux.com/docs/guides/upload-files-directly",
+        "source": "Mux",
+        "type": "Docs",
+        "why": "Shows the managed direct-upload pattern: backend issues an authenticated upload URL, client uploads resumably, and asset status is polled later."
+      },
+      {
+        "id": "cloudflare-stream-uploads",
+        "group": "Managed Media Pipelines",
+        "groupDescription": "Reference architectures and hosted APIs that expose end-to-end video ingest, transcode, and delivery tradeoffs.",
+        "title": "Upload Videos",
+        "url": "https://developers.cloudflare.com/stream/uploading-videos/",
+        "source": "Cloudflare Stream",
+        "type": "Docs",
+        "why": "Managed video ingest reference covering direct creator uploads, upload options, supported formats, and downstream encoding expectations."
       }
     ]
   },
   "assets": {
     "icon": "icon.png"
-  }
+  },
+  "aiVisuals": {
+    "requirements": "assets/generated/ai-visuals/requirements.jpg",
+    "capacity": "assets/generated/ai-visuals/capacity.jpg"
+  },
+  "explainerComic": "assets/generated/comic/interview-comic.jpg"
 }

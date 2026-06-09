@@ -120,7 +120,7 @@
       {
         "id": "User",
         "label": "Searcher",
-        "type": "client",
+        "type": "actor",
         "category": "boundary",
         "traits": [],
         "description": "Issues queries and reads ranked results."
@@ -247,10 +247,14 @@
   "capacityDiagram": [
     "graph LR",
     "  Docs[100B+ documents]",
-    "  Index[Sharded inverted index]",
-    "  QPS[~100K queries/s]",
-    "  Docs --> Index",
-    "  Index --> QPS"
+    "  Shards[~10K shards x 3 replicas]",
+    "  QPS[~100K QPS]",
+    "  Miss[~30K cache-miss QPS]",
+    "  Fanout[~300M shard-requests/s]",
+    "  Docs --> Shards",
+    "  QPS --> Miss",
+    "  Miss --> Fanout",
+    "  Shards --> Fanout"
   ],
   "requirements": {
     "functional": [
@@ -275,33 +279,53 @@
       "note": "Drives index size and shard count."
     },
     {
-      "label": "Queries per second",
-      "value": "~100,000",
-      "note": "Replicate shards to serve it."
+      "label": "Index size",
+      "value": "~10s of PB",
+      "note": "100B docs x ~5KB parsed content -> ~500TB raw text; postings + positions + per-doc metadata roughly equal the text, so the searchable index is ~PB-class and the doc store plus raw HTML pushes the total into tens of PB."
     },
     {
-      "label": "Index size",
-      "value": "PBs",
-      "note": "Posting lists across all terms; document-partitioned."
+      "label": "Shard count",
+      "value": "~10,000 shards x ~10M docs",
+      "note": "Target ~100GB-200GB of postings per shard so each shard's working set stays in RAM/SSD; 100B docs / 10M per shard ~= 10K primary shards."
+    },
+    {
+      "label": "Replicas",
+      "value": "3x+ per shard",
+      "note": "Replicas serve QPS and survive shard loss; total serving fleet ~= 10K shards x 3 = ~30K index servers (plus more replicas for hot shards)."
+    },
+    {
+      "label": "Queries per second",
+      "value": "~100,000",
+      "note": "Assume a ~60-70% result-cache hit rate on skewed query traffic, so only ~30-40K QPS actually scatter to shards."
+    },
+    {
+      "label": "Scatter fan-out",
+      "value": "~30K x 10K = 300M shard-requests/s",
+      "note": "Cache-miss QPS x shard count — absorbed by a broker fan-out tree, not one box. Each replica set sees ~30K req/s; with 3 replicas that is ~10K req/s per index server, which sets the per-server CPU/IO budget (see step 4b)."
+    },
+    {
+      "label": "Per-query work",
+      "value": "top-k ~100-1000 per shard",
+      "note": "Each shard returns a small top-k; the broker merges 10K x top-k into a global candidate set, then phase-2 re-ranks only the top ~1000. Network: ~10K shards x ~1KB top-k ~= ~10MB gathered per cache-miss query."
+    },
+    {
+      "label": "Deadline budget",
+      "value": "< 1s p99",
+      "note": "~Few ms broker, ~100-200ms shard fan-out (bounded by slowest replica + hedging), ~50-100ms merge/re-rank, ~tens of ms hydration. Shards that miss the deadline are dropped -> partial results rather than a timeout."
     },
     {
       "label": "Crawl rate",
       "value": "billions/day",
-      "note": "Continuous, politeness-bounded."
-    },
-    {
-      "label": "Query latency",
-      "value": "< 1s p99",
-      "note": "Despite scatter across many shards."
+      "note": "~1B fetches/day ~= ~12K fetches/s sustained; at ~2MB avg page that is ~25GB/s ~= 200Gbps of ingress, before per-host politeness caps cut effective throughput."
     }
   ],
   "api": [
     {
       "method": "GET",
       "path": "/search",
-      "description": "Run a query and return ranked results.",
-      "request": "?q=distributed+systems&page=1",
-      "response": "{ \"results\": [ { \"url\": \"...\", \"title\": \"...\", \"snippet\": \"...\" } ], \"total\": 12000 }",
+      "description": "Run a query and return ranked results. q supports multi-term, quoted phrases (\"exact match\"), and basic boolean operators (+required, -excluded, OR). hl/gl set language and country for ranking/locale; num+cursor page results — cursors are opaque, short-lived (minutes), and deep pagination is capped because the index changes under you. freshness is a ranking bias/filter toward recent content, not a guarantee that all new pages are visible. approxTotal is an estimate (capped at web scale, not an exact count). Under deadline pressure the response can be partial: partialResults flags it, timedOutShards counts dropped shards, servedFromCache tells whether the result cache answered.",
+      "request": "?q=%22distributed+systems%22+-tutorial&hl=en&gl=us&num=10&cursor=&freshness=any",
+      "response": "{ \"results\": [ { \"url\": \"...\", \"title\": \"...\", \"snippet\": \"...\", \"crawledAt\": \"...\" } ], \"approxTotal\": 12000, \"partialResults\": false, \"timedOutShards\": 0, \"servedFromCache\": true, \"nextCursor\": \"...\" }",
       "sequence": {
         "participants": [
           {
@@ -390,11 +414,11 @@
       "fields": [
         {
           "name": "doc_id",
-          "type": "bigint PK"
+          "type": "bigint PK (stable internal id)"
         },
         {
-          "name": "url",
-          "type": "varchar"
+          "name": "canonical_url",
+          "type": "varchar (canonicalized; dupes/redirects map here)"
         },
         {
           "name": "title",
@@ -402,11 +426,23 @@
         },
         {
           "name": "content_hash",
-          "type": "hash (dedup)"
+          "type": "hash (near-dup clustering)"
         },
         {
           "name": "page_score",
           "type": "float (query-independent, e.g. PageRank)"
+        },
+        {
+          "name": "quality_score",
+          "type": "float (spam/quality signal; lower demotes)"
+        },
+        {
+          "name": "current_version",
+          "type": "bigint (FK -> doc_versions)"
+        },
+        {
+          "name": "suppressed",
+          "type": "bool (takedown / safe-search / spam hide)"
         },
         {
           "name": "last_crawled",
@@ -415,26 +451,1185 @@
       ]
     },
     {
+      "name": "doc_versions",
+      "note": "Content lifecycle per doc: each crawl that materially changes content is a new version.",
+      "fields": [
+        {
+          "name": "version_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "doc_id",
+          "type": "bigint FK"
+        },
+        {
+          "name": "content_hash",
+          "type": "hash"
+        },
+        {
+          "name": "segment_id",
+          "type": "string (which index segment carries this version)"
+        },
+        {
+          "name": "fetched_at",
+          "type": "timestamp"
+        },
+        {
+          "name": "status",
+          "type": "enum(live, superseded, deleted)"
+        }
+      ]
+    },
+    {
+      "name": "index_segments",
+      "note": "Immutable index units; serving reads the published set.",
+      "fields": [
+        {
+          "name": "segment_id",
+          "type": "string PK"
+        },
+        {
+          "name": "shard_id",
+          "type": "int"
+        },
+        {
+          "name": "generation",
+          "type": "bigint (monotonic; readers refresh to latest published)"
+        },
+        {
+          "name": "doc_count",
+          "type": "int"
+        },
+        {
+          "name": "tombstones",
+          "type": "bitset/list<doc_id> (deleted/suppressed docs to skip)"
+        },
+        {
+          "name": "state",
+          "type": "enum(building, validated, published, merging, retired)"
+        }
+      ]
+    },
+    {
       "name": "url_frontier",
-      "note": "Crawl queue state.",
+      "note": "Crawl queue state, per canonical URL.",
       "fields": [
         {
           "name": "url",
-          "type": "string"
+          "type": "string (raw)"
         },
         {
-          "name": "priority",
-          "type": "float"
+          "name": "canonical_url",
+          "type": "string (post-canonicalization key)"
         },
         {
           "name": "host",
-          "type": "string (politeness bucket)"
+          "type": "string FK -> host_crawl_state (politeness + robots scheduled per host)"
+        },
+        {
+          "name": "priority",
+          "type": "float (importance x freshness need)"
+        },
+        {
+          "name": "crawl_status",
+          "type": "enum(pending, fetching, done, failed, blocked)"
+        },
+        {
+          "name": "fetch_attempts",
+          "type": "int (drives backoff / give-up)"
+        },
+        {
+          "name": "change_freq",
+          "type": "float (observed; sets recrawl interval)"
         },
         {
           "name": "next_fetch_at",
-          "type": "timestamp"
+          "type": "timestamp (politeness delay or retry/backoff time)"
         }
       ]
+    },
+    {
+      "name": "host_crawl_state",
+      "note": "Per-host politeness and robots state — the frontier schedules eligible hosts, then URLs within them.",
+      "fields": [
+        {
+          "name": "host",
+          "type": "string PK"
+        },
+        {
+          "name": "crawl_delay",
+          "type": "float (per-host rate limit / min gap between fetches)"
+        },
+        {
+          "name": "robots_rules",
+          "type": "blob (parsed robots.txt allow/disallow)"
+        },
+        {
+          "name": "robots_fetched_at",
+          "type": "timestamp (+ TTL; drives robots re-fetch)"
+        },
+        {
+          "name": "next_host_fetch_at",
+          "type": "timestamp (when this host may be fetched again)"
+        },
+        {
+          "name": "backoff_state",
+          "type": "enum(ok, slowed, blocked) + recent 429/5xx error budget"
+        }
+      ]
+    },
+    {
+      "name": "serving_metrics (control plane)",
+      "note": "Time-series the system is operated by — emitted across crawl, index, serving, and ranking; alerts fire on these.",
+      "fields": [
+        {
+          "name": "crawl",
+          "type": "frontier backlog by host/priority, fetch success rate, robots/blocked rate, 429/5xx rate, duplicate rate, crawl lag"
+        },
+        {
+          "name": "indexing",
+          "type": "segment build lag, validation failures, publish generation, merge backlog, tombstone ratio, rollback count"
+        },
+        {
+          "name": "serving",
+          "type": "result-cache hit rate, doc-cache hit rate, cache-miss QPS, shard p95/p99, hedge rate, partial-result rate, timeout rate, candidate count, merge/rank latency"
+        },
+        {
+          "name": "quality",
+          "type": "spam demotion rate, suppression count, ranker model version"
+        }
+      ]
+    }
+  ],
+  "technologyChoices": [
+    {
+      "concern": "Crawl frontier, politeness, and URL scheduling",
+      "steps": [
+        "crawl",
+        "freshness"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Apache Cassandra",
+          "icon": "assets/tech-icons/cassandra.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        },
+        {
+          "name": "Kubernetes",
+          "icon": "assets/tech-icons/kubernetes.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "EKS",
+            "icon": "assets/tech-icons/Arch_Amazon-Elastic-Kubernetes-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "GKE",
+            "icon": "assets/tech-icons/Containers-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "AKS",
+            "icon": "assets/tech-icons/10023-icon-service-Kubernetes-Services.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A durable queue or log keeps crawl work replayable and lets the fleet absorb host-specific backoff without losing URLs.",
+        "A database-backed priority frontier is easier to inspect and reprioritize, but it must be sharded by host and next_fetch_at to avoid hot partitions.",
+        "Managed queues reduce broker operations, while self-hosted Kafka or Cassandra gives more control over partitioning and crawl-state locality."
+      ],
+      "makesIrrelevant": "A managed queue plus a TTL-capable crawl-state store removes much of the custom retry lease, dead-letter, and cleanup machinery from the crawler step."
+    },
+    {
+      "concern": "Seen-URL dedup, content hashes, and host crawl state",
+      "steps": [
+        "crawl",
+        "freshness"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "Apache Cassandra",
+          "icon": "assets/tech-icons/cassandra.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Bloom filters",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          },
+          {
+            "name": "Keyspaces",
+            "icon": "assets/tech-icons/Arch_Amazon-Keyspaces_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "In-memory sets are fast for URL membership and short dedup windows, but durable wide-column stores are safer for a multi-month web corpus.",
+        "Bloom filters cut read load before hitting the durable store, at the cost of false positives that may skip some crawl candidates.",
+        "Relational uniqueness is simple for a small crawler, but host-scale crawling quickly needs partition-aware writes and TTL cleanup."
+      ],
+      "makesIrrelevant": "A store with conditional writes and TTL expiry removes a separate dedup cleanup pipeline for stale crawl leases and old content hashes."
+    },
+    {
+      "concern": "Raw document store and parsed-content lake",
+      "steps": [
+        "crawl",
+        "index",
+        "freshness"
+      ],
+      "selfHosted": [
+        {
+          "name": "HDFS",
+          "icon": "assets/tech-icons/hadoop.png"
+        },
+        {
+          "name": "Ceph",
+          "icon": "assets/tech-icons/ceph.png"
+        },
+        {
+          "name": "OpenStack Swift",
+          "icon": "assets/tech-icons/openstack.png"
+        },
+        {
+          "name": "MinIO",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Apache HBase",
+          "icon": "assets/tech-icons/hbase.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "S3",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Storage-Service_64.png"
+          },
+          {
+            "name": "EFS",
+            "icon": "assets/tech-icons/Arch_Amazon-EFS_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Storage",
+            "icon": "assets/tech-icons/Storage-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Blob Storage",
+            "icon": "assets/tech-icons/10781-icon-service-Blob-Page.svg"
+          },
+          {
+            "name": "Azure Data Lake Storage",
+            "icon": "assets/tech-icons/10090-icon-service-Data-Lake-Storage-Gen1.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Object storage is the right default for raw HTML, parsed text, and immutable index artifacts because it scales cheaply into PBs.",
+        "Wide-column or key-value stores fit hot metadata such as current_version, crawl status, and per-doc scores.",
+        "Self-hosted HDFS or Ceph can lower unit cost at very large scale, but the operations burden becomes a major part of the design."
+      ],
+      "makesIrrelevant": "A managed object store with lifecycle policy, versioning, and replication removes most custom blob replication and cold-tier migration code."
+    },
+    {
+      "concern": "Batch indexing, segment builds, and merge pipeline",
+      "steps": [
+        "index",
+        "freshness"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Spark",
+          "icon": "assets/tech-icons/spark.png"
+        },
+        {
+          "name": "Apache Flink",
+          "icon": "assets/tech-icons/flink.png"
+        },
+        {
+          "name": "Apache Airflow",
+          "icon": "assets/tech-icons/airflow.png"
+        },
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Kubernetes",
+          "icon": "assets/tech-icons/kubernetes.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "EMR",
+            "icon": "assets/tech-icons/Arch_Amazon-EMR_64.png"
+          },
+          {
+            "name": "AWS Batch",
+            "icon": "assets/tech-icons/Arch_AWS-Batch_64.png"
+          },
+          {
+            "name": "AWS Glue",
+            "icon": "assets/tech-icons/Arch_AWS-Glue_64.png"
+          },
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          },
+          {
+            "name": "Managed Service for Apache Flink",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Service-for-Apache-Flink_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Dataproc",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Cloud Composer",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Databricks",
+            "icon": "assets/tech-icons/10787-icon-service-Azure-Databricks.svg"
+          },
+          {
+            "name": "Azure Batch",
+            "icon": "assets/tech-icons/10031-icon-service-Batch-Accounts.svg"
+          },
+          {
+            "name": "Stream Analytics",
+            "icon": "assets/tech-icons/00042-icon-service-Stream-Analytics-Jobs.svg"
+          },
+          {
+            "name": "Logic Apps",
+            "icon": "assets/tech-icons/10363-icon-service-Logic-Apps-Custom-Connector.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Batch Spark jobs are efficient for full rebuilds, global term statistics, and large segment merges.",
+        "Streaming Flink jobs reduce freshness lag for changed pages, but they need careful checkpointing and exactly-once publish semantics.",
+        "Workflow engines make segment validation and publish/rollback explicit instead of hiding it inside ad hoc worker scripts."
+      ],
+      "makesIrrelevant": "A managed batch or stream runner with retries, checkpoints, and history replaces much of the custom job scheduler around segment generation."
+    },
+    {
+      "concern": "Inverted index engine and searchable segment serving",
+      "steps": [
+        "index",
+        "serve",
+        "partitioning-scheme",
+        "serve-scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Lucene",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Elasticsearch",
+          "icon": "assets/tech-icons/elasticsearch.png"
+        },
+        {
+          "name": "OpenSearch",
+          "icon": "assets/tech-icons/opensearch.png"
+        },
+        {
+          "name": "Apache Solr",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Custom log-structured store on bare disks",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "OpenSearch Service",
+            "icon": "assets/tech-icons/Arch_Amazon-OpenSearch-Service_64.png"
+          },
+          {
+            "name": "EKS",
+            "icon": "assets/tech-icons/Arch_Amazon-Elastic-Kubernetes-Service_64.png"
+          },
+          {
+            "name": "EC2",
+            "icon": "assets/tech-icons/Arch_Amazon-EC2_64.png"
+          },
+          {
+            "name": "S3",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Storage-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "GKE",
+            "icon": "assets/tech-icons/Containers-512-color.png"
+          },
+          {
+            "name": "Compute Engine",
+            "icon": "assets/tech-icons/Compute-512-color.png"
+          },
+          {
+            "name": "Cloud Storage",
+            "icon": "assets/tech-icons/Storage-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure AI Search",
+            "icon": "assets/tech-icons/10044-icon-service-Cognitive-Search.svg"
+          },
+          {
+            "name": "AKS",
+            "icon": "assets/tech-icons/10023-icon-service-Kubernetes-Services.svg"
+          },
+          {
+            "name": "Virtual Machine Scale Sets",
+            "icon": "assets/tech-icons/10034-icon-service-VM-Scale-Sets.svg"
+          },
+          {
+            "name": "Blob Storage",
+            "icon": "assets/tech-icons/10781-icon-service-Blob-Page.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Lucene-family engines give proven postings, skip data, analyzers, and segment merges, which is the right starting point for interview-scale search.",
+        "A custom segment server can optimize memory layout, compression, and top-k scoring at web scale, but it pushes correctness and operations onto the team.",
+        "Managed search is fastest to operate for smaller corpora; a flagship web index usually outgrows simple managed-cluster economics."
+      ],
+      "makesIrrelevant": "A mature search engine removes the need to hand-build analyzers, postings compression, merge policy, and shard replica management for the first production version."
+    },
+    {
+      "concern": "Query broker fan-out, shard routing, and overload control",
+      "steps": [
+        "serve",
+        "partitioning-scheme",
+        "serve-scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "HAProxy",
+          "icon": "assets/tech-icons/haproxy.png"
+        },
+        {
+          "name": "Consul",
+          "icon": "assets/tech-icons/consul.png"
+        },
+        {
+          "name": "etcd",
+          "icon": "assets/tech-icons/etcd.png"
+        },
+        {
+          "name": "Kubernetes",
+          "icon": "assets/tech-icons/kubernetes.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Elastic Load Balancing",
+            "icon": "assets/tech-icons/Arch_Elastic-Load-Balancing_64.png"
+          },
+          {
+            "name": "Cloud Map",
+            "icon": "assets/tech-icons/Arch_AWS-Cloud-Map_64.png"
+          },
+          {
+            "name": "Route 53",
+            "icon": "assets/tech-icons/Arch_Amazon-Route-53_64.png"
+          },
+          {
+            "name": "EKS",
+            "icon": "assets/tech-icons/Arch_Amazon-Elastic-Kubernetes-Service_64.png"
+          },
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Load Balancing",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Endpoints",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud DNS",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "GKE",
+            "icon": "assets/tech-icons/Containers-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Application Gateway",
+            "icon": "assets/tech-icons/10076-icon-service-Application-Gateways.svg"
+          },
+          {
+            "name": "Traffic Manager",
+            "icon": "assets/tech-icons/10065-icon-service-Traffic-Manager-Profiles.svg"
+          },
+          {
+            "name": "Azure DNS",
+            "icon": "assets/tech-icons/10064-icon-service-DNS-Zones.svg"
+          },
+          {
+            "name": "AKS",
+            "icon": "assets/tech-icons/10023-icon-service-Kubernetes-Services.svg"
+          },
+          {
+            "name": "API Management",
+            "icon": "assets/tech-icons/10042-icon-service-API-Management-Services.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A two-level broker tree lowers per-frontend connection count and lets the system enforce deadline propagation and partial-result policy.",
+        "Service discovery plus shard-map storage is required when replicas move, split, or merge; otherwise routing becomes stale during deploys.",
+        "Cloud load balancers help at the edge, but the shard fan-out tree is still application-specific because it understands top-k, hedging, and timeout budgets."
+      ],
+      "makesIrrelevant": "Managed service discovery and load balancing remove some static shard-map distribution, but not the search-specific broker merge and deadline logic."
+    },
+    {
+      "concern": "Ranking, link graph, and search-quality signals",
+      "steps": [
+        "index",
+        "rank",
+        "freshness"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Spark",
+          "icon": "assets/tech-icons/spark.png"
+        },
+        {
+          "name": "Apache Flink",
+          "icon": "assets/tech-icons/flink.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Apache Cassandra",
+          "icon": "assets/tech-icons/cassandra.png"
+        },
+        {
+          "name": "TensorFlow Serving",
+          "icon": "assets/tech-icons/tensorflow.png"
+        },
+        {
+          "name": "Neo4j",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SageMaker",
+            "icon": "assets/tech-icons/Arch_Amazon-SageMaker-AI_64.png"
+          },
+          {
+            "name": "Neptune",
+            "icon": "assets/tech-icons/Arch_Amazon-Neptune_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "EMR",
+            "icon": "assets/tech-icons/Arch_Amazon-EMR_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Vertex AI",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          },
+          {
+            "name": "BigQuery",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Dataproc",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Machine Learning",
+            "icon": "assets/tech-icons/10166-icon-service-Machine-Learning.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Databricks",
+            "icon": "assets/tech-icons/10787-icon-service-Azure-Databricks.svg"
+          },
+          {
+            "name": "Azure Synapse Analytics",
+            "icon": "assets/tech-icons/00606-icon-service-Azure-Synapse-Analytics.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Offline graph and quality jobs are cheaper and more stable for PageRank-like scores than computing link signals at query time.",
+        "A serving-time model improves relevance and freshness but must fit the ranking latency budget after shard top-k merge.",
+        "Graph databases are useful for exploration and smaller link graphs; web-scale scoring usually needs batch or streaming dataflow."
+      ],
+      "makesIrrelevant": "A managed ML platform with model registry, batch scoring, and online endpoints removes a separate model deployment and rollback service for the first ranking pipeline."
+    },
+    {
+      "concern": "Feature store and low-latency reranking state",
+      "steps": [
+        "rank",
+        "cache"
+      ],
+      "selfHosted": [
+        {
+          "name": "Feast",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "TensorFlow Serving",
+          "icon": "assets/tech-icons/tensorflow.png"
+        },
+        {
+          "name": "NVIDIA Triton",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SageMaker",
+            "icon": "assets/tech-icons/Arch_Amazon-SageMaker-AI_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "Lambda",
+            "icon": "assets/tech-icons/Arch_AWS-Lambda_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Vertex AI",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud Run",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Machine Learning",
+            "icon": "assets/tech-icons/10166-icon-service-Machine-Learning.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A feature store keeps offline and online ranking features consistent, but it is only worth it once ranking features change independently of code deploys.",
+        "Redis-class stores work well for hot doc features and model side inputs, while durable KV stores fit slower-changing quality and suppression state.",
+        "Model-serving frameworks give better batching and hardware control than embedding a large model directly in the query broker."
+      ],
+      "makesIrrelevant": "A managed feature and model-serving stack reduces custom code for feature freshness checks, model rollout, and online/offline skew monitoring."
+    },
+    {
+      "concern": "Result cache, snippet cache, and edge caching",
+      "steps": [
+        "serve-scale",
+        "cache",
+        "freshness"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "Memcached",
+          "icon": "assets/tech-icons/memcached.png"
+        },
+        {
+          "name": "Varnish",
+          "icon": "assets/tech-icons/varnish.png"
+        },
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "Dragonfly",
+          "icon": "assets/tech-icons/dragonfly.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudFront",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudFront_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          },
+          {
+            "name": "DAX",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud CDN",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Media CDN",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Run",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Azure CDN",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Result caching attacks the 100K QPS problem directly because repeated queries avoid scatter-gather fan-out.",
+        "Snippet/doc caches reduce hydration latency and protect the document store from hot-result amplification.",
+        "Edge caching is most useful for anonymous, popular queries; personalized or fresh-sensitive queries need shorter TTLs and better invalidation."
+      ],
+      "makesIrrelevant": "A managed cache with TTL, eviction metrics, and request coalescing support reduces the need for custom stampede protection around the hottest queries."
+    },
+    {
+      "concern": "Freshness event stream, segment publish, and cache invalidation",
+      "steps": [
+        "crawl",
+        "index",
+        "cache",
+        "freshness"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Redpanda",
+          "icon": "assets/tech-icons/redpanda.png"
+        },
+        {
+          "name": "Apache Pulsar",
+          "icon": "assets/tech-icons/pulsar.png"
+        },
+        {
+          "name": "Apache Flink",
+          "icon": "assets/tech-icons/flink.png"
+        },
+        {
+          "name": "Consul",
+          "icon": "assets/tech-icons/consul.png"
+        },
+        {
+          "name": "etcd",
+          "icon": "assets/tech-icons/etcd.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "MSK",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Streaming-for-Apache-Kafka_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          },
+          {
+            "name": "Managed Service for Apache Flink",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Service-for-Apache-Flink_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Managed Service for Apache Kafka",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Datastream",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          },
+          {
+            "name": "Event Grid",
+            "icon": "assets/tech-icons/10221-icon-service-Event-Grid-Subscriptions.svg"
+          },
+          {
+            "name": "Stream Analytics",
+            "icon": "assets/tech-icons/00042-icon-service-Stream-Analytics-Jobs.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A durable event stream lets new crawls drive parsing, segment build, publish notifications, and cache invalidation without tightly coupling workers.",
+        "A small coordination store is still needed for published generation pointers, reader refresh, and rollback state.",
+        "Managed streams simplify retention and consumer lag monitoring, but segment publish semantics remain an application-level contract."
+      ],
+      "makesIrrelevant": "A managed stream with replay and lag metrics removes much of the custom catch-up tooling for delayed indexers and stale cache invalidators."
+    },
+    {
+      "concern": "Observability, tracing, and search-quality operations",
+      "steps": [
+        "crawl",
+        "index",
+        "serve-scale",
+        "rank",
+        "cache",
+        "freshness"
+      ],
+      "selfHosted": [
+        {
+          "name": "OpenTelemetry",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Prometheus",
+          "icon": "assets/tech-icons/prometheus.png"
+        },
+        {
+          "name": "Grafana",
+          "icon": "assets/tech-icons/grafana.png"
+        },
+        {
+          "name": "Jaeger",
+          "icon": "assets/tech-icons/jaeger.png"
+        },
+        {
+          "name": "ELK Stack",
+          "icon": "assets/tech-icons/elasticsearch.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "X-Ray",
+            "icon": "assets/tech-icons/Arch_AWS-X-Ray_64.png"
+          },
+          {
+            "name": "Managed Grafana",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Grafana_64.png"
+          },
+          {
+            "name": "Managed Service for Prometheus",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Service-for-Prometheus_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Logging",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Trace",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Profiler",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Application Insights",
+            "icon": "assets/tech-icons/00012-icon-service-Application-Insights.svg"
+          },
+          {
+            "name": "Log Analytics",
+            "icon": "assets/tech-icons/00009-icon-service-Log-Analytics-Workspaces.svg"
+          },
+          {
+            "name": "Azure Managed Grafana",
+            "icon": "assets/tech-icons/02905-icon-service-Azure-Managed-Grafana.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Search needs both infrastructure metrics and domain metrics: crawl lag, segment generation, shard p99, partial-result rate, cache hit rate, and ranking quality.",
+        "Distributed tracing is valuable on cache misses because one user query fans out to thousands of shard and ranking calls.",
+        "Managed observability reduces platform work, but the team still needs domain-specific dashboards and replay tools for freshness and ranking regressions."
+      ],
+      "makesIrrelevant": "A managed metrics and trace backend removes most custom time-series storage from the serving_metrics control plane."
     }
   ],
   "patterns": [
@@ -488,17 +1683,17 @@
       "what": "Cache popular query results and hot document snippets.",
       "whenToUse": "Skewed query/document popularity (a few queries dominate).",
       "steps": [
-        "serve"
+        "cache"
       ],
-      "group": "Shard the Index and Scatter-Gather Queries"
+      "group": "Caching for QPS and Latency"
     }
   ],
   "steps": [
     {
       "id": "naive",
-      "title": "1. Naive: Scan Every Document for the Query Terms (the baseline)",
+      "title": "1. Naive Baseline: Scan Every Document for the Query Terms",
       "description": [
-        "Start with the simplest thing that works. Store the fetched pages in a document store, and on each search read through every document checking whether it contains the query terms, collecting the matches.",
+        "Start with the simplest thing that works. Assume pages have already been fetched somehow (the next step builds the crawler) and stored in a document store; on each search read through every document checking whether it contains the query terms, collecting the matches.",
         "This is correct and trivial — and it is hopeless at web scale. A single query would have to scan 100B+ documents (petabytes), so even one search takes far longer than the sub-second budget, and serving ~100K queries/sec this way is physically impossible. The cost is linear in the corpus size for every single query.",
         "So the baseline motivates everything that follows: instead of scanning documents per query, build an inverted index once (term -> the documents containing it) so a query becomes a posting-list lookup, then shard that index across machines and scatter-gather queries to stay sub-second at scale."
       ],
@@ -510,7 +1705,12 @@
         ],
         "caption": "The searcher's query hits the query service, which scans every document in the document store looking for the terms.",
         "links": [
-          "user-query"
+          "user-query",
+          {
+            "from": "QuerySvc",
+            "to": "DocStore",
+            "label": "scan every document"
+          }
         ],
         "highlight": [
           "QuerySvc",
@@ -522,10 +1722,11 @@
         "Establishing the scan-every-document baseline first makes it obvious why an inverted index exists and why it must be sharded and served via scatter-gather — every later step removes a specific pain from here."
       ],
       "probeLinks": [
+        "google-anatomy",
+        "lucene-docs",
+        "lucene-file-formats",
         "elasticsearch-docs",
-        "bigtable-paper",
-        "percolator-paper",
-        "lucene-docs"
+        "bigtable-paper"
       ],
       "recap": {
         "before": "Nothing.",
@@ -538,15 +1739,17 @@
           "why": "Per-query work scales with corpus size, so latency and cost are impossible at web scale.",
           "instead": "Build an inverted index once so a query is a posting-list lookup; shard it and scatter-gather for scale."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/01-naive.jpg"
     },
     {
       "id": "crawl",
       "title": "2. Crawl the Web with a URL Frontier",
       "description": [
-        "A crawler fleet fetches pages, but you can't just BFS naively: you must be polite (obey robots.txt, rate-limit per host), avoid re-fetching unchanged pages, and prioritize important/fresh URLs.",
+        "A crawler fleet fetches pages, but a naive breadth-first crawl won't do: you must be polite (obey robots.txt, rate-limit per host), avoid re-fetching unchanged pages, and prioritize important/fresh URLs.",
         "A URL frontier is a prioritized, politeness-aware queue: it hands out URLs respecting per-host delays and priority. Crawlers fetch, store the raw page, dedup by URL and content hash, and enqueue newly discovered links.",
-        "A seen-URL/content store prevents re-crawling the same page and detects duplicate content across URLs."
+        "Production crawling needs more than fetch-and-store. Canonicalize URLs (strip tracking params, resolve redirects) so the same page isn't crawled under many URLs; cache robots.txt per host so you don't refetch it every request; isolate DNS/fetch with timeouts; retry transient failures with exponential backoff and host-level backoff on 429/5xx; cluster near-duplicate content by hash; detect crawler traps (infinite calendars, faceted-URL explosions) and cap depth/URLs per host; and seed from sitemaps. A recrawl policy driven by each page's observed change frequency decides who gets re-fetched soon vs. rarely.",
+        "Underpinning all of this is a seen-URL/content store: it keys on both the canonical URL and a content hash, so it prevents re-crawling the same page and catches the same content served under different URLs."
       ],
       "view": {
         "nodes": [
@@ -581,10 +1784,13 @@
         }
       ],
       "probeLinks": [
-        "bigtable-paper",
-        "percolator-paper",
-        "lucene-docs",
-        "elasticsearch-docs"
+        "robots-rfc9309",
+        "sitemap-protocol",
+        "nutch-docs",
+        "heritrix",
+        "common-crawl",
+        "google-anatomy",
+        "bigtable-paper"
       ],
       "patterns": [
         "Politeness-aware crawl frontier"
@@ -602,6 +1808,23 @@
           "trap": "Naive BFS crawling without per-host limits.",
           "why": "You DDoS sites, get blocked, and waste budget re-fetching unchanged pages.",
           "instead": "A prioritized frontier with politeness and content-hash dedup."
+        },
+        {
+          "trap": "Treating every distinct URL as a distinct page.",
+          "why": "Tracking params, session IDs, and infinite faceted/calendar URLs explode the frontier and bloat the index with duplicates (crawler traps).",
+          "instead": "Canonicalize URLs, cluster by content hash, and cap depth/URLs per host."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A host starts returning 429/5xx (or its robots.txt suddenly disallows you).",
+          "expectedBehavior": "The crawler applies host-level backoff (raises next_fetch_at, slows that politeness bucket) and re-reads/respects the cached robots policy; it does not keep hammering.",
+          "mitigation": "Per-host backoff + retry budget with exponential delay; robots cache with TTL; give up after N failed attempts and lower priority."
+        },
+        {
+          "scenario": "A crawler trap (infinite calendar / faceted links) floods the frontier.",
+          "expectedBehavior": "Depth and per-host URL caps plus duplicate-cluster detection stop the explosion; the trap's near-identical pages are deduped by content hash.",
+          "mitigation": "Per-host URL budget, max crawl depth, content-hash near-dup clustering, and trap heuristics on URL patterns."
         }
       ],
       "flows": [
@@ -676,15 +1899,16 @@
             "Frontier"
           ]
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/02-crawl.jpg"
     },
     {
       "id": "index",
       "title": "3. Build the Inverted Index",
       "description": [
         "To answer 'which docs contain these words' fast, build an inverted index: for each term, a posting list of the documents (and positions) containing it — the opposite of scanning every document.",
-        "The indexing pipeline parses each stored doc, tokenizes/normalizes terms (lowercase, stemming), and writes postings. Indexing is a batch/stream pipeline that produces immutable index segments, periodically merged.",
-        "Also extract links to build the link graph used for query-independent scoring."
+        "The indexing pipeline parses each stored doc, assigns a compact internal docID, tokenizes/normalizes terms (lowercase, stemming), and writes postings. Concretely: a term dictionary maps each term to its posting list; postings are delta-encoded and compressed (docIDs are sorted and gap-encoded) so a multi-PB corpus stays affordable; and per-block skip lists / block-max metadata let query execution skip whole chunks of a posting list, which is why a posting-list lookup is fast even for common terms. Indexing is a batch/stream pipeline that produces immutable index segments, periodically merged.",
+        "The same pass also extracts each page's outbound links to build the link graph, which feeds the query-independent page scores (PageRank) used later at ranking time."
       ],
       "view": {
         "nodes": [
@@ -718,10 +1942,14 @@
         }
       ],
       "probeLinks": [
+        "google-anatomy",
+        "lucene-docs",
+        "lucene-file-formats",
         "elasticsearch-docs",
+        "mapreduce-paper",
         "bigtable-paper",
-        "percolator-paper",
-        "lucene-docs"
+        "reddit-search",
+        "linkedin-galene"
       ],
       "patterns": [
         "Inverted index"
@@ -733,15 +1961,16 @@
         "before": "Raw documents.",
         "after": "Term posting lists + a link graph.",
         "newRisk": "The index is far too large for one machine — it must be sharded, and queries must hit all shards."
-      }
+      },
+      "aiVisual": "assets/generated/ai-visuals/steps/03-index.jpg"
     },
     {
       "id": "serve",
       "title": "4. Shard the Index and Scatter-Gather Queries",
       "description": [
         "The index spans petabytes, so partition it by document: each shard holds the full inverted index for its slice of the corpus. (Document partitioning beats term partitioning here — each shard answers independently and load is even.)",
-        "A query is scattered to all shards in parallel; each returns its top-k candidates for the query, and an aggregator merges them. Replicate each shard for QPS and availability.",
-        "This scatter-gather is the latency challenge: total latency is the slowest shard, so you bound per-shard work and use the cheap first-phase scoring to limit candidates."
+        "A query is scattered to all shards in parallel; each returns its top-k candidates for the query, and an aggregator merges them. Replicate each shard for QPS and availability — concretely ~10K primary shards (~10M docs each) x ~3 replicas. 'Scatter to all shards' means hitting one chosen replica per primary partition, not broadcasting to every replica.",
+        "The basic path is: parse/rewrite the query -> scatter to one replica per partition -> per-shard top-k retrieval -> merge -> re-rank -> hydrate snippets. That is the clean partitioning lesson. Making that scatter-gather survive 100K QPS — broker fan-out topology, deadlines, hedging, top-k limits, partial results, and overload behavior — is involved enough that it gets its own sub-step (4b)."
       ],
       "view": {
         "nodes": [
@@ -800,7 +2029,8 @@
               "serve",
               "crawl"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-serve-opt1.jpg"
         },
         {
           "name": "Term partitioning",
@@ -821,7 +2051,8 @@
               "QuerySvc",
               {
                 "id": "TermShards",
-                "label": "Term-Partitioned Shards"
+                "label": "Term-Partitioned Shards",
+                "type": "index"
               },
               "ResultCache"
             ],
@@ -841,7 +2072,8 @@
             "groups": [
               "serve"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-serve-opt2.jpg"
         }
       ],
       "decisionPrompt": "Partition the index by document or by term? What does each do to a multi-term query?",
@@ -862,9 +2094,13 @@
         }
       ],
       "probeLinks": [
+        "tail-at-scale",
+        "two-level-retrieval",
+        "opensearch-concurrent-segment",
+        "linkedin-galene",
+        "facebook-graph-search",
         "lucene-docs",
         "elasticsearch-docs",
-        "pagerank-paper",
         "bigtable-paper"
       ],
       "patterns": [
@@ -876,15 +2112,9 @@
       ],
       "recap": {
         "before": "Monolithic index.",
-        "after": "Document-sharded, replicated index served via scatter-gather.",
-        "newRisk": "Merged candidates still need good ranking, and fanning out everything is expensive."
+        "after": "Document-sharded, replicated index served via basic scatter-gather.",
+        "newRisk": "Fanning out every cache-miss query to 10K shards is an enormous load — the serving path has to be hardened to survive 100K QPS (next sub-step)."
       },
-      "bottlenecks": [
-        {
-          "issue": "Tail latency: the slowest shard sets query latency.",
-          "mitigation": "Replicas + hedged requests; cap per-shard work; skip slow shards with partial results."
-        }
-      ],
       "flows": [
         {
           "name": "Scatter-gather query across shards",
@@ -978,7 +2208,7 @@
       "description": [
         "How you shard the index is a fork with big consequences. Document partitioning gives each shard the full index for a slice of documents: every shard can answer any query independently, load is even, and a multi-term query just runs locally per shard — but every query fans out to all shards (scatter-gather).",
         "Term partitioning splits by term (a shard owns certain terms' posting lists): a single-term query hits one shard, but a multi-term query must ship and intersect huge posting lists across shards, and popular terms create hotspots.",
-        "Web search overwhelmingly uses document partitioning — the scatter-gather cost is predictable and parallelizable, whereas term partitioning's cross-shard intersections and hotspots are worse at this scale."
+        "Web search uses document partitioning as the default — the scatter-gather cost is predictable and parallelizable, whereas term partitioning's cross-shard intersections and hotspots are worse at this scale. Real systems still add nuance on top: tiered indexes (a small hot tier served first), hybrid schemes, and special handling for very common terms — so 'document-partition everything' is the right starting point, not the whole story."
       ],
       "view": {
         "nodes": [
@@ -999,15 +2229,16 @@
           "term": "Document vs term partitioning",
           "definition": "Doc-partition = each shard has full postings for its docs (scatter-gather, even load); term-partition = shards own terms (single-term cheap, multi-term cross-shard expensive).",
           "whyItMatters": "It determines query fan-out, load balance, and hotspot behavior at web scale.",
-          "example": "Google/Elasticsearch use document partitioning + scatter-gather.",
+          "example": "Document partitioning + scatter-gather is the dominant web-search retrieval pattern (e.g. Elasticsearch shards, large web indexes) — though real systems layer tiering and hot-term handling on top.",
           "group": "Document vs Term Partitioning"
         }
       ],
       "probeLinks": [
+        "linkedin-galene",
+        "facebook-graph-search",
         "elasticsearch-docs",
         "bigtable-paper",
-        "percolator-paper",
-        "lucene-docs"
+        "lucene-file-formats"
       ],
       "traps": [
         {
@@ -1020,15 +2251,188 @@
         "before": "The index is sharded somehow.",
         "after": "Document partitioning chosen for even load and parallel scatter-gather.",
         "newRisk": "Every query touches all shards — tail latency is the slowest shard (addressed with replicas/hedging)."
-      }
+      },
+      "aiVisual": "assets/generated/ai-visuals/steps/05-partitioning-scheme.jpg"
+    },
+    {
+      "id": "serve-scale",
+      "parent": "serve",
+      "title": "4b. Make Scatter-Gather Survive 100K QPS",
+      "description": [
+        "Document partitioning is settled; now make the fan-out economical. The headline number is brutal: ~30K cache-miss QPS x ~10K shards = ~300M shard-requests/s, and each cache-miss query gathers ~10MB of top-k across the fleet. A single QuerySvc box opening 10K connections per query cannot do this — the serving topology has to absorb it.",
+        "Broker topology. Many stateless query frontends terminate user requests; each hands a parsed query to a broker that fans out. At 10K shards you don't fan out flat from one process — use a two-level (or n-ary) fan-out tree of broker workers, so each broker talks to a few hundred shards and an intermediate tier merges sub-results. This bounds per-process connections and lets merge happen hierarchically (early pruning at each level) instead of one box sorting a 10M-candidate set.",
+        "Per-replica load. ~30K cache-miss QPS x 10K shards spread over 3 replicas/shard is ~10K shard-requests/s per index server — that sets the per-server CPU/IO budget. If a shard's replicas can't hold ~10K req/s of top-k retrieval, you add replicas (hot shards get more) or treat each 'shard' as a logical partition spread across several serving nodes. Network: ~10MB gathered per miss x 30K miss QPS is hundreds of GB/s of internal egress, which is why top-k is hierarchically merged and pruned, not shipped whole to one aggregator.",
+        "Top-k discipline. Default to a small per-shard top-k (~100). 10K shards x top-100 is ~1M candidates before merge; phase-2 re-ranks only the top ~1000. Larger top-k (up to ~1000/shard) is reserved for rare queries that need deep recall — it is a deliberate, not default, cost because it multiplies both merge work and network.",
+        "Deadlines, hedging, partial results. The broker propagates a deadline so shards self-abort; it hedges a duplicate request to a second replica when the first is slow; and it drops shards that miss the deadline, returning partial results rather than blowing the sub-second budget.",
+        "Overload behavior. A 60-70% result-cache hit rate is what makes 100K QPS affordable, but it is not a complete overload story. Under a cache-miss burst the system also needs admission control / load shedding (shed or queue excess scatter-gathers), aggressive partial results (lower the deadline), hot-query precomputation and cache warming, and query classification (cheap path for common queries). A real 100K-QPS web search also tiers the index (a small hot tier served first) so most queries never touch the full fan-out."
+      ],
+      "view": {
+        "nodes": [
+          "User",
+          "QuerySvc",
+          "IndexShards",
+          "ResultCache"
+        ],
+        "caption": "Stateless query frontends check the result cache; on a miss a broker fan-out tree scatters to one replica per partition with deadlines and hedging, and merges hierarchically.",
+        "links": [
+          "user-query",
+          "query-resultcache",
+          "query-shards"
+        ],
+        "highlight": [
+          "QuerySvc",
+          "IndexShards"
+        ],
+        "groups": [
+          "serve"
+        ]
+      },
+      "decisionPrompt": "300M shard-requests/s on cache misses — what broker topology, per-replica load, top-k, and overload controls keep that sub-second?",
+      "concepts": [
+        {
+          "term": "Broker fan-out tree",
+          "definition": "A two-level (or n-ary) tree of broker workers that each fan out to a few hundred shards and merge sub-results hierarchically.",
+          "whyItMatters": "Bounds per-process connections and merge cost so no single box opens 10K connections or sorts a 10M-candidate set.",
+          "example": "Root broker -> ~32 intermediate brokers -> ~300 shards each; merge + prune at every level.",
+          "group": "Make Scatter-Gather Survive 100K QPS"
+        },
+        {
+          "term": "Deadline propagation + hedging",
+          "definition": "Send a per-request deadline shards self-abort on, and duplicate slow shard requests to a second replica.",
+          "whyItMatters": "Total latency is the slowest shard; deadlines + hedging bound the tail and yield partial results instead of timeouts.",
+          "example": "Hedge after p95; drop shards past the deadline and serve partial results.",
+          "group": "Make Scatter-Gather Survive 100K QPS"
+        }
+      ],
+      "probeLinks": [
+        "tail-at-scale",
+        "two-level-retrieval",
+        "opensearch-concurrent-segment",
+        "twitter-earlybird",
+        "linkedin-galene",
+        "reddit-search",
+        "elasticsearch-docs",
+        "lucene-docs"
+      ],
+      "whyNow": [
+        "Once the capacity model reveals 300M shard-requests/s, the design has to prove the serving fleet can absorb it — this is the senior/staff core of the case."
+      ],
+      "recap": {
+        "before": "Basic document-sharded scatter-gather.",
+        "after": "A broker fan-out tree with per-replica budgets, top-k discipline, deadlines/hedging, partial results, and overload controls.",
+        "newRisk": "Merged candidates still need good ranking; and at this QPS even cheap fan-out is heavy, so caching is mandatory."
+      },
+      "bottlenecks": [
+        {
+          "issue": "Tail latency: the slowest shard sets query latency across a 10K-way fan-out.",
+          "mitigation": "Replicas + hedged requests; per-shard deadline + cap on top-k work; skip slow shards with partial results; hierarchical merge so no single node sorts everything."
+        },
+        {
+          "issue": "Fan-out amplification: cache-miss QPS x shard count is huge (~30K x 10K ~= 300M shard-requests/s, ~10MB gathered per miss).",
+          "mitigation": "High result-cache hit rate to cut miss QPS; broker fan-out tree to bound connections; small default per-shard top-k with early pruning; index tiering and admission control / load shedding under bursts."
+        },
+        {
+          "issue": "Per-replica saturation: ~10K shard-requests/s per index server at 3x replication.",
+          "mitigation": "Add replicas to hot shards, or spread a logical shard over multiple serving nodes; balanced document partitioning so per-replica load is even."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "One replica goes slow (GC pause, hot shard) and threatens the deadline.",
+          "expectedBehavior": "The broker's hedge request to a second replica returns first; the slow shard's late reply is ignored. If no replica answers in time, that shard is dropped and the query returns partial results (partialResults=true, timedOutShards>0).",
+          "mitigation": "Request hedging + deadline propagation + partial-result merge; per-shard top-k cap to bound shard work."
+        },
+        {
+          "scenario": "Result-cache node fails and a burst of popular queries all miss at once (cache stampede).",
+          "expectedBehavior": "A single-flight / request-coalescing guard lets one query do the scatter-gather while duplicates wait for its result; admission control sheds excess miss traffic; serving degrades in load, not correctness.",
+          "mitigation": "Single-flight per query key, cache warming for top queries, TTL jitter so entries don't expire in lockstep, and load shedding on the cache-miss path."
+        },
+        {
+          "scenario": "A cache-miss burst pushes scatter QPS past fleet capacity.",
+          "expectedBehavior": "Admission control sheds or queues excess scatter-gathers and the broker tightens the deadline (more partial results) so latency for admitted queries stays bounded, rather than every query degrading together.",
+          "mitigation": "Load shedding / admission control, tighter deadlines under pressure, hot-query precomputation, index tiering so most queries hit the hot tier, and per-query-class budgets."
+        }
+      ],
+      "flows": [
+        {
+          "name": "Hierarchical broker fan-out under deadline",
+          "note": "A query frontend checks the result cache; on a miss a broker tree fans out to one replica per partition with a deadline, hedges slow replicas, and merges hierarchically, dropping shards that miss the deadline.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "QuerySvc",
+                "label": "Frontend / Broker"
+              },
+              {
+                "id": "ResultCache",
+                "label": "Result Cache"
+              },
+              {
+                "id": "IndexShards",
+                "label": "Shard Replicas"
+              }
+            ],
+            "messages": [
+              {
+                "from": "QuerySvc",
+                "to": "ResultCache",
+                "arrow": "->>",
+                "label": "cached query?"
+              },
+              {
+                "type": "alt",
+                "label": "cache miss",
+                "messages": [
+                  {
+                    "from": "QuerySvc",
+                    "to": "IndexShards",
+                    "arrow": "->>",
+                    "label": "fan-out tree: scatter w/ deadline (one replica/partition)"
+                  },
+                  {
+                    "from": "IndexShards",
+                    "to": "QuerySvc",
+                    "arrow": "-->>",
+                    "label": "top-k per shard (hierarchically merged + pruned)"
+                  },
+                  {
+                    "from": "QuerySvc",
+                    "to": "IndexShards",
+                    "arrow": "->>",
+                    "label": "hedge slow replica; drop shards past deadline"
+                  }
+                ],
+                "else": {
+                  "label": "cache hit",
+                  "messages": [
+                    {
+                      "from": "ResultCache",
+                      "to": "QuerySvc",
+                      "arrow": "-->>",
+                      "label": "cached results (servedFromCache)"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "QuerySvc",
+            "IndexShards"
+          ]
+        }
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/06-serve-scale.jpg"
     },
     {
       "id": "rank",
       "title": "5. Rank Results",
       "description": [
         "Relevance is more than 'contains the words'. Use a two-phase approach: each shard cheaply retrieves and scores candidates (e.g. TF-IDF/BM25 text relevance), then the aggregator re-ranks the merged candidate set with a richer model.",
-        "Blend signals: text relevance, query-independent page score (link-graph authority like PageRank), freshness, and quality. The expensive re-rank runs only on the small merged candidate set, not the whole corpus.",
-        "Query-independent scores (page authority) are precomputed offline from the link graph so they're a cheap lookup at query time."
+        "Blend signals: text relevance, query-independent page score (link-graph authority like PageRank), freshness, and a spam/quality score. The expensive re-rank runs only on the small merged candidate set, not the whole corpus.",
+        "Defending quality is not optional for web search: a per-doc spam/quality score (computed offline from link patterns, content heuristics, and known-bad signals, stored on the document and looked up at re-rank time) demotes link farms and low-quality pages, and suppressed/takedown docs are filtered out entirely. Freshness scoring biases recent content up for time-sensitive queries.",
+        "Query-independent scores (page authority and spam/quality) are precomputed offline from the link graph and content so they're a cheap lookup at query time.",
+        "Out of scope here (worth naming): ads, personalized ranking, semantic/vector retrieval, query understanding (synonyms/intent), and safe-search filtering depth — this case focuses on the core text + authority + quality ranking."
       ],
       "view": {
         "nodes": [
@@ -1055,11 +2459,11 @@
       "options": [
         {
           "name": "Two-phase: cheap recall + learned re-rank (default)",
-          "description": "Phase-1 BM25 narrows matches to a small candidate set per shard, then a learned model re-ranks the merged top candidates using text, authority, and freshness signals.",
+          "description": "Phase-1 BM25 narrows matches to a small candidate set per shard, then a learned model re-ranks the merged top candidates using text, authority, freshness, and spam/quality signals.",
           "pros": [
             "Phase-1 BM25 cheaply narrows 100K matches to a small candidate set per shard.",
             "The expensive learned model runs only on the merged top candidates, bounding latency.",
-            "Blends text relevance, precomputed page authority, and freshness for strong final ordering."
+            "Blends text relevance, precomputed page authority, freshness, and a spam/quality score for strong, abuse-resistant ordering."
           ],
           "cons": [
             "A good document can be cut in phase 1 before the re-ranker ever sees it (recall ceiling).",
@@ -1087,7 +2491,8 @@
               "serve",
               "crawl"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/07-rank-opt1.jpg"
         },
         {
           "name": "Single-pass full scoring of all matches",
@@ -1123,7 +2528,8 @@
             "groups": [
               "serve"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/07-rank-opt2.jpg"
         },
         {
           "name": "Static link-authority ordering (PageRank only)",
@@ -1131,11 +2537,12 @@
           "pros": [
             "Query-independent page score is precomputed offline — a cheap lookup at query time.",
             "Very fast: no per-query relevance model to run.",
-            "Strong against spam/low-quality pages via link-graph authority."
+            "Link authority gives a baseline quality signal — genuinely well-linked pages rank above obscure ones."
           ],
           "cons": [
             "Ignores query-specific text relevance, so results match authority more than intent.",
             "Same authoritative pages float up regardless of the actual query terms.",
+            "Vulnerable to link manipulation: link farms and SEO abuse game the graph, which is exactly why explicit spam/quality signals are needed on top of PageRank.",
             "Authority scores lag the live graph until the next recompute."
           ],
           "view": {
@@ -1160,7 +2567,8 @@
               "serve",
               "crawl"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/07-rank-opt3.jpg"
         }
       ],
       "decisionPrompt": "You have 100K matching docs. How do you rank them well without scoring all 100K expensively?",
@@ -1182,8 +2590,13 @@
       ],
       "probeLinks": [
         "pagerank-paper",
-        "lucene-docs",
-        "elasticsearch-docs"
+        "two-level-retrieval",
+        "solr-ltr",
+        "google-ranking-systems",
+        "google-spam-policies",
+        "etsy-search-ranking",
+        "linkedin-galene",
+        "facebook-graph-search"
       ],
       "patterns": [
         "Two-phase ranking"
@@ -1269,9 +2682,10 @@
       "id": "cache",
       "title": "6. Caching for QPS and Latency",
       "description": [
-        "Query popularity is heavily skewed: a small set of queries recurs constantly. Cache full results for popular queries so repeats skip scatter-gather entirely.",
+        "Query popularity is heavily skewed: a small set of queries recurs constantly. Cache full results for popular queries so repeats skip scatter-gather entirely. Assume a ~60-70% hit rate on the result cache — that is what turns ~100K QPS into only ~30-40K QPS actually scattering to shards, which is what makes the fleet size affordable.",
         "Cache hot document metadata/snippets so result hydration doesn't refetch per query. Both caches cut both latency and load.",
-        "Bound cache staleness with TTLs so fresh content still surfaces; invalidate or expire result-cache entries when the index for those terms updates materially."
+        "Bound cache staleness with TTLs (short for fresh/news-like queries, longer for stable ones) so fresh content still surfaces; invalidate or expire result-cache entries when a new index segment publishes documents matching those terms. Protect against stampede: when a hot entry expires, a single-flight guard lets one request recompute while duplicates wait, and TTL jitter avoids synchronized expiry. Warm the cache for the top queries after a big crawl/segment publish.",
+        "Operate the caches by metric: alert on result-cache and doc-cache hit rate (a sudden drop signals a stampede or eviction storm), single-flight wait/coalesce rate, stale-hit rate, and invalidation lag after a segment publish. A hit-rate collapse is the early warning that the scatter-gather fleet is about to be overloaded."
       ],
       "view": {
         "nodes": [
@@ -1301,10 +2715,10 @@
         "Result + doc caching"
       ],
       "probeLinks": [
-        "pagerank-paper",
-        "mapreduce-paper",
+        "tail-at-scale",
+        "elasticsearch-docs",
         "bigtable-paper",
-        "percolator-paper"
+        "reddit-search"
       ],
       "whyNow": [
         "Caching is how the QPS target is actually met affordably; recognizing query skew is the practical insight."
@@ -1322,28 +2736,33 @@
         "before": "Every query did full work.",
         "after": "Popular queries and hot docs served from cache.",
         "newRisk": "Stale results vs freshness; the index must keep updating as the crawl finds new content."
-      }
+      },
+      "aiVisual": "assets/generated/ai-visuals/steps/08-cache.jpg"
     },
     {
       "id": "freshness",
       "title": "7. Freshness and Continuous Indexing",
       "description": [
         "The crawl never stops, so the index must update continuously. Indexing produces immutable segments that are added and periodically merged; serving reads the current segment set, so new content appears without rebuilding the whole index.",
-        "Prioritize freshness in the crawl frontier (re-crawl fast-changing or important pages sooner) and propagate new segments to shards quickly so breaking content is searchable within a bounded time.",
-        "Recompute query-independent scores (link graph / PageRank) periodically as the graph evolves; serve with the latest available scores."
+        "Changes and deletes need real semantics, not just appends. Because segments are immutable, an updated page is written as a new version in a new segment and the old version is marked in a tombstone list so serving skips it; deletions, redirects, and takedowns/spam suppression are the same tombstone mechanism. The serving visibility contract is generation-based: an indexer builds a segment, validates it, then flips a publish marker that bumps the generation; readers atomically refresh to the latest published generation, so a query sees a consistent segment set. A bad segment is handled by not publishing it (or rolling the generation back), and background merge compacts small segments and drops tombstoned docs.",
+        "Prioritize freshness in the crawl frontier (re-crawl fast-changing or important pages sooner, driven by observed change frequency) and propagate new segments to shards quickly so breaking content is searchable within a bounded time. Tie result-cache invalidation to segment publishes that touch matching terms/docs, not a vague 'material' rule.",
+        "Recompute query-independent scores (link graph / PageRank) periodically as the graph evolves; serve with the latest available scores.",
+        "Operate the pipeline by metric: alert on segment build lag, validation failure rate, the live publish generation per shard, merge backlog, tombstone ratio, and rollback count. A stuck publish generation or a growing merge backlog means freshness is silently degrading even while serving looks healthy."
       ],
       "view": {
         "nodes": [
           "Crawler",
           "Frontier",
+          "DocStore",
           "Indexer",
           "IndexShards",
           "LinkGraph"
         ],
-        "caption": "The crawler and frontier keep discovering pages while the indexing pipeline continuously writes postings to the index shards and updates the link graph.",
+        "caption": "The crawler and frontier keep discovering pages into the document store while the indexing pipeline continuously writes postings to the index shards and updates the link graph.",
         "links": [
           "crawler-frontier",
           "frontier-crawler",
+          "crawler-doc",
           "doc-indexer",
           "indexer-shards",
           "indexer-linkgraph"
@@ -1390,7 +2809,8 @@
             "groups": [
               "crawl"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/09-freshness-opt1.jpg"
         },
         {
           "name": "Periodic full index rebuild",
@@ -1422,7 +2842,8 @@
             "groups": [
               "crawl"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/09-freshness-opt2.jpg"
         }
       ],
       "decisionPrompt": "How does a brand-new news article become searchable minutes after publication?",
@@ -1436,10 +2857,14 @@
         }
       ],
       "probeLinks": [
-        "elasticsearch-docs",
-        "pagerank-paper",
-        "bigtable-paper",
-        "percolator-paper"
+        "google-caffeine",
+        "percolator-paper",
+        "elastic-refresh",
+        "lucene-file-formats",
+        "twitter-earlybird",
+        "linkedin-galene",
+        "reddit-search",
+        "sitemap-protocol"
       ],
       "whyNow": [
         "Closing on freshness shows search is a living pipeline, not a one-time build — tying crawl priority and incremental indexing to the freshness requirement."
@@ -1454,13 +2879,23 @@
           "scenario": "An index shard is lost.",
           "expectedBehavior": "A replica serves it; the shard can be rebuilt from the document store / segments.",
           "mitigation": "Shard replication + rebuildable index from durable docs."
+        },
+        {
+          "scenario": "A bad segment is built (corrupt postings / quality regression) during a high-news crawl.",
+          "expectedBehavior": "Validation fails the segment so the publish marker never advances to it, or the generation is rolled back; readers keep serving the last good generation. Stale result-cache entries are flushed on the eventual good publish.",
+          "mitigation": "Build -> validate -> atomic publish-marker flip with rollback; generation-based reader refresh; cache invalidation tied to publishes."
+        },
+        {
+          "scenario": "A new ranker model or quality-score recompute regresses result quality after rollout.",
+          "expectedBehavior": "The ranker version is a tracked control-plane value; quality metrics (spam demotion rate, click/feedback indicators if in scope) flag the regression and the serving fleet is rolled back to the previous model version, decoupled from segment generation so ranking can revert without re-publishing the index.",
+          "mitigation": "Versioned ranker models with canary/shadow evaluation before full rollout, quality-metric alerts, and one-flip rollback to the last good model version; flush/repopulate result cache on the revert."
         }
       ]
     }
   ],
   "finalDesign": {
     "title": "Final Design — Web Search Engine",
-    "description": "A crawler fleet pulls from a politeness-aware URL frontier, dedups by URL/content, and stores raw pages. An indexing pipeline parses docs into a document-partitioned inverted index (immutable, merged segments) and builds a link graph for query-independent page scores. The query service checks a result cache, otherwise scatters the query to all (replicated) shards, gathers per-shard top-k candidates, and a ranker re-ranks the merged set blending text relevance with page authority and freshness; snippets hydrate from a doc cache. Popular queries and hot docs are cached; the crawl + segment-based indexing run continuously so new content is searchable within a bounded time.",
+    "description": "A crawler fleet pulls from a politeness-aware URL frontier (canonicalization, robots cache, host backoff, recrawl by change frequency), dedups by URL/content, and stores raw pages. An indexing pipeline parses docs into a document-partitioned inverted index (~10K shards x ~3 replicas) of immutable, generation-versioned segments, and builds a link graph for query-independent page and spam/quality scores. The query service parses/rewrites the query, checks a result cache (~60-70% hit), otherwise a broker scatters to one replica per partition with deadline propagation and hedging, gathers per-shard top-k, and a ranker re-ranks the merged set blending text relevance, page authority, freshness, and quality (suppressing spam/takedown docs); snippets hydrate from a doc cache, with partial results when a shard misses its deadline. Popular queries and hot docs are cached (single-flight + TTL jitter against stampede); the crawl + segment-based indexing run continuously, publishing new generations atomically so new content is searchable within a bounded time and bad segments can be rolled back. Explicitly out of scope: ads, personalized ranking, semantic/vector retrieval, query suggestions, image/video search, and legal takedown workflow.",
     "view": {
       "nodes": [
         "Crawler",
@@ -1496,7 +2931,8 @@
         "crawl",
         "serve"
       ]
-    }
+    },
+    "aiVisual": "assets/generated/ai-visuals/final-design.jpg"
   },
   "satisfies": {
     "functional": [
@@ -1510,6 +2946,14 @@
       {
         "requirement": "Answer keyword queries",
         "how": "Inverted index + scatter-gather over shards.",
+        "steps": [
+          "index",
+          "serve"
+        ]
+      },
+      {
+        "requirement": "Multi-term queries and basic operators",
+        "how": "Query parse/rewrite turns phrases and +/-/OR operators into posting-list intersections/unions; positions in postings support phrase (\"exact\") matching.",
         "steps": [
           "index",
           "serve"
@@ -1534,17 +2978,19 @@
     "nonFunctional": [
       {
         "requirement": "Sub-second p99",
-        "how": "Parallel scatter-gather + caching + bounded per-shard work.",
+        "how": "Parallel scatter-gather + broker deadlines/hedging/partial results + caching + bounded per-shard work.",
         "steps": [
           "serve",
+          "serve-scale",
           "cache"
         ]
       },
       {
         "requirement": "~100K QPS",
-        "how": "Shard replication + result/doc caches.",
+        "how": "Shard replication + broker fan-out tree + per-replica budgets + overload controls + result/doc caches.",
         "steps": [
           "serve",
+          "serve-scale",
           "cache"
         ]
       },
@@ -1646,9 +3092,20 @@
   "toProbeFurther": {
     "links": [
       {
+        "id": "google-anatomy",
+        "group": "Foundational Search Architecture",
+        "groupDescription": "Papers that explain the core web-search architecture, distributed processing, and link-analysis foundations.",
+        "title": "The Anatomy of a Large-Scale Hypertextual Web Search Engine",
+        "url": "https://research.google/pubs/the-anatomy-of-a-large-scale-hypertextual-web-search-engine/",
+        "source": "Google Research",
+        "type": "Paper",
+        "why": "Describes the original Google system end to end: crawling, indexing, ranking, and the scaling pressures that motivate the interview design.",
+        "year": "1998"
+      },
+      {
         "id": "pagerank-paper",
-        "group": "Search and Retrieval",
-        "groupDescription": "Indexing, ranking, crawling, geo search, and vector retrieval references.",
+        "group": "Foundational Search Architecture",
+        "groupDescription": "Papers that explain the core web-search architecture, distributed processing, and link-analysis foundations.",
         "title": "The PageRank Citation Ranking",
         "url": "https://research.google/pubs/the-pagerank-citation-ranking-bringing-order-to-the-web/",
         "source": "Google Research",
@@ -1658,8 +3115,8 @@
       },
       {
         "id": "mapreduce-paper",
-        "group": "Search and Retrieval",
-        "groupDescription": "Indexing, ranking, crawling, geo search, and vector retrieval references.",
+        "group": "Foundational Search Architecture",
+        "groupDescription": "Papers that explain the core web-search architecture, distributed processing, and link-analysis foundations.",
         "title": "MapReduce: Simplified Data Processing on Large Clusters",
         "url": "https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/",
         "source": "Google Research",
@@ -1669,8 +3126,8 @@
       },
       {
         "id": "bigtable-paper",
-        "group": "Distributed Data",
-        "groupDescription": "Primary papers and docs for storage, replication, partitioning, consistency, and caching.",
+        "group": "Indexing, Storage, and Freshness",
+        "groupDescription": "Search-index internals, storage layers, segment visibility, and continuous update mechanics.",
         "title": "Bigtable: A Distributed Storage System for Structured Data",
         "url": "https://research.google/pubs/bigtable-a-distributed-storage-system-for-structured-data/",
         "source": "Google Research",
@@ -1680,8 +3137,8 @@
       },
       {
         "id": "percolator-paper",
-        "group": "Search and Retrieval",
-        "groupDescription": "Indexing, ranking, crawling, geo search, and vector retrieval references.",
+        "group": "Indexing, Storage, and Freshness",
+        "groupDescription": "Search-index internals, storage layers, segment visibility, and continuous update mechanics.",
         "title": "Large-scale Incremental Processing Using Distributed Transactions and Notifications",
         "url": "https://research.google/pubs/large-scale-incremental-processing-using-distributed-transactions-and-notifications/",
         "source": "Google Research",
@@ -1690,9 +3147,20 @@
         "year": "2010"
       },
       {
+        "id": "google-caffeine",
+        "group": "Indexing, Storage, and Freshness",
+        "groupDescription": "Search-index internals, storage layers, segment visibility, and continuous update mechanics.",
+        "title": "Our New Search Index: Caffeine",
+        "url": "https://developers.google.com/search/blog/2010/06/our-new-search-index-caffeine",
+        "source": "Google Search Central",
+        "type": "Case study",
+        "why": "Connects continuous indexing to user-visible freshness and explains why new content should publish in small increments instead of full rebuilds.",
+        "year": "2010"
+      },
+      {
         "id": "lucene-docs",
-        "group": "Search and Retrieval",
-        "groupDescription": "Indexing, ranking, crawling, geo search, and vector retrieval references.",
+        "group": "Indexing, Storage, and Freshness",
+        "groupDescription": "Search-index internals, storage layers, segment visibility, and continuous update mechanics.",
         "title": "Apache Lucene Core",
         "url": "https://lucene.apache.org/core/",
         "source": "Apache Lucene",
@@ -1700,9 +3168,19 @@
         "why": "Foundational search-library reference for indexing, analyzers, scoring, and query execution."
       },
       {
+        "id": "lucene-file-formats",
+        "group": "Indexing, Storage, and Freshness",
+        "groupDescription": "Search-index internals, storage layers, segment visibility, and continuous update mechanics.",
+        "title": "Apache Lucene 9.12 Index File Formats",
+        "url": "https://lucene.apache.org/core/9_12_1/core/org/apache/lucene/codecs/lucene912/package-summary.html",
+        "source": "Apache Lucene",
+        "type": "Docs",
+        "why": "Shows how Lucene represents inverted indexes, segments, postings, live documents, and skip data that make the structured design concrete."
+      },
+      {
         "id": "elasticsearch-docs",
-        "group": "Search and Retrieval",
-        "groupDescription": "Indexing, ranking, crawling, geo search, and vector retrieval references.",
+        "group": "Indexing, Storage, and Freshness",
+        "groupDescription": "Search-index internals, storage layers, segment visibility, and continuous update mechanics.",
         "title": "Elasticsearch Reference",
         "url": "https://www.elastic.co/guide/en/elasticsearch/reference/current/index.html",
         "source": "Elastic",
@@ -1710,9 +3188,19 @@
         "why": "Operational reference for shards, inverted indexes, refresh, search APIs, and aggregations."
       },
       {
+        "id": "elastic-refresh",
+        "group": "Indexing, Storage, and Freshness",
+        "groupDescription": "Search-index internals, storage layers, segment visibility, and continuous update mechanics.",
+        "title": "The Refresh Parameter",
+        "url": "https://www.elastic.co/docs/reference/elasticsearch/rest-apis/refresh-parameter",
+        "source": "Elastic",
+        "type": "Docs",
+        "why": "Grounds the freshness discussion in a real visibility contract: writes become searchable after refresh rather than immediately by default."
+      },
+      {
         "id": "nutch-docs",
-        "group": "Search and Retrieval",
-        "groupDescription": "Indexing, ranking, crawling, geo search, and vector retrieval references.",
+        "group": "Crawling and Web Corpus",
+        "groupDescription": "Crawler behavior, standards, frontier implementation, and public web-corpus references.",
         "title": "Apache Nutch",
         "url": "https://nutch.apache.org/",
         "source": "Apache Nutch",
@@ -1721,17 +3209,169 @@
       },
       {
         "id": "heritrix",
-        "group": "Search and Retrieval",
-        "groupDescription": "Indexing, ranking, crawling, geo search, and vector retrieval references.",
+        "group": "Crawling and Web Corpus",
+        "groupDescription": "Crawler behavior, standards, frontier implementation, and public web-corpus references.",
         "title": "Heritrix Web Crawler",
         "url": "https://github.com/internetarchive/heritrix3",
         "source": "Internet Archive",
         "type": "Repository",
         "why": "Production-grade archival crawler codebase for frontier and politeness mechanics."
+      },
+      {
+        "id": "robots-rfc9309",
+        "group": "Crawling and Web Corpus",
+        "groupDescription": "Crawler behavior, standards, frontier implementation, and public web-corpus references.",
+        "title": "RFC 9309: Robots Exclusion Protocol",
+        "url": "https://www.ietf.org/rfc/rfc9309.html",
+        "source": "IETF",
+        "type": "Standard",
+        "why": "Defines the crawler access rules, parsing behavior, and caching considerations behind polite robots.txt handling.",
+        "year": "2022"
+      },
+      {
+        "id": "sitemap-protocol",
+        "group": "Crawling and Web Corpus",
+        "groupDescription": "Crawler behavior, standards, frontier implementation, and public web-corpus references.",
+        "title": "Sitemaps.org Protocol",
+        "url": "https://www.sitemaps.org/",
+        "source": "sitemaps.org",
+        "type": "Docs",
+        "why": "Explains how publishers expose URL and update metadata that a frontier can use for discovery and recrawl priority."
+      },
+      {
+        "id": "common-crawl",
+        "group": "Crawling and Web Corpus",
+        "groupDescription": "Crawler behavior, standards, frontier implementation, and public web-corpus references.",
+        "title": "Common Crawl",
+        "url": "https://commoncrawl.org/",
+        "source": "Common Crawl Foundation",
+        "type": "Dataset",
+        "why": "Provides scale context for public web crawling and a concrete corpus readers can inspect when thinking about crawl output."
+      },
+      {
+        "id": "tail-at-scale",
+        "group": "Serving, Latency, and Query Evaluation",
+        "groupDescription": "Fan-out serving, tail latency, top-k retrieval, and per-shard search execution.",
+        "title": "The Tail at Scale",
+        "url": "https://research.google/pubs/the-tail-at-scale/",
+        "source": "Google Research",
+        "type": "Paper",
+        "why": "Explains why scatter-gather search must handle stragglers, deadlines, hedged requests, and tail latency as first-class design concerns.",
+        "year": "2013"
+      },
+      {
+        "id": "two-level-retrieval",
+        "group": "Serving, Latency, and Query Evaluation",
+        "groupDescription": "Fan-out serving, tail latency, top-k retrieval, and per-shard search execution.",
+        "title": "Efficient Query Evaluation Using a Two-Level Retrieval Process",
+        "url": "https://research.google/pubs/efficient-query-evaluation-using-a-two-level-retrieval-process/",
+        "source": "Google Research",
+        "type": "Paper",
+        "why": "Motivates the cheap candidate retrieval plus expensive reranking split used to keep query evaluation bounded.",
+        "year": "2003"
+      },
+      {
+        "id": "opensearch-concurrent-segment",
+        "group": "Serving, Latency, and Query Evaluation",
+        "groupDescription": "Fan-out serving, tail latency, top-k retrieval, and per-shard search execution.",
+        "title": "Introducing Concurrent Segment Search in OpenSearch",
+        "url": "https://opensearch.org/blog/concurrent_segment_search/",
+        "source": "OpenSearch",
+        "type": "Case study",
+        "why": "Shows how a Lucene-based shard can split work across index segments and reduce shard-level query latency before the coordinator merge."
+      },
+      {
+        "id": "linkedin-galene",
+        "group": "Production Case Studies",
+        "groupDescription": "Shipped search systems and company migration stories with concrete operational lessons.",
+        "title": "Did You Mean Galene?",
+        "url": "https://www.linkedin.com/blog/engineering/search/did-you-mean-galene",
+        "source": "LinkedIn Engineering",
+        "type": "Case study",
+        "why": "Details a Lucene-backed production search architecture with query flow, early termination, live updates, and index-segment tradeoffs."
+      },
+      {
+        "id": "twitter-earlybird",
+        "group": "Production Case Studies",
+        "groupDescription": "Shipped search systems and company migration stories with concrete operational lessons.",
+        "title": "Earlybird: Real-Time Search at Twitter",
+        "url": "https://cs.uwaterloo.ca/~jimmylin/publications/Busch_etal_ICDE2012.pdf",
+        "source": "Twitter / University of Waterloo",
+        "type": "Paper",
+        "why": "Describes a real-time inverted-index serving engine where newly created content becomes searchable within seconds.",
+        "year": "2012"
+      },
+      {
+        "id": "facebook-graph-search",
+        "group": "Production Case Studies",
+        "groupDescription": "Shipped search systems and company migration stories with concrete operational lessons.",
+        "title": "Under the Hood: Building Out the Infrastructure for Graph Search",
+        "url": "https://engineering.fb.com/2013/03/06/core-infra/under-the-hood-building-out-the-infrastructure-for-graph-search/",
+        "source": "Meta Engineering",
+        "type": "Case study",
+        "why": "Explains how Facebook extended Unicorn from an inverted-index lookup system into a large-scale search backend.",
+        "year": "2013"
+      },
+      {
+        "id": "reddit-search",
+        "group": "Production Case Studies",
+        "groupDescription": "Shipped search systems and company migration stories with concrete operational lessons.",
+        "title": "The Search for Better Search at Reddit",
+        "url": "https://redditinc.com/news/the-search-for-better-search-at-reddit",
+        "source": "Reddit Engineering",
+        "type": "Case study",
+        "why": "Shows an end-to-end search migration with ingestion simplification, live relevance updates, rollout metrics, and latency/cost results.",
+        "year": "2017"
+      },
+      {
+        "id": "etsy-search-ranking",
+        "group": "Production Case Studies",
+        "groupDescription": "Shipped search systems and company migration stories with concrete operational lessons.",
+        "title": "Deep Learning for Search Ranking at Etsy",
+        "url": "https://www.etsy.com/codeascraft/deep-learning-for-search-ranking-at-etsy",
+        "source": "Etsy Engineering",
+        "type": "Case study",
+        "why": "Demonstrates second-pass ranking evolution from tree models to neural models and the serving implications of richer rankers.",
+        "year": "2022"
+      },
+      {
+        "id": "solr-ltr",
+        "group": "Ranking and Quality",
+        "groupDescription": "Ranking models, relevance signals, spam controls, and evaluation-oriented references.",
+        "title": "Learning To Rank",
+        "url": "https://solr.apache.org/guide/solr/latest/query-guide/learning-to-rank.html",
+        "source": "Apache Solr",
+        "type": "Docs",
+        "why": "Documents the common production pattern of retrieving top candidates cheaply and reranking them with a trained model."
+      },
+      {
+        "id": "google-ranking-systems",
+        "group": "Ranking and Quality",
+        "groupDescription": "Ranking models, relevance signals, spam controls, and evaluation-oriented references.",
+        "title": "A Guide to Google Search Ranking Systems",
+        "url": "https://developers.google.com/search/docs/appearance/ranking-systems-guide",
+        "source": "Google Search Central",
+        "type": "Docs",
+        "why": "Frames ranking as many signals and systems rather than a single score, including page-level and site-wide quality signals."
+      },
+      {
+        "id": "google-spam-policies",
+        "group": "Ranking and Quality",
+        "groupDescription": "Ranking models, relevance signals, spam controls, and evaluation-oriented references.",
+        "title": "Spam Policies for Google Web Search",
+        "url": "https://developers.google.com/search/docs/essentials/spam-policies",
+        "source": "Google Search Central",
+        "type": "Docs",
+        "why": "Gives concrete categories of adversarial content and ranking manipulation that a web-search quality pipeline must detect or demote."
       }
     ]
   },
   "assets": {
     "icon": "icon.png"
-  }
+  },
+  "aiVisuals": {
+    "requirements": "assets/generated/ai-visuals/requirements.jpg",
+    "capacity": "assets/generated/ai-visuals/capacity.jpg"
+  },
+  "explainerComic": "assets/generated/comic/interview-comic.jpg"
 }

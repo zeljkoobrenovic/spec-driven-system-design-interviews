@@ -257,7 +257,7 @@
   "capacityDiagram": [
     "graph LR",
     "  Tx[High charge volume]",
-    "  Exact[Exactly-once charge]",
+    "  Exact[Exactly-once effect]",
     "  Webhook[Reliable webhooks]",
     "  Tx --> Exact",
     "  Tx --> Webhook"
@@ -272,45 +272,66 @@
     ],
     "nonFunctional": [
       "Correctness over availability — never double-charge or lose a charge.",
-      "Idempotent API: a retried charge request charges at most once.",
+      "Idempotent API: a retried charge request charges at most once (exactly-once external effect via idempotency + durable state + reconciliation, not a generic distributed-systems guarantee).",
       "PCI compliance: minimize the surface that touches raw card data.",
       "Reliable webhooks: every event is eventually delivered (at-least-once).",
-      "Auditable: every money movement is recorded and reconcilable."
+      "Auditable: every money movement is recorded and reconcilable.",
+      "Scoped out (extensions, not gaps): 3DS/SCA customer authentication, disputes/chargebacks, multi-currency + FX, and merchant KYC/onboarding + bank-account verification are deliberately out of the core path — each is sketched in the follow-ups so its absence is a scope choice, not an oversight."
     ]
   },
   "capacity": [
     {
       "label": "Charge volume",
-      "value": "high, spiky",
-      "note": "Peaks on sales/holidays."
+      "value": "~2k charges/sec avg, ~10k/sec peak",
+      "note": "~2k/sec average sustained over a day is ~173M charges/day; the ~10k/sec peak is a ~5x holiday/flash-sale multiplier. All downstream counts below are derived from a ~173M charges/day baseline."
     },
     {
       "label": "Charge semantics",
-      "value": "exactly-once",
-      "note": "Idempotency-key enforced."
+      "value": "exactly-once external effect",
+      "note": "Idempotency key + durable state + reconciliation — not a generic distributed-systems guarantee."
     },
     {
-      "label": "PSP latency",
-      "value": "hundreds of ms",
-      "note": "External network call dominates."
+      "label": "Sync charge latency",
+      "value": "~300–800 ms p99",
+      "note": "Dominated by the external acquirer authorize/capture call."
     },
     {
-      "label": "Webhook delivery",
-      "value": "at-least-once",
-      "note": "Retried; merchants dedup."
+      "label": "Async work",
+      "value": "settlement, webhooks, reconciliation, payouts",
+      "note": "Decoupled from the sync path; runs on queues/jobs, not the request thread."
+    },
+    {
+      "label": "Webhook fan-out",
+      "value": "~2–3 events/charge, at-least-once",
+      "note": "charge.succeeded, refund.created, payout.paid, ... At ~173M charges/day that is ~350–500M events/day. The ~1.3x retry multiplier applies to outbound delivery attempts (HTTP calls), not to the event count, so ~450–650M delivery attempts/day; merchants dedup on event id."
+    },
+    {
+      "label": "Ledger entries",
+      "value": "~350M–1B entries/day",
+      "note": "Each charge posts a balanced double-entry transaction of 2–6 entries (capture, fee, plus reserve/refund legs). At ~173M charges/day that is ~350M–1B ledger_entries rows/day; this counts ledger lines only."
+    },
+    {
+      "label": "Total persisted rows",
+      "value": "~1–1.5B rows/day, ~12–20k writes/sec avg",
+      "note": "Per charge: 1 charge + 1 idempotency + 1+ payment_attempt + 2–6 ledger entries + 1+ webhook_event + 1+ delivery_attempt + ~1 reconciliation match ≈ 7–13 persisted rows. At ~10k charges/sec peak that is ~70k–130k writes/sec before retries — the number that motivates sharding the charge store."
     },
     {
       "label": "Payout cadence",
-      "value": "daily/scheduled",
-      "note": "Aggregate ledger balances."
+      "value": "daily/scheduled per merchant",
+      "note": "Aggregate available ledger balance at a cutoff, one PSP transfer per merchant."
+    },
+    {
+      "label": "Retention & storage",
+      "value": "7+ years for money records",
+      "note": "Charges/ledger/payouts kept for audit/compliance; idempotency keys expire in ~24h. Tens of TB/year growth — motivates sharding the charge store and async queues."
     }
   ],
   "api": [
     {
       "method": "POST",
       "path": "/v1/charges",
-      "description": "Charge a tokenized card. Idempotent on the Idempotency-Key header.",
-      "request": "{ \"amount\": 2000, \"currency\": \"usd\", \"source\": \"tok_9\" }  (Idempotency-Key: k_1)",
+      "description": "Charge a tokenized card. Authenticated by merchant API key; idempotent on the Idempotency-Key header (same key + same body replays the original result, same key + different body returns 409).",
+      "request": "{ \"amount\": 2000, \"currency\": \"usd\", \"source\": \"tok_9\", \"capture\": true, \"description\": \"...\", \"metadata\": {} }  (Authorization: Bearer sk_live_..., Idempotency-Key: k_1)",
       "response": "{ \"chargeId\": \"ch_9\", \"status\": \"succeeded\" }",
       "sequence": {
         "participants": [
@@ -365,9 +386,15 @@
               },
               {
                 "from": "ChargeSvc",
-                "to": "Merchant",
+                "to": "API",
                 "arrow": "-->>",
                 "label": "succeeded"
+              },
+              {
+                "from": "API",
+                "to": "Merchant",
+                "arrow": "-->>",
+                "label": "200 succeeded"
               }
             ],
             "else": {
@@ -375,9 +402,15 @@
               "messages": [
                 {
                   "from": "ChargeSvc",
-                  "to": "Merchant",
+                  "to": "API",
                   "arrow": "-->>",
                   "label": "declined"
+                },
+                {
+                  "from": "API",
+                  "to": "Merchant",
+                  "arrow": "-->>",
+                  "label": "402 declined"
                 }
               ]
             }
@@ -388,15 +421,78 @@
     {
       "method": "POST",
       "path": "/v1/refunds",
-      "description": "Refund a charge (full or partial).",
-      "request": "{ \"chargeId\": \"ch_9\", \"amount\": 500 }",
+      "description": "Refund a charge (full or partial). Idempotent on the Idempotency-Key header; amount is capped at captured_amount - already_refunded, so over-refunding returns 400.",
+      "request": "{ \"chargeId\": \"ch_9\", \"amount\": 500 }  (Authorization: Bearer sk_live_..., Idempotency-Key: rk_1)",
       "response": "{ \"refundId\": \"re_3\", \"status\": \"succeeded\" }"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/charges/{id}",
+      "description": "Fetch a charge's current state and history (lets merchants reconcile or recover after missing a webhook).",
+      "request": "GET /v1/charges/ch_9  (Authorization: Bearer sk_live_...)",
+      "response": "{ \"chargeId\": \"ch_9\", \"status\": \"succeeded\", \"amount\": 2000, \"refunded\": 0 }"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/refunds/{id}",
+      "description": "Fetch a refund's current state.",
+      "request": "GET /v1/refunds/re_3  (Authorization: Bearer sk_live_...)",
+      "response": "{ \"refundId\": \"re_3\", \"status\": \"succeeded\", \"amount\": 500 }"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/events",
+      "description": "List recent webhook events for the merchant (poll/backfill if a webhook was missed).",
+      "request": "GET /v1/events?type=charge.succeeded&limit=100  (Authorization: Bearer sk_live_...)",
+      "response": "{ \"data\": [ { \"eventId\": \"evt_7\", \"type\": \"charge.succeeded\", \"delivered\": true } ] }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/events/{id}/replay",
+      "description": "Re-deliver a past event to the configured endpoint (recovery after an outage). Authorized to the owning merchant. Replay creates a NEW delivery attempt for the SAME event id — never a new business event — so merchant dedup-by-event-id still collapses it to one outcome.",
+      "request": "POST /v1/events/evt_7/replay  (Authorization: Bearer sk_live_...)",
+      "response": "{ \"eventId\": \"evt_7\", \"status\": \"queued\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/webhook_endpoints",
+      "description": "Configure a webhook endpoint: URL, subscribed event types, and retry policy. Returns the signing secret (rotatable, versioned). Authenticated by the merchant secret key.",
+      "request": "{ \"url\": \"https://m.example/hooks\", \"enabledEvents\": [\"charge.succeeded\", \"refund.created\"] }  (Authorization: Bearer sk_live_...)",
+      "response": "{ \"endpointId\": \"we_2\", \"signingSecret\": \"whsec_...\", \"secretVersion\": 1 }"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/webhook_endpoints/{id}",
+      "description": "Update or disable a webhook endpoint (change URL, subscribed types, retry policy, or set enabled=false). Idempotent; authorized to the owning merchant only. Disabling stops delivery without losing the event history.",
+      "request": "{ \"url\": \"https://m.example/hooks2\", \"enabled\": false }  (Authorization: Bearer sk_live_...)",
+      "response": "{ \"endpointId\": \"we_2\", \"enabled\": false }"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/webhook_endpoints/{id}",
+      "description": "Delete a webhook endpoint. Idempotent (deleting an already-deleted endpoint returns 200); authorized to the owning merchant only.",
+      "request": "DELETE /v1/webhook_endpoints/we_2  (Authorization: Bearer sk_live_...)",
+      "response": "{ \"endpointId\": \"we_2\", \"deleted\": true }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/webhook_endpoints/{id}/rotate_secret",
+      "description": "Rotate the endpoint's signing secret. Returns a new versioned secret while the previous version stays valid for an overlap window, so in-flight deliveries verify under either secret during migration.",
+      "request": "POST /v1/webhook_endpoints/we_2/rotate_secret  (Authorization: Bearer sk_live_...)",
+      "response": "{ \"endpointId\": \"we_2\", \"signingSecret\": \"whsec_new\", \"secretVersion\": 2, \"previousValidUntil\": \"...\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/api_keys/rotate",
+      "description": "Issue a new merchant secret key alongside the current one (overlap rotation). The old key keeps working until explicitly revoked, so traffic migrates with no downtime. Authorized by an existing secret key. Revoke the old key via DELETE /v1/api_keys/{id}.",
+      "request": "POST /v1/api_keys/rotate  (Authorization: Bearer sk_live_old)",
+      "response": "{ \"keyId\": \"key_8\", \"secretKey\": \"sk_live_new\", \"oldKeyState\": \"active\" }"
     },
     {
       "method": "POST",
       "path": "/v1/tokens",
-      "description": "Tokenize card data in the browser (hosted fields), keeping it off the merchant server.",
-      "request": "{ \"card\": { ... } }  (sent from client SDK to the vault)",
+      "description": "Tokenize card data from the browser (hosted fields), keeping it off the merchant server. Called by the client SDK against the vault using the merchant's PUBLISHABLE client key (pk_live_...), never the secret key — a publishable key can only tokenize, not charge, so it is safe to ship to the browser.",
+      "request": "{ \"card\": { ... } }  (sent from client SDK to the vault with the publishable key: Authorization: Bearer pk_live_...)",
       "response": "{ \"token\": \"tok_9\" }",
       "sequence": {
         "participants": [
@@ -428,7 +524,7 @@
   "dataModel": [
     {
       "name": "charges",
-      "note": "Authoritative charge record + state machine + idempotency.",
+      "note": "Authoritative charge record + state machine. State distinguishes sent-but-unknown external calls so an ambiguous PSP response is never blindly retried.",
       "fields": [
         {
           "name": "charge_id",
@@ -439,7 +535,7 @@
           "type": "bigint"
         },
         {
-          "name": "amount",
+          "name": "amount / captured_amount / refunded_amount",
           "type": "int (minor units)"
         },
         {
@@ -447,62 +543,1344 @@
           "type": "char(3)"
         },
         {
+          "name": "card_token",
+          "type": "varchar (vault token, never a PAN)"
+        },
+        {
+          "name": "capture_mode",
+          "type": "enum(automatic, manual)"
+        },
+        {
           "name": "state",
-          "type": "enum(created, risk_review, authorized, captured, succeeded, declined, refunded, failed)"
+          "type": "enum(created, risk_review, authorize_sent, authorize_unknown, authorized, capture_sent, capture_unknown, captured, succeeded, voided, refunded, declined, failed)"
+        },
+        {
+          "name": "last_psp_status / reconciliation_state",
+          "type": "enum (acquirer-reported status; pending/matched/mismatch)"
+        },
+        {
+          "name": "psp_ref / acquirer_id",
+          "type": "external acquirer reference + which acquirer handled it"
+        },
+        {
+          "name": "description / metadata",
+          "type": "varchar / json"
+        }
+      ]
+    },
+    {
+      "name": "payment_attempts",
+      "note": "One row per external acquirer call. Holds the PSP-side idempotency key so a retry resolves the original attempt instead of creating a new authorization.",
+      "fields": [
+        {
+          "name": "attempt_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "charge_id",
+          "type": "uuid FK -> charges"
+        },
+        {
+          "name": "acquirer_id",
+          "type": "which acquirer this attempt targeted"
+        },
+        {
+          "name": "psp_request_id / psp_idempotency_key",
+          "type": "varchar (sent to the PSP before the call)"
+        },
+        {
+          "name": "network_trace_id",
+          "type": "varchar (card-network correlation id)"
+        },
+        {
+          "name": "kind / status",
+          "type": "enum(authorize, capture, void, refund) / enum(sent, unknown, succeeded, failed)"
+        }
+      ]
+    },
+    {
+      "name": "idempotency_keys",
+      "note": "Per-merchant request dedup. Stores a request fingerprint so a repeat with the SAME key but a DIFFERENT body is a defined 409 conflict, not a silent second charge.",
+      "fields": [
+        {
+          "name": "merchant_id + idempotency_key",
+          "type": "composite PK (unique per merchant)"
+        },
+        {
+          "name": "request_fingerprint",
+          "type": "hash of the request body"
+        },
+        {
+          "name": "charge_id / response_snapshot",
+          "type": "uuid / json (the original result replayed on repeat)"
+        },
+        {
+          "name": "state",
+          "type": "enum(in_progress, completed)"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamp (retention horizon, e.g. 24h)"
+        }
+      ]
+    },
+    {
+      "name": "refunds",
+      "note": "A refund is its own idempotent money movement against a captured charge; partial refunds are capped at captured_amount - refunded_amount.",
+      "fields": [
+        {
+          "name": "refund_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "charge_id",
+          "type": "uuid FK -> charges"
+        },
+        {
+          "name": "amount",
+          "type": "int (<= remaining captured amount)"
         },
         {
           "name": "idempotency_key",
           "type": "varchar (unique per merchant)"
         },
         {
+          "name": "state",
+          "type": "enum(created, sent, unknown, succeeded, failed)"
+        },
+        {
           "name": "psp_ref",
-          "type": "external acquirer reference"
+          "type": "acquirer refund/reversal reference"
+        }
+      ]
+    },
+    {
+      "name": "ledger_accounts",
+      "note": "Double-entry accounts. Each merchant has available and pending balances; the platform has fee and reserve accounts. A materialized balance is an optimization derived from (and reconcilable to) the sum of entries — never the source of truth.",
+      "fields": [
+        {
+          "name": "account_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "owner_type / owner_id",
+          "type": "enum(merchant, platform) / id"
+        },
+        {
+          "name": "kind",
+          "type": "enum(available, pending, fees, reserve)"
+        },
+        {
+          "name": "currency",
+          "type": "char(3) (one account per (owner, kind, currency))"
+        },
+        {
+          "name": "materialized_balance / balance_version",
+          "type": "int (cached sum of entries) / bigint (optimistic-concurrency version; payouts read a consistent (balance, version) snapshot)"
+        }
+      ]
+    },
+    {
+      "name": "ledger_entries",
+      "note": "Immutable, append-only debit/credit lines grouped into balanced transactions. INVARIANTS: for each transaction_id, sum(debits) = sum(credits) per currency; rows are never updated or deleted (reversals are new transactions); a transaction is posted once via a unique (ref_type, ref_id) so the same money movement can't post twice.",
+      "fields": [
+        {
+          "name": "entry_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "transaction_id",
+          "type": "uuid (groups the balanced legs; the unit that must net to zero per currency)"
+        },
+        {
+          "name": "account_id",
+          "type": "uuid FK -> ledger_accounts"
+        },
+        {
+          "name": "direction / amount",
+          "type": "enum(debit, credit) / int (minor units)"
+        },
+        {
+          "name": "currency",
+          "type": "char(3) (transactions balance within a currency, never across)"
+        },
+        {
+          "name": "ref_type / ref_id",
+          "type": "enum(charge, refund, fee, payout, reversal) / id — UNIQUE per transaction so a movement posts at most once (idempotent posting)"
+        },
+        {
+          "name": "posting_state",
+          "type": "enum(pending, posted) — pending until the underlying movement settles, then posted"
+        },
+        {
+          "name": "created_at / effective_at",
+          "type": "timestamp (when the row was written) / timestamp (the accounting date it affects)"
+        }
+      ]
+    },
+    {
+      "name": "payouts",
+      "note": "A scheduled settlement of a merchant's available balance, with its own state machine and idempotent PSP transfer.",
+      "fields": [
+        {
+          "name": "payout_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "merchant_id / amount / currency",
+          "type": "id / int / char(3)"
+        },
+        {
+          "name": "balance_cutoff_at",
+          "type": "timestamp (balance snapshot boundary)"
+        },
+        {
+          "name": "state",
+          "type": "enum(scheduled, sent, unknown, paid, failed, returned)"
+        },
+        {
+          "name": "psp_transfer_ref",
+          "type": "acquirer/bank transfer reference"
+        }
+      ]
+    },
+    {
+      "name": "reconciliation_runs",
+      "note": "Each ingest of a PSP settlement report and the matched/mismatched results that drive compensating ledger entries.",
+      "fields": [
+        {
+          "name": "run_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "acquirer_id / report_date",
+          "type": "id / date"
+        },
+        {
+          "name": "matched_count / mismatch_count",
+          "type": "int"
+        },
+        {
+          "name": "state",
+          "type": "enum(ingesting, matched, has_mismatches, resolved)"
+        }
+      ]
+    },
+    {
+      "name": "reconciliation_items",
+      "note": "One row per individual PSP settlement-report line, so a mismatch is traced to a specific charge/refund/payout — not just an aggregate run count. Drives the compensating ledger entry that resolves it.",
+      "fields": [
+        {
+          "name": "item_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "run_id",
+          "type": "uuid FK -> reconciliation_runs"
+        },
+        {
+          "name": "psp_ref / report_amount",
+          "type": "the settlement line's external reference / int (minor units, as the PSP reported)"
+        },
+        {
+          "name": "matched_ref_type / matched_ref_id",
+          "type": "enum(charge, refund, payout, none) / id — which internal record this line matched"
+        },
+        {
+          "name": "match_state",
+          "type": "enum(matched, amount_mismatch, missing_internal, missing_external, resolved)"
+        },
+        {
+          "name": "resolution_txn_id",
+          "type": "uuid (the compensating ledger transaction that fixed a mismatch, if any)"
         }
       ]
     },
     {
       "name": "card_tokens (vault)",
-      "note": "Inside the PCI boundary; merchants never see raw PAN.",
+      "note": "Inside the PCI boundary; merchants never see raw PAN. The encryption key version is stored per row so keys can be rotated without re-encrypting everything at once.",
       "fields": [
         {
           "name": "token",
           "type": "varchar PK"
         },
         {
-          "name": "pan_encrypted",
-          "type": "encrypted card number"
+          "name": "pan_encrypted / key_version",
+          "type": "encrypted card number / int (which KMS/HSM key version encrypted it — enables rotation)"
         },
         {
           "name": "last4 / brand / exp",
           "type": "non-sensitive display data"
+        },
+        {
+          "name": "state / expires_at",
+          "type": "enum(active, revoked, expired) / timestamp (token lifecycle)"
         }
       ]
     },
     {
-      "name": "webhook_events",
-      "note": "Outbound events + delivery state.",
+      "name": "vault_access_log",
+      "note": "Append-only audit of every detokenization (token -> PAN). PCI requires that PAN access is least-privilege and fully audited; this is what an auditor reads.",
+      "fields": [
+        {
+          "name": "access_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "token / actor_identity",
+          "type": "varchar / the service identity that detokenized (least-privilege; only the PSP-call path)"
+        },
+        {
+          "name": "reason_code",
+          "type": "enum(psp_authorize, psp_capture, psp_refund) — why detokenization was needed"
+        },
+        {
+          "name": "charge_id / accessed_at",
+          "type": "uuid (correlating charge) / timestamp"
+        }
+      ]
+    },
+    {
+      "name": "webhook_events (outbox)",
+      "note": "The immutable event record, written in the same transaction as the charge/refund/payout state change (transactional outbox). Merchants dedup on event_id.",
       "fields": [
         {
           "name": "event_id",
           "type": "uuid PK"
         },
         {
+          "name": "merchant_id",
+          "type": "bigint"
+        },
+        {
           "name": "type",
-          "type": "charge.succeeded, refund.created, ..."
+          "type": "charge.succeeded, refund.created, payout.paid, ..."
         },
         {
           "name": "payload",
-          "type": "json (signed)"
+          "type": "json"
         },
         {
           "name": "delivery_state",
-          "type": "enum(pending, delivered, failed)"
-        },
-        {
-          "name": "attempts",
-          "type": "int"
+          "type": "enum(pending, delivered, dead_lettered)"
         }
       ]
+    },
+    {
+      "name": "webhook_delivery_attempts",
+      "note": "One row per delivery try, separate from the event so retries/backoff/DLQ are auditable and replay is possible.",
+      "fields": [
+        {
+          "name": "attempt_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "event_id",
+          "type": "uuid FK -> webhook_events"
+        },
+        {
+          "name": "endpoint_id",
+          "type": "uuid FK -> webhook_endpoints"
+        },
+        {
+          "name": "response_code / attempted_at",
+          "type": "int / timestamp"
+        },
+        {
+          "name": "next_retry_at",
+          "type": "timestamp (exponential backoff; null after DLQ)"
+        }
+      ]
+    },
+    {
+      "name": "merchants",
+      "note": "Merchant auth and per-merchant policy. API keys authenticate requests; rate limits are enforced per merchant. A compromised merchant can be disabled to immediately stop new charges.",
+      "fields": [
+        {
+          "name": "merchant_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "status",
+          "type": "enum(active, disabled, suspended) — disable a compromised merchant to halt charges"
+        },
+        {
+          "name": "rate_limit",
+          "type": "requests/sec budget (per-merchant throttle)"
+        },
+        {
+          "name": "payout_schedule",
+          "type": "enum(daily, weekly, manual)"
+        }
+      ]
+    },
+    {
+      "name": "merchant_api_keys",
+      "note": "Multiple live keys per merchant so a secret can be rotated overlap-style: issue a new key, migrate, then revoke the old one — never a single in-place edit that breaks live traffic. Includes a publishable client key (for browser tokenization) distinct from the secret key.",
+      "fields": [
+        {
+          "name": "key_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "merchant_id",
+          "type": "bigint FK -> merchants"
+        },
+        {
+          "name": "key_hash / key_type",
+          "type": "hashed secret / enum(secret, publishable) — secret authorizes charges; publishable only tokenizes"
+        },
+        {
+          "name": "state / created_at / revoked_at",
+          "type": "enum(active, revoked) / timestamp / timestamp (rotation history)"
+        }
+      ]
+    },
+    {
+      "name": "webhook_endpoints",
+      "note": "Per-merchant webhook configuration, including the signing secret (versioned for rotation) and retry policy.",
+      "fields": [
+        {
+          "name": "endpoint_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "merchant_id",
+          "type": "bigint FK -> merchants"
+        },
+        {
+          "name": "url",
+          "type": "https endpoint"
+        },
+        {
+          "name": "signing_secret / secret_version",
+          "type": "secret used to sign payloads / int"
+        },
+        {
+          "name": "subscribed_types / retry_policy",
+          "type": "json (event filter) / json (max attempts, backoff)"
+        }
+      ]
+    }
+  ],
+  "technologyChoices": [
+    {
+      "concern": "API edge, merchant auth, and rate limiting",
+      "steps": [
+        "pci",
+        "idempotency",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Kong",
+          "icon": "assets/tech-icons/kong.png"
+        },
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "HAProxy",
+          "icon": "assets/tech-icons/haproxy.png"
+        },
+        {
+          "name": "Open Policy Agent",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          },
+          {
+            "name": "WAF",
+            "icon": "assets/tech-icons/Arch_AWS-WAF_64.png"
+          },
+          {
+            "name": "ALB",
+            "icon": "assets/tech-icons/Arch_Elastic-Load-Balancing_64.png"
+          },
+          {
+            "name": "Cognito",
+            "icon": "assets/tech-icons/Arch_Amazon-Cognito_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Endpoints",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Armor",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Load Balancing",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Identity Platform",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "API Management",
+            "icon": "assets/tech-icons/10042-icon-service-API-Management-Services.svg"
+          },
+          {
+            "name": "Application Gateway",
+            "icon": "assets/tech-icons/10076-icon-service-Application-Gateways.svg"
+          },
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Microsoft Entra ID",
+            "icon": "assets/tech-icons/10231-icon-service-Entra-ID-Protection.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A self-hosted gateway gives full control over idempotency headers, merchant auth, and per-merchant throttles, but the team owns WAF rules, upgrades, and global capacity.",
+        "Managed API gateways and WAFs remove edge operations and rate-limit storage, but can make custom idempotency and merchant-policy logic harder to keep close to the charge transaction."
+      ],
+      "makesIrrelevant": "A managed gateway with built-in WAF, quotas, and key validation removes much of the custom edge-proxy fleet for the public charge API."
+    },
+    {
+      "concern": "PCI card vault, tokenization, and key custody",
+      "steps": [
+        "pci",
+        "orchestrate"
+      ],
+      "selfHosted": [
+        {
+          "name": "HashiCorp Vault",
+          "icon": "assets/tech-icons/hashicorp_vault.png"
+        },
+        {
+          "name": "HSM (PKCS#11)",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Open Policy Agent",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "KMS",
+            "icon": "assets/tech-icons/Arch_AWS-Key-Management-Service_64.png"
+          },
+          {
+            "name": "CloudHSM",
+            "icon": "assets/tech-icons/Arch_AWS-CloudHSM_64.png"
+          },
+          {
+            "name": "CloudTrail",
+            "icon": "assets/tech-icons/Arch_AWS-CloudTrail_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud KMS",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          },
+          {
+            "name": "Cloud Logging",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Key Vault",
+            "icon": "assets/tech-icons/10245-icon-service-Key-Vaults.svg"
+          },
+          {
+            "name": "Managed HSM",
+            "icon": "assets/tech-icons/02322-icon-service-Dedicated-HSM.svg"
+          },
+          {
+            "name": "Log Analytics",
+            "icon": "assets/tech-icons/00009-icon-service-Log-Analytics-Workspaces.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Self-hosting the vault is portable and keeps tokenization logic under direct control, but it puts HSM HA, key rotation, audit logging, and PCI evidence on the gateway team.",
+        "Managed KMS/HSM services reduce key-custody work and audit burden, but the vault API and detokenization policy still need strict service identity, redaction, and access logs."
+      ],
+      "makesIrrelevant": "A cloud HSM/KMS with immutable audit trails removes most custom key-wrap, key-version, and vault-access-log plumbing."
+    },
+    {
+      "concern": "Charge state and idempotency store",
+      "steps": [
+        "idempotency",
+        "orchestrate",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "CockroachDB",
+          "icon": "assets/tech-icons/cockroach.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Aurora",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Keeping idempotency keys, charge state, and PSP attempt rows in one transactional store is simplest and safest for money movement.",
+        "A separate KV/cache layer can absorb duplicate-check traffic, but it must not become the source of truth for whether an external authorize happened.",
+        "Globally distributed SQL improves regional resilience, but cross-region consensus can hurt the 300-800 ms p99 charge path."
+      ],
+      "makesIrrelevant": "A durable store with conditional writes, TTLs, and strong per-merchant consistency removes a separate lock service for idempotency."
+    },
+    {
+      "concern": "Charge orchestration and resumable workflows",
+      "steps": [
+        "orchestrate",
+        "psp-resilience"
+      ],
+      "selfHosted": [
+        {
+          "name": "Temporal",
+          "icon": "assets/tech-icons/temporal.png"
+        },
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "RabbitMQ",
+          "icon": "assets/tech-icons/rabbitmq.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          },
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Logic Apps",
+            "icon": "assets/tech-icons/10363-icon-service-Logic-Apps-Custom-Connector.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Event Grid",
+            "icon": "assets/tech-icons/10221-icon-service-Event-Grid-Subscriptions.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A workflow engine makes retry, timeout, and resume behavior explicit, which fits ambiguous PSP calls and long-running refunds/payouts.",
+        "An event bus scales decoupled services well, but the charge state machine still needs one authoritative record of what external call was sent.",
+        "A synchronous handler is easiest to reason about at low volume, but it couples merchant latency to risk, PSP, ledger, and webhook side effects."
+      ],
+      "makesIrrelevant": "A durable workflow runtime can remove much of the custom scheduler, retry table, and stuck-state sweeper around charge attempts."
+    },
+    {
+      "concern": "Risk scoring and fraud feature pipeline",
+      "steps": [
+        "orchestrate",
+        "psp-resilience"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Apache Flink",
+          "icon": "assets/tech-icons/flink.png"
+        },
+        {
+          "name": "TensorFlow Serving",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Drools",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SageMaker",
+            "icon": "assets/tech-icons/Arch_Amazon-SageMaker-AI_64.png"
+          },
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Vertex AI",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          },
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "BigQuery",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Machine Learning",
+            "icon": "assets/tech-icons/10166-icon-service-Machine-Learning.svg"
+          },
+          {
+            "name": "Stream Analytics",
+            "icon": "assets/tech-icons/00042-icon-service-Stream-Analytics-Jobs.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Rules and cached velocity features keep the online risk gate fast and explainable.",
+        "Model serving catches subtler fraud patterns, but it adds feature freshness, model drift, and review-queue operations.",
+        "Streaming feature pipelines improve fraud reaction time, while batch features are cheaper and easier to audit."
+      ],
+      "makesIrrelevant": "A managed feature and model-serving stack can remove a custom online feature store for the first version of risk scoring."
+    },
+    {
+      "concern": "Webhook outbox, retry queue, and DLQ",
+      "steps": [
+        "webhooks",
+        "ledger"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Redpanda",
+          "icon": "assets/tech-icons/redpanda.png"
+        },
+        {
+          "name": "RabbitMQ",
+          "icon": "assets/tech-icons/rabbitmq.png"
+        },
+        {
+          "name": "NATS (JetStream)",
+          "icon": "assets/tech-icons/nats.png"
+        },
+        {
+          "name": "Redis Streams",
+          "icon": "assets/tech-icons/redis.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "SNS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Notification-Service_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          },
+          {
+            "name": "MSK",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Streaming-for-Apache-Kafka_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Managed Service for Apache Kafka",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          },
+          {
+            "name": "Event Grid",
+            "icon": "assets/tech-icons/10221-icon-service-Event-Grid-Subscriptions.svg"
+          },
+          {
+            "name": "Queue Storage",
+            "icon": "assets/tech-icons/10840-icon-service-Storage-Queue.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A log/stream fits replay, multiple consumers, and backfills from the transactional outbox.",
+        "A queue fits per-delivery attempts, visibility timeouts, and DLQs, but long replay and fanout are weaker.",
+        "Managed queues remove broker operations, but merchants must still dedup by event id because delivery remains at-least-once."
+      ],
+      "makesIrrelevant": "A managed queue with native DLQ, delayed retry, and retention removes most custom retry-wheel and lease code in webhook delivery."
+    },
+    {
+      "concern": "Double-entry ledger and payout source of truth",
+      "steps": [
+        "ledger",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "CockroachDB",
+          "icon": "assets/tech-icons/cockroach.png"
+        },
+        {
+          "name": "Citus",
+          "icon": "assets/tech-icons/citus.png"
+        },
+        {
+          "name": "MySQL",
+          "icon": "assets/tech-icons/mysql.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Aurora",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "RDS",
+            "icon": "assets/tech-icons/Arch_Amazon-RDS_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          },
+          {
+            "name": "Cosmos DB for PostgreSQL",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A relational ledger with strict transactions is the clearest way to enforce balanced entries, immutable postings, and payout eligibility.",
+        "Distributed SQL helps when ledger write volume and regional availability matter, but it raises latency, cost, and operational complexity.",
+        "A wide-column/KV store can scale append-heavy ledger lines, but balance invariants and payout reads must be enforced in application logic."
+      ],
+      "makesIrrelevant": "A strongly consistent managed SQL database can remove a hand-built ledger shard router until write volume forces finer partitioning."
+    },
+    {
+      "concern": "Reconciliation ingestion and settlement analytics",
+      "steps": [
+        "orchestrate",
+        "ledger",
+        "psp-resilience"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Debezium",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Apache Airflow",
+          "icon": "assets/tech-icons/airflow.png"
+        },
+        {
+          "name": "Apache Flink",
+          "icon": "assets/tech-icons/flink.png"
+        },
+        {
+          "name": "ClickHouse",
+          "icon": "assets/tech-icons/clickhouse.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DMS",
+            "icon": "assets/tech-icons/Arch_AWS-Database-Migration-Service_64.png"
+          },
+          {
+            "name": "AWS Glue",
+            "icon": "assets/tech-icons/Arch_AWS-Glue_64.png"
+          },
+          {
+            "name": "Athena",
+            "icon": "assets/tech-icons/Arch_Amazon-Athena_64.png"
+          },
+          {
+            "name": "Redshift",
+            "icon": "assets/tech-icons/Arch_Amazon-Redshift_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Datastream",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "BigQuery",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Cloud Composer",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          },
+          {
+            "name": "Stream Analytics",
+            "icon": "assets/tech-icons/00042-icon-service-Stream-Analytics-Jobs.svg"
+          },
+          {
+            "name": "Azure Synapse Analytics",
+            "icon": "assets/tech-icons/00606-icon-service-Azure-Synapse-Analytics.svg"
+          },
+          {
+            "name": "Azure Data Lake Storage",
+            "icon": "assets/tech-icons/10090-icon-service-Data-Lake-Storage-Gen1.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Batch settlement-file processing is cheap and audit-friendly for daily reports, but it delays discovery of PSP mismatches.",
+        "Streaming reconciliation catches drift faster, but every event must still be traceable back to a settlement line and ledger correction.",
+        "CDC keeps outbox and analytics projections close to the source tables, but schema changes and replay need disciplined versioning."
+      ],
+      "makesIrrelevant": "A managed CDC plus batch analytics stack removes most custom report-ingestion workers and ad hoc reconciliation exports."
+    },
+    {
+      "concern": "PSP adapter routing and circuit breakers",
+      "steps": [
+        "orchestrate",
+        "psp-resilience"
+      ],
+      "selfHosted": [
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "HAProxy",
+          "icon": "assets/tech-icons/haproxy.png"
+        },
+        {
+          "name": "Consul",
+          "icon": "assets/tech-icons/consul.png"
+        },
+        {
+          "name": "Temporal",
+          "icon": "assets/tech-icons/temporal.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Global Accelerator",
+            "icon": "assets/tech-icons/Arch_AWS-Global-Accelerator_64.png"
+          },
+          {
+            "name": "Route 53",
+            "icon": "assets/tech-icons/Arch_Amazon-Route-53_64.png"
+          },
+          {
+            "name": "Lambda",
+            "icon": "assets/tech-icons/Arch_AWS-Lambda_64.png"
+          },
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Load Balancing",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Run",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          },
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Traffic Manager",
+            "icon": "assets/tech-icons/10065-icon-service-Traffic-Manager-Profiles.svg"
+          },
+          {
+            "name": "Container Apps",
+            "icon": "assets/tech-icons/02989-icon-service-Container-Apps-Environments.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A simple primary-plus-backup route is easy to operate and audit, but availability drops during a primary acquirer outage until failures are confirmed.",
+        "Dynamic routing by BIN, geography, cost, and live success rate improves approval rates but needs safe handling of ambiguous authorizations and token scope.",
+        "Circuit breakers protect the charge path from a failing PSP, but the breaker state must never trigger a blind duplicate authorize."
+      ],
+      "makesIrrelevant": "A routing layer with health probes, breaker state, and per-attempt idempotency keys removes most one-off PSP failover branches from charge code."
+    },
+    {
+      "concern": "Payment-store sharding and regional failover",
+      "steps": [
+        "scale",
+        "psp-resilience"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Citus",
+          "icon": "assets/tech-icons/citus.png"
+        },
+        {
+          "name": "Apache ShardingSphere",
+          "icon": "assets/tech-icons/sharding_sphere.png"
+        },
+        {
+          "name": "CockroachDB",
+          "icon": "assets/tech-icons/cockroach.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Aurora Global Database",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "DynamoDB Global Tables",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "Route 53",
+            "icon": "assets/tech-icons/Arch_Amazon-Route-53_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud Load Balancing",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Traffic Manager",
+            "icon": "assets/tech-icons/10065-icon-service-Traffic-Manager-Profiles.svg"
+          },
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Merchant-based sharding keeps idempotency, charges, and ledger reads colocated, which avoids distributed transactions on the hot money path.",
+        "Active/passive regional failover is operationally simpler than active/active, but it creates failover lag and reconciliation work after promotion.",
+        "Active/active writes raise availability, but external PSP calls and ledger invariants make conflict resolution dangerous."
+      ],
+      "makesIrrelevant": "A managed distributed SQL store can delay or remove custom shard maps, but the payment state machine still needs a clear regional write-owner rule."
+    },
+    {
+      "concern": "Payment observability, audit, and money SLOs",
+      "steps": [
+        "idempotency",
+        "orchestrate",
+        "webhooks",
+        "ledger",
+        "scale",
+        "psp-resilience"
+      ],
+      "selfHosted": [
+        {
+          "name": "Prometheus",
+          "icon": "assets/tech-icons/prometheus.png"
+        },
+        {
+          "name": "Grafana",
+          "icon": "assets/tech-icons/grafana.png"
+        },
+        {
+          "name": "Jaeger",
+          "icon": "assets/tech-icons/jaeger.png"
+        },
+        {
+          "name": "OpenTelemetry",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "ELK Stack",
+          "icon": "assets/tech-icons/elasticsearch.png"
+        },
+        {
+          "name": "ClickHouse",
+          "icon": "assets/tech-icons/clickhouse.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "X-Ray",
+            "icon": "assets/tech-icons/Arch_AWS-X-Ray_64.png"
+          },
+          {
+            "name": "CloudTrail",
+            "icon": "assets/tech-icons/Arch_AWS-CloudTrail_64.png"
+          },
+          {
+            "name": "Managed Grafana",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Grafana_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Trace",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Logging",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "BigQuery",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Application Insights",
+            "icon": "assets/tech-icons/00012-icon-service-Application-Insights.svg"
+          },
+          {
+            "name": "Log Analytics",
+            "icon": "assets/tech-icons/00009-icon-service-Log-Analytics-Workspaces.svg"
+          },
+          {
+            "name": "Azure Managed Grafana",
+            "icon": "assets/tech-icons/02905-icon-service-Azure-Managed-Grafana.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Generic latency and CPU metrics are not enough; money systems need alerts for unknown charges, stale reconciliation, ledger imbalance, payout failures, and webhook backlog age.",
+        "Long audit retention and trace correlation are expensive, but they are what make PSP disputes, PCI reviews, and payout incidents explainable.",
+        "Managed observability reduces storage and scaling work, while self-hosted stacks give tighter control over redaction and retention policy."
+      ],
+      "makesIrrelevant": "A managed observability suite with audit logging and trace retention removes much of the custom log warehouse for operational debugging, but not the money-specific alerts."
     }
   ],
   "patterns": [
@@ -559,6 +1937,53 @@
         "ledger"
       ],
       "group": "Ledger and Payouts"
+    },
+    {
+      "name": "Transactional outbox",
+      "what": "Write the event in the same DB transaction as the state change, then a relay drains the outbox — so an event exists iff its transition committed.",
+      "whenToUse": "Whenever a state change must reliably emit an event without a lossy dual-write.",
+      "steps": [
+        "webhooks"
+      ],
+      "group": "Reliable Webhooks"
+    },
+    {
+      "name": "PSP reconciliation",
+      "what": "Resolve ambiguous external calls and verify internal state against the PSP's authoritative status and settlement reports; correct drift with compensating entries.",
+      "whenToUse": "Any system whose source of truth is an external provider that can time out or disagree.",
+      "steps": [
+        "orchestrate",
+        "ledger",
+        "psp-resilience"
+      ],
+      "group": "Charge Orchestration: Risk -> Network"
+    },
+    {
+      "name": "Payout state machine",
+      "what": "Model a payout as an idempotent, reconciled state machine (scheduled -> sent -> paid/returned), never a fire-and-forget transfer.",
+      "whenToUse": "Sending money out where the transfer can fail, be unknown, or be returned.",
+      "steps": [
+        "ledger"
+      ],
+      "group": "Ledger and Payouts"
+    },
+    {
+      "name": "Merchant webhook dedup",
+      "what": "Consumers dedup by event id because delivery is at-least-once; the gateway never claims exactly-once delivery.",
+      "whenToUse": "At-least-once event delivery to external consumers.",
+      "steps": [
+        "webhooks"
+      ],
+      "group": "Reliable Webhooks"
+    },
+    {
+      "name": "Circuit breaker + failover",
+      "what": "Trip a breaker around a failing PSP and fail over to another acquirer only when it is safe (before authorize sent, or after a confirmed failure).",
+      "whenToUse": "Hard dependency on a flaky external provider where blind retries are dangerous.",
+      "steps": [
+        "psp-resilience"
+      ],
+      "group": "PSP Resilience & Multi-Acquirer Routing"
     }
   ],
   "steps": [
@@ -566,8 +1991,8 @@
       "id": "naive",
       "title": "1. Naive: Merchant Server Charges the Bank Directly (the baseline)",
       "description": [
-        "Start with the obvious version: the merchant's server collects the raw card number in a form, posts it to the gateway API, which forwards the PAN straight to the acquirer/bank to charge it.",
-        "It 'works' for one happy-path charge, and it exposes the two problems the rest of the design exists to solve. First, raw card data now flows through (and likely gets logged by) the merchant server and your API — a PCI compliance nightmare and a huge breach blast radius. Second, when the network times out and the merchant retries, the bank gets charged twice: there is nothing tying the retry to the original attempt, so the customer is double-charged.",
+        "Start with the obvious — and intentionally wrong — version, to expose the hazards the rest of the design exists to remove: the merchant's server collects the raw card number in a form, posts it to the gateway API, which forwards the PAN straight to the acquirer/bank to charge it. This is not a serious candidate design; it is the strawman whose two failures motivate the next two steps.",
+        "It 'works' for one happy-path charge, and that is exactly what makes it instructive — it exposes two problems cleanly. First, raw card data now flows through (and likely gets logged by) the merchant server and your API — a PCI compliance nightmare and a huge breach blast radius. Second, when the network times out and the merchant retries, the bank gets charged twice: there is nothing tying the retry to the original attempt, so the customer is double-charged.",
         "So the baseline motivates everything that follows: tokenize card data so raw PANs never touch general systems, and make charges idempotent so retries charge at most once."
       ],
       "view": {
@@ -579,7 +2004,11 @@
         "caption": "The merchant app posts a charge to the gateway API, which forwards the raw card straight to the acquirer/card network.",
         "links": [
           "merchant-api",
-          "charge-psp"
+          {
+            "from": "API",
+            "to": "PSP",
+            "label": "forward raw card to authorize"
+          }
         ],
         "highlight": [
           "Merchant",
@@ -595,7 +2024,9 @@
       ],
       "probeLinks": [
         "stripe-idempotency",
-        "paypal-idempotency"
+        "stripe-idempotency-blog",
+        "aws-idempotent-apis",
+        "stripe-pci-compliance"
       ],
       "recap": {
         "before": "Nothing.",
@@ -608,7 +2039,8 @@
           "why": "Every system that touches the PAN is in PCI scope and a breach target, and a bare forward-to-bank double-charges on retry.",
           "instead": "Tokenize card data at the client/vault and require an idempotency key so a card is charged at most once."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/01-naive.jpg"
     },
     {
       "id": "pci",
@@ -616,7 +2048,8 @@
       "description": [
         "The first design decision is to never let raw card data touch the merchant's servers or your general systems. The client SDK (hosted fields) sends card data directly to a small, hardened vault, which returns a token; the merchant only ever handles the token.",
         "This shrinks PCI scope to the vault: the rest of the gateway operates on tokens, dramatically reducing compliance burden and breach blast radius. The vault stores the encrypted PAN and exposes only non-sensitive display data (last4, brand).",
-        "Detokenization (token -> PAN) happens only inside the vault when calling the card network, never elsewhere."
+        "Detokenization (token -> PAN) happens only inside the vault when calling the card network, never elsewhere. The vault is the hardened core: PANs encrypted with a KMS/HSM-backed key with scheduled rotation, least-privilege detokenization (only the orchestrator's PSP call path may detokenize, and it's audit-logged), network segmentation, and a token lifecycle that can revoke/expire tokens.",
+        "Tokenization is necessary but not sufficient: PANs must never leak through logs, traces, analytics pipelines, search indexes, error reports, or support tooling. Redaction at the logging boundary is part of staying in scope."
       ],
       "view": {
         "nodes": [
@@ -673,7 +2106,8 @@
               "pci",
               "charge-flow"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-pci-opt1.jpg"
         },
         {
           "name": "Tokenize server-side in your API",
@@ -706,7 +2140,8 @@
             "highlight": [
               "API"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-pci-opt2.jpg"
         },
         {
           "name": "Delegate tokenization to the PSP/network",
@@ -745,7 +2180,8 @@
             "highlight": [
               "PSP"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-pci-opt3.jpg"
         }
       ],
       "decisionPrompt": "How do you charge a card without your servers (or the merchant's) ever storing the raw card number?",
@@ -756,6 +2192,13 @@
           "whyItMatters": "Minimizes PCI scope and breach risk; merchants never see the PAN.",
           "example": "SDK -> vault -> tok_9; the merchant charges with tok_9.",
           "group": "The PCI Boundary: Tokenize Card Data"
+        },
+        {
+          "term": "Vault security controls",
+          "definition": "KMS/HSM-backed encryption with a per-row key version (so keys rotate without re-encrypting everything at once), least-privilege + audited detokenization with reason codes, network segmentation, and token lifecycle management.",
+          "whyItMatters": "Tokenization only shrinks scope if the vault itself is hardened, every PAN access is audited, and the rest of the system can't leak PANs.",
+          "example": "Only the orchestrator's PSP-call path may detokenize; every detokenize writes a vault_access_log row (actor identity, reason_code, charge_id) and is rate-limited; PANs are scrubbed from logs/traces.",
+          "group": "The PCI Boundary: Tokenize Card Data"
         }
       ],
       "patterns": [
@@ -764,9 +2207,23 @@
       "whyNow": [
         "The PCI boundary is the defining architectural constraint of a card gateway; establishing tokenization first shapes everything downstream."
       ],
+      "probeLinks": [
+        "pci-standards",
+        "pci-tokenization-guidelines",
+        "stripe-pci-compliance",
+        "stripe-tokens",
+        "braintree-hosted-fields"
+      ],
+      "traps": [
+        {
+          "trap": "Tokenizing the card but still logging or storing the PAN elsewhere.",
+          "why": "PANs that land in application logs, traces, analytics, search indexes, error reports, or support tools pull those systems right back into PCI scope and become a breach target.",
+          "instead": "Redact at the logging boundary, never put PANs in events/metrics, and keep detokenization confined to the vault's PSP-call path."
+        }
+      ],
       "recap": {
         "before": "Raw card passed to the bank; no PCI isolation.",
-        "after": "Card data isolated in a vault; the system runs on tokens.",
+        "after": "Card data isolated in a hardened vault; the system runs on tokens.",
         "newRisk": "Charge requests over flaky networks get retried — a card must not be charged twice."
       }
     },
@@ -776,7 +2233,7 @@
       "description": [
         "Networks retry, and merchants retry on timeouts. Without protection, a retried charge double-charges the customer. The API requires an idempotency key per charge; the gateway records key -> result and returns the original result on any repeat.",
         "Persist the idempotency key in the same transaction that creates the charge, so a crash can't leave a charge without its dedup record. This turns at-least-once requests into exactly-once charges.",
-        "Keys are scoped per merchant and stored durably; a repeat of an in-flight key returns the in-progress/final result rather than starting a new charge."
+        "Keys are scoped per merchant and stored durably. The in-progress contract is explicit: a repeat that arrives while the first request is still running returns 409 in_progress (the merchant retries-with-backoff or polls GET /v1/charges/{id}) rather than starting a second charge or blocking a request thread on the slow PSP call; once the first completes, the same key replays the stored final result. Store a fingerprint (hash) of the request body alongside the key so a repeat of the same key with a different body is a defined 409 conflict, not an ambiguous second charge. Keys carry a retention horizon (e.g. 24h) after which they expire."
       ],
       "view": {
         "nodes": [
@@ -833,7 +2290,8 @@
             "groups": [
               "charge-flow"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-idempotency-opt1.jpg"
         },
         {
           "name": "Unique constraint on (merchant, key)",
@@ -866,7 +2324,8 @@
             "highlight": [
               "ChargeDB"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-idempotency-opt2.jpg"
         },
         {
           "name": "Distributed lock per key",
@@ -904,7 +2363,8 @@
             "highlight": [
               "LockSvc"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-idempotency-opt3.jpg"
         }
       ],
       "decisionPrompt": "A merchant's charge call times out and they retry. How do you guarantee the customer is charged once?",
@@ -919,7 +2379,9 @@
       ],
       "probeLinks": [
         "stripe-idempotency",
-        "stripe-webhooks",
+        "stripe-idempotency-blog",
+        "aws-idempotent-apis",
+        "adyen-idempotency",
         "paypal-idempotency",
         "stripe-payment-intents"
       ],
@@ -928,6 +2390,18 @@
       ],
       "whyNow": [
         "Idempotency is the second payments non-negotiable; doing it transactionally with charge creation is the correctness nuance."
+      ],
+      "traps": [
+        {
+          "trap": "Accepting a repeated idempotency key without comparing the request body.",
+          "why": "If the merchant reuses a key for a different amount or card, returning the old result (or charging again) is silently wrong.",
+          "instead": "Fingerprint the request body; same key + same body replays the result, same key + different body is a 409 conflict."
+        },
+        {
+          "trap": "Caching idempotency in Redis only, not in the durable charge transaction.",
+          "why": "A cache eviction or restart loses the dedup record and a retry double-charges.",
+          "instead": "Persist key -> result in the same transaction as the charge; treat any cache as an optimization, not the source of truth."
+        }
       ],
       "recap": {
         "before": "Retries could double-charge.",
@@ -939,9 +2413,9 @@
       "id": "orchestrate",
       "title": "4. Charge Orchestration: Risk -> Network",
       "description": [
-        "A charge is a state machine: created -> risk_review -> authorized -> captured -> succeeded (with declined/failed branches). The charge orchestrator drives it, persisting each transition so a crash resumes rather than re-charges.",
+        "A charge is a state machine with explicit states for sent-but-unknown external calls: created -> risk_review -> authorize_sent -> authorized -> capture_sent -> captured -> succeeded, with authorize_unknown/capture_unknown branches when the PSP times out, plus voided/declined/failed. The charge orchestrator drives it, persisting each transition so a crash resumes rather than re-charges.",
         "First, the risk/fraud service scores the charge and approves, declines, or flags for review — stopping bad charges before they hit the network (reducing fraud and chargebacks). Approved charges go to the acquirer/card network to authorize and capture, with the result recorded.",
-        "The external PSP call is the slow, failure-prone step: handle timeouts carefully (an ambiguous authorize is reconciled via the PSP's status, never blindly retried) so you don't double-authorize."
+        "The external PSP call is the slow, failure-prone step. Before the network call, write a payment_attempt row carrying a psp_request_id and a psp_idempotency_key, then move the charge to authorize_sent; on a timeout the charge sits in authorize_unknown and is reconciled via the PSP's status (or replayed safely with the same PSP idempotency key), never blindly retried — so you don't double-authorize."
       ],
       "view": {
         "nodes": [
@@ -971,9 +2445,9 @@
           "name": "Persisted state-machine orchestrator (default)",
           "description": "A central orchestrator drives the charge state machine — created, risk_review, authorized, captured, succeeded — persisting each transition so a crash resumes rather than re-charges.",
           "pros": [
-            "Each transition (created -> risk_review -> authorized -> captured -> succeeded) is persisted, so a crash resumes rather than re-charges.",
+            "Each transition (created -> risk_review -> authorize_sent -> authorized -> capture_sent -> captured -> succeeded) is persisted, so a crash resumes rather than re-charges.",
             "One orchestrator owns the flow, making the charge lifecycle easy to reason about and audit.",
-            "Network timeouts are handled by recording 'authorize sent' and reconciling the outcome."
+            "Network timeouts land the charge in authorize_unknown/capture_unknown; the stored psp_request_id/psp_idempotency_key lets it reconcile or safely replay the same attempt."
           ],
           "cons": [
             "A central orchestrator is one more service to scale and make highly available.",
@@ -1002,7 +2476,8 @@
             "groups": [
               "charge-flow"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-orchestrate-opt1.jpg"
         },
         {
           "name": "Event-driven choreography (no central orchestrator)",
@@ -1048,7 +2523,8 @@
             "highlight": [
               "EventBus"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-orchestrate-opt2.jpg"
         },
         {
           "name": "Synchronous inline calls in one request",
@@ -1083,7 +2559,8 @@
             "highlight": [
               "ChargeSvc"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-orchestrate-opt3.jpg"
         }
       ],
       "decisionPrompt": "You send an authorize to the card network and the response times out. Did it go through? What do you do?",
@@ -1097,9 +2574,12 @@
         }
       ],
       "probeLinks": [
-        "stripe-idempotency",
-        "stripe-webhooks",
-        "paypal-idempotency"
+        "stripe-payment-intents",
+        "stripe-auth-capture",
+        "saga-pattern",
+        "aws-idempotent-apis",
+        "adyen-idempotency",
+        "aws-retries-backoff-jitter"
       ],
       "patterns": [
         "Charge state machine",
@@ -1172,9 +2652,15 @@
                   },
                   {
                     "from": "ChargeSvc",
+                    "to": "ChargeDB",
+                    "arrow": "->>",
+                    "label": "write attempt {psp_request_id, psp_idemKey}; state=authorize_sent"
+                  },
+                  {
+                    "from": "ChargeSvc",
                     "to": "PSP",
                     "arrow": "->>",
-                    "label": "authorize + capture"
+                    "label": "authorize + capture (psp_idemKey)"
                   },
                   {
                     "type": "alt",
@@ -1233,7 +2719,7 @@
       "description": [
         "Outcomes are often async (a capture settles later; the network sends events). Merchants learn results via webhooks, which must be reliable: persist each event and deliver it at-least-once with retries and exponential backoff.",
         "Use the transactional outbox — write the event in the same transaction as the charge state change, then a delivery service streams it — so an event exists iff its charge transition committed. Sign payloads so merchants can verify authenticity, and include an event id so merchants dedup (delivery is at-least-once).",
-        "Failed deliveries retry with backoff and dead-letter after a limit (merchant endpoint down); merchants can also poll/replay events."
+        "Keep the immutable event record separate from per-delivery attempts so retries, backoff, and DLQ are auditable. Each merchant configures an endpoint URL, subscribed event types, a versioned signing secret (so secrets can be rotated without downtime — a previous secret stays valid during an overlap window), and a retry policy. Failed deliveries retry with backoff and dead-letter after a max-attempts/backoff limit (merchant endpoint down); merchants can list (GET /v1/events) and replay (POST /v1/events/{id}/replay) to catch up. Replay always creates a new delivery_attempt for the same event id — never a new business event — so merchant dedup-by-event-id collapses an outage-recovery replay into the one outcome it already represents."
       ],
       "view": {
         "nodes": [
@@ -1294,7 +2780,8 @@
             "groups": [
               "async"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-webhooks-opt1.jpg"
         },
         {
           "name": "Push the webhook inline after the charge",
@@ -1325,7 +2812,8 @@
             "highlight": [
               "ChargeSvc"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-webhooks-opt2.jpg"
         },
         {
           "name": "Merchants poll a charge-status API",
@@ -1362,7 +2850,8 @@
             "highlight": [
               "API"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-webhooks-opt3.jpg"
         }
       ],
       "decisionPrompt": "A merchant's webhook endpoint is down for an hour. How do you make sure they still get the charge.succeeded event?",
@@ -1377,14 +2866,30 @@
       ],
       "probeLinks": [
         "stripe-webhooks",
-        "stripe-idempotency",
-        "paypal-idempotency"
+        "adyen-webhooks",
+        "paypal-webhooks",
+        "github-webhook-best-practices",
+        "aws-retries-backoff-jitter"
       ],
       "patterns": [
-        "Reliable webhooks (outbox + retry)"
+        "Reliable webhooks (outbox + retry)",
+        "Transactional outbox",
+        "Merchant webhook dedup"
       ],
       "whyNow": [
         "Reliable async notification is a core gateway feature and a classic at-least-once + idempotency story on the consumer side."
+      ],
+      "traps": [
+        {
+          "trap": "Promising exactly-once webhook delivery.",
+          "why": "Delivery over the network is at-least-once; a 2xx that the merchant never recorded, or a retry after a slow ack, both cause duplicates.",
+          "instead": "Deliver at-least-once with a stable event id and tell merchants to dedup by event id; never claim exactly-once."
+        },
+        {
+          "trap": "Dual-writing the DB then firing the HTTP POST inline.",
+          "why": "A crash between commit and POST loses the event; the merchant and gateway then disagree with no recovery.",
+          "instead": "Use the transactional outbox: persist the event with the state change, and let a relay deliver and retry it."
+        }
       ],
       "recap": {
         "before": "Outcomes not reliably communicated.",
@@ -1470,8 +2975,8 @@
       "title": "6. Ledger and Payouts",
       "description": [
         "Every charge, refund, and fee is a money movement recorded in a double-entry ledger — the auditable source of truth for what the platform owes each merchant (and what it collected in fees). Charges credit a merchant's balance; refunds and fees debit it.",
-        "Payouts run on a schedule: aggregate each merchant's available ledger balance and send the payout via the network, recording it as a ledger entry too. The ledger reconciles against the PSP's settlement reports.",
-        "This reuses the double-entry + idempotency + reconciliation discipline of a money ledger — correctness over availability, immutable entries, balances derived and verified."
+        "Payouts run on a schedule: aggregate each merchant's available ledger balance and send the payout via the network, recording it as a ledger entry too. The ledger reconciles against the PSP's settlement reports, line by line.",
+        "The ledger is only safe if its invariants are explicit and enforced: (1) each transaction balances to zero per currency — sum(debits) = sum(credits); (2) entries are append-only and immutable — a reversal is a new transaction, never an edit; (3) each money movement posts at most once, enforced by a unique (ref_type, ref_id); (4) a materialized balance is a derived optimization that must reconcile to the sum of entries, never the source of truth; (5) funds are pending until settled, then available, and a payout reads only settled available balance minus reserve. These reuse the double-entry + idempotency + reconciliation discipline of a money ledger — correctness over availability."
       ],
       "view": {
         "nodes": [
@@ -1530,7 +3035,8 @@
               "charge-flow",
               "async"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-ledger-opt1.jpg"
         },
         {
           "name": "Single mutable balance per merchant",
@@ -1570,7 +3076,8 @@
             "highlight": [
               "BalanceTbl"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-ledger-opt2.jpg"
         },
         {
           "name": "Event-sourced ledger",
@@ -1619,7 +3126,8 @@
             "highlight": [
               "EventStore"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-ledger-opt3.jpg"
         }
       ],
       "decisionPrompt": "How do you track what each merchant is owed and pay them correctly, including refunds and fees?",
@@ -1630,16 +3138,25 @@
           "whyItMatters": "Auditable, reconcilable money tracking and correct settlement.",
           "example": "Charge credits merchant balance minus fee; daily payout debits the balance.",
           "group": "Ledger and Payouts"
+        },
+        {
+          "term": "Available vs pending balance & reserves",
+          "definition": "Funds sit in a pending balance until settled, move to available, and may be held in a reserve before they can be paid out.",
+          "whyItMatters": "Paying out unsettled or reserved funds risks negative balances when refunds/chargebacks land.",
+          "example": "A $20 charge credits pending; on settlement it moves to available; the daily payout pays available minus reserve.",
+          "group": "Ledger and Payouts"
         }
       ],
       "probeLinks": [
-        "stripe-idempotency",
-        "stripe-webhooks",
         "modern-treasury-ledgers",
-        "paypal-idempotency"
+        "square-books-ledger",
+        "stripe-reports-reconciliation",
+        "modern-treasury-reconciliation"
       ],
       "patterns": [
-        "Double-entry ledger + payouts"
+        "Double-entry ledger + payouts",
+        "Payout state machine",
+        "PSP reconciliation"
       ],
       "whyNow": [
         "The ledger + payouts close the money loop; tying it to the double-entry discipline shows the whole financial flow is correct and auditable."
@@ -1649,21 +3166,203 @@
         "after": "Auditable ledger + reconciled scheduled payouts.",
         "newRisk": "Volume spikes, PSP outages, and webhook fan-out stress the system."
       },
+      "traps": [
+        {
+          "trap": "Editing a balance or a posted entry to correct a mistake.",
+          "why": "Mutating money records destroys the audit trail and races with concurrent writers (lost updates); you can no longer explain how a balance reached its value or reconcile it.",
+          "instead": "Keep entries immutable and append-only; correct a mistake with a new reversing transaction that references the original."
+        },
+        {
+          "trap": "Posting an unbalanced transaction (only the credit, or legs that don't net to zero).",
+          "why": "A transaction whose debits != credits silently corrupts the ledger; the imbalance compounds and is painful to find months later.",
+          "instead": "Post all legs of a movement in one atomic transaction and assert sum(debits) = sum(credits) per currency before commit; alert on any global imbalance."
+        },
+        {
+          "trap": "Paying out pending (unsettled) funds.",
+          "why": "If a charge is later reversed/charged back before it settles, you've already paid the merchant and are left with an unrecoverable negative balance.",
+          "instead": "Pay out only settled available balance minus reserve; keep funds in pending until the PSP settlement confirms them."
+        },
+        {
+          "trap": "Reading a stale materialized balance when deciding a payout.",
+          "why": "A cached balance that lags un-applied entries (or an eventually-consistent replica) can over-pay a merchant.",
+          "instead": "Read the payout balance from a strongly-consistent, reconciled source with an optimistic version check; treat the materialized balance as an optimization to verify, not trust."
+        }
+      ],
       "failureDrills": [
         {
           "scenario": "The PSP settlement report disagrees with internal ledger entries.",
           "expectedBehavior": "Reconciliation flags the mismatch; compensating ledger entries correct it; the report is authoritative for settled funds.",
           "mitigation": "Ledger reconciliation against PSP reports + compensating entries (never edit history)."
         }
+      ],
+      "flows": [
+        {
+          "name": "Refund: PSP reversal -> ledger reversal -> webhook",
+          "note": "A refund is its own idempotent state machine; it posts reversing (not edited) ledger entries and emits refund.created at-least-once.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "API",
+                "label": "Gateway API"
+              },
+              {
+                "id": "ChargeSvc",
+                "label": "Charge Orchestrator"
+              },
+              {
+                "id": "PSP",
+                "label": "Acquirer"
+              },
+              {
+                "id": "Ledger",
+                "label": "Ledger"
+              },
+              {
+                "id": "WebhookSvc",
+                "label": "Webhook Delivery"
+              }
+            ],
+            "messages": [
+              {
+                "from": "API",
+                "to": "ChargeSvc",
+                "arrow": "->>",
+                "label": "refund(chargeId, amount, idemKey)"
+              },
+              {
+                "from": "ChargeSvc",
+                "to": "ChargeSvc",
+                "arrow": "->>",
+                "label": "check amount <= captured - refunded"
+              },
+              {
+                "from": "ChargeSvc",
+                "to": "PSP",
+                "arrow": "->>",
+                "label": "reverse/refund (psp idemKey)"
+              },
+              {
+                "type": "alt",
+                "label": "PSP confirms",
+                "messages": [
+                  {
+                    "from": "ChargeSvc",
+                    "to": "Ledger",
+                    "arrow": "->>",
+                    "label": "post reversing entries (debit merchant)"
+                  },
+                  {
+                    "from": "ChargeSvc",
+                    "to": "WebhookSvc",
+                    "arrow": "->>",
+                    "label": "emit refund.created (outbox)"
+                  }
+                ],
+                "else": {
+                  "label": "timeout (unknown)",
+                  "messages": [
+                    {
+                      "from": "ChargeSvc",
+                      "to": "PSP",
+                      "arrow": "->>",
+                      "label": "query refund status (reconcile)"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Ledger",
+            "PSP"
+          ]
+        },
+        {
+          "name": "Scheduled payout: balance cutoff -> transfer -> reconcile -> webhook",
+          "note": "The payout worker snapshots available balance at a cutoff, sends an idempotent transfer, and only marks paid after reconciliation against the PSP.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Payout",
+                "label": "Payout Worker"
+              },
+              {
+                "id": "Ledger",
+                "label": "Ledger"
+              },
+              {
+                "id": "PSP",
+                "label": "Acquirer / Bank"
+              },
+              {
+                "id": "WebhookSvc",
+                "label": "Webhook Delivery"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Payout",
+                "to": "Ledger",
+                "arrow": "->>",
+                "label": "read available balance at cutoff (minus reserve)"
+              },
+              {
+                "from": "Payout",
+                "to": "Ledger",
+                "arrow": "->>",
+                "label": "create payout (state=scheduled)"
+              },
+              {
+                "from": "Payout",
+                "to": "PSP",
+                "arrow": "->>",
+                "label": "transfer (state=sent, idemKey)"
+              },
+              {
+                "type": "alt",
+                "label": "transfer confirmed in settlement report",
+                "messages": [
+                  {
+                    "from": "Payout",
+                    "to": "Ledger",
+                    "arrow": "->>",
+                    "label": "debit available; payout state=paid"
+                  },
+                  {
+                    "from": "Payout",
+                    "to": "WebhookSvc",
+                    "arrow": "->>",
+                    "label": "emit payout.paid"
+                  }
+                ],
+                "else": {
+                  "label": "returned / failed",
+                  "messages": [
+                    {
+                      "from": "Payout",
+                      "to": "Ledger",
+                      "arrow": "->>",
+                      "label": "reversing entries; payout state=returned"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Payout",
+            "Ledger"
+          ]
+        }
       ]
     },
     {
       "id": "scale",
-      "title": "7. Resilience, PSP Failures, and Scale",
+      "title": "7. Scale the Payment Store",
       "description": [
-        "The gateway depends on external networks, so design for their failure: multiple acquirers with failover, circuit breakers around PSP calls, and queue-based retry for transient errors — while never double-charging (idempotency + reconciliation).",
-        "Scale the charge path horizontally (stateless orchestrator, charges sharded by id); webhook delivery and payouts are async consumers that scale independently. Spikes (holiday sales) buffer in queues; the charge state machine persists progress so nothing is lost on restart.",
-        "Everything money-touching is auditable and reconcilable; the ledger and charge store are authoritative, while webhook delivery state and risk caches are recoverable."
+        "The money model fans out to ~70k–130k writes/sec at peak, so the charge/payment store is the throughput-defining component. Decide its topology: a single regional primary is simplest but ceiling-bound; sharding by merchant_id buys horizontal write capacity while keeping each merchant's charges, idempotency keys, and ledger entries co-located (so dedup and balance reads stay single-shard and strongly consistent); multi-region active/passive adds disaster resilience at the cost of replication lag and failover testing.",
+        "Scale the charge path horizontally around it: the orchestrator is stateless, webhook delivery and payouts are async consumers that scale independently, and spikes (holiday sales) buffer in queues while the persisted charge state machine means nothing is lost on restart.",
+        "Everything money-touching is auditable and reconcilable; the ledger and charge store are authoritative, while webhook delivery state and risk caches are recoverable. (Resilience to the external acquirer going down is the next step.)"
       ],
       "view": {
         "nodes": [
@@ -1671,13 +3370,15 @@
           "ChargeSvc",
           "ChargeDB",
           "PSP",
+          "WebhookSvc",
           "WebhookQ"
         ],
-        "caption": "The gateway API drives the stateless orchestrator, which persists to the sharded charge store, calls the acquirer, and enqueues async webhook delivery.",
+        "caption": "The gateway API drives the stateless orchestrator, which persists to the sharded charge store, calls the acquirer behind a breaker, and hands events to the webhook delivery service to enqueue async.",
         "links": [
           "api-charge",
           "charge-db",
           "charge-psp",
+          "charge-webhook",
           "webhook-q"
         ],
         "highlight": [
@@ -1688,19 +3389,382 @@
           "async"
         ]
       },
-      "decisionPrompt": "Your primary acquirer goes down during peak. What happens to in-flight and new charges?",
+      "options": [
+        {
+          "name": "Charge store: merchant-sharded primary (default)",
+          "description": "Scale the charge/payment store by sharding on merchant_id with a strongly-consistent primary per shard, keeping each merchant's money records on one shard for clean idempotency and ledger reads.",
+          "pros": [
+            "Horizontal write capacity for the ~70k–130k writes/sec the money model fans out to at peak.",
+            "A merchant's charges, idempotency keys, and ledger entries co-locate, so dedup and balance reads stay single-shard and strongly consistent.",
+            "Blast radius of a shard incident is limited to its merchants."
+          ],
+          "cons": [
+            "Cross-merchant or global reporting must scatter-gather.",
+            "Hot merchants (huge sellers) can create skew that needs sub-sharding.",
+            "Resharding is operationally heavy and must preserve money invariants."
+          ],
+          "view": {
+            "nodes": [
+              "API",
+              "ChargeSvc",
+              "ChargeDB"
+            ],
+            "caption": "The stateless orchestrator writes to a charge store sharded by merchant_id, keeping each merchant's money records on one strongly-consistent shard.",
+            "links": [
+              "api-charge",
+              {
+                "from": "ChargeSvc",
+                "to": "ChargeDB",
+                "label": "write to shard(merchant_id)"
+              }
+            ],
+            "highlight": [
+              "ChargeDB"
+            ]
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/07-scale-opt1.jpg"
+        },
+        {
+          "name": "Charge store: single regional primary",
+          "description": "Keep one strongly-consistent primary in one region with read replicas, deferring sharding until volume forces it.",
+          "pros": [
+            "Simplest to reason about: one source of truth, trivial cross-merchant queries.",
+            "Strong consistency everywhere with no shard-routing logic.",
+            "Fine until you approach the write ceiling of a single primary."
+          ],
+          "cons": [
+            "Single write ceiling becomes the throughput limit under peak.",
+            "Regional outage takes the whole gateway down.",
+            "Eventually forces a painful migration to sharding."
+          ],
+          "view": {
+            "nodes": [
+              "API",
+              "ChargeSvc",
+              "ChargeDB"
+            ],
+            "caption": "All charges write to a single regional primary store with read replicas — simple but ceiling-bound.",
+            "links": [
+              "api-charge",
+              "charge-db"
+            ],
+            "highlight": [
+              "ChargeDB"
+            ]
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/07-scale-opt2.jpg"
+        },
+        {
+          "name": "Charge store: multi-region active/passive",
+          "description": "Run a hot standby region that replicates the charge store and can take over on a regional failure, trading some failover lag for disaster resilience.",
+          "pros": [
+            "Survives a full regional outage with a bounded RPO/RTO.",
+            "Keeps a strongly-consistent primary (active) while the passive only serves reads/standby.",
+            "Clear story for compliance/availability requirements."
+          ],
+          "cons": [
+            "Cross-region replication lag means a failover can lose the most recent unreplicated writes unless synchronous (which adds latency).",
+            "Most expensive option to run and to test.",
+            "Failover drills are mandatory or the standby rots."
+          ],
+          "view": {
+            "nodes": [
+              "ChargeSvc",
+              "ChargeDB",
+              {
+                "id": "ChargeDBStandby",
+                "label": "Standby Store (region B)"
+              }
+            ],
+            "caption": "The active primary replicates to a passive standby in another region that takes over on regional failure.",
+            "links": [
+              "charge-db",
+              {
+                "from": "ChargeDB",
+                "to": "ChargeDBStandby",
+                "label": "replicate"
+              }
+            ],
+            "highlight": [
+              "ChargeDBStandby"
+            ]
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/07-scale-opt3.jpg"
+        }
+      ],
+      "decisionPrompt": "Peak holiday traffic pushes the charge store toward ~100k writes/sec. How do you scale it without breaking idempotency or the ledger's strong-consistency needs?",
       "whyNow": [
-        "Closing on PSP failure handling + scale shows the gateway stays correct and available despite external dependencies — the reliability requirement."
+        "The charge store is the throughput-defining, correctness-critical component; choosing its topology is the scaling decision a senior candidate must reason about before worrying about external dependencies."
       ],
       "probeLinks": [
-        "stripe-idempotency",
-        "stripe-webhooks",
+        "stripe-online-migrations",
+        "vitess-sharding",
+        "cockroachdb-payments-architecture",
+        "square-books-ledger",
         "modern-treasury-ledgers",
-        "paypal-idempotency"
+        "stripe-reports-reconciliation"
+      ],
+      "concepts": [
+        {
+          "term": "Merchant-sharded money store",
+          "definition": "Sharding the charge/payment/ledger store by merchant_id so each merchant's charges, idempotency keys, and ledger entries co-locate on one strongly-consistent shard.",
+          "whyItMatters": "Keeps dedup and balance reads single-shard and strongly consistent while giving horizontal write capacity for the peak fan-out.",
+          "example": "shard(merchant_id) owns a merchant's charges + idempotency_keys + ledger_entries; cross-merchant reports scatter-gather.",
+          "group": "Scale the Payment Store"
+        }
+      ],
+      "patterns": [
+        "PSP reconciliation"
+      ],
+      "traps": [
+        {
+          "trap": "Scaling the ledger with eventual consistency on balances that determine payouts.",
+          "why": "If a payout reads a stale or not-yet-reconciled balance, you can overpay a merchant and create a negative balance you can't recover.",
+          "instead": "Keep balance reads for payouts strongly consistent and reconciled; pay out available (settled) balance minus reserve, never pending."
+        },
+        {
+          "trap": "Sharding charges so a merchant's idempotency keys and ledger entries land on different shards.",
+          "why": "Idempotency dedup and balance reads then span shards, turning a single-shard strong-consistency guarantee into a distributed transaction.",
+          "instead": "Shard everything money-touching by the same merchant_id key so a merchant's records stay co-located on one shard."
+        }
       ],
       "recap": {
-        "before": "Happy-path gateway.",
-        "after": "Multi-acquirer failover, circuit breakers, sharded scale, reconcilable state.",
+        "before": "Happy-path gateway accounting.",
+        "after": "Horizontally scaled, merchant-sharded charge store with a stateless charge path and async consumers.",
+        "newRisk": "The external acquirer can still go down or time out — scale doesn't make the dependency reliable."
+      },
+      "bottlenecks": [
+        {
+          "issue": "Single charge-store primary write ceiling under peak.",
+          "mitigation": "Shard by merchant_id; keep each merchant's money records single-shard."
+        },
+        {
+          "issue": "Webhook fan-out to slow merchant endpoints.",
+          "mitigation": "Per-endpoint queues, backoff, DLQ; don't let one slow merchant block others."
+        }
+      ]
+    },
+    {
+      "id": "psp-resilience",
+      "title": "8. PSP Resilience & Multi-Acquirer Routing",
+      "description": [
+        "The gateway's hardest dependency is the external acquirer/card network: it can be slow, time out, or go down entirely, and a blind retry double-charges. Design routing around its failure: a circuit breaker around each acquirer's calls, multiple acquirers to fail over to, and — above all — a safe routing contract that never re-sends an ambiguous authorization.",
+        "The safe-failover rule has three cases where moving a charge to another acquirer is provably safe: (1) before any authorize was sent to the first acquirer; (2) after the first attempt is reconciled to a confirmed failure; or (3) when a provider/network idempotency contract guarantees the same logical authorization can't double-charge. An authorize_unknown is none of those until reconciled — so you reconcile acquirer A first, and only route to B once A is confirmed failed.",
+        "Beyond failover, choose how you route normally: a single acquirer is simplest; active/passive uses a backup only on failure; rule-based multi-acquirer routing spreads volume by cost, BIN, or success rate. Network-token/PSP-token constraints can pin a charge to the acquirer that issued the token, limiting where you can fail over."
+      ],
+      "view": {
+        "nodes": [
+          "ChargeSvc",
+          "ChargeDB",
+          "PSP"
+        ],
+        "caption": "The orchestrator calls the acquirer behind a circuit breaker, persisting authorize_unknown on a timeout and reconciling before any failover.",
+        "links": [
+          "charge-db",
+          "charge-psp"
+        ],
+        "highlight": [
+          "PSP",
+          "ChargeSvc"
+        ],
+        "groups": [
+          "charge-flow"
+        ]
+      },
+      "options": [
+        {
+          "name": "Active/passive failover after confirmed failure (default)",
+          "description": "Route all charges to a primary acquirer behind a circuit breaker; on a confirmed failure (after reconciling any ambiguous attempt) fail over to a backup acquirer. Never re-send an unresolved authorize.",
+          "pros": [
+            "Simple routing with a clear safety contract: fail over only after the first attempt is reconciled to a confirmed failure.",
+            "Survives a full primary-acquirer outage without standing up complex routing rules.",
+            "An ambiguous authorize_unknown blocks failover until reconciled, so a customer is never double-authorized."
+          ],
+          "cons": [
+            "Reconcile-before-failover adds latency to the unlucky charges that hit the outage.",
+            "The passive acquirer's capacity and integration must be kept warm and tested or it rots.",
+            "No load spreading in steady state — the backup sits idle."
+          ],
+          "view": {
+            "nodes": [
+              "ChargeSvc",
+              {
+                "id": "PSPA",
+                "label": "Acquirer A",
+                "type": "external"
+              },
+              {
+                "id": "PSPB",
+                "label": "Acquirer B",
+                "type": "external"
+              },
+              "ChargeDB"
+            ],
+            "caption": "Charges go to acquirer A behind a breaker; on confirmed failure (after reconcile) they fail over to acquirer B.",
+            "links": [
+              {
+                "from": "ChargeSvc",
+                "to": "PSPA",
+                "label": "authorize (primary, breaker)"
+              },
+              {
+                "from": "ChargeSvc",
+                "to": "PSPB",
+                "label": "failover after A confirmed failed"
+              },
+              {
+                "from": "ChargeSvc",
+                "to": "ChargeDB",
+                "label": "persist attempt + state"
+              }
+            ],
+            "highlight": [
+              "PSPA",
+              "PSPB"
+            ]
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/08-psp-resilience-opt1.jpg"
+        },
+        {
+          "name": "Single acquirer",
+          "description": "Route every charge to one acquirer. No failover path; an acquirer outage is a gateway outage for new charges.",
+          "pros": [
+            "Simplest possible integration and reconciliation — one settlement report, one set of credentials.",
+            "No routing logic, no cross-acquirer token constraints to reason about.",
+            "Easiest to get correct first; failover is a later hardening step."
+          ],
+          "cons": [
+            "A single acquirer outage stalls all new charges — directly violates the resilience requirement.",
+            "No leverage on cost, BIN coverage, or per-acquirer success rates.",
+            "Vendor lock-in, including PSP-scoped tokens."
+          ],
+          "view": {
+            "nodes": [
+              "ChargeSvc",
+              "PSP",
+              "ChargeDB"
+            ],
+            "caption": "All charges authorize through a single acquirer behind a breaker; an outage stalls new charges.",
+            "links": [
+              "charge-psp",
+              "charge-db"
+            ],
+            "highlight": [
+              "PSP"
+            ]
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/08-psp-resilience-opt2.jpg"
+        },
+        {
+          "name": "Rule-based multi-acquirer routing",
+          "description": "A routing layer picks an acquirer per charge by cost, card BIN/network, geography, or live success rate, with the same safe-failover contract on top.",
+          "pros": [
+            "Optimizes authorization rate, fees, and coverage by sending each charge to the best acquirer.",
+            "Spreads load so no single acquirer is a bottleneck or single point of failure.",
+            "Degrades gracefully: an unhealthy acquirer is weighted down by live success-rate feedback."
+          ],
+          "cons": [
+            "Most complex to build, test, and reconcile (multiple settlement reports, per-acquirer quirks).",
+            "Network/PSP-token constraints can pin some charges to a specific acquirer, limiting routing freedom.",
+            "Routing bugs can concentrate traffic or fail over unsafely if the contract isn't enforced everywhere."
+          ],
+          "view": {
+            "nodes": [
+              "ChargeSvc",
+              {
+                "id": "Router",
+                "label": "Acquirer Router"
+              },
+              {
+                "id": "PSPA",
+                "label": "Acquirer A",
+                "type": "external"
+              },
+              {
+                "id": "PSPB",
+                "label": "Acquirer B",
+                "type": "external"
+              }
+            ],
+            "caption": "A routing layer selects an acquirer per charge by cost/BIN/success-rate, applying the same safe-failover contract.",
+            "links": [
+              {
+                "from": "ChargeSvc",
+                "to": "Router",
+                "label": "route(charge)"
+              },
+              {
+                "from": "Router",
+                "to": "PSPA",
+                "label": "authorize (A)"
+              },
+              {
+                "from": "Router",
+                "to": "PSPB",
+                "label": "authorize (B)"
+              }
+            ],
+            "highlight": [
+              "Router"
+            ]
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/08-psp-resilience-opt3.jpg"
+        }
+      ],
+      "decisionPrompt": "Your primary acquirer goes down during peak. What happens to in-flight and new charges — and when is it safe to route a charge to a second acquirer?",
+      "whyNow": [
+        "Closing on PSP failure handling shows the gateway stays correct and available despite its least-reliable dependency; the safe-failover contract is the senior/staff signal."
+      ],
+      "probeLinks": [
+        "checkout-routing",
+        "aws-retries-backoff-jitter",
+        "azure-circuit-breaker",
+        "sre-monitoring",
+        "stripe-payment-intents",
+        "adyen-webhooks"
+      ],
+      "concepts": [
+        {
+          "term": "Safe acquirer failover",
+          "definition": "Failing a charge over to another acquirer only when it is provably safe: before any authorize was sent, after a confirmed failure, or when a provider/network idempotency contract guarantees no double-authorization.",
+          "whyItMatters": "Retrying an ambiguous authorize through a second acquirer is how you double-charge a customer.",
+          "example": "authorize_unknown on acquirer A => reconcile A first; only route to B once A is confirmed failed.",
+          "group": "PSP Resilience & Multi-Acquirer Routing"
+        },
+        {
+          "term": "Circuit breaker around the acquirer",
+          "definition": "A breaker that trips after consecutive failures/timeouts to a PSP, fast-failing new calls instead of piling them onto a struggling provider, and half-opens to probe recovery.",
+          "whyItMatters": "Stops a slow acquirer from exhausting orchestrator threads and lets routing shed load to a healthy acquirer.",
+          "example": "5 consecutive timeouts trips the breaker on A; new charges route to B while A is probed for recovery.",
+          "group": "PSP Resilience & Multi-Acquirer Routing"
+        },
+        {
+          "term": "Payment observability signals",
+          "definition": "The money-specific metrics and alerts a gateway must watch beyond generic latency/error rates.",
+          "whyItMatters": "These are the signals that catch silent money loss, stuck flows, and accounting drift before customers or auditors do.",
+          "example": "Charge success rate, PSP timeout/unknown rate, stale authorize_unknown age, webhook backlog age, reconciliation mismatch count, payout failure count, and ledger imbalance alerts (debits != credits).",
+          "group": "PSP Resilience & Multi-Acquirer Routing"
+        }
+      ],
+      "patterns": [
+        "Circuit breaker + failover",
+        "PSP reconciliation"
+      ],
+      "traps": [
+        {
+          "trap": "Retrying a timed-out (ambiguous) authorize through a different acquirer.",
+          "why": "The first acquirer may have authorized; sending the same authorization to a second one double-charges the customer.",
+          "instead": "Reconcile the first attempt to a confirmed outcome before any failover; only route to another acquirer once the first is provably failed (or with a network-level idempotency contract)."
+        },
+        {
+          "trap": "Failing over a charge whose card was tokenized as a PSP/network token scoped to the first acquirer.",
+          "why": "A PSP-scoped token is meaningless to a second acquirer, so the failover authorize fails (or forces an unsafe re-tokenization).",
+          "instead": "Track token scope; only fail over charges whose token the target acquirer can use, or re-tokenize through a safe path before routing."
+        }
+      ],
+      "recap": {
+        "before": "Scaled but single-acquirer-dependent.",
+        "after": "Multi-acquirer failover behind circuit breakers with a safe routing contract and reconcilable state.",
         "newRisk": "Acquirer failover and reconciliation lag — bounded by idempotency, circuit breakers, and authoritative ledgers."
       },
       "bottlenecks": [
@@ -1709,15 +3773,106 @@
           "mitigation": "Circuit breaker + acquirer failover + async retry for transient declines."
         },
         {
-          "issue": "Webhook fan-out to slow merchant endpoints.",
-          "mitigation": "Per-endpoint queues, backoff, DLQ; don't let one slow merchant block others."
+          "issue": "Reconcile-before-failover backlog when a primary acquirer is flapping.",
+          "mitigation": "Bound the reconcile/queue depth; alert on stale authorize_unknown age so stuck charges are worked, not silently aging."
+        }
+      ],
+      "flows": [
+        {
+          "name": "PSP resilience: breaker + safe acquirer failover",
+          "note": "A tripped breaker on acquirer A only fails over after the in-flight charge is reconciled to a confirmed failure — never while it is ambiguous.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "ChargeSvc",
+                "label": "Charge Orchestrator"
+              },
+              {
+                "id": "PSPA",
+                "label": "Acquirer A"
+              },
+              {
+                "id": "PSPB",
+                "label": "Acquirer B"
+              },
+              {
+                "id": "ChargeDB",
+                "label": "Charge Store"
+              }
+            ],
+            "messages": [
+              {
+                "from": "ChargeSvc",
+                "to": "PSPA",
+                "arrow": "->>",
+                "label": "authorize (breaker closed)"
+              },
+              {
+                "type": "alt",
+                "label": "timeout / breaker trips",
+                "messages": [
+                  {
+                    "from": "ChargeSvc",
+                    "to": "ChargeDB",
+                    "arrow": "->>",
+                    "label": "state=authorize_unknown"
+                  },
+                  {
+                    "from": "ChargeSvc",
+                    "to": "PSPA",
+                    "arrow": "->>",
+                    "label": "query status (reconcile A first)"
+                  },
+                  {
+                    "type": "alt",
+                    "label": "A confirmed failed",
+                    "messages": [
+                      {
+                        "from": "ChargeSvc",
+                        "to": "PSPB",
+                        "arrow": "->>",
+                        "label": "authorize on B (now safe)"
+                      }
+                    ],
+                    "else": {
+                      "label": "A succeeded / still unknown",
+                      "messages": [
+                        {
+                          "from": "ChargeSvc",
+                          "to": "ChargeDB",
+                          "arrow": "->>",
+                          "label": "resolve from A; do NOT route to B"
+                        }
+                      ]
+                    }
+                  }
+                ],
+                "else": {
+                  "label": "A responds",
+                  "messages": [
+                    {
+                      "from": "ChargeSvc",
+                      "to": "ChargeDB",
+                      "arrow": "->>",
+                      "label": "state=authorized"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "ChargeSvc",
+            "PSPA",
+            "PSPB"
+          ]
         }
       ]
     }
   ],
   "finalDesign": {
     "title": "Final Design — Payment Gateway",
-    "description": "Card data is tokenized in a small PCI vault (client SDK -> vault), so the gateway runs on tokens. Charges are idempotent (merchant key, persisted with the charge) and driven by an orchestrator through a state machine: risk-score, then authorize/capture via an acquirer with careful ambiguous-response reconciliation (no double-auth). Outcomes flow to merchants via signed, at-least-once webhooks (transactional outbox + retry/DLQ). Every movement posts to a double-entry ledger that's reconciled against PSP settlement and drives scheduled merchant payouts. The charge path scales statelessly (sharded), external PSP calls use circuit breakers + multi-acquirer failover, and the ledger/charge store stay authoritative and auditable.",
+    "description": "Card data is tokenized in a small PCI vault (client SDK -> vault), so the gateway runs on tokens. Charges are idempotent (merchant key, persisted with the charge) and driven by an orchestrator through a state machine: risk-score, then authorize/capture via an acquirer with careful ambiguous-response reconciliation (no double-auth). Outcomes flow to merchants via signed, at-least-once webhooks (transactional outbox + retry/DLQ). Every movement posts to a double-entry ledger (balanced per currency, append-only, reconciled line-by-line against PSP settlement) that drives scheduled merchant payouts of settled available balance minus reserve. The charge path scales statelessly on a merchant-sharded store, external PSP calls use circuit breakers + safe multi-acquirer failover, and the ledger/charge store stay authoritative and auditable. Around all of this sits an operational plane that the diagram omits but the system depends on: merchant configuration and API-key/webhook-secret rotation, an admin/reconciliation console with runbooks for stuck authorize_unknown charges, reconciliation mismatches, payout returns, webhook DLQ replay, and ledger-imbalance alerts, plus PCI controls (vault access audit log, key versioning, PAN redaction in logs/traces) and money-specific alerting (unknown-payment count and stale age, reconciliation mismatch count, ledger imbalance, payout failures, webhook backlog age, per-merchant throttle/drop rates).",
     "view": {
       "nodes": [
         "Merchant",
@@ -1756,7 +3911,8 @@
         "charge-flow",
         "async"
       ]
-    }
+    },
+    "aiVisual": "assets/generated/ai-visuals/final-design.jpg"
   },
   "satisfies": {
     "functional": [
@@ -1766,73 +3922,84 @@
         "steps": [
           "pci",
           "orchestrate"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-01-charge-a-card.jpg"
       },
       {
         "requirement": "Refund",
-        "how": "Refund as a reverse money movement (ledger + PSP).",
+        "how": "Idempotent refund (capped at remaining captured amount): PSP reversal, reversing ledger entries, refund.created webhook.",
         "steps": [
           "ledger"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-02-refund.jpg"
       },
       {
         "requirement": "Fraud check",
         "how": "Risk scoring gate before the network.",
         "steps": [
           "orchestrate"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-03-fraud-check.jpg"
       },
       {
         "requirement": "Notify via webhooks",
         "how": "Outbox + at-least-once signed delivery.",
         "steps": [
           "webhooks"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-04-notify-via-webhooks.jpg"
       },
       {
         "requirement": "Merchant balances + payouts",
         "how": "Double-entry ledger + scheduled payouts.",
         "steps": [
           "ledger"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-05-merchant-balances-payouts.jpg"
       }
     ],
     "nonFunctional": [
       {
         "requirement": "No double-charge",
-        "how": "Idempotency key + PSP reconciliation.",
+        "how": "Idempotency key (+ request fingerprint) + explicit sent/unknown states + PSP reconciliation; exactly-once external effect, not exactly-once messaging.",
         "steps": [
           "idempotency",
           "orchestrate"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-01-no-double-charge.jpg"
       },
       {
         "requirement": "PCI compliance",
         "how": "Tokenization vault shrinks scope.",
         "steps": [
           "pci"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-02-pci-compliance.jpg"
       },
       {
         "requirement": "Reliable webhooks",
         "how": "Outbox + retry/backoff/DLQ + signatures.",
         "steps": [
           "webhooks"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-03-reliable-webhooks.jpg"
       },
       {
         "requirement": "Auditable money flow",
         "how": "Double-entry ledger reconciled to PSP.",
         "steps": [
           "ledger"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-04-auditable-money-flow.jpg"
       },
       {
         "requirement": "Resilient to PSP failure",
-        "how": "Circuit breakers + multi-acquirer failover.",
+        "how": "Circuit breakers + safe multi-acquirer failover (only after reconcile), on top of a horizontally-scaled merchant-sharded charge store.",
         "steps": [
-          "scale"
-        ]
+          "scale",
+          "psp-resilience"
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-05-resilient-to-psp-failure.jpg"
       }
     ]
   },
@@ -1861,7 +4028,7 @@
       "say": [
         "Ambiguous-PSP-response reconciliation (no double-auth).",
         "Reliable signed webhooks (outbox + retry).",
-        "Ledger + payouts; PSP failover and scale."
+        "Ledger + payouts; scale the charge store, then PSP failover with a safe routing contract."
       ]
     },
     {
@@ -1902,87 +4069,310 @@
   ],
   "followUps": [
     "How do you resolve an ambiguous authorize (timeout) without double-charging?",
-    "How would you handle disputes/chargebacks end to end?",
+    "How would you handle disputes/chargebacks end to end? — scoped out of the core case. It would touch the ledger as dispute holds/reserve debits, a chargeback debit against the merchant when lost, and reversing entries when won, plus an evidence-submission workflow and a dispute state machine.",
     "How do you keep PCI scope minimal across the whole system?",
     "How would you support multiple acquirers and route charges among them?",
-    "How do you make webhooks both reliable and not overwhelm a slow merchant?"
+    "How do you make webhooks both reliable and not overwhelm a slow merchant?",
+    "Where would 3DS/SCA (asynchronous customer authentication) fit into the charge state machine? — scoped out above. It would add requires_action / authentication_pending / authentication_failed states between risk_review and authorize_sent, with the customer redirected to the issuer and the charge resumed on an async authentication callback.",
+    "How would multi-currency and FX change the ledger? — scoped out above. It would add per-currency accounts (transactions still balance per currency), FX conversion entries at a booked rate, and a settlement-currency vs presentment-currency distinction.",
+    "How would merchant KYC/onboarding and bank-account verification gate payouts? — scoped out above. Payouts must not move funds until the merchant is onboarded (KYC/AML cleared) and the payout destination is a verified bank account; until then balances accrue but the payout state machine stays blocked."
   ],
   "toProbeFurther": {
     "links": [
       {
         "id": "stripe-idempotency",
-        "group": "Payments and Commerce",
-        "groupDescription": "Payment correctness, idempotency, ledgers, checkout, orders, and reconciliation references.",
+        "group": "Payment API Correctness",
+        "groupDescription": "Idempotency, retry semantics, payment lifecycles, and side-effect boundaries.",
         "title": "Idempotent Requests",
         "url": "https://docs.stripe.com/api/idempotent_requests",
         "source": "Stripe",
         "type": "Docs",
-        "why": "Canonical API reference for safe retries and exactly-once effects at payment boundaries.",
-        "year": "2024"
+        "why": "Canonical API reference for storing an idempotency key result and replaying the original response on retry."
+      },
+      {
+        "id": "stripe-idempotency-blog",
+        "group": "Payment API Correctness",
+        "groupDescription": "Idempotency, retry semantics, payment lifecycles, and side-effect boundaries.",
+        "title": "Designing robust and predictable APIs with idempotency",
+        "url": "https://stripe.com/blog/idempotency",
+        "source": "Stripe",
+        "type": "Engineering post",
+        "year": "2017",
+        "why": "Explains why charge APIs need explicit idempotency keys when networks fail mid-request."
+      },
+      {
+        "id": "aws-idempotent-apis",
+        "group": "Payment API Correctness",
+        "groupDescription": "Idempotency, retry semantics, payment lifecycles, and side-effect boundaries.",
+        "title": "Making retries safe with idempotent APIs",
+        "url": "https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-apis/",
+        "source": "AWS Builders' Library",
+        "type": "Engineering article",
+        "why": "Generalizes client request identifiers, semantic equivalence, late arrivals, and payload mismatch handling for mutating APIs."
+      },
+      {
+        "id": "adyen-idempotency",
+        "group": "Payment API Correctness",
+        "groupDescription": "Idempotency, retry semantics, payment lifecycles, and side-effect boundaries.",
+        "title": "API idempotency",
+        "url": "https://docs.adyen.com/development-resources/api-idempotency",
+        "source": "Adyen",
+        "type": "Docs",
+        "why": "Shows a second PSP contract for safe POST retries, duplicate processing, and timeout recovery."
+      },
+      {
+        "id": "paypal-idempotency",
+        "group": "Payment API Correctness",
+        "groupDescription": "Idempotency, retry semantics, payment lifecycles, and side-effect boundaries.",
+        "title": "Idempotency",
+        "url": "https://developer.paypal.com/api/rest/reference/idempotency/",
+        "source": "PayPal",
+        "type": "Docs",
+        "why": "Additional PSP reference for caller-supplied idempotency keys and repeat request behavior."
       },
       {
         "id": "stripe-payment-intents",
-        "group": "Payments and Commerce",
-        "groupDescription": "Payment correctness, idempotency, ledgers, checkout, orders, and reconciliation references.",
-        "title": "Payment Intents",
+        "group": "Payment API Correctness",
+        "groupDescription": "Idempotency, retry semantics, payment lifecycles, and side-effect boundaries.",
+        "title": "The Payment Intents API",
         "url": "https://docs.stripe.com/payments/payment-intents",
         "source": "Stripe",
         "type": "Docs",
-        "why": "Shows payment lifecycle, authorization/capture, retries, and asynchronous confirmation."
+        "why": "Shows how a payment object tracks lifecycle state, retries, additional authentication, and webhook-based completion."
       },
       {
-        "id": "stripe-webhooks",
-        "group": "Payments and Commerce",
-        "groupDescription": "Payment correctness, idempotency, ledgers, checkout, orders, and reconciliation references.",
-        "title": "Webhooks",
-        "url": "https://docs.stripe.com/webhooks",
+        "id": "stripe-auth-capture",
+        "group": "Payment API Correctness",
+        "groupDescription": "Idempotency, retry semantics, payment lifecycles, and side-effect boundaries.",
+        "title": "Place a hold on a payment method",
+        "url": "https://docs.stripe.com/payments/place-a-hold-on-a-payment-method",
         "source": "Stripe",
         "type": "Docs",
-        "why": "Concrete reference for asynchronous payment events, retries, signatures, and idempotent consumers."
+        "why": "Grounds the authorize-versus-capture split and timeout-sensitive capture window used by the charge state machine."
       },
       {
         "id": "pci-standards",
-        "group": "Payments and Commerce",
-        "groupDescription": "Payment correctness, idempotency, ledgers, checkout, orders, and reconciliation references.",
+        "group": "PCI Boundary and Tokenization",
+        "groupDescription": "Standards and implementation references for keeping raw card data out of general systems.",
         "title": "PCI Security Standards",
         "url": "https://www.pcisecuritystandards.org/standards/",
         "source": "PCI Security Standards Council",
         "type": "Standards",
-        "why": "Defines the compliance boundary for payment card data handling."
+        "why": "Defines the compliance boundary for systems that store, process, or transmit payment card data."
+      },
+      {
+        "id": "pci-tokenization-guidelines",
+        "group": "PCI Boundary and Tokenization",
+        "groupDescription": "Standards and implementation references for keeping raw card data out of general systems.",
+        "title": "PCI DSS Tokenization Guidelines Information Supplement",
+        "url": "https://www.pcisecuritystandards.org/documents/Tokenization_Guidelines_Info_Supplement.pdf",
+        "source": "PCI Security Standards Council",
+        "type": "Standards",
+        "year": "2011",
+        "why": "Details tokenization system scope and the fact that the tokenization system itself remains in the cardholder data environment."
+      },
+      {
+        "id": "stripe-pci-compliance",
+        "group": "PCI Boundary and Tokenization",
+        "groupDescription": "Standards and implementation references for keeping raw card data out of general systems.",
+        "title": "A guide to PCI compliance",
+        "url": "https://stripe.com/guides/pci-compliance",
+        "source": "Stripe",
+        "type": "Guide",
+        "why": "Explains how hosted fields and SDK-based collection reduce PCI burden by sending card data directly to the processor."
+      },
+      {
+        "id": "stripe-tokens",
+        "group": "PCI Boundary and Tokenization",
+        "groupDescription": "Standards and implementation references for keeping raw card data out of general systems.",
+        "title": "Tokens",
+        "url": "https://docs.stripe.com/api/tokens",
+        "source": "Stripe",
+        "type": "Docs",
+        "why": "Concrete tokenization API model: sensitive details are collected securely and represented by a token used by the server."
+      },
+      {
+        "id": "braintree-hosted-fields",
+        "group": "PCI Boundary and Tokenization",
+        "groupDescription": "Standards and implementation references for keeping raw card data out of general systems.",
+        "title": "Hosted Fields",
+        "url": "https://developer.paypal.com/braintree/docs/start/hosted-fields/",
+        "source": "Braintree",
+        "type": "Docs",
+        "why": "Shows the hosted iframe pattern where raw card data bypasses the merchant server and returns a nonce instead."
+      },
+      {
+        "id": "stripe-webhooks",
+        "group": "Webhook Delivery and State Repair",
+        "groupDescription": "References for signed, at-least-once event delivery, deduplication, retries, and replay.",
+        "title": "Receive Stripe events in your webhook endpoint",
+        "url": "https://docs.stripe.com/webhooks",
+        "source": "Stripe",
+        "type": "Docs",
+        "why": "Documents duplicate events, non-guaranteed ordering, signatures, automatic retries, and asynchronous processing guidance."
+      },
+      {
+        "id": "adyen-webhooks",
+        "group": "Webhook Delivery and State Repair",
+        "groupDescription": "References for signed, at-least-once event delivery, deduplication, retries, and replay.",
+        "title": "Webhooks",
+        "url": "https://docs.adyen.com/development-resources/webhooks/",
+        "source": "Adyen",
+        "type": "Docs",
+        "why": "Shows webhook-based state management for asynchronous payment flows, external events, reports, and account updates."
+      },
+      {
+        "id": "paypal-webhooks",
+        "group": "Webhook Delivery and State Repair",
+        "groupDescription": "References for signed, at-least-once event delivery, deduplication, retries, and replay.",
+        "title": "Webhooks",
+        "url": "https://developer.paypal.com/docs/api/webhooks/v1/",
+        "source": "PayPal",
+        "type": "Docs",
+        "why": "Provides a second payment-provider webhook API reference, including event subscription and signature verification fields."
+      },
+      {
+        "id": "github-webhook-best-practices",
+        "group": "Webhook Delivery and State Repair",
+        "groupDescription": "References for signed, at-least-once event delivery, deduplication, retries, and replay.",
+        "title": "Best practices for using webhooks",
+        "url": "https://docs.github.com/en/webhooks/using-webhooks/best-practices-for-using-webhooks",
+        "source": "GitHub",
+        "type": "Docs",
+        "why": "Useful non-payments reference for delivery IDs, replay protection, signature validation, and fast acknowledgement."
       },
       {
         "id": "modern-treasury-ledgers",
-        "group": "Payments and Commerce",
-        "groupDescription": "Payment correctness, idempotency, ledgers, checkout, orders, and reconciliation references.",
-        "title": "Ledgers",
+        "group": "Ledgers, Settlement, and Reconciliation",
+        "groupDescription": "Production ledger, payout, settlement, and reconciliation models for money movement.",
+        "title": "Ledgers Overview",
         "url": "https://docs.moderntreasury.com/ledgers/docs",
         "source": "Modern Treasury",
         "type": "Docs",
-        "why": "Practical API model for double-entry ledgers, accounts, transactions, and balance views."
+        "why": "Practical API model for double-entry ledger accounts, transactions, balances, settlements, and concurrency."
       },
       {
-        "id": "paypal-idempotency",
-        "group": "Payments and Commerce",
-        "groupDescription": "Payment correctness, idempotency, ledgers, checkout, orders, and reconciliation references.",
-        "title": "API Idempotency",
-        "url": "https://developer.paypal.com/api/rest/reference/idempotency/",
-        "source": "PayPal",
+        "id": "square-books-ledger",
+        "group": "Ledgers, Settlement, and Reconciliation",
+        "groupDescription": "Production ledger, payout, settlement, and reconciliation models for money movement.",
+        "title": "Books, an immutable double-entry accounting database service",
+        "url": "https://developer.squareup.com/blog/books-an-immutable-double-entry-accounting-database-service/",
+        "source": "Square",
+        "type": "Engineering post",
+        "year": "2019",
+        "why": "Company implementation case study for a scalable immutable double-entry ledger used across Square products."
+      },
+      {
+        "id": "stripe-reports-reconciliation",
+        "group": "Ledgers, Settlement, and Reconciliation",
+        "groupDescription": "Production ledger, payout, settlement, and reconciliation models for money movement.",
+        "title": "How to select a report",
+        "url": "https://docs.stripe.com/reports/select-a-report",
+        "source": "Stripe",
         "type": "Docs",
-        "why": "Additional PSP reference for idempotent payment API behavior."
+        "why": "Clarifies balance versus payout reconciliation reports and how payout batches map to underlying transactions."
+      },
+      {
+        "id": "modern-treasury-reconciliation",
+        "group": "Ledgers, Settlement, and Reconciliation",
+        "groupDescription": "Production ledger, payout, settlement, and reconciliation models for money movement.",
+        "title": "Reconciliation Overview",
+        "url": "https://docs.moderntreasury.com/reconciliation/docs/overview",
+        "source": "Modern Treasury",
+        "type": "Docs",
+        "why": "Explains automated reconciliation as matching external bank or processor transactions against internal expected records."
+      },
+      {
+        "id": "saga-pattern",
+        "group": "Workflow Resilience and PSP Routing",
+        "groupDescription": "Patterns for resumable orchestration, external dependency failure, backoff, circuit breaking, and routing.",
+        "title": "Pattern: Saga",
+        "url": "https://microservices.io/patterns/data/saga.html",
+        "source": "Microservices.io",
+        "type": "Pattern",
+        "why": "Frames long-running multi-step transactions and compensations when a payment flow spans local state and external services."
+      },
+      {
+        "id": "aws-retries-backoff-jitter",
+        "group": "Workflow Resilience and PSP Routing",
+        "groupDescription": "Patterns for resumable orchestration, external dependency failure, backoff, circuit breaking, and routing.",
+        "title": "Timeouts, retries, and backoff with jitter",
+        "url": "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/",
+        "source": "AWS Builders' Library",
+        "type": "Engineering article",
+        "why": "Operational guidance for retry budgets, timeout selection, backoff, jitter, and avoiding retry storms against PSPs."
+      },
+      {
+        "id": "azure-circuit-breaker",
+        "group": "Workflow Resilience and PSP Routing",
+        "groupDescription": "Patterns for resumable orchestration, external dependency failure, backoff, circuit breaking, and routing.",
+        "title": "Circuit Breaker Pattern",
+        "url": "https://learn.microsoft.com/azure/architecture/patterns/circuit-breaker",
+        "source": "Microsoft Learn",
+        "type": "Pattern",
+        "why": "Covers failure isolation when external services are slow, unavailable, or repeatedly timing out."
+      },
+      {
+        "id": "checkout-routing",
+        "group": "Workflow Resilience and PSP Routing",
+        "groupDescription": "Patterns for resumable orchestration, external dependency failure, backoff, circuit breaking, and routing.",
+        "title": "Intelligent payment routing explained",
+        "url": "https://www.checkout.com/blog/intelligent-payment-routing-explained",
+        "source": "Checkout.com",
+        "type": "Explainer",
+        "year": "2023",
+        "why": "Payment-provider explanation of dynamic PSP/network routing, retry, and acceptance-rate tradeoffs."
       },
       {
         "id": "sre-monitoring",
-        "group": "Foundations",
-        "groupDescription": "Core system design references for scalability, reliability, and operating distributed services.",
+        "group": "Workflow Resilience and PSP Routing",
+        "groupDescription": "Patterns for resumable orchestration, external dependency failure, backoff, circuit breaking, and routing.",
         "title": "Monitoring Distributed Systems",
         "url": "https://sre.google/sre-book/monitoring-distributed-systems/",
         "source": "Google SRE",
         "type": "Book chapter",
-        "why": "Grounds monitoring and alerting decisions in user-visible reliability signals."
+        "why": "Grounds payment gateway monitoring in latency, traffic, errors, and saturation instead of only component health."
+      },
+      {
+        "id": "stripe-online-migrations",
+        "group": "Payment Store Scale and Migration",
+        "groupDescription": "References for scaling and changing correctness-critical payment data stores without downtime.",
+        "title": "Online migrations at scale",
+        "url": "https://stripe.com/blog/online-migrations",
+        "source": "Stripe",
+        "type": "Engineering post",
+        "year": "2017",
+        "why": "Describes dual writes, backfills, read comparison, and incremental cutover for large always-on data migrations."
+      },
+      {
+        "id": "vitess-sharding",
+        "group": "Payment Store Scale and Migration",
+        "groupDescription": "References for scaling and changing correctness-critical payment data stores without downtime.",
+        "title": "What Is Vitess?",
+        "url": "https://vitess.io/docs/23.0/overview/whatisvitess/",
+        "source": "Vitess",
+        "type": "Docs",
+        "why": "Shows how a sharding layer can scale MySQL while hiding shard routing, failover, and topology changes from application code."
+      },
+      {
+        "id": "cockroachdb-payments-architecture",
+        "group": "Payment Store Scale and Migration",
+        "groupDescription": "References for scaling and changing correctness-critical payment data stores without downtime.",
+        "title": "How to build a payments system that scales to infinity (with examples)",
+        "url": "https://www.cockroachlabs.com/blog/cockroachdb-payments-system-architecture/",
+        "source": "Cockroach Labs",
+        "type": "Explainer",
+        "year": "2026",
+        "why": "Discusses payment database scale, strong consistency, manual sharding costs, and distributed SQL tradeoffs."
       }
     ]
   },
   "assets": {
     "icon": "icon.png"
-  }
+  },
+  "aiVisuals": {
+    "requirements": "assets/generated/ai-visuals/requirements.jpg",
+    "capacity": "assets/generated/ai-visuals/capacity.jpg"
+  },
+  "explainerComic": "assets/generated/comic/interview-comic.jpg"
 }

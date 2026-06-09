@@ -29,7 +29,7 @@
         "traits": [
           "stateless"
         ],
-        "description": "CRUD for events; expands recurrence; checks conflicts."
+        "description": "CRUD for events; expands recurrence; applies conflict policy (calendars allow overlap unless a resource/room policy rejects it)."
       },
       {
         "id": "EventDB",
@@ -111,6 +111,38 @@
           "stateless"
         ],
         "description": "Delta sync to devices/external calendars (CalDAV)."
+      },
+      {
+        "id": "Cache",
+        "label": "Read Cache",
+        "type": "cache",
+        "category": "state",
+        "traits": [
+          "stateful",
+          "derived"
+        ],
+        "description": "Hot calendar-view and free/busy results; invalidated through the same change log so it never serves a stale write."
+      },
+      {
+        "id": "ChangeLog",
+        "label": "Change Log / Outbox",
+        "type": "stream",
+        "category": "async",
+        "traits": [
+          "stateful",
+          "durable"
+        ],
+        "description": "Per-calendar ordered log of committed event mutations; the single durable source that feeds busy-index, reminders, invite fanout, and device sync."
+      },
+      {
+        "id": "Projector",
+        "label": "Derived-State Projectors",
+        "type": "worker",
+        "category": "async",
+        "traits": [
+          "stateless"
+        ],
+        "description": "Idempotent workers that consume the change log to update the busy index, materialize reminder jobs, fan out invite updates, and advance sync cursors."
       }
     ],
     "links": [
@@ -131,6 +163,48 @@
         "from": "EventSvc",
         "to": "EventDB",
         "label": "persist event + RRULE"
+      },
+      {
+        "id": "event-changelog",
+        "from": "EventSvc",
+        "to": "ChangeLog",
+        "label": "append mutation (outbox, same txn)"
+      },
+      {
+        "id": "changelog-projector",
+        "from": "ChangeLog",
+        "to": "Projector",
+        "label": "consume changes"
+      },
+      {
+        "id": "projector-index",
+        "from": "Projector",
+        "to": "BusyIndex",
+        "label": "update busy intervals"
+      },
+      {
+        "id": "projector-reminder",
+        "from": "Projector",
+        "to": "ReminderQ",
+        "label": "materialize due jobs"
+      },
+      {
+        "id": "projector-invite",
+        "from": "Projector",
+        "to": "InviteSvc",
+        "label": "fan out update"
+      },
+      {
+        "id": "projector-cache",
+        "from": "Projector",
+        "to": "Cache",
+        "label": "invalidate hot entries"
+      },
+      {
+        "id": "freebusy-cache",
+        "from": "FreeBusy",
+        "to": "Cache",
+        "label": "cached free/busy"
       },
       {
         "id": "event-expander",
@@ -163,12 +237,6 @@
         "label": "materialize busy"
       },
       {
-        "id": "event-invite",
-        "from": "EventSvc",
-        "to": "InviteSvc",
-        "label": "invite attendees"
-      },
-      {
         "id": "invite-notify",
         "from": "InviteSvc",
         "to": "Notify",
@@ -179,12 +247,6 @@
         "from": "Notify",
         "to": "Client",
         "label": "notification"
-      },
-      {
-        "id": "event-reminder",
-        "from": "EventSvc",
-        "to": "ReminderQ",
-        "label": "schedule reminder"
       },
       {
         "id": "reminder-notify",
@@ -199,9 +261,9 @@
         "label": "delta sync"
       },
       {
-        "id": "sync-eventdb",
+        "id": "sync-changelog",
         "from": "SyncSvc",
-        "to": "EventDB",
+        "to": "ChangeLog",
         "label": "changes since cursor"
       },
       {
@@ -226,7 +288,8 @@
         "label": "Availability",
         "nodes": [
           "FreeBusy",
-          "BusyIndex"
+          "BusyIndex",
+          "Cache"
         ]
       },
       {
@@ -238,28 +301,46 @@
           "ReminderQ",
           "SyncSvc"
         ]
+      },
+      {
+        "id": "pipeline",
+        "label": "Durable Change Pipeline",
+        "nodes": [
+          "ChangeLog",
+          "Projector"
+        ]
       }
     ]
   },
   "requirementsDiagram": [
     "graph LR",
     "  User[User]",
-    "  Create[Create event]",
-    "  Recur[Recurring rules]",
+    "  Create[Create / edit event]",
+    "  Recur[Recurring rules + edits]",
+    "  TZ[Timezone / DST correct]",
     "  Find[Find free time]",
     "  Invite[Invite + RSVP]",
+    "  Remind[Reminders]",
+    "  Sync[Device / external sync]",
     "  User --> Create",
     "  Create --> Recur",
+    "  Recur --> TZ",
     "  Create --> Find",
-    "  Create --> Invite"
+    "  Create --> Invite",
+    "  Create --> Remind",
+    "  Create --> Sync"
   ],
   "capacityDiagram": [
     "graph LR",
-    "  Events[Billions of events]",
-    "  Recur[Recurring expand]",
-    "  Busy[Free/busy queries]",
-    "  Events --> Recur",
-    "  Recur --> Busy"
+    "  Users[~500M users]",
+    "  Reads[~600k view reads/sec]",
+    "  Writes[~30k mutations/sec]",
+    "  Busy[~50k free/busy/sec]",
+    "  Remind[9am burst ~1M/sec]",
+    "  Users --> Reads",
+    "  Users --> Writes",
+    "  Users --> Busy",
+    "  Users --> Remind"
   ],
   "requirements": {
     "functional": [
@@ -272,45 +353,62 @@
     "nonFunctional": [
       "Correct across timezones and DST — the hardest hidden requirement.",
       "Fast free/busy and calendar reads (common operations).",
-      "Consistent: an RSVP/edit propagates to all attendees' views.",
+      "Consistent: an RSVP/edit propagates to all attendees' views without losing derived state.",
       "Scale to billions of events across many users.",
-      "Reliable reminders (fire on time, once) and delta sync to devices."
+      "Reliable reminders (fire once via the scheduler, at-least-once delivery) and delta sync to devices.",
+      "Safe under retries and races: idempotent mutations, versioned edits.",
+      "Privacy: free/busy exposes only busy/free per calendar ACLs, not event details."
     ]
   },
   "capacity": [
     {
-      "label": "Events",
-      "value": "billions",
-      "note": "Sharded by calendar/user."
+      "label": "Users / calendars",
+      "value": "~500M users, ~1.5B calendars",
+      "note": "~3 calendars/user (personal, work, shared/resource). Shard key is calendar_id."
     },
     {
-      "label": "Recurring",
-      "value": "common",
-      "note": "One rule -> many instances; don't store them all."
+      "label": "Canonical events vs attendee refs",
+      "value": "~10B canonical events, ~25–30B attendee refs",
+      "note": "'10B' counts canonical organizer-owned event rows (one per series — a recurring event is a single rule, never expanded). ~50% of meetings are solo; the rest average ~4 attendees, so attendee-calendar refs (calendar_event_refs) are ~2.5–3x the canonical count. Expanded instances are transient — materialized per read window, not stored."
     },
     {
-      "label": "Free/busy queries",
-      "value": "frequent",
-      "note": "Scheduling assistants, meeting finders."
+      "label": "Calendar view reads",
+      "value": "~600k QPS",
+      "note": "Most reads are narrow window reads (day/week view). Each expands ~30 days of recurrence for the visible calendars."
     },
     {
-      "label": "Timezones",
-      "value": "all",
-      "note": "Plus DST transitions — correctness minefield."
+      "label": "Mutations (create/update/RSVP)",
+      "value": "~30k QPS",
+      "note": "~20:1 read:write. Each write appends one change-log entry that fans out to busy index, reminders, invites, sync."
     },
     {
-      "label": "Reminders",
-      "value": "exactly-once-ish",
-      "note": "Fire on time, dedup repeats."
+      "label": "Free/busy",
+      "value": "~50k QPS, ~8 attendees avg",
+      "note": "Fanout multiplies by attendee count: a 20-person meeting-finder merges 20 interval lists over a 30-day window."
+    },
+    {
+      "label": "Reminder fanout",
+      "value": "steady ~50k/sec, ~1M/sec at local 9am",
+      "note": "Reminders spike at round local times (9am, :00/:30). The burst is ~20x steady-state and must be absorbed, not dropped."
+    },
+    {
+      "label": "Storage",
+      "value": "~10–15 TB authoritative + derived",
+      "note": "Rough rows: ~10B canonical events @ ~0.5 KB ≈ 5 TB; ~28B attendee refs @ ~0.2 KB ≈ 5–6 TB; overrides are a small fraction. Derived/bounded: change-log retained ~30–90 days (and tombstones with it) ≈ low TB at 30k writes/sec; busy intervals are compact merged ranges; reminder jobs only hold a rolling near-future horizon. Expanded instances are never stored."
+    },
+    {
+      "label": "Latency targets",
+      "value": "view <150ms, free/busy <300ms, write <200ms p99",
+      "note": "Reads served from busy index / expanded window; sync delta pulls <500ms."
     }
   ],
   "api": [
     {
       "method": "POST",
       "path": "/v1/events",
-      "description": "Create an event (one-off or recurring); conflict-checks and invites attendees.",
-      "request": "{ \"start\": \"2026-06-01T10:00\", \"tz\": \"America/Los_Angeles\", \"rrule\": \"FREQ=WEEKLY\", \"attendees\": [...] }",
-      "response": "{ \"eventId\": \"e_9\" }",
+      "description": "Create an event (one-off or recurring). Synchronously conflict-checks (policy) and commits the event plus an outbox row in one transaction; invite fanout, reminder materialization, busy-index, and cache updates are projector work off the change log, not part of the request. Idempotent via Idempotency-Key.",
+      "request": "{ \"calendarId\": \"c_1\", \"organizerId\": \"u_1\", \"start\": \"2026-06-01T10:00\", \"tz\": \"America/Los_Angeles\", \"duration\": \"PT1H\", \"rrule\": \"FREQ=WEEKLY;BYDAY=MO\", \"visibility\": \"busy\", \"attendees\": [\"u_2\",\"u_3\"], \"reminders\": [{ \"offset\": \"PT10M\" }], \"idempotencyKey\": \"k_8f3\" }",
+      "response": "{ \"eventId\": \"e_9\", \"version\": 1 }",
       "sequence": {
         "participants": [
           {
@@ -329,8 +427,12 @@
             "label": "Event Store"
           },
           {
-            "id": "InviteSvc",
-            "label": "Invites"
+            "id": "ChangeLog",
+            "label": "Change Log"
+          },
+          {
+            "id": "Projector",
+            "label": "Projector"
           }
         ],
         "messages": [
@@ -344,25 +446,31 @@
             "from": "EventSvc",
             "to": "FreeBusy",
             "arrow": "->>",
-            "label": "conflict check"
+            "label": "conflict check (policy: rooms/resources)"
           },
           {
             "from": "EventSvc",
             "to": "EventDB",
             "arrow": "->>",
-            "label": "persist rule (not instances)"
-          },
-          {
-            "from": "EventSvc",
-            "to": "InviteSvc",
-            "arrow": "->>",
-            "label": "invite attendees"
+            "label": "persist event/attendees + outbox row (one txn)"
           },
           {
             "from": "EventSvc",
             "to": "Client",
             "arrow": "-->>",
             "label": "201 eventId"
+          },
+          {
+            "from": "EventDB",
+            "to": "ChangeLog",
+            "arrow": "->>",
+            "label": "committed change available"
+          },
+          {
+            "from": "ChangeLog",
+            "to": "Projector",
+            "arrow": "->>",
+            "label": "async: invites, reminders, busy index, attendee refs"
           }
         ]
       }
@@ -370,9 +478,9 @@
     {
       "method": "GET",
       "path": "/v1/freebusy",
-      "description": "Find busy intervals (or free slots) across attendees over a range.",
-      "request": "?attendees=u1,u2,u3&from=...&to=...",
-      "response": "{ \"busy\": { \"u1\": [ ... ] }, \"freeSlots\": [ ... ] }",
+      "description": "Find busy intervals (or free slots) across attendees over a range. The caller is authenticated (callerId from the auth context) and authorized per attendee against calendar_acl before any interval is returned. Per attendee the response is one of: busy intervals (freebusy_only/reader rights — private events still contribute a busy block but no title/location), event detail (reader+ rights), or 'unknown' (no permission). The caller never learns more than their ACL allows.",
+      "request": "Authorization: Bearer <caller>  ?attendees=u1,u2,u3&from=...&to=...",
+      "response": "{ \"perAttendee\": { \"u1\": { \"access\": \"busy\", \"busy\": [ ... ] }, \"u2\": { \"access\": \"unknown\" } }, \"freeSlots\": [ ... over authorized attendees ... ] }",
       "sequence": {
         "participants": [
           {
@@ -392,19 +500,25 @@
             "from": "Client",
             "to": "FreeBusy",
             "arrow": "->>",
-            "label": "free/busy(attendees, range)"
+            "label": "free/busy(caller, attendees, range)"
+          },
+          {
+            "from": "FreeBusy",
+            "to": "FreeBusy",
+            "arrow": "->>",
+            "label": "authorize caller per attendee (calendar_acl)"
           },
           {
             "from": "FreeBusy",
             "to": "BusyIndex",
             "arrow": "->>",
-            "label": "busy intervals per calendar"
+            "label": "busy intervals for authorized calendars"
           },
           {
             "from": "FreeBusy",
             "to": "Client",
             "arrow": "-->>",
-            "label": "busy + free slots"
+            "label": "busy/unknown per attendee + free slots"
           }
         ]
       }
@@ -415,12 +529,40 @@
       "description": "List events in a window (recurring rules expanded to instances for that window).",
       "request": "?calendar=c_1&from=...&to=...",
       "response": "{ \"events\": [ ... expanded instances ... ] }"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/events/{eventId}",
+      "description": "Edit an event. 'scope' selects the recurrence edit semantics; 'recurrenceId' identifies the target occurrence; 'expectedVersion' guards against lost updates. Idempotent.",
+      "request": "{ \"scope\": \"this | thisAndFollowing | series\", \"recurrenceId\": \"2026-06-08T09:00:00[America/New_York]\", \"changes\": { \"start\": \"2026-06-08T10:00\" }, \"expectedVersion\": 4, \"idempotencyKey\": \"k_b2\" }",
+      "response": "{ \"eventId\": \"e_9\", \"version\": 5 }"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/events/{eventId}",
+      "description": "Cancel an event or occurrence using the same recurrence scope. 'this' writes an EXDATE; 'thisAndFollowing' bounds the rule; 'series' deletes the rule.",
+      "request": "{ \"scope\": \"this | thisAndFollowing | series\", \"recurrenceId\": \"2026-06-08T09:00:00[America/New_York]\", \"expectedVersion\": 5 }",
+      "response": "{ \"eventId\": \"e_9\", \"version\": 6 }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/events/{eventId}/rsvp",
+      "description": "Attendee responds to an invite. Idempotent and version-stamped so it never clobbers a concurrent organizer edit.",
+      "request": "{ \"attendeeId\": \"u_2\", \"recurrenceId\": null, \"response\": \"accepted | declined | tentative\", \"eventVersion\": 5, \"idempotencyKey\": \"k_c9\" }",
+      "response": "{ \"ok\": true, \"response\": \"accepted\", \"respondedAt\": \"...\" }"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/sync",
+      "description": "Cursor-based delta sync. Returns changed events and tombstones since the cursor, plus the next cursor. The cursor maps to a position in the calendar change log.",
+      "request": "?calendarId=c_1&cursor=seq_77412",
+      "response": "{ \"changes\": [ { \"eventId\": \"e_9\", \"version\": 5, \"op\": \"upsert\" } ], \"tombstones\": [ \"e_4\" ], \"nextCursor\": \"seq_77460\" }"
     }
   ],
   "dataModel": [
     {
       "name": "events",
-      "note": "Authoritative events; recurring stored as a rule, not expanded instances.",
+      "note": "Authoritative events; recurring stored as a rule, not expanded instances. 'version' drives optimistic concurrency; local start + TZID preserve user intent across DST/tzdb changes. A 'this and following' edit is a series split: the old row gets an UNTIL-bounded rrule and the new series is a new row with split_from_event_id pointing back.",
       "fields": [
         {
           "name": "event_id",
@@ -431,8 +573,16 @@
           "type": "bigint (shard key)"
         },
         {
-          "name": "start_utc",
-          "type": "timestamp (UTC) + original tz"
+          "name": "organizer_id",
+          "type": "bigint"
+        },
+        {
+          "name": "local_start",
+          "type": "local wall-clock datetime (no zone)"
+        },
+        {
+          "name": "tzid",
+          "type": "IANA zone, e.g. America/New_York"
         },
         {
           "name": "duration",
@@ -444,21 +594,33 @@
         },
         {
           "name": "exdates",
-          "type": "list<date> (cancelled instances)"
+          "type": "list<recurrence_id> (cancelled instances)"
+        },
+        {
+          "name": "visibility",
+          "type": "enum(default, busy, private, public)"
+        },
+        {
+          "name": "version",
+          "type": "int (optimistic concurrency)"
+        },
+        {
+          "name": "split_from_event_id",
+          "type": "uuid | null (set on the new series of a 'this and following' split)"
         }
       ]
     },
     {
       "name": "event_overrides",
-      "note": "Per-instance edits to a recurring series.",
+      "note": "Per-instance edits to a recurring series. recurrence_id is the stable RFC-style identity: the original local occurrence timestamp + TZID, not a bare date (safe across multi-per-day, DST, and series splits).",
       "fields": [
         {
           "name": "event_id",
           "type": "uuid (series)"
         },
         {
-          "name": "instance_date",
-          "type": "the occurrence being overridden"
+          "name": "recurrence_id",
+          "type": "original local occurrence ts + TZID (stable identity)"
         },
         {
           "name": "changes",
@@ -468,7 +630,7 @@
     },
     {
       "name": "attendees",
-      "note": "Invite + RSVP state per event.",
+      "note": "Invite + RSVP state per event (organizer-side roster). response_at + event_version let an RSVP merge cleanly with concurrent organizer edits. The per-attendee-calendar projection used for attendee reads/busy/sync lives in calendar_event_refs.",
       "fields": [
         {
           "name": "event_id",
@@ -481,8 +643,1137 @@
         {
           "name": "response",
           "type": "enum(needs_action, accepted, declined, tentative)"
+        },
+        {
+          "name": "response_at",
+          "type": "timestamp (last response)"
+        },
+        {
+          "name": "event_version",
+          "type": "int (version the response was made against)"
         }
       ]
+    },
+    {
+      "name": "calendar_event_refs",
+      "note": "Attendee-calendar projection: one row per (attendee calendar, event) so an attendee's calendar reads, busy index, reminders, and delta sync work without scanning organizer-owned events. Maintained by the projector off the change log; the organizer event stays the source of truth for details.",
+      "fields": [
+        {
+          "name": "calendar_id",
+          "type": "bigint (attendee's calendar = shard key)"
+        },
+        {
+          "name": "event_id",
+          "type": "uuid (organizer-owned event)"
+        },
+        {
+          "name": "organizer_calendar_id",
+          "type": "bigint (where the canonical event lives)"
+        },
+        {
+          "name": "attendee_user_id",
+          "type": "bigint"
+        },
+        {
+          "name": "response",
+          "type": "enum(needs_action, accepted, declined, tentative)"
+        },
+        {
+          "name": "blocks_time",
+          "type": "bool (does this copy contribute a busy interval — false when declined)"
+        },
+        {
+          "name": "visibility_override",
+          "type": "enum(inherit, busy, private, hidden) | null"
+        },
+        {
+          "name": "local_reminder_overrides",
+          "type": "json (per-attendee reminder offsets) | null"
+        },
+        {
+          "name": "last_seen_event_version",
+          "type": "int (organizer version this ref reflects)"
+        }
+      ]
+    },
+    {
+      "name": "calendar_acl",
+      "note": "Who may see/edit a calendar, and at what detail (the free/busy privacy boundary).",
+      "fields": [
+        {
+          "name": "calendar_id",
+          "type": "bigint"
+        },
+        {
+          "name": "principal_id",
+          "type": "bigint (user or group)"
+        },
+        {
+          "name": "role",
+          "type": "enum(freebusy_only, reader, writer, owner)"
+        }
+      ]
+    },
+    {
+      "name": "reminder_jobs",
+      "note": "Materialized due reminders. dedup_key makes (re)scheduling and retries idempotent; leasing prevents two workers firing the same reminder.",
+      "fields": [
+        {
+          "name": "fire_at_utc",
+          "type": "timestamp (due-index key)"
+        },
+        {
+          "name": "event_id",
+          "type": "uuid"
+        },
+        {
+          "name": "recurrence_id",
+          "type": "occurrence identity | null"
+        },
+        {
+          "name": "dedup_key",
+          "type": "hash(event, recurrence_id, offset) — fire once"
+        },
+        {
+          "name": "state",
+          "type": "enum(scheduled, leased, sent, failed, cancelled, superseded)"
+        },
+        {
+          "name": "lease_until",
+          "type": "timestamp | null (visibility timeout while a worker holds the job)"
+        },
+        {
+          "name": "attempt_count",
+          "type": "int (retries; drives backoff and dead-lettering)"
+        },
+        {
+          "name": "channel",
+          "type": "enum(push, email, sms)"
+        },
+        {
+          "name": "recipient_id",
+          "type": "bigint (who to notify)"
+        }
+      ]
+    },
+    {
+      "name": "calendar_changes",
+      "note": "Per-calendar ordered change log / outbox. The single durable source for busy-index, reminder, invite-fanout, and sync projectors; cursor = seq.",
+      "fields": [
+        {
+          "name": "calendar_id",
+          "type": "bigint"
+        },
+        {
+          "name": "seq",
+          "type": "bigint (monotonic per calendar = sync cursor)"
+        },
+        {
+          "name": "event_id",
+          "type": "uuid"
+        },
+        {
+          "name": "op",
+          "type": "enum(upsert, tombstone)"
+        },
+        {
+          "name": "version",
+          "type": "int (event version at change time)"
+        }
+      ]
+    },
+    {
+      "name": "idempotency_keys",
+      "note": "Dedups retried create/update/RSVP/reminder-send. Stores the first result so retries return it instead of re-applying.",
+      "fields": [
+        {
+          "name": "key",
+          "type": "string (client-supplied)"
+        },
+        {
+          "name": "scope",
+          "type": "actor + operation + request fingerprint"
+        },
+        {
+          "name": "result",
+          "type": "json (cached response)"
+        }
+      ]
+    }
+  ],
+  "technologyChoices": [
+    {
+      "concern": "API edge, auth, ACL enforcement, and rate limiting",
+      "steps": [
+        "naive",
+        "freebusy",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "Kong",
+          "icon": "assets/tech-icons/kong.png"
+        },
+        {
+          "name": "HAProxy",
+          "icon": "assets/tech-icons/haproxy.png"
+        },
+        {
+          "name": "Keycloak",
+          "icon": "assets/tech-icons/keycloak.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          },
+          {
+            "name": "ALB",
+            "icon": "assets/tech-icons/Arch_Elastic-Load-Balancing_64.png"
+          },
+          {
+            "name": "WAF",
+            "icon": "assets/tech-icons/Arch_AWS-WAF_64.png"
+          },
+          {
+            "name": "Cognito",
+            "icon": "assets/tech-icons/Arch_Amazon-Cognito_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Apigee",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Load Balancing",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Armor",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Identity Platform",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "API Management",
+            "icon": "assets/tech-icons/10042-icon-service-API-Management-Services.svg"
+          },
+          {
+            "name": "Application Gateway",
+            "icon": "assets/tech-icons/10076-icon-service-Application-Gateways.svg"
+          },
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Microsoft Entra ID",
+            "icon": "assets/tech-icons/10231-icon-service-Entra-ID-Protection.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A gateway centralizes TLS, routing, auth context propagation, request limits, and abuse controls before traffic reaches calendar services.",
+        "Self-hosted gateways give tight control over filters and deployment topology, while managed edges reduce patching and absorb regional traffic spikes.",
+        "Free/busy privacy still belongs in service logic: the edge can authenticate the caller, but Free/Busy must enforce calendar ACLs before returning intervals."
+      ],
+      "makesIrrelevant": "A managed gateway with WAF, identity integration, and usage plans removes most custom edge throttling and auth middleware from the Event and Free/Busy services."
+    },
+    {
+      "concern": "Authoritative event store and calendar-sharded tables",
+      "steps": [
+        "naive",
+        "recurrence",
+        "timezone",
+        "invites",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "MySQL",
+          "icon": "assets/tech-icons/mysql.png"
+        },
+        {
+          "name": "CockroachDB",
+          "icon": "assets/tech-icons/cockroach.png"
+        },
+        {
+          "name": "Citus",
+          "icon": "assets/tech-icons/citus.png"
+        },
+        {
+          "name": "Apache Cassandra",
+          "icon": "assets/tech-icons/cassandra.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Aurora",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "RDS",
+            "icon": "assets/tech-icons/Arch_Amazon-RDS_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "Keyspaces",
+            "icon": "assets/tech-icons/Arch_Amazon-Keyspaces_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "AlloyDB",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          },
+          {
+            "name": "SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Cosmos DB for PostgreSQL",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Relational stores make recurrence rules, overrides, attendee rows, ACLs, idempotency keys, and per-event version checks straightforward.",
+        "Wide-column stores handle calendar-id sharding and high write volume well, but push cross-row constraints and recurrence edits into application logic.",
+        "Globally distributed SQL reduces regional failover complexity, but calendar-local writes still need careful partitioning by calendar_id."
+      ],
+      "makesIrrelevant": "A database with conditional writes, partition-level ordering, and TTL support can absorb idempotency keys, tombstone retention, and several cleanup jobs into the storage layer."
+    },
+    {
+      "concern": "Recurrence expansion and timezone-safe instance reads",
+      "steps": [
+        "recurrence",
+        "timezone",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kubernetes",
+          "icon": "assets/tech-icons/kubernetes.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Apache Flink",
+          "icon": "assets/tech-icons/flink.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Lambda",
+            "icon": "assets/tech-icons/Arch_AWS-Lambda_64.png"
+          },
+          {
+            "name": "ECS",
+            "icon": "assets/tech-icons/Arch_Amazon-Elastic-Container-Service_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Run",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          },
+          {
+            "name": "Cloud Functions",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          },
+          {
+            "name": "Container Apps",
+            "icon": "assets/tech-icons/02989-icon-service-Container-Apps-Environments.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Expanding RRULEs on read keeps infinite series bounded to the requested window and preserves the user's local-time intent.",
+        "A stateless expander is easy to scale horizontally; caching only safe, short windows avoids serving stale results after a series split or DST policy change.",
+        "Streaming or batch precomputation helps for very hot calendars, but the authoritative event rule and override model must remain the source of truth."
+      ],
+      "makesIrrelevant": "A small window cache plus deterministic expansion removes the need to persist every future occurrence of a recurring event."
+    },
+    {
+      "concern": "Free/busy interval index and availability range queries",
+      "steps": [
+        "freebusy",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Apache Cassandra",
+          "icon": "assets/tech-icons/cassandra.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          },
+          {
+            "name": "Keyspaces",
+            "icon": "assets/tech-icons/Arch_Amazon-Keyspaces_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A compact per-calendar interval index turns multi-attendee free/busy into a bounded merge instead of scanning event rows.",
+        "In-memory sorted sets are fast for hot windows but need rebuild and warmup paths after loss or invalidation.",
+        "Wide-column or relational interval tables are more durable and rebuildable, with higher read latency unless cached."
+      ],
+      "makesIrrelevant": "A durable interval store fed from the change log removes the need for Free/Busy to expand every attendee's events during each request."
+    },
+    {
+      "concern": "Transactional outbox, change log, and derived-state projectors",
+      "steps": [
+        "freebusy",
+        "invites",
+        "reminders",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Redpanda",
+          "icon": "assets/tech-icons/redpanda.png"
+        },
+        {
+          "name": "RabbitMQ",
+          "icon": "assets/tech-icons/rabbitmq.png"
+        },
+        {
+          "name": "NATS (JetStream)",
+          "icon": "assets/tech-icons/nats.png"
+        },
+        {
+          "name": "Apache Pulsar",
+          "icon": "assets/tech-icons/pulsar.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "MSK",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Streaming-for-Apache-Kafka_64.png"
+          },
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Managed Service for Apache Kafka",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Event Grid",
+            "icon": "assets/tech-icons/10221-icon-service-Event-Grid-Subscriptions.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A log fits ordered per-calendar replay, projector rebuilds, and multiple derived consumers for busy index, reminders, invite fanout, cache, and sync.",
+        "A queue is simpler for discrete work items and DLQs, but weaker when consumers need independent replay or ordered catch-up.",
+        "The critical boundary is transactional: the event write and outbox row commit together before any asynchronous projector work starts."
+      ],
+      "makesIrrelevant": "A managed stream with retention, consumer lag metrics, and DLQ support removes much of the hand-built replay and offset bookkeeping from the projector layer."
+    },
+    {
+      "concern": "Reminder scheduler, delayed jobs, leases, and retries",
+      "steps": [
+        "reminders",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "RabbitMQ",
+          "icon": "assets/tech-icons/rabbitmq.png"
+        },
+        {
+          "name": "Temporal",
+          "icon": "assets/tech-icons/temporal.png"
+        },
+        {
+          "name": "BullMQ",
+          "icon": "assets/tech-icons/bullmq.png"
+        },
+        {
+          "name": "Celery",
+          "icon": "assets/tech-icons/celery.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          },
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Firestore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Queue Storage",
+            "icon": "assets/tech-icons/10840-icon-service-Storage-Queue.svg"
+          },
+          {
+            "name": "Durable Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A due-time table is transparent and easy to repair, but the polling and lease logic must absorb local-time reminder bursts.",
+        "A managed delayed queue or workflow engine reduces scheduler mechanics, but may impose maximum delay, throughput, or fanout limits.",
+        "Reminder sends must remain idempotent because the delivery model is at-least-once even when jobs are leased."
+      ],
+      "makesIrrelevant": "A queue with native delay, visibility timeout, DLQ, and retry policy removes most custom reminder leasing and backoff code."
+    },
+    {
+      "concern": "Invite, RSVP fanout, and user notification delivery",
+      "steps": [
+        "invites",
+        "reminders"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "RabbitMQ",
+          "icon": "assets/tech-icons/rabbitmq.png"
+        },
+        {
+          "name": "Postfix",
+          "icon": "assets/tech-icons/postfix.png"
+        },
+        {
+          "name": "SendGrid",
+          "icon": "assets/tech-icons/sendgrid.png"
+        },
+        {
+          "name": "Firebase Cloud Messaging",
+          "icon": "assets/tech-icons/fcm.png"
+        },
+        {
+          "name": "Apple Push Notification Service (APNs)",
+          "icon": "assets/tech-icons/apns.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SNS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Notification-Service_64.png"
+          },
+          {
+            "name": "SES",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Email-Service_64.png"
+          },
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Firebase Cloud Messaging",
+            "icon": "assets/tech-icons/fcm.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Notification Hubs",
+            "icon": "assets/tech-icons/10045-icon-service-Notification-Hubs.svg"
+          },
+          {
+            "name": "Communication Services",
+            "icon": "assets/tech-icons/00968-icon-service-Azure-Communication-Services.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Event Grid",
+            "icon": "assets/tech-icons/10221-icon-service-Event-Grid-Subscriptions.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Invite fanout should be projector-driven so an organizer edit never commits without eventually reaching attendee projections and notification channels.",
+        "Provider push/email services remove channel-specific retry and deliverability work, but RSVP state and event versions still live in the calendar domain.",
+        "Direct APNs/FCM/email integration gives control over payloads and costs, at the price of more credentials, feedback-loop, and rate-limit handling."
+      ],
+      "makesIrrelevant": "A managed notification hub removes much of the per-platform device-token routing and retry logic, but not the calendar-specific RSVP merge semantics."
+    },
+    {
+      "concern": "Delta sync, tombstones, and external calendar feed propagation",
+      "steps": [
+        "reminders",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "S3",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Storage-Service_64.png"
+          },
+          {
+            "name": "CloudFront",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudFront_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Firestore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Storage",
+            "icon": "assets/tech-icons/Storage-512-color.png"
+          },
+          {
+            "name": "Cloud CDN",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          },
+          {
+            "name": "Blob Storage",
+            "icon": "assets/tech-icons/10781-icon-service-Blob-Page.svg"
+          },
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A per-calendar ordered change log gives devices a stable cursor and lets them receive tombstones without comparing full calendar snapshots.",
+        "Object storage plus CDN works for coarse external feeds, while interactive device sync needs low-latency cursor reads.",
+        "Keeping tombstone retention finite makes storage predictable, but clients that sync after the retention window need a full resync path."
+      ],
+      "makesIrrelevant": "A durable change stream with cursor retention removes the need for clients to poll full event lists to discover deletes and edits."
+    },
+    {
+      "concern": "Read cache for hot calendar views and free/busy results",
+      "steps": [
+        "freebusy",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "Memcached",
+          "icon": "assets/tech-icons/memcached.png"
+        },
+        {
+          "name": "Varnish",
+          "icon": "assets/tech-icons/varnish.png"
+        },
+        {
+          "name": "Apache Ignite",
+          "icon": "assets/tech-icons/ignite.png"
+        },
+        {
+          "name": "Hazelcast",
+          "icon": "assets/tech-icons/hazelcast.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          },
+          {
+            "name": "DAX",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "CloudFront",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudFront_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud CDN",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Load Balancing",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Azure CDN",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Calendar views and free/busy ranges are read-heavy, but caches must be invalidated by the same change log that updates derived state.",
+        "Caching expanded windows improves common day/week reads, while caching too far into the future risks stale recurrence and timezone behavior.",
+        "Edge caches help public/shared feeds; private calendar views need user-aware keys and ACL-safe responses."
+      ],
+      "makesIrrelevant": "A shared cache with change-log invalidation removes most per-service memoization and avoids serving stale data after RSVP or recurrence edits."
+    },
+    {
+      "concern": "Idempotency keys, optimistic concurrency, and worker leases",
+      "steps": [
+        "invites",
+        "reminders",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "etcd",
+          "icon": "assets/tech-icons/etcd.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Firestore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Database unique constraints and event versions are the cleanest fit for create/update/RSVP correctness because they live with the authoritative write.",
+        "Redis-style stores are fast for short-lived idempotency and leases, but durable event versions still need to be checked in the event store.",
+        "A wide-column or document store with conditional writes scales idempotency windows, at the cost of eventual cleanup and cross-row coordination."
+      ],
+      "makesIrrelevant": "A store with native conditional writes and TTL expiry removes custom dedup cleanup jobs and simplifies reminder lease recovery."
+    },
+    {
+      "concern": "Observability for projector lag, reminder SLOs, and calendar correctness",
+      "steps": [
+        "reminders",
+        "scale"
+      ],
+      "selfHosted": [
+        {
+          "name": "Prometheus",
+          "icon": "assets/tech-icons/prometheus.png"
+        },
+        {
+          "name": "Grafana",
+          "icon": "assets/tech-icons/grafana.png"
+        },
+        {
+          "name": "Jaeger",
+          "icon": "assets/tech-icons/jaeger.png"
+        },
+        {
+          "name": "ELK Stack",
+          "icon": "assets/tech-icons/elasticsearch.png"
+        },
+        {
+          "name": "Fluentd/Fluent Bit",
+          "icon": "assets/tech-icons/fluentd.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "X-Ray",
+            "icon": "assets/tech-icons/Arch_AWS-X-Ray_64.png"
+          },
+          {
+            "name": "CloudTrail",
+            "icon": "assets/tech-icons/Arch_AWS-CloudTrail_64.png"
+          },
+          {
+            "name": "Managed Service for Prometheus",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Service-for-Prometheus_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Trace",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Logging",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Application Insights",
+            "icon": "assets/tech-icons/00012-icon-service-Application-Insights.svg"
+          },
+          {
+            "name": "Log Analytics",
+            "icon": "assets/tech-icons/00009-icon-service-Log-Analytics-Workspaces.svg"
+          },
+          {
+            "name": "Azure Managed Grafana",
+            "icon": "assets/tech-icons/02905-icon-service-Azure-Managed-Grafana.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Projector lag, reminder delay, free/busy cache hit rate, DST edge-case errors, and sync cursor age need domain-level metrics, not only infrastructure health.",
+        "Self-hosted observability is flexible and cheaper at high cardinality, but operating retention, query scale, and alert pipelines becomes its own system.",
+        "Managed observability reduces operations and integrates with cloud queues/databases, but can be expensive for per-calendar or per-user dimensions."
+      ],
+      "makesIrrelevant": "A managed metrics, tracing, and log stack removes most bespoke projector-lag dashboards and alert plumbing, but not the need to emit calendar-specific correctness signals."
     }
   ],
   "patterns": [
@@ -539,6 +1830,27 @@
         "reminders"
       ],
       "group": "Reminders and Device Sync"
+    },
+    {
+      "name": "Durable change log + idempotent projectors",
+      "what": "Commit each event write with an outbox row into a per-calendar change log; idempotent projectors replay it to update busy index, reminders, invite fanout, sync cursors, and cache.",
+      "whenToUse": "Whenever derived state (indexes, queues, caches, device sync) must not lose a mutation.",
+      "steps": [
+        "freebusy",
+        "reminders",
+        "scale"
+      ],
+      "group": "Scaling and Consistency"
+    },
+    {
+      "name": "Idempotency + optimistic concurrency",
+      "what": "Idempotency keys dedup retried create/update/RSVP/send; event versions guard against lost updates and let RSVPs merge with organizer edits.",
+      "whenToUse": "Mutations that retry or race (creates, edits, RSVPs, reminder sends).",
+      "steps": [
+        "invites",
+        "reminders"
+      ],
+      "group": "Invites and RSVPs"
     }
   ],
   "steps": [
@@ -547,7 +1859,7 @@
       "title": "1. Naive: One Row per Occurrence, Local-String Times",
       "description": [
         "Start with the simplest thing that works. Store each event as a row with a plain local time string (e.g. '2026-06-01 09:00'). For a recurring event, pre-create a row for every occurrence up front — a 'daily standup' becomes thousands of rows.",
-        "This is intuitive and breaks on the two things that make calendars hard. Recurrence: a rule with no end date is infinite, so you can't pre-create its occurrences at all, and even bounded ones explode into huge instance sets — and editing the series means rewriting every row. Time: storing a bare local string with no zone means you can't compare or order events across timezones, and DST quietly corrupts everything — a 'daily 9am' either drifts by an hour after a DST change or lands on times that don't exist (spring-forward) or repeat (fall-back).",
+        "This is intuitive and breaks on the two things that make calendars hard. Recurrence: a rule with no end date is infinite, so you can't pre-create its occurrences at all; even bounded ones explode into huge instance sets, and editing the series means rewriting every row. Time: storing a bare local string with no zone means you can't compare or order events across timezones, and DST quietly corrupts everything — a 'daily 9am' either drifts by an hour after a DST change or lands on a time that doesn't exist (spring-forward) or repeats (fall-back).",
         "So the baseline motivates the real model: store a recurring event as a rule and expand it to concrete instances only for the window being viewed, and store times in UTC with the original timezone, expanding recurrence in local wall-clock so 9am stays 9am across DST."
       ],
       "view": {
@@ -573,8 +1885,11 @@
         "Establishing the one-row-per-occurrence, local-string baseline first makes both core problems concrete — it's why recurrence must be stored as a rule and expanded on read, and why times must be UTC plus zone."
       ],
       "probeLinks": [
-        "postgres-isolation",
-        "kafka-design"
+        "ical-rfc",
+        "iana-timezones",
+        "jscalendar-rfc",
+        "dateutil-rrule",
+        "temporal-zoneddatetime"
       ],
       "recap": {
         "before": "Nothing.",
@@ -587,14 +1902,16 @@
           "why": "No-end rules are infinite, editing a series means rewriting every row, and zoneless times break ordering across timezones and silently corrupt on DST transitions.",
           "instead": "Store recurring events as a rule expanded on read, and store UTC plus the original timezone (expanding in local wall-clock)."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/01-naive.jpg"
     },
     {
       "id": "recurrence",
       "title": "2. Recurring Events: Store the Rule, Expand on Read",
       "description": [
         "A 'daily standup forever' has infinite instances — you can't store them all. Store the recurrence as a rule (RFC 5545 RRULE: FREQ/INTERVAL/BYDAY/UNTIL); concrete occurrences are materialized only for the window a query asks about (e.g. this month's view).",
-        "Edits are the tricky part: 'this instance' (an override), 'this and following' (split the series), or 'all' (edit the rule). Cancellations of one occurrence are exception dates (EXDATE); single-instance changes are overrides keyed by occurrence date.",
+        "Edits are the tricky part: 'this instance' (an override), 'this and following' (split the series), or 'all' (edit the rule). Cancellations of one occurrence are exception dates (EXDATE); single-instance changes are overrides keyed by a stable recurrence id — the original local occurrence timestamp + TZID (RFC RECURRENCE-ID), not a bare date that breaks for multi-per-day or post-split events.",
+        "'This and following' is a series split: bound the original rule with an UNTIL just before the boundary occurrence, and create a new event/series from that boundary with the edited fields and its own rule. Overrides and EXDATEs after the boundary move with the new series.",
         "So reads expand the rule + apply overrides/exceptions for the window; writes touch the rule or a small override, never a giant instance set."
       ],
       "view": {
@@ -656,7 +1973,8 @@
             "groups": [
               "events"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-recurrence-opt1.jpg"
         },
         {
           "name": "Materialize every occurrence as a row",
@@ -689,7 +2007,8 @@
             "highlight": [
               "EventDB"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-recurrence-opt2.jpg"
         },
         {
           "name": "Rule + bounded materialized cache",
@@ -733,7 +2052,8 @@
             "highlight": [
               "OccCache"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-recurrence-opt3.jpg"
         }
       ],
       "decisionPrompt": "A meeting recurs weekly with no end date. How do you store and query it?",
@@ -747,7 +2067,11 @@
         }
       ],
       "probeLinks": [
-        "kafka-design"
+        "ical-rfc",
+        "rrule-tool",
+        "google-calendar-recurring",
+        "dateutil-rrule",
+        "jscalendar-rfc"
       ],
       "patterns": [
         "Store rule, expand on read",
@@ -766,6 +2090,11 @@
           "trap": "Materializing all instances of a recurring event up front.",
           "why": "No-end rules are infinite; editing the series means rewriting everything.",
           "instead": "Store the rule; expand on read; represent edits as overrides."
+        },
+        {
+          "trap": "Keying overrides by occurrence date alone.",
+          "why": "A bare date is ambiguous for events that recur multiple times a day, and it becomes wrong after a 'this and following' split moves the occurrence into a new series.",
+          "instead": "Key overrides by a stable recurrence id (original local timestamp + TZID), and model 'this and following' as a real series split (UNTIL on the old rule, a new rule from the boundary)."
         }
       ]
     },
@@ -775,7 +2104,8 @@
       "description": [
         "The most error-prone requirement. Store event times in UTC plus the original timezone, and convert at the edges (display, recurrence expansion). But a recurring 'every day at 9am local' is anchored to wall-clock local time, not a fixed UTC offset — across a DST change, 9am local shifts in UTC.",
         "So recurrence must expand in the event's local timezone (apply the rule on local wall-clock, then convert each instance to UTC), or DST transitions produce wrong instance times. Handle the gnarly DST edge cases: a 2:30am event on a spring-forward day doesn't exist; a fall-back hour repeats.",
-        "Keep the original tz on the event (not just UTC) so edits and expansion stay correct, and so '9am' stays 9am after DST."
+        "Keep the original tz on the event (not just UTC) so edits and expansion stay correct, and so '9am' stays 9am after DST.",
+        "Operational policy for tzdb updates: because future UTC instants are derived from local-time + TZID, a government rule change (or tzdb release) must not corrupt stored events. Recompute lazily — future instances are derived at read time from the live tz database, so they're already correct. Then run a background reindex of the affected zones' derived busy index, materialized windows, and scheduled reminder jobs, so derived state and already-scheduled reminders pick up the new offsets. The authoritative local-time + TZID rows never change."
       ],
       "view": {
         "nodes": [
@@ -783,7 +2113,7 @@
           "Expander",
           "EventDB"
         ],
-        "caption": "The Event Service hands the stored event and its RRULE to the expander, which generates the local-time occurrences attached to the event's IANA time zone.",
+        "caption": "The Event Service hands the stored event and its RRULE to the expander, which generates the local-time occurrences attached to the event's IANA timezone.",
         "links": [
           "event-expander",
           "event-db"
@@ -826,7 +2156,8 @@
             "groups": [
               "events"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-timezone-opt1.jpg"
         },
         {
           "name": "Store absolute UTC instants",
@@ -853,7 +2184,8 @@
             "highlight": [
               "EventDB"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-timezone-opt2.jpg"
         }
       ],
       "decisionPrompt": "A daily 9am meeting in NYC: after the DST change, what time is it in UTC, and how do you keep it 9am local?",
@@ -867,8 +2199,10 @@
         }
       ],
       "probeLinks": [
-        "postgres-isolation",
-        "kafka-design"
+        "iana-timezones",
+        "rrule-tool",
+        "dateutil-rrule",
+        "temporal-zoneddatetime"
       ],
       "patterns": [
         "UTC storage + tz at edges"
@@ -886,6 +2220,11 @@
           "trap": "Storing only UTC and expanding recurrence in UTC.",
           "why": "A fixed UTC offset breaks 'daily at 9am local' across DST — instances drift by an hour.",
           "instead": "Keep the original tz; expand the rule in local time, then convert each instance."
+        },
+        {
+          "trap": "Leaving nonexistent and ambiguous local times undefined.",
+          "why": "On spring-forward, 02:30 doesn't exist; on fall-back, 01:30 happens twice. Without a policy the instance is silently dropped or fires twice.",
+          "instead": "Pick an explicit policy: shift a nonexistent time forward to the gap's end (02:30 -> 03:00), and resolve a repeated fall-back hour to the first occurrence (earlier offset). Apply it consistently in the expander and document it."
         }
       ]
     },
@@ -894,8 +2233,8 @@
       "title": "4. Free/Busy Availability",
       "description": [
         "Scheduling assistants and meeting-finders need 'when are these N people free?'. Computing that by expanding every attendee's full calendar per query is slow. Maintain a per-calendar busy-interval index: the merged busy time ranges, kept current as events change.",
-        "Free/busy then becomes a fast range query: pull each attendee's busy intervals over the window, merge them, and the gaps are the mutually-free slots. The index hides event details (privacy) — it only exposes busy/free, which is also what cross-organization free/busy sharing needs.",
-        "The busy index is derived from events (including expanded recurrence) and rebuildable; it's updated when events are created/edited."
+        "Free/busy then becomes a fast range query: pull each attendee's busy intervals over the window, merge them, and the gaps are the mutually-free slots. The index exposes only busy/free, never event details — but it is privacy-preserving only when the caller is authorized against the calendar ACL before any interval is returned (busy-only for a colleague, 'unknown' for someone with no permission). That same ACL check is what cross-organization free/busy sharing needs.",
+        "Per-attendee, the index must reflect that attendee's own copy, not just the organizer's event: it's built from the attendee calendar's refs (see Step 5), so a declined or hidden invite contributes no busy block while an accepted one does. The busy index is derived from events + attendee refs (including expanded recurrence) and rebuildable; the projector updates it off the change log when events or RSVPs change."
       ],
       "view": {
         "nodes": [
@@ -956,7 +2295,8 @@
             "groups": [
               "availability"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-freebusy-opt1.jpg"
         },
         {
           "name": "Scan calendars on demand",
@@ -1000,7 +2340,8 @@
               "FreeBusy",
               "EventDB"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-freebusy-opt2.jpg"
         }
       ],
       "decisionPrompt": "How do you find a 30-min slot free for 8 people next week without scanning everyone's full calendar?",
@@ -1014,10 +2355,16 @@
         }
       ],
       "probeLinks": [
-        "kafka-design"
+        "google-calendar-freebusy",
+        "microsoft-graph-freebusy",
+        "microsoft-calendar-permissions",
+        "caldav-scheduling-rfc",
+        "sabre-dav-scheduling",
+        "nextcloud-caldav-admin"
       ],
       "patterns": [
-        "Busy-interval index"
+        "Busy-interval index",
+        "Durable change log + idempotent projectors"
       ],
       "whyNow": [
         "Free/busy is a core, frequent operation; the busy-interval index is the mechanism that makes meeting-finding fast and privacy-preserving."
@@ -1030,7 +2377,7 @@
       "flows": [
         {
           "name": "Multi-attendee free/busy via the busy-interval index",
-          "note": "Instead of expanding every attendee's full calendar, pull each attendee's merged busy intervals from the index over the window and merge; the gaps are the mutually-free slots.",
+          "note": "The caller is authorized per attendee against calendar_acl before any interval is read — busy-only for freebusy_only/reader, 'unknown' where the caller has no permission. For authorized calendars, pull merged busy intervals from the index over the window and merge; the gaps are the mutually-free slots. Private events still contribute a busy block but expose no title/location, so the index is privacy-preserving only because the ACL check happens first.",
           "sequence": {
             "participants": [
               {
@@ -1054,9 +2401,15 @@
               },
               {
                 "from": "FreeBusy",
+                "to": "FreeBusy",
+                "arrow": "->>",
+                "label": "authorize caller per attendee (calendar_acl)"
+              },
+              {
+                "from": "FreeBusy",
                 "to": "BusyIndex",
                 "arrow": "->>",
-                "label": "busy intervals per calendar"
+                "label": "busy intervals for authorized calendars"
               },
               {
                 "from": "FreeBusy",
@@ -1068,12 +2421,61 @@
                 "from": "FreeBusy",
                 "to": "Client",
                 "arrow": "-->>",
-                "label": "candidate free slots"
+                "label": "candidate free slots (+ unknown attendees)"
               }
             ]
           },
           "highlight": [
             "FreeBusy",
+            "BusyIndex"
+          ]
+        },
+        {
+          "name": "Busy-index update path (event change → projector)",
+          "note": "The index is derived, not authoritative: an event write commits with an outbox row, and a projector consumes the change log to update busy intervals idempotently (keyed by event + version). A free/busy read during the brief lag sees a slightly stale index, which is acceptable for availability.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "EventSvc",
+                "label": "Event Service"
+              },
+              {
+                "id": "ChangeLog",
+                "label": "Change Log"
+              },
+              {
+                "id": "Projector",
+                "label": "Projector"
+              },
+              {
+                "id": "BusyIndex",
+                "label": "Busy Index"
+              }
+            ],
+            "messages": [
+              {
+                "from": "EventSvc",
+                "to": "ChangeLog",
+                "arrow": "->>",
+                "label": "event upsert @ v5 (in write txn)"
+              },
+              {
+                "from": "ChangeLog",
+                "to": "Projector",
+                "arrow": "->>",
+                "label": "consume change"
+              },
+              {
+                "from": "Projector",
+                "to": "BusyIndex",
+                "arrow": "->>",
+                "label": "upsert intervals if version > stored"
+              }
+            ]
+          },
+          "highlight": [
+            "ChangeLog",
+            "Projector",
             "BusyIndex"
           ]
         }
@@ -1083,29 +2485,35 @@
       "id": "invites",
       "title": "5. Invites and RSVPs",
       "description": [
-        "A meeting with attendees lives on multiple calendars. The invite service fans the event out to each attendee's calendar (or external system) and tracks RSVP state (accepted/declined/tentative) per attendee.",
-        "RSVPs and organizer edits must propagate: when an attendee responds or the organizer changes the time, all attendees' views update and are notified. There's one organizer-owned source event; attendee copies/references reflect it. Cross-provider invites use the iCalendar/iTIP standard.",
-        "Concurrency: organizer edits and attendee RSVPs can race; the organizer's event is authoritative for the event details, attendee rows for responses."
+        "A meeting with attendees lives on multiple calendars. The default keeps one organizer-owned source event (no per-attendee copy write-storm), but each attendee still needs that event to show up in their own calendar reads, busy index, reminders, and delta sync — without scanning every organizer-owned event they might appear on. That's the attendee-calendar projection: a lightweight per-(attendee calendar, event) reference (calendar_event_refs) that the projector maintains off the change log.",
+        "So an organizer edit doesn't call attendees directly: it commits the new version plus an outbox row, and the projector fans the change into each affected attendee calendar's refs — updating its busy intervals, local reminder state, and that calendar's sync cursor — then notifies. The ref carries per-attendee state the organizer event shouldn't: response, blocks_time (false when declined), visibility_override, and local reminder overrides. Cross-provider invites use the iCalendar/iTIP standard.",
+        "Concurrency: organizer edits and attendee RSVPs can race; the organizer's event is authoritative for the event details, the attendee row / ref for that attendee's response and local overrides. RSVPs are idempotent and version-stamped so an update fanout never erases a just-recorded response."
       ],
       "view": {
         "nodes": [
           "EventSvc",
+          "ChangeLog",
+          "Projector",
           "InviteSvc",
           "Notify",
           "Client"
         ],
-        "caption": "The Event Service tells the Invite/RSVP Service to invite attendees; it notifies clients of invites and updates, and RSVP replies flow back to update the event.",
+        "caption": "Each event write commits an outbox row to the change log; a projector fans the change out into every attendee calendar's refs and notifies clients, while RSVP replies flow back to update the organizer's event.",
         "links": [
-          "event-invite",
+          "event-changelog",
+          "changelog-projector",
+          "projector-invite",
           "invite-notify",
           "notify-client",
           "invite-event"
         ],
         "highlight": [
+          "Projector",
           "InviteSvc"
         ],
         "groups": [
           "collab",
+          "pipeline",
           "events"
         ]
       },
@@ -1126,25 +2534,32 @@
           "view": {
             "nodes": [
               "EventSvc",
+              "ChangeLog",
+              "Projector",
               "InviteSvc",
               "Notify",
               "Client"
             ],
-            "caption": "Attendees reference a single organizer-owned event, so the Invite Service sends notifications and writes RSVP changes back onto that one event.",
+            "caption": "Attendees reference one organizer-owned event; a projector replays each event change into the attendees' calendar refs and notifications, and RSVP changes write back onto that single event.",
             "links": [
-              "event-invite",
+              "event-changelog",
+              "changelog-projector",
+              "projector-invite",
               "invite-notify",
               "notify-client",
               "invite-event"
             ],
             "highlight": [
+              "Projector",
               "InviteSvc"
             ],
             "groups": [
               "collab",
+              "pipeline",
               "events"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-invites-opt1.jpg"
         },
         {
           "name": "Per-attendee event copies (fan-out on invite)",
@@ -1172,7 +2587,11 @@
             ],
             "caption": "The Invite Service writes one event copy per attendee into per-attendee storage and notifies each client, instead of sharing a single organizer event.",
             "links": [
-              "event-invite",
+              {
+                "from": "EventSvc",
+                "to": "InviteSvc",
+                "label": "fan out on invite"
+              },
               {
                 "from": "InviteSvc",
                 "to": "AttendeeDB",
@@ -1184,15 +2603,21 @@
             "highlight": [
               "AttendeeDB"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-invites-opt2.jpg"
         }
       ],
       "decisionPrompt": "The organizer moves a meeting an hour later. What happens on all 10 attendees' calendars?",
       "patterns": [
-        "Invite fanout + RSVP"
+        "Invite fanout + RSVP",
+        "Idempotency + optimistic concurrency"
       ],
       "probeLinks": [
-        "kafka-design"
+        "itip-rfc",
+        "imip-rfc",
+        "caldav-scheduling-rfc",
+        "microsoft-graph-event-resource",
+        "sabre-dav-scheduling"
       ],
       "whyNow": [
         "Invites/RSVP make calendars collaborative; fanout + propagation + a clear source-of-truth is the multi-attendee correctness model."
@@ -1204,6 +2629,13 @@
           "whyItMatters": "Keeps event details consistent across many calendars while letting each attendee respond.",
           "example": "Organizer moves the time -> propagate to attendees -> notify; RSVPs preserved.",
           "group": "Invites and RSVPs"
+        },
+        {
+          "term": "Attendee-calendar projection",
+          "definition": "A lightweight per-(attendee calendar, event) reference (calendar_event_refs) the projector maintains off the change log, carrying response, blocks_time, visibility, and reminder overrides.",
+          "whyItMatters": "Lets an attendee's calendar reads, busy index, reminders, and delta sync work locally without scanning organizer-owned events — and connects invites to free/busy and sync.",
+          "example": "Organizer event v5 → projector updates u2's ref (blocks_time=true) → u2's busy index and sync cursor advance.",
+          "group": "Invites and RSVPs"
         }
       ],
       "recap": {
@@ -1213,8 +2645,8 @@
       },
       "flows": [
         {
-          "name": "Organizer edit propagates to attendees",
-          "note": "The organizer's event is authoritative; an edit fans out to each attendee's calendar via the invite service and notifies them, while RSVP state per attendee is preserved.",
+          "name": "Organizer edit propagates to attendees (via change log)",
+          "note": "The organizer's event is authoritative. The edit commits the new version plus an outbox row in one transaction; a projector replays the change into each attendee calendar's refs (updating its busy intervals and local reminder state), then the invite service notifies them. Per-attendee RSVP state is preserved — the projection updates the time/details, not the response.",
           "sequence": {
             "participants": [
               {
@@ -1223,6 +2655,14 @@
               {
                 "id": "EventSvc",
                 "label": "Event Service"
+              },
+              {
+                "id": "ChangeLog",
+                "label": "Change Log"
+              },
+              {
+                "id": "Projector",
+                "label": "Projector"
               },
               {
                 "id": "InviteSvc",
@@ -1238,13 +2678,25 @@
                 "from": "Client",
                 "to": "EventSvc",
                 "arrow": "->>",
-                "label": "organizer moves time +1h"
+                "label": "organizer moves time +1h (v5)"
               },
               {
                 "from": "EventSvc",
+                "to": "ChangeLog",
+                "arrow": "->>",
+                "label": "event upsert @ v5 (in write txn)"
+              },
+              {
+                "from": "ChangeLog",
+                "to": "Projector",
+                "arrow": "->>",
+                "label": "consume change"
+              },
+              {
+                "from": "Projector",
                 "to": "InviteSvc",
                 "arrow": "->>",
-                "label": "propagate updated event"
+                "label": "update each attendee ref (RSVPs kept)"
               },
               {
                 "from": "InviteSvc",
@@ -1256,14 +2708,75 @@
                 "from": "Notify",
                 "to": "Client",
                 "arrow": "->>",
-                "label": "notify attendees (RSVPs kept)"
+                "label": "notify attendees"
+              }
+            ]
+          },
+          "highlight": [
+            "Projector",
+            "InviteSvc",
+            "Notify"
+          ]
+        },
+        {
+          "name": "Attendee RSVP (idempotent, version-stamped)",
+          "note": "The attendee's response writes to their attendee row, not the organizer's event details, stamped with the event version it responded against and an idempotency key. A retried RSVP is a no-op; a concurrent organizer edit bumps the event version but never erases the response.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Client"
+              },
+              {
+                "id": "InviteSvc",
+                "label": "Invite / RSVP"
+              },
+              {
+                "id": "EventDB",
+                "label": "Event Store"
+              },
+              {
+                "id": "Notify",
+                "label": "Notification"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Client",
+                "to": "InviteSvc",
+                "arrow": "->>",
+                "label": "rsvp(accepted, eventVersion=5, key)"
+              },
+              {
+                "from": "InviteSvc",
+                "to": "EventDB",
+                "arrow": "->>",
+                "label": "upsert attendee row (idempotent on key)"
+              },
+              {
+                "from": "InviteSvc",
+                "to": "Notify",
+                "arrow": "->>",
+                "label": "notify organizer of response"
+              },
+              {
+                "from": "InviteSvc",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "200 response recorded"
               }
             ]
           },
           "highlight": [
             "InviteSvc",
-            "Notify"
+            "EventDB"
           ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Letting an organizer edit and an attendee RSVP write the same row / last-writer-wins.",
+          "why": "They race: an organizer time change and an attendee 'accepted' can cross in flight, and the update fanout can overwrite the just-recorded response.",
+          "instead": "Keep event details on the organizer's event (versioned) and responses on per-attendee rows; make RSVP writes idempotent and version-stamped, and have update notifications preserve existing responses (re-confirm rather than reset)."
         }
       ]
     },
@@ -1272,24 +2785,25 @@
       "title": "6. Reminders and Device Sync",
       "description": [
         "Reminders must fire on time and once. Schedule them by fire time in a time-ordered reminder queue/scheduler (the same due-index idea as a job scheduler); a due reminder triggers a notification. Recurring events generate the next reminder as each instance passes.",
-        "Device/external sync uses delta sync: each client tracks a cursor and pulls changes since it last synced (new/edited/cancelled events), reconciling locally — efficient and offline-tolerant. CalDAV/standard sync interoperates with external calendars.",
-        "Reminders are deduped (fire once even if the scheduler retries) and respect the user's timezone for 'remind me at 9am'."
+        "Be precise about the guarantee: scheduler execution is fire-once via leasing + a dedup_key, but delivery through external push/email is at-least-once. So the contract is at-least-once send with idempotent, user-visible dedup — the user never sees two reminders even though a provider might be retried. A reminder job has an explicit lifecycle: scheduled -> leased -> sent (or failed/retry, cancelled if the event is deleted, superseded if the time moved).",
+        "Device/external sync uses delta sync: each client tracks a cursor (a position in the per-calendar change log) and pulls changes since it last synced — upserts plus tombstones for deletions — reconciling locally. Tombstones and a cursor-retention window are what let offline devices converge instead of missing deletions. CalDAV/standard sync interoperates with external calendars.",
+        "Reminders respect the user's timezone for 'remind me at 9am', and an edit/cancel supersedes the old job so a moved meeting doesn't fire at the stale time."
       ],
       "view": {
         "nodes": [
-          "EventSvc",
+          "ChangeLog",
+          "Projector",
           "ReminderQ",
           "Notify",
-          "SyncSvc",
-          "EventDB"
+          "SyncSvc"
         ],
-        "caption": "The Event Service schedules reminders in the reminder scheduler, which fires due reminders to clients via notifications, while the sync service streams delta changes from the event store.",
+        "caption": "Projectors consume the change log to materialize due reminders into the scheduler (which fires them via notifications) and to advance the per-calendar cursor the sync service serves to devices.",
         "links": [
-          "event-reminder",
+          "changelog-projector",
+          "projector-reminder",
           "reminder-notify",
           "notify-client",
-          "client-sync",
-          "sync-eventdb"
+          "sync-changelog"
         ],
         "highlight": [
           "ReminderQ",
@@ -1297,10 +2811,81 @@
         ],
         "groups": [
           "collab",
-          "events"
+          "pipeline"
         ]
       },
       "decisionPrompt": "How do you fire a reminder exactly once at the right local time, and keep all the user's devices in sync?",
+      "options": [
+        {
+          "name": "Time-ordered scheduler (due-index) + idempotent send (default)",
+          "description": "Materialize due reminder jobs keyed by fire_at_utc into a time-ordered store; workers lease the due slice, check the job is still valid, and send with a stable dedup key. Recurring events enqueue the next instance as each one passes.",
+          "pros": [
+            "O(1) to find what's due now — workers scan a narrow fire-time window, not all reminders.",
+            "Leasing + dedup_key give fire-once execution even when a worker crashes mid-send and retries.",
+            "Absorbs top-of-hour bursts by widening the lease window and adding workers; jitter spreads sends."
+          ],
+          "cons": [
+            "Needs a durable job table and a leasing/visibility-timeout protocol to operate.",
+            "Materializing recurring reminders requires a rolling horizon (you don't pre-create infinite jobs).",
+            "A cancelled/edited event must invalidate or supersede already-scheduled jobs."
+          ],
+          "view": {
+            "nodes": [
+              "ChangeLog",
+              "Projector",
+              "ReminderQ",
+              "Notify"
+            ],
+            "caption": "A projector materializes due reminder jobs from the change log into a time-ordered scheduler; workers lease due jobs and send idempotently.",
+            "links": [
+              "changelog-projector",
+              "projector-reminder",
+              "reminder-notify"
+            ],
+            "highlight": [
+              "ReminderQ"
+            ],
+            "groups": [
+              "pipeline"
+            ]
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-reminders-opt1.jpg"
+        },
+        {
+          "name": "Database polling (SELECT due rows on an interval)",
+          "description": "A cron-like worker periodically queries the event/reminder table for rows due in the next interval and sends them.",
+          "pros": [
+            "Trivial to build — one indexed query on fire time, no separate scheduler infrastructure.",
+            "No extra job store; reminders derive directly from event rows.",
+            "Fine at low volume or for coarse reminder granularity."
+          ],
+          "cons": [
+            "Poll interval bounds precision and adds latency; tight intervals hammer the DB.",
+            "The top-of-hour burst becomes one giant query returning millions of rows.",
+            "Concurrency control (don't double-send) is bolted on rather than built in."
+          ],
+          "view": {
+            "nodes": [
+              "ReminderQ",
+              "EventDB",
+              "Notify"
+            ],
+            "caption": "A poller periodically scans the event store for due reminders and sends them, with no precomputed due-index.",
+            "links": [
+              {
+                "from": "ReminderQ",
+                "to": "EventDB",
+                "label": "SELECT due rows"
+              },
+              "reminder-notify"
+            ],
+            "highlight": [
+              "ReminderQ"
+            ]
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-reminders-opt2.jpg"
+        }
+      ],
       "concepts": [
         {
           "term": "Time-ordered reminders + delta sync",
@@ -1311,10 +2896,21 @@
         }
       ],
       "probeLinks": [
-        "kafka-design"
+        "caldav-rfc",
+        "transactional-outbox",
+        "webdav-sync-rfc",
+        "google-calendar-sync",
+        "google-calendar-push",
+        "google-calendar-reminders",
+        "microsoft-graph-delta-events",
+        "google-sre-cron",
+        "slack-cron-scale",
+        "sre-monitoring"
       ],
       "patterns": [
-        "Time-ordered reminders + delta sync"
+        "Time-ordered reminders + delta sync",
+        "Durable change log + idempotent projectors",
+        "Idempotency + optimistic concurrency"
       ],
       "whyNow": [
         "Reminders + sync complete the user experience; reusing the scheduler due-index and delta-sync patterns ties it to known mechanisms."
@@ -1323,45 +2919,295 @@
         "before": "No reminders/sync.",
         "after": "On-time deduped reminders + cursor-based device sync.",
         "newRisk": "Billions of events and reminder bursts (top-of-hour) need scaling."
-      }
+      },
+      "flows": [
+        {
+          "name": "Due reminder execution (lease → validate → idempotent send)",
+          "note": "A worker leases the due slice, re-checks the event/version is still valid and the job isn't cancelled/superseded, sends via the notification provider with a stable dedup key, then marks sent (or fails with backoff). Metrics track due-lag, duplicate suppression, provider errors, and abandoned leases.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "ReminderQ",
+                "label": "Reminder Scheduler"
+              },
+              {
+                "id": "EventDB",
+                "label": "Event Store"
+              },
+              {
+                "id": "Notify",
+                "label": "Notification"
+              },
+              {
+                "id": "Client"
+              }
+            ],
+            "messages": [
+              {
+                "from": "ReminderQ",
+                "to": "ReminderQ",
+                "arrow": "->>",
+                "label": "lease due jobs (visibility timeout)"
+              },
+              {
+                "from": "ReminderQ",
+                "to": "EventDB",
+                "arrow": "->>",
+                "label": "still valid? not cancelled/superseded?"
+              },
+              {
+                "from": "ReminderQ",
+                "to": "Notify",
+                "arrow": "->>",
+                "label": "send(dedup_key)"
+              },
+              {
+                "from": "Notify",
+                "to": "Client",
+                "arrow": "->>",
+                "label": "push/email (deduped by key)"
+              },
+              {
+                "from": "ReminderQ",
+                "to": "ReminderQ",
+                "arrow": "->>",
+                "label": "mark sent (or retry w/ backoff)"
+              }
+            ]
+          },
+          "highlight": [
+            "ReminderQ",
+            "Notify"
+          ]
+        },
+        {
+          "name": "Delta sync (cursor pull with tombstones)",
+          "note": "The device sends its last cursor; the sync service reads the change log from that position and returns upserts + tombstones plus the next cursor. The device applies changes and deletions locally. A cursor older than the retention window triggers a full resync.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Client"
+              },
+              {
+                "id": "SyncSvc",
+                "label": "Sync Service"
+              },
+              {
+                "id": "ChangeLog",
+                "label": "Change Log"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Client",
+                "to": "SyncSvc",
+                "arrow": "->>",
+                "label": "sync(cursor=seq_77412)"
+              },
+              {
+                "from": "SyncSvc",
+                "to": "ChangeLog",
+                "arrow": "->>",
+                "label": "changes since seq_77412"
+              },
+              {
+                "from": "SyncSvc",
+                "to": "Client",
+                "arrow": "-->>",
+                "label": "upserts + tombstones + nextCursor"
+              }
+            ]
+          },
+          "highlight": [
+            "SyncSvc",
+            "ChangeLog"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Promising exactly-once reminder delivery.",
+          "why": "External push/email providers retry; you cannot guarantee a single delivery end-to-end.",
+          "instead": "Make scheduler execution fire-once (lease + dedup_key) and treat delivery as at-least-once with idempotent, user-visible dedup."
+        },
+        {
+          "trap": "Syncing without tombstones, or expiring cursors silently.",
+          "why": "An offline device that only receives upserts never learns about deletions, and a cursor past the retention window returns nothing or errors — the device silently diverges.",
+          "instead": "Emit tombstones for deletes and force a full resync when a cursor is older than the retained change-log window."
+        }
+      ]
     },
     {
       "id": "scale",
       "title": "7. Scaling and Consistency",
       "description": [
-        "Shard events by calendar/user so a calendar's events and busy index live together and reads are local. Free/busy across many attendees fans out per-calendar (each shard answers its own busy intervals) and merges.",
-        "Reminder bursts (everyone's 9am meeting) concentrate at round times; the time-ordered scheduler + queue absorbs them with scalable workers, jittering where possible. Caches hold hot calendar views and free/busy results.",
-        "Consistency: the event store is authoritative; busy index, expanded instances, and device caches are derived/rebuildable. An RSVP or edit propagates via the invite/sync path; brief propagation lag across attendees' devices is acceptable (eventual), but the organizer's event details are the source of truth."
+        "Shard events by calendar/user so a calendar's events, change log, and busy index live together and reads are local. At ~30k mutation QPS and ~600k view-read QPS the read path dominates, so hot calendar views and free/busy results sit behind a cache invalidated through the same change log. A 20-attendee free/busy fans out across up to 20 shards and merges, so cap attendee count and parallelize the fan-out. Hot resource calendars (a popular meeting room) are a shard hotspot — give them their own partition or a write-through cache.",
+        "Reminder bursts (everyone's 9am meeting) concentrate at round local times — ~1M/sec vs ~50k/sec steady, about 20x. The time-ordered scheduler + queue absorbs them by widening the lease window and autoscaling workers; jitter sends within the allowed pre-meeting offset. Provision workers for the burst, not the average.",
+        "Consistency rests on the durable change pipeline: the event store + outbox row commit in one transaction, and idempotent projectors rebuild busy index, reminder jobs, sync cursors, and cache from that log. So busy index, expanded instances, reminder jobs, and device caches are all derived/rebuildable — a lost index is replayed from the log or recomputed from events. Projector lag (the gap between commit and derived-state update) is the eventual-consistency budget: bounded by partitioned consumers and monitored as a first-class signal. The organizer's event details remain the single source of truth.",
+        "DR for derived state: if a busy index or reminder partition is lost, free/busy falls back to direct expansion and reminders are re-materialized from the change log/event store; backfills replay the log from a retained offset rather than re-deriving from scratch."
       ],
       "view": {
         "nodes": [
           "EventSvc",
           "EventDB",
+          "ChangeLog",
+          "Projector",
           "BusyIndex",
-          "FreeBusy",
+          "Cache",
           "ReminderQ"
         ],
-        "caption": "The Event Service writes events to a sharded event store while the Free/Busy Service serves find-a-time from the busy index and the scheduler drives reminders at scale.",
+        "caption": "Events and their outbox commit to a sharded store; partitioned projectors replay the change log to keep the busy index, cache, and reminder jobs current and rebuildable.",
         "links": [
           "event-db",
-          "freebusy-index",
-          "lb-freebusy",
-          "event-reminder"
+          "event-changelog",
+          "changelog-projector",
+          "projector-index",
+          "projector-cache",
+          "projector-reminder"
         ],
         "highlight": [
-          "EventDB"
+          "ChangeLog",
+          "Projector"
         ],
         "groups": [
           "events",
-          "availability"
+          "availability",
+          "pipeline"
         ]
       },
-      "decisionPrompt": "Everyone has a 9am meeting reminder. What happens at 8:50am across millions of users?",
+      "options": [
+        {
+          "name": "Shard by calendar (default)",
+          "description": "Partition the event store, change log, and busy index by calendar_id, so a calendar's authoritative events, its ordered change log (= sync cursor), and its derived busy intervals all live on the same shard.",
+          "pros": [
+            "A calendar read, its delta-sync cursor, and its busy index are all shard-local — no cross-shard join for the common day/week view.",
+            "The per-calendar change log gives a natural monotonic sync cursor and projector partition.",
+            "Resource calendars (rooms) are first-class shards you can isolate or cache when hot."
+          ],
+          "cons": [
+            "A multi-attendee free/busy still fans out across each attendee's calendar shard and merges (cap attendee count, parallelize).",
+            "A user with many calendars spreads across shards, so 'all my calendars' is a scatter-gather.",
+            "Hot shared/resource calendars are hotspots needing a dedicated partition or write-through cache."
+          ],
+          "view": {
+            "nodes": [
+              "EventSvc",
+              "EventDB",
+              "ChangeLog",
+              "BusyIndex"
+            ],
+            "caption": "Events, the per-calendar change log, and the busy index are co-located on the calendar's shard, so reads and the sync cursor stay local.",
+            "links": [
+              "event-db",
+              "event-changelog",
+              {
+                "from": "ChangeLog",
+                "to": "BusyIndex",
+                "label": "per-calendar projector"
+              }
+            ],
+            "highlight": [
+              "EventDB",
+              "ChangeLog"
+            ]
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/07-scale-opt1.jpg"
+        },
+        {
+          "name": "Shard by user",
+          "description": "Partition by user_id so all of a user's calendars and their attendee refs sit on one shard; a user's full view is one shard-local read.",
+          "pros": [
+            "'All my calendars' and a user's whole device sync are a single shard-local read.",
+            "Per-user reminder and sync state co-locate with the user.",
+            "Simple owner-based routing for personal-calendar-heavy workloads."
+          ],
+          "cons": [
+            "Shared and resource calendars have no single owner — they fit awkwardly or get duplicated across member shards.",
+            "A meeting spanning many users still fans out across user shards for free/busy.",
+            "Power users / large org calendars become individual hotspots."
+          ],
+          "view": {
+            "nodes": [
+              "EventSvc",
+              "EventDB",
+              "BusyIndex"
+            ],
+            "caption": "All of a user's calendars and attendee refs live on the user's shard, so a user's full calendar view is one local read.",
+            "links": [
+              "event-db",
+              {
+                "from": "EventDB",
+                "to": "BusyIndex",
+                "label": "per-user busy index"
+              }
+            ],
+            "highlight": [
+              "EventDB"
+            ]
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/07-scale-opt2.jpg"
+        },
+        {
+          "name": "Hybrid: calendar-sharded + isolated resource/shared calendars",
+          "description": "Shard by calendar by default, but pull hot shared/resource calendars (popular rooms, large org calendars) onto dedicated partitions with write-through caches and stricter conflict policy.",
+          "pros": [
+            "Keeps shard-local reads/sync for personal calendars while removing the room-calendar hotspot.",
+            "Conflict policy (room double-booking) is enforced at one authoritative partition.",
+            "Lets you scale the few hot calendars independently of the long tail."
+          ],
+          "cons": [
+            "Two routing rules to operate (default hash + hot-calendar override list).",
+            "Promoting a calendar to its own partition is a migration, not a config flip.",
+            "Cross-shard free/busy fan-out is unchanged for mixed-attendee meetings."
+          ],
+          "view": {
+            "nodes": [
+              "EventSvc",
+              "EventDB",
+              "ChangeLog",
+              "Cache",
+              "BusyIndex"
+            ],
+            "caption": "Default calendars shard by calendar_id; hot resource/shared calendars get a dedicated partition fronted by a write-through cache.",
+            "links": [
+              "event-db",
+              "event-changelog",
+              {
+                "from": "EventSvc",
+                "to": "Cache",
+                "label": "write-through (hot resource cal)"
+              },
+              {
+                "from": "ChangeLog",
+                "to": "BusyIndex",
+                "label": "per-calendar projector"
+              }
+            ],
+            "highlight": [
+              "Cache",
+              "EventDB"
+            ]
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/07-scale-opt3.jpg"
+        }
+      ],
+      "decisionPrompt": "Everyone has a 9am meeting reminder. What happens at 8:50am across millions of users — and how should you shard so the busy index, sync cursor, and reminders stay local?",
+      "patterns": [
+        "Durable change log + idempotent projectors"
+      ],
       "whyNow": [
         "Closing on sharding + reminder bursts + derived-state consistency shows the design scales and stays correct at billions of events."
       ],
       "probeLinks": [
-        "kafka-design"
+        "kafka-design",
+        "transactional-outbox",
+        "webdav-sync-rfc",
+        "google-calendar-sync",
+        "google-calendar-push",
+        "microsoft-graph-delta-events",
+        "google-sre-cron",
+        "slack-cron-scale",
+        "sre-monitoring"
       ],
       "recap": {
         "before": "Single-store assumptions.",
@@ -1370,26 +3216,44 @@
       },
       "bottlenecks": [
         {
-          "issue": "Top-of-hour reminder burst.",
-          "mitigation": "Time-ordered scheduler + queue + autoscaled workers; jitter where allowed."
+          "issue": "Top-of-hour reminder burst (~1M/sec vs ~50k/sec steady).",
+          "mitigation": "Time-ordered scheduler + queue + autoscaled workers provisioned for the burst; jitter sends within the allowed offset; widen the lease window."
         },
         {
-          "issue": "Free/busy across many attendees.",
-          "mitigation": "Per-calendar busy index, parallel fan-out + merge, cached results."
+          "issue": "Free/busy across many attendees fans out across many shards.",
+          "mitigation": "Per-calendar busy index, parallel fan-out + merge, cached results, and a cap on attendee count per query."
+        },
+        {
+          "issue": "Hot resource calendar (popular meeting room) is a shard hotspot.",
+          "mitigation": "Dedicated partition or write-through cache; conflict policy enforced at the resource calendar."
+        },
+        {
+          "issue": "Projector lag grows during a write spike.",
+          "mitigation": "Partition the change log per calendar, scale consumers independently, and monitor commit-to-derived lag as an SLO."
         }
       ],
       "failureDrills": [
         {
           "scenario": "The busy index is lost for a calendar.",
-          "expectedBehavior": "Rebuild it from events (expanding recurrence); free/busy briefly falls back to direct expansion.",
-          "mitigation": "Treat the busy index as rebuildable derived state."
+          "expectedBehavior": "Rebuild it by replaying the change log (or expanding events); free/busy briefly falls back to direct expansion.",
+          "mitigation": "Treat the busy index as rebuildable derived state fed by the change log."
+        },
+        {
+          "scenario": "A projector falls far behind or crashes mid-batch.",
+          "expectedBehavior": "On restart it resumes from its committed offset; idempotent upserts (keyed by event + version) make re-processing safe with no double effects.",
+          "mitigation": "At-least-once consumption with idempotent writes; alert on consumer lag."
+        },
+        {
+          "scenario": "The event write commits but the outbox enqueue is lost.",
+          "expectedBehavior": "Outbox row is written in the same transaction as the event, so it cannot be lost independently; a relay publishes pending rows.",
+          "mitigation": "Transactional outbox — never enqueue outside the write transaction."
         }
       ]
     }
   ],
   "finalDesign": {
     "title": "Final Design — Calendar System",
-    "description": "Events persist authoritatively (recurring ones as RRULE rules, never expanded instances), with single-instance edits/cancellations as overrides/exceptions. Reads expand rules for the queried window in the event's local timezone (DST-correct) and apply overrides. A per-calendar busy-interval index makes multi-attendee free/busy a fast range-merge. Invites fan out to attendees with organizer-authoritative details and tracked RSVPs; reminders are scheduled by fire time (deduped, local-tz) and devices stay current via cursor-based delta sync. Events shard by calendar; busy index, expanded instances, and device caches are derived/rebuildable; reminder bursts are absorbed by the scheduler queue.",
+    "description": "Events persist authoritatively (recurring ones as RRULE rules, never expanded instances), with single-instance edits/cancellations as overrides keyed by a stable recurrence id and 'this and following' modeled as a series split. Reads expand rules for the queried window in the event's local timezone (DST-correct, with explicit nonexistent/ambiguous-time policies) and apply overrides. Every event write commits with an outbox row into a per-calendar change log; idempotent projectors replay that log to keep the busy-interval index, reminder jobs, invite fanout, device-sync cursors, and read cache current — so all of those are derived and rebuildable. A per-calendar busy-interval index makes multi-attendee free/busy a fast range-merge, and the Free/Busy service authorizes the caller against calendar ACLs before returning intervals (busy-only / unknown / detail). Invites stay organizer-authoritative with versioned details and idempotent RSVPs; the projector maintains a lightweight attendee-calendar projection (calendar_event_refs) so each attendee's reads, busy index, reminders, and sync cursor work without scanning organizer-owned events. Reminders are fired once via lease + dedup (at-least-once delivery), local-tz, and devices stay current via cursor-based delta sync with tombstones. Events shard by calendar; reminder bursts are absorbed by the scheduler queue; projector lag is the bounded eventual-consistency budget.",
     "view": {
       "nodes": [
         "Client",
@@ -1397,38 +3261,48 @@
         "EventSvc",
         "EventDB",
         "Expander",
+        "ChangeLog",
+        "Projector",
         "FreeBusy",
         "BusyIndex",
+        "Cache",
         "InviteSvc",
         "Notify",
         "ReminderQ",
         "SyncSvc"
       ],
-      "caption": "End to end: clients reach event, free/busy, and sync services through the gateway, with the expander, busy-interval index, invites, reminders, and notifications all backed by the event store.",
+      "caption": "End to end: clients reach event, free/busy, and sync services through the gateway; event writes append to a durable change log that idempotent projectors replay to keep the busy index, reminders, invites, cache, and sync cursors current and rebuildable.",
       "links": [
         "client-lb",
         "lb-event",
         "event-db",
+        "event-changelog",
         "event-expander",
         "event-freebusy",
         "lb-freebusy",
         "freebusy-index",
         "expander-index",
-        "event-invite",
+        "freebusy-cache",
+        "changelog-projector",
+        "projector-index",
+        "projector-reminder",
+        "projector-invite",
+        "projector-cache",
         "invite-notify",
         "notify-client",
-        "event-reminder",
         "reminder-notify",
         "client-sync",
-        "sync-eventdb",
+        "sync-changelog",
         "invite-event"
       ],
       "groups": [
         "events",
         "availability",
-        "collab"
+        "collab",
+        "pipeline"
       ]
-    }
+    },
+    "aiVisual": "assets/generated/ai-visuals/final-design.jpg"
   },
   "satisfies": {
     "functional": [
@@ -1437,35 +3311,40 @@
         "how": "Rule storage + on-read expansion + overrides.",
         "steps": [
           "recurrence"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-01-one-off-recurring-events.jpg"
       },
       {
         "requirement": "Single-instance vs series edits",
         "how": "Override/exception model.",
         "steps": [
           "recurrence"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-02-single-instance-vs-series-edits.jpg"
       },
       {
         "requirement": "Free/busy across attendees",
         "how": "Per-calendar busy-interval index + merge.",
         "steps": [
           "freebusy"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-03-free-busy-across-attendees.jpg"
       },
       {
         "requirement": "Invites + RSVP",
         "how": "Organizer-authoritative invite fanout + responses.",
         "steps": [
           "invites"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-04-invites-rsvp.jpg"
       },
       {
         "requirement": "Reminders + device sync",
         "how": "Time-ordered reminders + cursor delta sync.",
         "steps": [
           "reminders"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-05-reminders-device-sync.jpg"
       }
     ],
     "nonFunctional": [
@@ -1474,7 +3353,8 @@
         "how": "UTC + original tz; expand recurrence in local time.",
         "steps": [
           "timezone"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-01-timezone-dst-correctness.jpg"
       },
       {
         "requirement": "Fast availability/reads",
@@ -1482,29 +3362,61 @@
         "steps": [
           "freebusy",
           "scale"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-02-fast-availability-reads.jpg"
       },
       {
         "requirement": "Consistent propagation",
-        "how": "Organizer-authoritative events + invite/sync paths.",
+        "how": "Organizer-authoritative events; projector fans changes into attendee-calendar refs (calendar_event_refs) for reads, busy index, and sync.",
         "steps": [
-          "invites"
-        ]
+          "invites",
+          "scale"
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-03-consistent-propagation.jpg"
       },
       {
         "requirement": "Scale to billions",
         "how": "Calendar sharding + rebuildable derived state.",
         "steps": [
           "scale"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-04-scale-to-billions.jpg"
       },
       {
         "requirement": "Reliable reminders",
-        "how": "Time-ordered scheduler, deduped, burst-tolerant.",
+        "how": "Time-ordered scheduler (lease + dedup, fire-once); at-least-once delivery; burst-tolerant.",
         "steps": [
           "reminders",
           "scale"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-05-reliable-reminders.jpg"
+      },
+      {
+        "requirement": "Durable derived state",
+        "how": "Transactional outbox + per-calendar change log; idempotent projectors rebuild busy index, reminders, sync cursors, and cache.",
+        "steps": [
+          "freebusy",
+          "reminders",
+          "scale"
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-06-durable-derived-state.jpg"
+      },
+      {
+        "requirement": "Safe under retries and races",
+        "how": "Idempotency keys on writes; event versions for optimistic concurrency; version-stamped RSVPs.",
+        "steps": [
+          "invites",
+          "reminders"
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-07-safe-under-retries-and-races.jpg"
+      },
+      {
+        "requirement": "Free/busy privacy",
+        "how": "Caller authorized against calendar ACLs before any interval is returned (busy-only / unknown / detail); private events contribute a busy block but no title/location.",
+        "steps": [
+          "freebusy"
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-08-free-busy-privacy.jpg"
       }
     ]
   },
@@ -1583,79 +3495,290 @@
     "links": [
       {
         "id": "ical-rfc",
-        "group": "Booking and Contention",
-        "groupDescription": "Inventory reservation, waiting rooms, locks, leases, and contention-management references.",
+        "group": "Calendar Standards",
+        "groupDescription": "iCalendar/iTIP/CalDAV object models and scheduling protocols.",
         "title": "Internet Calendaring and Scheduling Core Object Specification",
         "url": "https://www.rfc-editor.org/rfc/rfc5545",
         "source": "IETF",
         "type": "RFC",
-        "why": "Canonical iCalendar model for events, recurrence, time zones, and scheduling data.",
+        "why": "Canonical iCalendar model for events, RRULE recurrence, RECURRENCE-ID overrides, EXDATE, and time zones.",
         "year": "2009"
       },
       {
-        "id": "caldav-rfc",
-        "group": "Booking and Contention",
-        "groupDescription": "Inventory reservation, waiting rooms, locks, leases, and contention-management references.",
-        "title": "Calendaring Extensions to WebDAV",
-        "url": "https://www.rfc-editor.org/rfc/rfc4791",
+        "id": "itip-rfc",
+        "group": "Calendar Standards",
+        "groupDescription": "iCalendar/iTIP/CalDAV object models and scheduling protocols.",
+        "title": "iCalendar Transport-Independent Interoperability Protocol (iTIP)",
+        "url": "https://www.rfc-editor.org/rfc/rfc5546",
         "source": "IETF",
         "type": "RFC",
-        "why": "Calendar protocol reference for syncing, querying, and managing calendar collections.",
-        "year": "2007"
+        "why": "Defines the REQUEST/REPLY/CANCEL invite and RSVP exchange used for cross-provider organizer/attendee fanout.",
+        "year": "2009"
+      },
+      {
+        "id": "imip-rfc",
+        "group": "Calendar Standards",
+        "groupDescription": "iCalendar/iTIP/CalDAV object models and scheduling protocols.",
+        "title": "iCalendar Message-Based Interoperability Protocol (iMIP)",
+        "url": "https://www.rfc-editor.org/rfc/rfc6047",
+        "source": "IETF",
+        "type": "RFC",
+        "why": "Shows how calendar invites and replies travel over email, including METHOD handling, organizer/attendee correlation, and security checks.",
+        "year": "2010"
+      },
+      {
+        "id": "caldav-scheduling-rfc",
+        "group": "Calendar Standards",
+        "groupDescription": "iCalendar/iTIP/CalDAV object models and scheduling protocols.",
+        "title": "Scheduling Extensions to CalDAV",
+        "url": "https://datatracker.ietf.org/doc/html/rfc6638",
+        "source": "IETF",
+        "type": "RFC",
+        "why": "Defines CalDAV scheduling inbox/outbox behavior, schedule privileges, invite delivery, replies, and free/busy request authorization.",
+        "year": "2012"
+      },
+      {
+        "id": "jscalendar-rfc",
+        "group": "Calendar Standards",
+        "groupDescription": "iCalendar/iTIP/CalDAV object models and scheduling protocols.",
+        "title": "JSCalendar: A JSON Representation of Calendar Data",
+        "url": "https://www.rfc-editor.org/rfc/rfc8984",
+        "source": "IETF",
+        "type": "RFC",
+        "why": "A modern JSON calendar model that makes event, recurrence rule, recurrence override, participant, and timezone semantics explicit.",
+        "year": "2021"
       },
       {
         "id": "google-calendar-freebusy",
-        "group": "Booking and Contention",
-        "groupDescription": "Inventory reservation, waiting rooms, locks, leases, and contention-management references.",
+        "group": "Calendar Standards",
+        "groupDescription": "iCalendar/iTIP/CalDAV object models and scheduling protocols.",
         "title": "Freebusy Query",
         "url": "https://developers.google.com/workspace/calendar/api/v3/reference/freebusy/query",
         "source": "Google Calendar API",
         "type": "Docs",
-        "why": "Concrete API model for availability checks across calendars."
+        "why": "Concrete API model for availability checks across calendars — the privacy-preserving busy/free contract."
+      },
+      {
+        "id": "microsoft-graph-freebusy",
+        "group": "Availability and Privacy",
+        "groupDescription": "Provider API contracts for free/busy lookup, ACLs, and attendee-visible event data.",
+        "title": "Get free/busy schedule of Outlook calendar users and resources",
+        "url": "https://learn.microsoft.com/en-us/graph/outlook-get-free-busy-schedule",
+        "source": "Microsoft Graph",
+        "type": "Docs",
+        "why": "Shows another production API shape for free/busy lookup, resource availability, returned status buckets, limits, and timezone headers."
+      },
+      {
+        "id": "microsoft-calendar-permissions",
+        "group": "Availability and Privacy",
+        "groupDescription": "Provider API contracts for free/busy lookup, ACLs, and attendee-visible event data.",
+        "title": "calendarPermission resource type",
+        "url": "https://learn.microsoft.com/en-us/graph/api/resources/calendarpermission?view=graph-rest-1.0",
+        "source": "Microsoft Graph",
+        "type": "Docs",
+        "why": "Maps calendar ACL levels such as freeBusyRead, limitedRead, read, and write to the privacy boundary used by free/busy results."
+      },
+      {
+        "id": "microsoft-graph-event-resource",
+        "group": "Availability and Privacy",
+        "groupDescription": "Provider API contracts for free/busy lookup, ACLs, and attendee-visible event data.",
+        "title": "event resource type",
+        "url": "https://learn.microsoft.com/en-us/graph/api/resources/event?view=graph-rest-1.0",
+        "source": "Microsoft Graph",
+        "type": "Docs",
+        "why": "Grounds invite and RSVP modeling in concrete fields for attendees, response status, sensitivity, recurrence masters, instances, and exceptions."
+      },
+      {
+        "id": "google-calendar-recurring",
+        "group": "Provider APIs and Interop",
+        "groupDescription": "Concrete provider behavior for recurring events, sync, notifications, and reminders.",
+        "title": "Recurring events",
+        "url": "https://developers.google.com/workspace/calendar/api/guides/recurringevents",
+        "source": "Google Calendar API",
+        "type": "Docs",
+        "why": "Shows provider semantics for recurring series, instances, exceptions, and the two-request series split needed for 'this and following' edits."
       },
       {
         "id": "iana-timezones",
-        "group": "Booking and Contention",
-        "groupDescription": "Inventory reservation, waiting rooms, locks, leases, and contention-management references.",
+        "group": "Time and Recurrence",
+        "groupDescription": "Timezone data, DST edge cases, and recurrence-rule correctness.",
         "title": "Time Zone Database",
         "url": "https://data.iana.org/time-zones/tz-link.html",
         "source": "IANA",
         "type": "Docs",
-        "why": "Canonical timezone reference for recurrence, daylight-saving changes, and calendar correctness."
+        "why": "Canonical tzdb: how zone rules change over time, why future instants must be recomputed, and how DST gaps/overlaps arise."
       },
       {
-        "id": "postgres-isolation",
-        "group": "Booking and Contention",
-        "groupDescription": "Inventory reservation, waiting rooms, locks, leases, and contention-management references.",
-        "title": "Transaction Isolation",
-        "url": "https://www.postgresql.org/docs/current/transaction-iso.html",
-        "source": "PostgreSQL",
+        "id": "rrule-tool",
+        "group": "Time and Recurrence",
+        "groupDescription": "Timezone data, DST edge cases, and recurrence-rule correctness.",
+        "title": "RFC 5545 RRULE semantics and edge cases",
+        "url": "https://www.rfc-editor.org/rfc/rfc5545#section-3.3.10",
+        "source": "IETF",
+        "type": "RFC",
+        "why": "RRULE expansion rules, nonexistent/ambiguous local times, and how RECURRENCE-ID anchors single-instance edits."
+      },
+      {
+        "id": "dateutil-rrule",
+        "group": "Time and Recurrence",
+        "groupDescription": "Timezone data, DST edge cases, and recurrence-rule correctness.",
+        "title": "rrule",
+        "url": "https://dateutil.readthedocs.io/en/stable/rrule.html",
+        "source": "dateutil",
         "type": "Docs",
-        "why": "Useful for reasoning about locks, serialization anomalies, and inventory correctness."
+        "why": "A practical RRULE implementation reference that calls out invalid dates and nonexistent local times, useful for testing recurrence expansion edge cases."
+      },
+      {
+        "id": "temporal-zoneddatetime",
+        "group": "Time and Recurrence",
+        "groupDescription": "Timezone data, DST edge cases, and recurrence-rule correctness.",
+        "title": "Temporal.ZonedDateTime",
+        "url": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Temporal/ZonedDateTime",
+        "source": "MDN Web Docs",
+        "type": "Docs",
+        "why": "Explains gap/overlap disambiguation and the offset-versus-timezone decision that calendar systems must make for future reminders and recurring meetings."
+      },
+      {
+        "id": "caldav-rfc",
+        "group": "Sync Protocols",
+        "groupDescription": "Cursor/collection sync, tombstones, and device convergence.",
+        "title": "Calendaring Extensions to WebDAV (CalDAV)",
+        "url": "https://www.rfc-editor.org/rfc/rfc4791",
+        "source": "IETF",
+        "type": "RFC",
+        "why": "Calendar collection sync, querying, and the sync-token (cursor) model devices use to pull deltas and deletions.",
+        "year": "2007"
+      },
+      {
+        "id": "webdav-sync-rfc",
+        "group": "Sync Protocols",
+        "groupDescription": "Cursor/collection sync, tombstones, and device convergence.",
+        "title": "Collection Synchronization for Web Distributed Authoring and Versioning (WebDAV)",
+        "url": "https://www.rfc-editor.org/rfc/rfc6578",
+        "source": "IETF",
+        "type": "RFC",
+        "why": "Defines sync-token based collection synchronization, the standard pattern behind efficient device delta sync for DAV-style clients.",
+        "year": "2012"
+      },
+      {
+        "id": "google-calendar-sync",
+        "group": "Sync Protocols",
+        "groupDescription": "Cursor/collection sync, tombstones, and device convergence.",
+        "title": "Synchronize resources efficiently",
+        "url": "https://developers.google.com/workspace/calendar/api/guides/sync",
+        "source": "Google Calendar API",
+        "type": "Docs",
+        "why": "Concrete incremental-sync flow: initial full sync, persisted sync token, repeated delta pulls, and token handling."
+      },
+      {
+        "id": "microsoft-graph-delta-events",
+        "group": "Sync Protocols",
+        "groupDescription": "Cursor/collection sync, tombstones, and device convergence.",
+        "title": "Get incremental changes to events in a calendar view",
+        "url": "https://learn.microsoft.com/en-us/graph/delta-query-events",
+        "source": "Microsoft Graph",
+        "type": "Docs",
+        "why": "Provider example of event delta queries with opaque state tokens, date-range calendar views, and changed/deleted event synchronization."
       },
       {
         "id": "kafka-design",
-        "group": "Queues and Streams",
-        "groupDescription": "Messaging, event streaming, delivery semantics, and async processing references.",
+        "group": "Notifications and Streams",
+        "groupDescription": "Durable change logs, outbox/projector mechanics, and at-least-once delivery.",
         "title": "Apache Kafka Design",
         "url": "https://kafka.apache.org/documentation/#design",
         "source": "Apache Kafka",
         "type": "Docs",
-        "why": "Explains Kafka's log, partitions, consumer groups, replication, and operational model."
+        "why": "Ordered partitioned log + consumer offsets — the model behind the per-calendar change log that feeds busy-index, reminder, invite, and sync projectors."
+      },
+      {
+        "id": "transactional-outbox",
+        "group": "Notifications and Streams",
+        "groupDescription": "Durable change logs, outbox/projector mechanics, and at-least-once delivery.",
+        "title": "Transactional Outbox Pattern",
+        "url": "https://microservices.io/patterns/data/transactional-outbox.html",
+        "source": "microservices.io",
+        "type": "Pattern",
+        "why": "Commit the event write and its change-log entry in one transaction so derived state (busy index, reminders, sync) never loses an update.",
+        "year": "2017"
+      },
+      {
+        "id": "google-calendar-push",
+        "group": "Notifications and Streams",
+        "groupDescription": "Durable change logs, outbox/projector mechanics, and at-least-once delivery.",
+        "title": "Push notifications",
+        "url": "https://developers.google.com/workspace/calendar/api/guides/push",
+        "source": "Google Calendar API",
+        "type": "Docs",
+        "why": "Shows webhook channel lifecycle, sync/start messages, change notifications, retries, and why notifications still require a follow-up fetch."
+      },
+      {
+        "id": "google-calendar-reminders",
+        "group": "Notifications and Streams",
+        "groupDescription": "Durable change logs, outbox/projector mechanics, and at-least-once delivery.",
+        "title": "Reminders & notifications",
+        "url": "https://developers.google.com/workspace/calendar/api/concepts/reminders",
+        "source": "Google Calendar API",
+        "type": "Docs",
+        "why": "Grounds reminder and notification behavior in a provider model, including custom overrides and external attendee notification constraints."
+      },
+      {
+        "id": "google-sre-cron",
+        "group": "Notifications and Streams",
+        "groupDescription": "Durable change logs, outbox/projector mechanics, and at-least-once delivery.",
+        "title": "Distributed Periodic Scheduling with Cron",
+        "url": "https://sre.google/sre-book/distributed-periodic-scheduling/",
+        "source": "Google SRE",
+        "type": "Book chapter",
+        "why": "Production-scale scheduler design notes for leader failover, replicated state, launch deduplication, and scheduled-job reliability."
+      },
+      {
+        "id": "slack-cron-scale",
+        "group": "Notifications and Streams",
+        "groupDescription": "Durable change logs, outbox/projector mechanics, and at-least-once delivery.",
+        "title": "Executing Cron Scripts Reliably At Scale",
+        "url": "https://slack.engineering/executing-cron-scripts-reliably-at-scale/",
+        "source": "Slack Engineering",
+        "type": "Case study",
+        "why": "A production migration from one cron host to a scheduler service, queue, and dedup table — directly relevant to reminder burst handling."
       },
       {
         "id": "sre-monitoring",
-        "group": "Foundations",
-        "groupDescription": "Core system design references for scalability, reliability, and operating distributed services.",
+        "group": "Notifications and Streams",
+        "groupDescription": "Durable change logs, outbox/projector mechanics, and at-least-once delivery.",
         "title": "Monitoring Distributed Systems",
         "url": "https://sre.google/sre-book/monitoring-distributed-systems/",
         "source": "Google SRE",
         "type": "Book chapter",
-        "why": "Grounds monitoring and alerting decisions in user-visible reliability signals."
+        "why": "Grounds the reminder due-lag, duplicate-suppression, and projector-lag signals in user-visible reliability metrics."
+      },
+      {
+        "id": "sabre-dav-scheduling",
+        "group": "Implementations and Toolkits",
+        "groupDescription": "Open-source or operational references that expose how calendar protocols are implemented.",
+        "title": "CalDAV Scheduling",
+        "url": "https://sabre.io/dav/scheduling/",
+        "source": "sabre/dav",
+        "type": "Docs",
+        "why": "Implementation-oriented view of CalDAV scheduling, local delivery, iMIP fallback, accept/decline handling, and free/busy support."
+      },
+      {
+        "id": "nextcloud-caldav-admin",
+        "group": "Implementations and Toolkits",
+        "groupDescription": "Open-source or operational references that expose how calendar protocols are implemented.",
+        "title": "Calendar / CalDAV",
+        "url": "https://docs.nextcloud.com/server/stable/admin_manual/groupware/calendar.html",
+        "source": "Nextcloud",
+        "type": "Docs",
+        "why": "Operational reference for FreeBusy, calendar subscriptions, federation, and rate limits in a deployed CalDAV-backed product."
       }
     ]
   },
   "assets": {
     "icon": "icon.png"
-  }
+  },
+  "aiVisuals": {
+    "requirements": "assets/generated/ai-visuals/requirements.jpg",
+    "capacity": "assets/generated/ai-visuals/capacity.jpg"
+  },
+  "explainerComic": "assets/generated/comic/interview-comic.jpg"
 }

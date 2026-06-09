@@ -261,29 +261,49 @@
   },
   "capacity": [
     {
-      "label": "Concurrent users at T0",
-      "value": "millions",
-      "note": "All arriving in the same second."
+      "label": "Arrivals at T0",
+      "value": "~10M in the first 1-2 s",
+      "note": "Working example: 10M buyers for 10K units (1000:1). Most must be shed."
     },
     {
       "label": "Stock",
-      "value": "thousands",
-      "note": "Tiny relative to demand."
+      "value": "10K units",
+      "note": "Single SKU; the entire correctness budget is 10K successful reservations."
     },
     {
-      "label": "Demand:supply",
-      "value": "100-1000:1",
-      "note": "Most requests must be rejected cheaply."
+      "label": "Admitted rate",
+      "value": "~2-3x stock over 1-5 min",
+      "note": "Admit ≈ stock / completion_rate (e.g. ~70% pay) ⇒ ~14K admitted for 10K units, metered at a few hundred/sec."
+    },
+    {
+      "label": "Buy attempts/sec",
+      "value": "~300-1000/sec",
+      "note": "Derived from the admitted rate, not the 10M arrivals — what the atomic counter must serve."
+    },
+    {
+      "label": "Waiting-room writes/sec",
+      "value": "~5-10M/sec at T0 (edge/CDN-absorbed)",
+      "note": "Enqueue/position writes; must live in the edge tier, never the purchase core."
+    },
+    {
+      "label": "Counter ops/sec",
+      "value": "≥ buy attempts (single hot key)",
+      "note": "One Redis key; ~300-1000 DECRs/sec is trivial — the risk is availability, not throughput."
+    },
+    {
+      "label": "Queue + payment throughput",
+      "value": "~300-1000 msg/sec; payment ~hundreds of ms each",
+      "note": "Order workers and PSP calls run async; scale workers to drain ~14K reservations in minutes."
+    },
+    {
+      "label": "Hold-window expiry volume",
+      "value": "~30% of admitted (~4K) reclaimed",
+      "note": "Non-payers (~14K admitted − ~10K paid) expire and return units to the counter."
     },
     {
       "label": "Sale window",
       "value": "seconds to minutes",
-      "note": "Often sells out almost instantly."
-    },
-    {
-      "label": "Steady-state load",
-      "value": "tiny",
-      "note": "The system is overprovisioned only for the spike — or sheds instead."
+      "note": "Often sells out almost instantly; steady-state load is tiny — provision for the spike or shed."
     }
   ],
   "api": [
@@ -297,9 +317,9 @@
     {
       "method": "POST",
       "path": "/sale/{id}/enter",
-      "description": "Request admission. Joins the virtual waiting room and may receive a signed admission token.",
-      "request": "{ }",
-      "response": "{ \"status\": \"waiting\" } | { \"status\": \"admitted\", \"token\": \"...\" }",
+      "description": "Request admission (authenticated; binds to the caller's account/session). Joins the virtual waiting room and, when admitted, returns a single-use signed token whose claims are { sale_id, user_id, admission_id (nonce/jti), max_qty, exp }. The token is the gate for /buy; expired, forged, or already-consumed tokens are rejected.",
+      "request": "{ } (identity from auth header/session; optional bot-challenge result)",
+      "response": "{ \"status\": \"waiting\", \"position\": 42001, \"etaSec\": 120 } | { \"status\": \"admitted\", \"token\": \"<signed JWT: sale_id,user_id,admission_id,max_qty,exp>\" }",
       "sequence": {
         "participants": [
           {
@@ -366,9 +386,9 @@
     {
       "method": "POST",
       "path": "/sale/{id}/buy",
-      "description": "Attempt to buy. Requires a valid admission token; reserves one unit if stock remains.",
-      "request": "{ \"token\": \"...\", \"idempotencyKey\": \"k_1\" }",
-      "response": "{ \"status\": \"reserved\", \"orderId\": \"o_1\" } | { \"status\": \"sold_out\" }",
+      "description": "Attempt to buy. Requires a valid, unexpired, unconsumed admission token. Assumes a logged-in buyer with a stored default payment method (a saved PSP customer + payment-method reference) — the buyer picks/confirms it at admission, so /buy carries only a paymentMethodId pointer, never raw card data. The token is consumed single-use atomically with the reservation, so a replayed/shared token cannot reserve twice. A retry with the same idempotencyKey returns the original reservation (no second unit). Reserves one unit if stock remains; the async worker then charges that payment method within the hold window.",
+      "request": "{ \"token\": \"<signed>\", \"paymentMethodId\": \"pm_1\", \"idempotencyKey\": \"k_1\" }",
+      "response": "{ \"status\": \"reserved\", \"reservationId\": \"r_1\", \"holdExpiresAt\": \"...\" } | { \"status\": \"sold_out\" } | { \"status\": \"token_invalid\" }",
       "sequence": {
         "participants": [
           {
@@ -441,12 +461,26 @@
           }
         ]
       }
+    },
+    {
+      "method": "GET",
+      "path": "/sale/{id}/reservation/{reservationId}",
+      "description": "Poll the lifecycle of a reservation. Async order/payment work means /buy returns 'reserved' before the charge resolves, so the client polls here to learn the terminal state.",
+      "request": "(reservationId in path; authenticated)",
+      "response": "{ \"status\": \"held\", \"holdExpiresAt\": \"...\" } | { \"status\": \"paid\", \"orderId\": \"o_1\" } | { \"status\": \"expired\" } | { \"status\": \"cancelled\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/internal/payment-callback",
+      "description": "PSP webhook (signature-verified) reporting the outcome of a charge. Idempotent on payment_intent_id so duplicate/replayed webhooks don't double-confirm or double-release. On success the reservation is confirmed and the order created; on failure/timeout it is released.",
+      "request": "{ \"paymentIntentId\": \"pi_1\", \"event\": \"succeeded\" | \"failed\", \"reservationId\": \"r_1\" }",
+      "response": "200 OK (ack; processing is idempotent)"
     }
   ],
   "dataModel": [
     {
       "name": "inventory_counter (in-memory)",
-      "note": "The hot atomic counter that gates reservations.",
+      "note": "The hot atomic counter that gates reservations; rebuilt from the ledger on restart.",
       "fields": [
         {
           "name": "sale_id",
@@ -454,39 +488,51 @@
         },
         {
           "name": "remaining",
-          "type": "int (atomic DECR)"
+          "type": "int (atomic DECR-if-positive)"
+        },
+        {
+          "name": "epoch",
+          "type": "int (fencing token; bumped on rebuild)"
         }
       ]
     },
     {
-      "name": "stock_ledger",
-      "note": "Durable source of truth for units allocated; reconciled against the counter.",
+      "name": "waiting_room_entries (edge, sharded)",
+      "note": "Ordered, replicated queue state at the edge; deduped per user so a refresh keeps one place. Drained into admissions at the metered rate.",
       "fields": [
         {
-          "name": "sale_id",
-          "type": "string"
+          "name": "queue_entry_id",
+          "type": "uuid PK (idempotency key for admission)"
         },
         {
-          "name": "total",
-          "type": "int"
+          "name": "sale_id / user_id",
+          "type": "string / bigint"
         },
         {
-          "name": "reserved",
-          "type": "int"
+          "name": "shard",
+          "type": "string (region / hash partition)"
         },
         {
-          "name": "confirmed",
-          "type": "int"
+          "name": "position / enqueued_at",
+          "type": "bigserial / timestamptz (best-effort FIFO within a window)"
+        },
+        {
+          "name": "status",
+          "type": "enum(waiting, admitted, expired)"
+        },
+        {
+          "name": "unique",
+          "type": "(sale_id, user_id) — one place in line per user per sale"
         }
       ]
     },
     {
-      "name": "orders",
-      "note": "One order per successful reservation.",
+      "name": "admissions",
+      "note": "One row per admitted user; backs the signed token and enforces per-user limits.",
       "fields": [
         {
-          "name": "order_id",
-          "type": "uuid PK"
+          "name": "admission_id",
+          "type": "uuid PK (token's jti / nonce)"
         },
         {
           "name": "sale_id",
@@ -494,15 +540,135 @@
         },
         {
           "name": "user_id",
-          "type": "bigint"
+          "type": "bigint (identity the token binds to)"
+        },
+        {
+          "name": "max_qty",
+          "type": "int (per-user purchase cap, e.g. 1)"
+        },
+        {
+          "name": "issued_at / expires_at",
+          "type": "timestamptz (token validity window)"
+        },
+        {
+          "name": "consumed_at",
+          "type": "timestamptz null (set when the token is spent — single-use)"
+        },
+        {
+          "name": "unique",
+          "type": "(sale_id, user_id) — one admission per user per sale"
+        }
+      ]
+    },
+    {
+      "name": "reservations",
+      "note": "First-class hold created on a successful counter decrement; the unit of inventory truth.",
+      "fields": [
+        {
+          "name": "reservation_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "sale_id / user_id",
+          "type": "string / bigint"
+        },
+        {
+          "name": "admission_id",
+          "type": "uuid FK (which token spent it)"
         },
         {
           "name": "status",
-          "type": "enum(reserved, paid, expired, cancelled)"
+          "type": "enum(held, paid, expired, cancelled)"
+        },
+        {
+          "name": "hold_expires_at",
+          "type": "timestamptz (reaper deadline)"
         },
         {
           "name": "idempotency_key",
-          "type": "varchar (dedup)"
+          "type": "varchar"
+        },
+        {
+          "name": "unique",
+          "type": "(sale_id, idempotency_key) — retries map to the same reservation"
+        }
+      ]
+    },
+    {
+      "name": "payment_attempts",
+      "note": "Each charge try against the PSP; carries the buyer's stored payment reference and the idempotency key sent to the provider.",
+      "fields": [
+        {
+          "name": "attempt_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "reservation_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "psp_customer_id / payment_method_id",
+          "type": "string (stored buyer + payment-method reference, from /buy)"
+        },
+        {
+          "name": "payment_intent_id",
+          "type": "string (PSP reference)"
+        },
+        {
+          "name": "payment_status",
+          "type": "enum(pending, succeeded, failed, timeout)"
+        },
+        {
+          "name": "psp_idempotency_key",
+          "type": "varchar (safe PSP retries)"
+        }
+      ]
+    },
+    {
+      "name": "orders",
+      "note": "Durable order created once a reservation is paid.",
+      "fields": [
+        {
+          "name": "order_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "reservation_id",
+          "type": "uuid FK unique (one order per reservation)"
+        },
+        {
+          "name": "sale_id / user_id",
+          "type": "string / bigint"
+        },
+        {
+          "name": "status",
+          "type": "enum(confirmed, refunded, cancelled)"
+        }
+      ]
+    },
+    {
+      "name": "stock_ledger_events",
+      "note": "Append-only allocation log; the durable source of truth the counter is rebuilt from.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "bigserial PK (allocation sequence)"
+        },
+        {
+          "name": "sale_id",
+          "type": "string"
+        },
+        {
+          "name": "reservation_id",
+          "type": "uuid"
+        },
+        {
+          "name": "type",
+          "type": "enum(reserve, confirm, release)"
+        },
+        {
+          "name": "delta",
+          "type": "int (-1 reserve, +1 release)"
         }
       ]
     }
@@ -578,9 +744,13 @@
           "BuySvc",
           "OrderDB"
         ],
-        "caption": "The buyer client sends buy (with token) to the Purchase Service, which reads and decrements the stock row in the Order Store.",
+        "caption": "The buyer client sends a buy request to the Purchase Service, which reads and decrements the stock row in the Order Store.",
         "links": [
-          "client-buy",
+          {
+            "from": "Client",
+            "to": "BuySvc",
+            "label": "buy request"
+          },
           "buy-db"
         ],
         "highlight": [
@@ -597,9 +767,11 @@
       ],
       "probeLinks": [
         "redis-locks",
+        "redis-transactions",
         "sre-overload",
         "dynamodb-condition",
-        "postgres-isolation"
+        "postgres-isolation",
+        "shopify-inventory-reservations"
       ],
       "recap": {
         "before": "Nothing.",
@@ -612,7 +784,8 @@
           "why": "The spike is orders of magnitude over capacity, and naive read-then-decrement oversells while a hot row serializes throughput.",
           "instead": "Offload reads to the edge, admit a fair capped rate, and reserve with a single atomic decrement-if-positive counter."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/01-naive.jpg"
     },
     {
       "id": "offload",
@@ -653,11 +826,18 @@
       "patterns": [
         "Static edge offload (CDN)"
       ],
+      "probeLinks": [
+        "aws-flash-sale-considerations",
+        "fastly-request-collapsing",
+        "cloudflare-cache-revalidation",
+        "aws-visitor-prioritization",
+        "shopify-scale-testing"
+      ],
       "whyNow": [
         "Cutting read load at the edge is the cheapest, highest-leverage move; everything after only has to handle the residual transactional traffic."
       ],
       "recap": {
-        "before": "Nothing.",
+        "before": "Every read and buy hits the backend; the DB takes the full flood.",
         "after": "Reads absorbed by CDN; backend sees only buy/admission attempts.",
         "newRisk": "Even the residual transactional traffic at T0 can swamp the core — need admission control."
       },
@@ -667,7 +847,8 @@
           "why": "Millions polling per second is itself a DDoS on your own DB.",
           "instead": "Serve availability from the CDN edge with a short TTL."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/02-offload.jpg"
     },
     {
       "id": "admission",
@@ -675,6 +856,7 @@
       "description": [
         "Demand is 100-1000x stock, so most requests cannot succeed. Reject early and cheaply: rate-limit per user/IP, filter bots, and shed excess load at the edge with a fast, clear 'try later' instead of letting it reach the core.",
         "The goal is to protect the purchase core so it only ever receives a survivable request rate — admitting somewhat more than `stock` (to cover non-completers) but nowhere near the full flood.",
+        "Admission is a feedback controller, not a fixed constant. The capacity math (`admit ≈ stock / completion_rate`, metered over 1-5 min) is just the starting set-point. At runtime the admission service watches the live counter value, reservation-success and payment-completion rates, hold-expiry rate, queue backlog, and worker/payment health, and adjusts: it slows or pauses when the counter is near zero, when order/payment workers are unhealthy, or when the counter epoch is uncertain (fail closed), and it admits another tranche when holds expire or payment completion runs lower than expected so the remaining units still find buyers.",
         "Failure here must be the cheap, common case: a shed request should cost almost nothing."
       ],
       "view": {
@@ -703,10 +885,23 @@
           "whyItMatters": "A system that sheds cleanly survives; one that tries to serve everyone collapses.",
           "example": "Edge returns 429/try-later once admitted rate hits the cap.",
           "group": "Admission Control at the Edge"
+        },
+        {
+          "term": "Admission as a feedback loop",
+          "definition": "Treating the admission rate as a controller driven by live outcomes, not a fixed constant set once from capacity math.",
+          "whyItMatters": "The right number of admissions depends on how fast reservations convert to paid orders, which only the running sale reveals.",
+          "example": "Slow/pause admission when the counter nears zero or workers are unhealthy; admit another tranche when holds expire.",
+          "group": "Admission Control at the Edge"
         }
       ],
       "probeLinks": [
-        "sre-overload"
+        "sre-overload",
+        "google-cascading-failures",
+        "envoy-overload-manager",
+        "netflix-concurrency-limits",
+        "aws-visitor-prioritization",
+        "aws-flash-sale-considerations",
+        "shopify-bfcm-readiness"
       ],
       "patterns": [
         "Admission control / load shedding"
@@ -718,14 +913,15 @@
         "before": "All transactional traffic reaches the core.",
         "after": "Edge sheds the excess; core sees a survivable rate.",
         "newRisk": "Raw shedding is unfair (luck of the millisecond) — need fairness."
-      }
+      },
+      "aiVisual": "assets/generated/ai-visuals/steps/03-admission.jpg"
     },
     {
       "id": "waitroom",
       "title": "4. Fairness: Virtual Waiting Room",
       "description": [
         "Pure load-shedding is a lottery on network timing and favors bots with fast connections. A virtual waiting room makes admission fair: users join a queue and are admitted at a controlled rate.",
-        "Admission grants a signed, time-boxed token that the buy endpoint requires. The token caps how many users can be in the purchase path at once and ties a buy attempt to an admitted identity (anti-abuse).",
+        "Admission grants a signed, time-boxed token that the buy endpoint requires. Its claims bind it to one identity — { sale_id, user_id, admission_id (nonce), max_qty, exp } — so it isn't a bearer ticket anyone can share. Abuse defenses ride on this: enter is authenticated and admissions are unique per (sale_id, user_id), so one account gets one place in line; the token is single-use (consumed atomically at buy), so a replayed or shared token can't reserve twice; and a bot-challenge/risk score can gate entry. Per-user and per-household purchase limits are enforced via max_qty plus the unique reservation constraint.",
         "Communicate position/wait so users don't hammer retry; the waiting room itself must be cheap (often edge/CDN-backed) since everyone passes through it."
       ],
       "view": {
@@ -783,7 +979,8 @@
             "groups": [
               "admission"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-waitroom-opt1.jpg"
         },
         {
           "name": "Random lottery admission",
@@ -824,7 +1021,8 @@
             "groups": [
               "admission"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-waitroom-opt2.jpg"
         },
         {
           "name": "Token-bucket throttle (no ordering)",
@@ -865,7 +1063,8 @@
             "groups": [
               "admission"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-waitroom-opt3.jpg"
         }
       ],
       "decisionPrompt": "How do you make admission fair rather than 'whoever's packet arrived first'?",
@@ -886,13 +1085,45 @@
         }
       ],
       "probeLinks": [
-        "sre-overload",
         "cloudflare-waiting-room",
-        "redis-locks",
-        "kafka-design"
+        "cloudflare-waiting-room-queues",
+        "cloudflare-random-queueing",
+        "queue-it-how-it-works",
+        "aws-virtual-waiting-room",
+        "seatgeek-waiting-room",
+        "aws-visitor-prioritization"
       ],
       "patterns": [
         "Virtual waiting room"
+      ],
+      "deepDives": [
+        {
+          "title": "Durable waiting-room state and recovery",
+          "points": [
+            "At 10M arrivals in 1-2 s the queue state is the first hard production problem — 'durable ordered queue at the edge' has to be specified, not hand-waved. Give each entrant a `queue_entry_id` and enforce a `(sale_id, user_id)` uniqueness so a refreshing client or retry maps back to its existing place instead of taking a second one (and can't be admitted twice).",
+            "Shard the queue across many edge partitions (e.g. by region or by hash of user_id) so no single node absorbs 10M writes; admission then drains round-robin across shards at the global set-point rate.",
+            "Persist/replicate each shard's ordered log (the same broker class as the order queue, or the edge provider's managed waiting room) so an edge-region failure replays entrants from the log on recovery rather than dropping everyone's place. Admission is idempotent on `queue_entry_id`, so replay can't double-issue tokens.",
+            "Be honest about FIFO scope: true global FIFO across 10M sharded entrants is expensive and rarely worth it. Frame it as best-effort FIFO within an arrival window — ordered within a shard/window, approximately ordered across shards — which is fair enough to communicate ('you're ~#42,000') without a global total order.",
+            "Managed waiting rooms (Cloudflare/Fastly) give this durability, sharding, and recovery turnkey; self-hosting means building the ordered, replicated, edge-resident queue yourself."
+          ]
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A reseller spins up 50K fresh accounts before T0 to flood the waiting room and win most of the stock.",
+          "expectedBehavior": "Bulk fake accounts shouldn't translate into bulk admissions or purchases; real buyers keep a fair chance.",
+          "mitigation": "Combine pre-sale account eligibility (account age / prior activity / verification), device + risk scoring and velocity checks at entry, a bot challenge gating token issuance, and per-household / per-payment-method limits beyond the per-account `max_qty` — with a manual override + appeal path for false positives. The waiting room raises the cost of each fake identity rather than promising perfect bot-proofing."
+        },
+        {
+          "scenario": "An admitted user shares or replays their signed admission token across many browser sessions/devices.",
+          "expectedBehavior": "One admission yields at most one reserved unit; extra sessions gain nothing.",
+          "mitigation": "Tokens are identity-bound (sale_id, user_id, admission_id) and consumed single-use atomically at buy; admissions are unique per (sale_id, user_id) and reservations unique per (sale_id, idempotency_key), so replays collapse to the same reservation."
+        },
+        {
+          "scenario": "The edge region holding part of the waiting room fails mid-sale.",
+          "expectedBehavior": "Entrants on that shard don't silently lose their place or get admitted twice on recovery.",
+          "mitigation": "Replay the shard's replicated ordered log; admission idempotent on queue_entry_id; surviving shards keep draining so the sale doesn't stall."
+        }
       ],
       "whyNow": [
         "Fairness is an explicit requirement and the differentiator from a generic rate limiter; the token also becomes the gate for the buy path."
@@ -907,9 +1138,9 @@
       "id": "reserve",
       "title": "5. Oversell-Proof Reservation",
       "description": [
-        "Admitted buyers contend for limited stock. The whole correctness requirement reduces to: at most `stock` reservations succeed. Use a single atomic counter (e.g. Redis DECR) — decrement-if-positive returns success only while units remain.",
-        "An atomic counter is the contention point but is extremely fast and trivially oversell-proof: the (stock+1)th decrement returns 'sold out'. No locking, no race.",
-        "Require the admission token and an idempotency key so a retry doesn't consume two units. Success here is a reservation, not yet a durable order."
+        "Admitted buyers contend for limited stock. The whole correctness requirement reduces to: at most `stock` reservations succeed. Use a single atomic counter — but be precise about the primitive. A plain `DECR` that goes negative and then needs a compensating `INCR` is racy; use a guarded conditional instead: a Redis Lua script (`if GET > 0 then DECR`), a `WATCH`/`MULTI` transaction, or a DynamoDB conditional write (`UpdateItem` with `ConditionExpression remaining > 0`). The decrement happens only while units remain.",
+        "An atomic counter is the contention point but is extremely fast and trivially oversell-proof: the (stock+1)th decrement is rejected by the guard and returns 'sold out'. No locking, no race.",
+        "Make idempotency explicit. The buy is keyed by (sale_id, idempotencyKey) with a unique constraint on the `reservations` row, and the admission token is consumed single-use in the same atomic step. So a retry — same key — maps back to the existing reservation and returns it, rather than consuming a second unit or a second token. Success here is a reservation (a durable hold), not yet a paid order."
       ],
       "view": {
         "nodes": [
@@ -966,7 +1197,8 @@
             "groups": [
               "purchase"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-reserve-opt1.jpg"
         },
         {
           "name": "DB row lock / SELECT FOR UPDATE",
@@ -1004,13 +1236,14 @@
             "groups": [
               "purchase"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-reserve-opt2.jpg"
         },
         {
           "name": "Pre-minted reservation tokens",
           "description": "Exactly one single-use claim token is minted per unit up front, and holding a token from the pool structurally guarantees a unit, so oversell cannot occur.",
           "pros": [
-            "Mint exactly 100 single-use claim tokens up front; possessing one guarantees a unit.",
+            "Mint exactly one single-use claim token per unit up front; possessing one guarantees a unit.",
             "Oversell is structurally impossible — there are only as many tokens as units.",
             "Token check can be distributed/sharded, removing the single hot counter."
           ],
@@ -1049,24 +1282,35 @@
             "groups": [
               "purchase"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-reserve-opt3.jpg"
         }
       ],
       "decisionPrompt": "10,000 admitted users hit buy at the same millisecond for 100 units. How do you guarantee exactly 100 succeed?",
       "concepts": [
         {
           "term": "Atomic decrement-if-positive",
-          "definition": "A single atomic operation that reserves a unit only while the counter is above zero.",
-          "whyItMatters": "Oversell-proof under unlimited concurrency with no locks.",
-          "example": "Redis DECR returning >= 0 = reserved; < 0 = sold out (with a guard).",
+          "definition": "A single guarded atomic operation that reserves a unit only while the counter is above zero.",
+          "whyItMatters": "Oversell-proof under unlimited concurrency with no locks and no compensating increment.",
+          "example": "Redis Lua `if GET>0 then DECR`, or DynamoDB UpdateItem with ConditionExpression remaining>0.",
+          "group": "Oversell-Proof Reservation"
+        },
+        {
+          "term": "Idempotency",
+          "definition": "Keying a write so retries produce one effect: the same (sale_id, idempotencyKey) maps to the same reservation.",
+          "whyItMatters": "Clients retry aggressively under a spike; without it a retry would consume a second unit.",
+          "example": "Unique (sale_id, idempotency_key) on reservations; a duplicate buy returns the original reservationId.",
           "group": "Oversell-Proof Reservation"
         }
       ],
       "probeLinks": [
         "redis-locks",
+        "redis-transactions",
+        "redis-inventory-reservation",
         "stripe-idempotency",
-        "sre-overload",
-        "dynamodb-condition"
+        "dynamodb-condition",
+        "postgres-isolation",
+        "shopify-inventory-reservations"
       ],
       "patterns": [
         "Atomic counter reservation"
@@ -1180,7 +1424,8 @@
       "title": "6. Async Order Creation and Payment",
       "description": [
         "Keep the contended buy path tiny: a successful counter decrement returns 'reserved' immediately and enqueues the reservation. Order creation, persistence, and payment happen asynchronously off the hot path.",
-        "A worker creates the durable order, decrements the durable stock ledger, and charges the buyer within a reservation hold window. The slow/durable work is now decoupled from the spike.",
+        "This assumes the buyer is already a logged-in customer with a stored payment method: /buy passed a paymentMethodId, and the reservation carries the PSP customer + payment-method reference. So the worker can charge without any further buyer interaction — there is no separate 'enter card' step racing the hold window. (A guest-checkout variant would instead create a checkout session at admission and have the buyer complete it within the hold.)",
+        "A worker creates the durable order, decrements the durable stock ledger, and charges that stored payment method within a reservation hold window. The slow/durable work is now decoupled from the spike.",
         "If payment fails or times out, the reservation expires and the unit is released back — so a non-paying winner doesn't permanently consume stock."
       ],
       "view": {
@@ -1242,7 +1487,8 @@
             "groups": [
               "purchase"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-async-opt1.jpg"
         },
         {
           "name": "Synchronous order + charge in the buy request",
@@ -1280,7 +1526,8 @@
             "groups": [
               "purchase"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-async-opt2.jpg"
         }
       ],
       "decisionPrompt": "Why not create the order and charge the card synchronously inside the buy request?",
@@ -1288,10 +1535,12 @@
         "Async order processing"
       ],
       "probeLinks": [
-        "redis-locks",
-        "sre-overload",
         "kafka-design",
-        "cloudflare-waiting-room"
+        "aws-transactional-outbox",
+        "stripe-idempotency",
+        "stripe-webhooks",
+        "amazon-idempotent-apis",
+        "shopify-idempotent-graphql"
       ],
       "whyNow": [
         "Pushing durable/slow work behind a queue keeps the contended path microsecond-cheap; it's why the design survives the spike."
@@ -1315,6 +1564,16 @@
           "scenario": "A reserved buyer never completes payment.",
           "expectedBehavior": "The reservation expires after the hold window; the unit is released (counter incremented, ledger adjusted) and can resell.",
           "mitigation": "Reaper job on reservation TTL + counter/ledger reconciliation."
+        },
+        {
+          "scenario": "The order queue delivers the same reservation twice (at-least-once delivery or a worker crash after charging but before ack).",
+          "expectedBehavior": "Exactly one order and one charge result; the duplicate is a no-op.",
+          "mitigation": "Idempotent consumer: unique order per reservation_id, and a PSP idempotency key per reservation so a re-delivered message reuses the same payment_intent rather than double-charging."
+        },
+        {
+          "scenario": "Payment times out after the charge actually succeeded at the PSP (ambiguous outcome).",
+          "expectedBehavior": "Don't blindly release — releasing a paid unit would oversell or refund-and-resell.",
+          "mitigation": "Reconcile against the PSP (query payment_intent / wait for webhook) before releasing; the webhook is idempotent on payment_intent_id so the late 'succeeded' still confirms the order."
         }
       ],
       "flows": [
@@ -1395,9 +1654,9 @@
       "id": "consistency",
       "title": "7. Consistency, Reconciliation, and Degradation",
       "description": [
-        "The in-memory counter is fast but not durable; the order store/ledger is the source of truth. Reconcile them: confirmed orders + live reservations must equal units allocated, and the counter is rebuilt from the ledger after a restart.",
-        "Released (expired) reservations increment the counter back. A reaper enforces hold-window TTLs. Periodic reconciliation catches any drift, with the durable ledger authoritative.",
-        "Degrade gracefully: if a component is overwhelmed, fall back to shedding (clear 'sold out / try later'), keep the sold-out state correct, and never oversell even under partial failure."
+        "The in-memory counter is fast but not durable; the append-only stock_ledger_events table is the source of truth. The invariant: `remaining = total − reserves + releases`, equivalently `confirmed_orders + live_reservations ≤ total`. Reconcile periodically and rebuild the counter from the ledger after a restart (`remaining = total − Σ deltas`).",
+        "But reconciliation is only half the story — the live failure mode matters. When the Redis primary dies, fails over, or its authority is uncertain (replication lag, possible split-brain), the safe default is **fail closed for scarce inventory**: stop issuing 'reserved' responses and return 'try later / sold out', rather than risk a stale or split counter overselling. A new counter epoch is minted on rebuild and carried in the token/reservation as a fence, so writes from a deposed primary are rejected. Availability of the *buy* path is sacrificed before correctness — the no-oversell guarantee is never negotiable.",
+        "Released (expired) reservations append a `release` event and increment the counter back. A reaper enforces hold-window TTLs and is itself idempotent (keyed on reservation_id) so re-running it can't double-release a unit. Degrade gracefully elsewhere too: if a component is overwhelmed, fall back to shedding (clear 'sold out / try later'), keep the sold-out state correct, and accept that the CDN-cached availability flag may lag the true counter by its TTL — the authoritative buy path still rejects oversell even when stale 'in stock' is shown."
       ],
       "view": {
         "nodes": [
@@ -1426,12 +1685,59 @@
           "term": "Counter/ledger reconciliation",
           "definition": "Keeping the fast in-memory counter consistent with the durable allocation ledger.",
           "whyItMatters": "Lets you use a fast counter as the gate while the durable store stays authoritative.",
-          "example": "On restart, remaining = total - confirmed - live_reservations (from the ledger).",
+          "example": "On restart, remaining = total − Σ ledger deltas (reserve −1, release +1).",
+          "group": "Consistency, Reconciliation, and Degradation"
+        },
+        {
+          "term": "Fail closed for scarce inventory",
+          "definition": "When inventory truth is uncertain, stop granting reservations rather than risk overselling.",
+          "whyItMatters": "Resolves counter-failover ambiguity: correctness (no oversell) outranks buy-path availability.",
+          "example": "Redis primary failover ⇒ pause /buy, return 'try later' until the counter is rebuilt and fenced.",
           "group": "Consistency, Reconciliation, and Degradation"
         }
       ],
+      "deepDives": [
+        {
+          "title": "Highly-available counter without overselling",
+          "points": [
+            "Treat the counter as a fenced leader, not just a cache: each rebuild bumps an epoch; reservations and tokens carry it so a deposed primary's writes are rejected.",
+            "On primary failure, fail closed — pause buy admissions and serve 'try later' — until the counter is reconstructed from the ledger (`remaining = total − Σ deltas`).",
+            "Prefer a synchronously-replicated or quorum store for the counter so a failover can't lose acknowledged decrements; never trust an async replica that may have missed the last reserves.",
+            "For multi-SKU drops, partition the counter per SKU so one hot key's failure or contention is isolated.",
+            "Pre-minted reservation tokens (one per unit) are an alternative that makes oversell structurally impossible at the cost of a reclaim process — a good fallback when a single HA counter is too risky."
+          ]
+        },
+        {
+          "title": "Operating the drop: dashboards and kill switches",
+          "points": [
+            "A flash sale is a live operation, not a fire-and-forget deploy — the operator needs real-time signals and manual controls for the few minutes it runs.",
+            "Dashboard signals: token-issuance rate, queue depth / estimated wait, reservation-success rate, payment-failure rate, hold-expiry rate, counter value vs. ledger total (reconciliation drift), and counter epoch / rebuild status.",
+            "Kill switches: pause/throttle admission (stop or slow token issuance), force sold-out (flip the cached flag + stop the buy path), trigger a counter rebuild from the ledger, and bump the epoch to fence a suspect primary.",
+            "These tie back to the admission feedback loop and fail-closed behavior: the same signals that drive automatic throttling are what the operator watches, and the same fail-closed path the system takes on counter uncertainty is also a button a human can press."
+          ]
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The Redis counter primary fails over mid-sale and the new primary's value is uncertain (replication lag / possible split-brain).",
+          "expectedBehavior": "No oversell. The buy path pauses ('try later') rather than trusting a possibly-stale counter.",
+          "mitigation": "Fail closed; rebuild remaining from the ledger; bump the epoch and fence out the old primary before resuming."
+        },
+        {
+          "scenario": "CDN shows 'in stock' but the counter just hit zero.",
+          "expectedBehavior": "Buyers may still attempt, but the authoritative buy path returns sold_out; no oversell.",
+          "mitigation": "Short availability TTL to bound the staleness; treat the cached flag as advisory, the counter as truth."
+        }
+      ],
       "probeLinks": [
-        "redis-locks"
+        "redis-locks",
+        "redis-inventory-reservation",
+        "dynamodb-condition",
+        "aws-transactional-outbox",
+        "stripe-reconciliation",
+        "amazon-idempotent-apis",
+        "shopify-inventory-reservations",
+        "shopify-idempotent-graphql"
       ],
       "patterns": [
         "Reconciliation + reaping"
@@ -1440,15 +1746,16 @@
         "Closing on reconciliation + graceful degradation shows the fast-path design stays correct under failure — the no-oversell guarantee survives."
       ],
       "recap": {
-        "before": "Fast counter trusted blindly.",
-        "after": "Counter reconciled to durable ledger; failures shed cleanly; no oversell.",
-        "newRisk": "Reconciliation lag and reaper timing — bounded by conservative holds and the durable ledger as authority."
-      }
+        "before": "Fast counter trusted blindly, even through failover.",
+        "after": "Counter reconciled to the durable ledger and fenced by epoch; on counter failure the buy path fails closed; failures shed cleanly; no oversell.",
+        "newRisk": "Reconciliation lag and reaper timing — bounded by conservative holds, idempotent reaping, and the durable ledger as authority."
+      },
+      "aiVisual": "assets/generated/ai-visuals/steps/07-consistency.jpg"
     }
   ],
   "finalDesign": {
     "title": "Final Design — Flash Sale",
-    "description": "The CDN serves the static page and cached availability so the backend only sees transactional traffic. The edge enforces admission control (rate-limit, bot-filter, shed), and a virtual waiting room admits a fair, capped rate of users with signed tokens. Admitted buyers hit the purchase service, which verifies the token and performs a single atomic decrement-if-positive on an in-memory inventory counter — oversell-proof and lock-free. Success returns 'reserved' and enqueues the reservation; a worker creates the durable order, decrements the ledger, and charges within a hold window, releasing the unit on timeout. A reaper + reconciliation keep the fast counter consistent with the authoritative ledger, and the system degrades by shedding rather than overselling.",
+    "description": "The CDN serves the static page and cached availability so the backend only sees transactional traffic. The edge enforces admission control (rate-limit, bot-filter, shed), and a virtual waiting room admits a fair, capped rate of users with signed tokens. Admitted buyers hit the purchase service, which verifies the token and performs a single atomic decrement-if-positive on an in-memory inventory counter — oversell-proof and lock-free. Success returns 'reserved' and enqueues the reservation; a worker creates the durable order, decrements the ledger, and charges the buyer's stored payment method within a hold window, releasing the unit on timeout. A reaper + reconciliation keep the fast counter consistent with the authoritative ledger, and the system degrades by shedding rather than overselling. Operationally, the drop is run from a live console: dashboards for token-issuance rate, queue depth, reservation-success and payment-failure rates, hold-expiry rate, counter value vs. ledger (reconciliation drift), and counter epoch/rebuild status; and kill switches for pausing admission, forcing sold-out, and triggering a counter rebuild — so an operator can throttle or fail closed in seconds.",
     "view": {
       "nodes": [
         "Client",
@@ -1483,7 +1790,8 @@
         "admission",
         "purchase"
       ]
-    }
+    },
+    "aiVisual": "assets/generated/ai-visuals/final-design.jpg"
   },
   "satisfies": {
     "functional": [
@@ -1493,28 +1801,33 @@
         "steps": [
           "waitroom",
           "reserve"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-01-sell-limited-stock-at-t0.jpg"
       },
       {
         "requirement": "Buy one unit",
-        "how": "Token + idempotency-keyed reservation.",
+        "how": "Single-use token (max_qty) + idempotency-keyed reservation; unique (sale_id, user_id) caps per-user purchases.",
         "steps": [
+          "waitroom",
           "reserve"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-02-buy-one-unit.jpg"
       },
       {
         "requirement": "Show availability / sold out",
         "how": "CDN-cached availability flag.",
         "steps": [
           "offload"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-03-show-availability-sold-out.jpg"
       },
       {
         "requirement": "Durable order + charge",
         "how": "Async order creation and payment within a hold.",
         "steps": [
           "async"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-04-durable-order-charge.jpg"
       }
     ],
     "nonFunctional": [
@@ -1524,22 +1837,25 @@
         "steps": [
           "offload",
           "admission"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-01-survive-the-spike.jpg"
       },
       {
         "requirement": "Never oversell",
-        "how": "Single atomic decrement-if-positive; ledger reconciliation.",
+        "how": "Guarded atomic decrement-if-positive; epoch-fenced counter that fails closed on failover; ledger reconciliation.",
         "steps": [
           "reserve",
           "consistency"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-02-never-oversell.jpg"
       },
       {
         "requirement": "Fairness",
         "how": "Virtual waiting room admits a capped, fair rate.",
         "steps": [
           "waitroom"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-03-fairness.jpg"
       },
       {
         "requirement": "Graceful degradation",
@@ -1547,7 +1863,8 @@
         "steps": [
           "admission",
           "consistency"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-04-graceful-degradation.jpg"
       },
       {
         "requirement": "Cheap failure",
@@ -1555,10 +1872,667 @@
         "steps": [
           "offload",
           "admission"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-05-cheap-failure.jpg"
       }
     ]
   },
+  "technologyChoices": [
+    {
+      "concern": "Static offload + edge admission / waiting room",
+      "steps": [
+        "offload",
+        "admission",
+        "waitroom"
+      ],
+      "selfHosted": [
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "HAProxy",
+          "icon": "assets/tech-icons/haproxy.png"
+        },
+        {
+          "name": "Varnish",
+          "icon": "assets/tech-icons/varnish.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudFront",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudFront_64.png"
+          },
+          {
+            "name": "WAF",
+            "icon": "assets/tech-icons/Arch_AWS-WAF_64.png"
+          },
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud CDN",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Armor",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Apigee",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Azure CDN",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "API Management",
+            "icon": "assets/tech-icons/10042-icon-service-API-Management-Services.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A managed CDN/edge absorbs the 10M-arrival read and waiting-room write burst that must never reach the purchase core.",
+        "Cloudflare/Fastly offer turnkey waiting-room products; self-hosting one means building durable, ordered, edge-replicated queue state yourself."
+      ],
+      "makesIrrelevant": "A managed waiting-room + WAF product removes most custom rate-limiter, bot-filter, and queue-position code at the edge."
+    },
+    {
+      "concern": "Durable waiting-room queue state",
+      "steps": [
+        "admission",
+        "waitroom"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Redpanda",
+          "icon": "assets/tech-icons/redpanda.png"
+        },
+        {
+          "name": "Redis Streams",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Firestore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A replicated log preserves entrant order and supports replay after an edge-region failure, but global FIFO across every shard is expensive.",
+        "A durable queue or KV store is enough when the fairness contract is best-effort FIFO within a shard/window and admissions are idempotent on queue_entry_id."
+      ],
+      "makesIrrelevant": "A managed waiting-room product with durable queue state, bot filtering, and regional failover removes most of the custom edge queue, position, and replay machinery."
+    },
+    {
+      "concern": "Bot challenge and buyer eligibility",
+      "steps": [
+        "admission",
+        "waitroom",
+        "reserve"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kong",
+          "icon": "assets/tech-icons/kong.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Keycloak",
+          "icon": "assets/tech-icons/keycloak.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "WAF",
+            "icon": "assets/tech-icons/Arch_AWS-WAF_64.png"
+          },
+          {
+            "name": "Cognito",
+            "icon": "assets/tech-icons/Arch_Amazon-Cognito_64.png"
+          },
+          {
+            "name": "Lambda@Edge",
+            "icon": "assets/tech-icons/Arch_AWS-Lambda_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Armor",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Identity Platform",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          },
+          {
+            "name": "Cloud Functions",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Application Gateway",
+            "icon": "assets/tech-icons/10076-icon-service-Application-Gateways.svg"
+          },
+          {
+            "name": "Microsoft Entra ID",
+            "icon": "assets/tech-icons/10231-icon-service-Entra-ID-Protection.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Eligibility checks and bot challenges must run before token issue so fake accounts and scripted clients burn cheap edge resources instead of scarce reservations.",
+        "A strict risk gate protects fairness, but false positives need an operator override path because the sale window is short."
+      ],
+      "makesIrrelevant": "A managed edge security stack with WAF rules, bot challenges, identity signals, and per-account/device velocity limits reduces custom anti-abuse services for this interview."
+    },
+    {
+      "concern": "Admission token issue + verification",
+      "steps": [
+        "waitroom",
+        "reserve"
+      ],
+      "selfHosted": [
+        {
+          "name": "JWT (signed)",
+          "icon": "assets/tech-icons/jwt.png"
+        },
+        {
+          "name": "PASETO",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Keycloak",
+          "icon": "assets/tech-icons/keycloak.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Cognito",
+            "icon": "assets/tech-icons/Arch_Amazon-Cognito_64.png"
+          },
+          {
+            "name": "Lambda@Edge",
+            "icon": "assets/tech-icons/Arch_AWS-Lambda_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Identity Platform",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          },
+          {
+            "name": "Cloud Functions",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Microsoft Entra ID",
+            "icon": "assets/tech-icons/10231-icon-service-Entra-ID-Protection.svg"
+          },
+          {
+            "name": "Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Stateless signed tokens verify at the edge without a round-trip, but single-use consumption needs a small shared store (the admissions table / Redis) to mark them spent.",
+        "Pure JWT is cheapest; a managed identity platform adds account binding, MFA, and abuse signals for free."
+      ]
+    },
+    {
+      "concern": "Atomic inventory counter",
+      "steps": [
+        "reserve",
+        "consistency"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis (Lua)",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Redis + Sentinel/Cluster",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "etcd",
+          "icon": "assets/tech-icons/etcd.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "ElastiCache (Redis)",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "DynamoDB (conditional write)",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Memorystore (Redis)",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Redis with a guarded Lua decrement is fastest but in-memory — it needs replication, fencing, and ledger rebuild for HA.",
+        "A DynamoDB/Cosmos conditional write (remaining > 0) is durable and HA out of the box, trading a little latency for no rebuild step.",
+        "AWS MemoryDB / Redis-with-quorum avoids losing acknowledged decrements on failover."
+      ],
+      "makesIrrelevant": "A durable conditional-write store (DynamoDB/Spanner/Cosmos) removes the separate counter-vs-ledger reconciliation entirely — the counter IS the durable truth."
+    },
+    {
+      "concern": "Reservation queue + async order workers",
+      "steps": [
+        "async"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "RabbitMQ",
+          "icon": "assets/tech-icons/rabbitmq.png"
+        },
+        {
+          "name": "NATS JetStream",
+          "icon": "assets/tech-icons/nats.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "At-least-once delivery from any of these requires an idempotent consumer (unique order per reservation_id) to avoid double orders/charges.",
+        "A managed queue removes broker operations; the burst is only ~hundreds/sec, so throughput isn't the constraint — durability and ordering are."
+      ]
+    },
+    {
+      "concern": "Order store + durable stock ledger",
+      "steps": [
+        "async",
+        "consistency"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "MySQL",
+          "icon": "assets/tech-icons/mysql.png"
+        },
+        {
+          "name": "CockroachDB",
+          "icon": "assets/tech-icons/cockroach.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Aurora (PostgreSQL/MySQL)",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure SQL",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Append-only ledger events + unique constraints (sale_id+idempotency_key, one order per reservation) give correctness and the counter-rebuild source of truth.",
+        "A single SKU's order volume is tiny (≤ stock), so a plain relational DB is plenty — the value is constraints and durability, not scale."
+      ]
+    },
+    {
+      "concern": "Payment integration",
+      "steps": [
+        "async"
+      ],
+      "selfHosted": [
+        {
+          "name": "Direct PSP API (Stripe/Adyen/Braintree)",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Payment Cryptography",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Step Functions (orchestration)",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Logic Apps",
+            "icon": "assets/tech-icons/10363-icon-service-Logic-Apps-Custom-Connector.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Charge asynchronously with a PSP idempotency key per reservation so re-delivered queue messages or webhook retries don't double-charge.",
+        "Treat the webhook as the source of payment truth and reconcile ambiguous timeouts against the PSP before releasing a unit."
+      ]
+    },
+    {
+      "concern": "Hold expiry, reconciliation, and operator workflows",
+      "steps": [
+        "async",
+        "consistency"
+      ],
+      "selfHosted": [
+        {
+          "name": "Temporal",
+          "icon": "assets/tech-icons/temporal.png"
+        },
+        {
+          "name": "Apache Airflow",
+          "icon": "assets/tech-icons/airflow.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Durable Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          },
+          {
+            "name": "Logic Apps",
+            "icon": "assets/tech-icons/10363-icon-service-Logic-Apps-Custom-Connector.svg"
+          },
+          {
+            "name": "Azure SQL",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Timer-driven workflows make hold expiry, counter rebuilds, and reconciliation retries visible and restartable.",
+        "A simple cron/reaper is cheaper for one sale, but it hides state unless every attempt and operator action is persisted.",
+        "Workflow tooling does not replace the durable ledger; it coordinates work around the ledger."
+      ],
+      "makesIrrelevant": "A durable workflow service with timers, retries, and execution history removes much of the custom hold-expiry scheduler and manual replay console."
+    },
+    {
+      "concern": "Live operations and observability",
+      "steps": [
+        "admission",
+        "waitroom",
+        "reserve",
+        "async",
+        "consistency"
+      ],
+      "selfHosted": [
+        {
+          "name": "Prometheus",
+          "icon": "assets/tech-icons/prometheus.png"
+        },
+        {
+          "name": "Grafana",
+          "icon": "assets/tech-icons/grafana.png"
+        },
+        {
+          "name": "Jaeger",
+          "icon": "assets/tech-icons/jaeger.png"
+        },
+        {
+          "name": "ELK Stack",
+          "icon": "assets/tech-icons/elasticsearch.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "Managed Service for Prometheus",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Service-for-Prometheus_64.png"
+          },
+          {
+            "name": "Managed Grafana",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Grafana_64.png"
+          },
+          {
+            "name": "X-Ray",
+            "icon": "assets/tech-icons/Arch_AWS-X-Ray_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Trace",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Logging",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Application Insights",
+            "icon": "assets/tech-icons/00012-icon-service-Application-Insights.svg"
+          },
+          {
+            "name": "Azure Managed Grafana",
+            "icon": "assets/tech-icons/02905-icon-service-Azure-Managed-Grafana.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "The key SLOs are operational and business-facing: token issue rate, queue depth, reservation success, payment failure, hold expiry, counter-vs-ledger drift, and counter epoch health.",
+        "Self-hosting Prometheus/Grafana gives custom labels and retention, but high-cardinality sale/user/device labels can become an operational problem during the burst.",
+        "Managed observability shortens setup for a one-time drop, but cost and retention controls need to be set before T0."
+      ],
+      "makesIrrelevant": "A managed observability suite with dashboards, alerts, traces, and audit logs removes much of the custom live-console telemetry plumbing."
+    }
+  ],
   "interviewScript": [
     {
       "phase": "Scope & requirements",
@@ -1633,9 +2607,135 @@
   "toProbeFurther": {
     "links": [
       {
+        "id": "aws-flash-sale-considerations",
+        "group": "Flash-Sale Operations and Case Studies",
+        "groupDescription": "Real flash-sale, BFCM, ticketing, and launch-readiness references.",
+        "title": "Top considerations for Flash sale events",
+        "url": "https://aws.amazon.com/blogs/mt/top-considerations-for-flash-sale-events/",
+        "source": "AWS",
+        "type": "Best practices",
+        "year": "2023",
+        "why": "Gives a launch-readiness checklist for quota planning, prewarming, performance testing, queue management, WAF, and event operations."
+      },
+      {
+        "id": "shopify-bfcm-readiness",
+        "group": "Flash-Sale Operations and Case Studies",
+        "groupDescription": "Real flash-sale, BFCM, ticketing, and launch-readiness references.",
+        "title": "How we prepare Shopify for BFCM",
+        "url": "https://shopify.engineering/bfcm-readiness-2025",
+        "source": "Shopify Engineering",
+        "type": "Case study",
+        "year": "2025",
+        "why": "Shows how a commerce platform prepares for extreme sale traffic with scale tests, chaos exercises, bottleneck fixes, and live operational readiness."
+      },
+      {
+        "id": "shopify-scale-testing",
+        "group": "Flash-Sale Operations and Case Studies",
+        "groupDescription": "Real flash-sale, BFCM, ticketing, and launch-readiness references.",
+        "title": "Performance Testing At Scale - for BFCM and Beyond",
+        "url": "https://shopify.engineering/scale-performance-testing",
+        "source": "Shopify Engineering",
+        "type": "Case study",
+        "year": "2023",
+        "why": "Explains capacity planning, resiliency testing, and full-scale load testing for peak commerce events."
+      },
+      {
+        "id": "seatgeek-waiting-room",
+        "group": "Flash-Sale Operations and Case Studies",
+        "groupDescription": "Real flash-sale, BFCM, ticketing, and launch-readiness references.",
+        "title": "Build a Virtual Waiting Room with Amazon DynamoDB and AWS Lambda at SeatGeek",
+        "url": "https://aws.amazon.com/blogs/architecture/build-a-virtual-waiting-room-with-amazon-dynamodb-and-aws-lambda-at-seatgeek/",
+        "source": "AWS Architecture Blog / SeatGeek",
+        "type": "Case study",
+        "year": "2021",
+        "why": "Production ticketing case study for buffering high-demand on-sales, prioritizing users, and protecting the purchase zone."
+      },
+      {
+        "id": "shopify-inventory-reservations",
+        "group": "Flash-Sale Operations and Case Studies",
+        "groupDescription": "Real flash-sale, BFCM, ticketing, and launch-readiness references.",
+        "title": "We replaced Redis with MySQL for inventory reservations - and it scaled",
+        "url": "https://shopify.engineering/scaling-inventory-reservations",
+        "source": "Shopify Engineering",
+        "type": "Case study",
+        "year": "2026",
+        "why": "Deep production example of reservation holds, oversell protection, contention reduction, ACID ledger coupling, and rollout validation."
+      },
+      {
+        "id": "fastly-request-collapsing",
+        "group": "Edge Offload and Admission Control",
+        "groupDescription": "CDN, edge-compute, throttling, overload, and cache-stampede references.",
+        "title": "Request collapsing",
+        "url": "https://www.fastly.com/documentation/guides/concepts/cache/request-collapsing/",
+        "source": "Fastly",
+        "type": "Docs",
+        "why": "Explains how collapsing simultaneous cache misses reduces origin load for hot sale pages and availability endpoints."
+      },
+      {
+        "id": "cloudflare-cache-revalidation",
+        "group": "Edge Offload and Admission Control",
+        "groupDescription": "CDN, edge-compute, throttling, overload, and cache-stampede references.",
+        "title": "Revalidation",
+        "url": "https://developers.cloudflare.com/cache/concepts/revalidation/",
+        "source": "Cloudflare",
+        "type": "Docs",
+        "why": "Useful for stale-while-revalidate and smart revalidation choices when sale-state reads must be cheap and boundedly stale."
+      },
+      {
+        "id": "aws-visitor-prioritization",
+        "group": "Edge Offload and Admission Control",
+        "groupDescription": "CDN, edge-compute, throttling, overload, and cache-stampede references.",
+        "title": "Visitor Prioritization on e-Commerce Websites with CloudFront and CloudFront Functions",
+        "url": "https://aws.amazon.com/blogs/networking-and-content-delivery/visitor-prioritization-on-e-commerce-websites-with-cloudfront-and-cloudfront-functions/",
+        "source": "AWS",
+        "type": "Technical how-to",
+        "year": "2023",
+        "why": "Shows an edge-compute pattern for probabilistic admission, premium-cookie bypass, and WAF bot-control integration."
+      },
+      {
+        "id": "sre-overload",
+        "group": "Edge Offload and Admission Control",
+        "groupDescription": "CDN, edge-compute, throttling, overload, and cache-stampede references.",
+        "title": "Handling Overload",
+        "url": "https://sre.google/sre-book/handling-overload/",
+        "source": "Google SRE",
+        "type": "Book chapter",
+        "why": "Useful for admission control, client-side throttling, load shedding, quotas, and graceful degradation under spikes."
+      },
+      {
+        "id": "google-cascading-failures",
+        "group": "Edge Offload and Admission Control",
+        "groupDescription": "CDN, edge-compute, throttling, overload, and cache-stampede references.",
+        "title": "Addressing Cascading Failures",
+        "url": "https://sre.google/sre-book/addressing-cascading-failures/",
+        "source": "Google SRE",
+        "type": "Book chapter",
+        "why": "Frames why load shedding, graceful degradation, and avoiding retry amplification matter during a flash-sale overload."
+      },
+      {
+        "id": "envoy-overload-manager",
+        "group": "Edge Offload and Admission Control",
+        "groupDescription": "CDN, edge-compute, throttling, overload, and cache-stampede references.",
+        "title": "Overload manager",
+        "url": "https://www.envoyproxy.io/docs/envoy/latest/configuration/operations/overload_manager/overload_manager",
+        "source": "Envoy",
+        "type": "Docs",
+        "why": "Concrete proxy-level implementation reference for shedding connections and streams as resources approach overload."
+      },
+      {
+        "id": "netflix-concurrency-limits",
+        "group": "Edge Offload and Admission Control",
+        "groupDescription": "CDN, edge-compute, throttling, overload, and cache-stampede references.",
+        "title": "Netflix concurrency-limits",
+        "url": "https://github.com/Netflix/concurrency-limits",
+        "source": "Netflix",
+        "type": "Repository",
+        "why": "Implementation reference for adaptive concurrency limits when the admission rate should follow observed latency instead of a fixed cap."
+      },
+      {
         "id": "cloudflare-waiting-room",
-        "group": "Booking and Contention",
-        "groupDescription": "Inventory reservation, waiting rooms, locks, leases, and contention-management references.",
+        "group": "Waiting Rooms and Fairness",
+        "groupDescription": "Virtual queue, lottery, fairness, signed-token, and waiting-room implementation references.",
         "title": "Cloudflare Waiting Room",
         "url": "https://developers.cloudflare.com/waiting-room/",
         "source": "Cloudflare",
@@ -1643,29 +2743,82 @@
         "why": "Practical waiting-room design reference for admission control during traffic surges."
       },
       {
-        "id": "sre-overload",
-        "group": "Foundations",
-        "groupDescription": "Core system design references for scalability, reliability, and operating distributed services.",
-        "title": "Handling Overload",
-        "url": "https://sre.google/sre-book/handling-overload/",
-        "source": "Google SRE",
-        "type": "Book chapter",
-        "why": "Useful for admission control, load shedding, quotas, and graceful degradation under spikes."
+        "id": "cloudflare-waiting-room-queues",
+        "group": "Waiting Rooms and Fairness",
+        "groupDescription": "Virtual queue, lottery, fairness, signed-token, and waiting-room implementation references.",
+        "title": "How Waiting Room makes queueing decisions on Cloudflare's highly distributed network",
+        "url": "https://blog.cloudflare.com/how-waiting-room-queues/",
+        "source": "Cloudflare",
+        "type": "Engineering post",
+        "year": "2023",
+        "why": "Deep dive into distributed edge queue decisions, active-user limits, per-data-center state, and the latency-vs-accuracy tradeoff."
+      },
+      {
+        "id": "cloudflare-random-queueing",
+        "group": "Waiting Rooms and Fairness",
+        "groupDescription": "Virtual queue, lottery, fairness, signed-token, and waiting-room implementation references.",
+        "title": "Waiting Room: Random Queueing and Custom Web/Mobile Apps",
+        "url": "https://blog.cloudflare.com/waiting-room-random-queueing-and-custom-web-mobile-apps/",
+        "source": "Cloudflare",
+        "type": "Engineering post",
+        "why": "Explains random queueing as a fairness option when arriving milliseconds earlier should not determine who gets scarce inventory."
+      },
+      {
+        "id": "queue-it-how-it-works",
+        "group": "Waiting Rooms and Fairness",
+        "groupDescription": "Virtual queue, lottery, fairness, signed-token, and waiting-room implementation references.",
+        "title": "How Queue-it Works",
+        "url": "https://www.queue-it.com/developers/how-queue-it-works/",
+        "source": "Queue-it",
+        "type": "Docs",
+        "why": "Technical overview of redirect flow, signed queue tokens, scheduled-sale pre-queues, randomization, and protected bottleneck placement."
+      },
+      {
+        "id": "aws-virtual-waiting-room",
+        "group": "Waiting Rooms and Fairness",
+        "groupDescription": "Virtual queue, lottery, fairness, signed-token, and waiting-room implementation references.",
+        "title": "Introducing AWS Virtual Waiting Room",
+        "url": "https://aws.amazon.com/blogs/compute/introducing-aws-virtual-waiting-room/",
+        "source": "AWS",
+        "type": "Technical how-to",
+        "year": "2022",
+        "why": "Architecture reference for line numbers, polling, secure session tokens, protected API authorizers, and multiple integration patterns."
       },
       {
         "id": "redis-locks",
-        "group": "Booking and Contention",
-        "groupDescription": "Inventory reservation, waiting rooms, locks, leases, and contention-management references.",
+        "group": "Inventory Reservations and Contention",
+        "groupDescription": "Atomic reservation, locking, conditional writes, and transaction-isolation references.",
         "title": "Distributed Locks with Redis",
         "url": "https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/",
         "source": "Redis",
         "type": "Docs",
-        "why": "Clarifies when Redis locks are acceptable and why leases/fencing matter."
+        "why": "Clarifies when Redis locks are acceptable and why leases, fencing, and failure modes matter."
+      },
+      {
+        "id": "redis-transactions",
+        "group": "Inventory Reservations and Contention",
+        "groupDescription": "Atomic reservation, locking, conditional writes, and transaction-isolation references.",
+        "title": "Transactions",
+        "url": "https://redis.io/docs/latest/develop/using-commands/transactions/",
+        "source": "Redis",
+        "type": "Docs",
+        "why": "Explains MULTI/EXEC, WATCH-based optimistic locking, and how Redis conditional updates behave under concurrent stock changes."
+      },
+      {
+        "id": "redis-inventory-reservation",
+        "group": "Inventory Reservations and Contention",
+        "groupDescription": "Atomic reservation, locking, conditional writes, and transaction-isolation references.",
+        "title": "How to reserve inventory in real time with Redis",
+        "url": "https://redis.io/tutorials/inventory-reservation-in-real-time-with-redis/",
+        "source": "Redis",
+        "type": "Tutorial",
+        "year": "2026",
+        "why": "Hands-on reservation flow with holds, confirm/release paths, WATCH/MULTI, audit streams, and expired-reservation recovery."
       },
       {
         "id": "dynamodb-condition",
-        "group": "Booking and Contention",
-        "groupDescription": "Inventory reservation, waiting rooms, locks, leases, and contention-management references.",
+        "group": "Inventory Reservations and Contention",
+        "groupDescription": "Atomic reservation, locking, conditional writes, and transaction-isolation references.",
         "title": "DynamoDB Condition Expressions",
         "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html",
         "source": "AWS",
@@ -1673,39 +2826,93 @@
         "why": "Useful for atomic inventory updates, idempotency guards, and optimistic concurrency checks."
       },
       {
-        "id": "kafka-design",
-        "group": "Queues and Streams",
-        "groupDescription": "Messaging, event streaming, delivery semantics, and async processing references.",
-        "title": "Apache Kafka Design",
-        "url": "https://kafka.apache.org/documentation/#design",
-        "source": "Apache Kafka",
-        "type": "Docs",
-        "why": "Explains Kafka's log, partitions, consumer groups, replication, and operational model."
-      },
-      {
-        "id": "stripe-idempotency",
-        "group": "Payments and Commerce",
-        "groupDescription": "Payment correctness, idempotency, ledgers, checkout, orders, and reconciliation references.",
-        "title": "Idempotent Requests",
-        "url": "https://docs.stripe.com/api/idempotent_requests",
-        "source": "Stripe",
-        "type": "Docs",
-        "why": "Canonical API reference for safe retries and exactly-once effects at payment boundaries.",
-        "year": "2024"
-      },
-      {
         "id": "postgres-isolation",
-        "group": "Booking and Contention",
-        "groupDescription": "Inventory reservation, waiting rooms, locks, leases, and contention-management references.",
+        "group": "Inventory Reservations and Contention",
+        "groupDescription": "Atomic reservation, locking, conditional writes, and transaction-isolation references.",
         "title": "Transaction Isolation",
         "url": "https://www.postgresql.org/docs/current/transaction-iso.html",
         "source": "PostgreSQL",
         "type": "Docs",
-        "why": "Useful for reasoning about locks, serialization anomalies, and inventory correctness."
+        "why": "Useful for reasoning about row locks, serialization anomalies, hot-row contention, and inventory correctness."
+      },
+      {
+        "id": "kafka-design",
+        "group": "Async Orders, Payments, and Reconciliation",
+        "groupDescription": "Messaging, event streaming, idempotency, payment callbacks, and reconciliation references.",
+        "title": "Apache Kafka Design",
+        "url": "https://kafka.apache.org/documentation/#design",
+        "source": "Apache Kafka",
+        "type": "Docs",
+        "why": "Explains Kafka's log, partitions, consumer groups, replication, and operational model for async order processing."
+      },
+      {
+        "id": "aws-transactional-outbox",
+        "group": "Async Orders, Payments, and Reconciliation",
+        "groupDescription": "Messaging, event streaming, idempotency, payment callbacks, and reconciliation references.",
+        "title": "Transactional outbox pattern",
+        "url": "https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/transactional-outbox.html",
+        "source": "AWS Prescriptive Guidance",
+        "type": "Docs",
+        "why": "Covers the dual-write problem between order DB updates and queue messages, plus duplicate-message and idempotent-consumer concerns."
+      },
+      {
+        "id": "stripe-idempotency",
+        "group": "Async Orders, Payments, and Reconciliation",
+        "groupDescription": "Messaging, event streaming, idempotency, payment callbacks, and reconciliation references.",
+        "title": "Idempotent Requests",
+        "url": "https://docs.stripe.com/api/idempotent_requests",
+        "source": "Stripe",
+        "type": "Docs",
+        "why": "Canonical API reference for safe retries and exactly-once effects at payment boundaries."
+      },
+      {
+        "id": "stripe-webhooks",
+        "group": "Async Orders, Payments, and Reconciliation",
+        "groupDescription": "Messaging, event streaming, idempotency, payment callbacks, and reconciliation references.",
+        "title": "Receive Stripe events in your webhook endpoint",
+        "url": "https://docs.stripe.com/webhooks",
+        "source": "Stripe",
+        "type": "Docs",
+        "why": "Shows how to process asynchronous payment outcomes and return quickly before heavier order/accounting work."
+      },
+      {
+        "id": "stripe-reconciliation",
+        "group": "Async Orders, Payments, and Reconciliation",
+        "groupDescription": "Messaging, event streaming, idempotency, payment callbacks, and reconciliation references.",
+        "title": "Bank reconciliation",
+        "url": "https://docs.stripe.com/bank-reconciliation",
+        "source": "Stripe",
+        "type": "Docs",
+        "why": "Useful for thinking about payout, charge, refund, dispute, fee, and bank reconciliation after the sale."
+      },
+      {
+        "id": "amazon-idempotent-apis",
+        "group": "Async Orders, Payments, and Reconciliation",
+        "groupDescription": "Messaging, event streaming, idempotency, payment callbacks, and reconciliation references.",
+        "title": "Making retries safe with idempotent APIs",
+        "url": "https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-apis/",
+        "source": "Amazon Builders' Library",
+        "type": "Article",
+        "why": "Explains idempotency contracts, retry semantics, late requests, and reconciliation for ambiguous distributed outcomes."
+      },
+      {
+        "id": "shopify-idempotent-graphql",
+        "group": "Async Orders, Payments, and Reconciliation",
+        "groupDescription": "Messaging, event streaming, idempotency, payment callbacks, and reconciliation references.",
+        "title": "Building Resilient GraphQL APIs Using Idempotency",
+        "url": "https://shopify.engineering/building-resilient-graphql-apis-using-idempotency",
+        "source": "Shopify Engineering",
+        "type": "Engineering post",
+        "why": "Payment-service example covering idempotent GraphQL mutations, request tracking, recovery points, and automatic reconciliation."
       }
     ]
   },
   "assets": {
     "icon": "icon.png"
-  }
+  },
+  "aiVisuals": {
+    "requirements": "assets/generated/ai-visuals/requirements.jpg",
+    "capacity": "assets/generated/ai-visuals/capacity.jpg"
+  },
+  "explainerComic": "assets/generated/comic/interview-comic.jpg"
 }

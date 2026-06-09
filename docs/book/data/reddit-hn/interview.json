@@ -202,6 +202,18 @@
         "label": "remove/penalize"
       },
       {
+        "id": "mod-db",
+        "from": "ModSvc",
+        "to": "PostDB",
+        "label": "write status / tombstone"
+      },
+      {
+        "id": "mod-commentcache",
+        "from": "ModSvc",
+        "to": "CommentCache",
+        "label": "invalidate removed subtree"
+      },
+      {
         "id": "post-mod",
         "from": "PostSvc",
         "to": "ModSvc",
@@ -269,29 +281,59 @@
   },
   "capacity": [
     {
-      "label": "Reads",
-      "value": "the dominant load",
-      "note": "Listings + comment trees; served from cache."
+      "label": "Daily active users",
+      "value": "~50M DAU",
+      "note": "Assume ~5M peak concurrent; numbers below are illustrative to size the design, not exact."
     },
     {
-      "label": "Votes per second",
-      "value": "high",
-      "note": "Bursty on viral posts; processed async for scoring."
+      "label": "Listing reads/sec",
+      "value": "~150k/s (peak ~300k/s)",
+      "note": "The dominant load: ~10 listing views per user-session-minute. Served from RankCache, so this is cache QPS."
     },
     {
-      "label": "Posts per second",
-      "value": "low",
-      "note": "Far fewer than votes."
+      "label": "Comment-tree reads/sec",
+      "value": "~50k/s",
+      "note": "Thread opens; ~1/3 of listing reads. Hot threads served from CommentCache."
     },
     {
-      "label": "Comment depth",
-      "value": "deep / wide",
-      "note": "Threads can be thousands of comments."
+      "label": "Votes/sec",
+      "value": "~10k/s (peak viral-post burst ~5k/s on a single post)",
+      "note": "Recorded synchronously, scored async. A single viral post can absorb thousands of votes/sec — handled by the queue."
     },
     {
-      "label": "Ranking freshness",
-      "value": "seconds",
-      "note": "Hot score recomputed continuously, not per vote synchronously."
+      "label": "Comment writes/sec",
+      "value": "~2k/s",
+      "note": "Far fewer than votes; each emits an event for thread-cache invalidation."
+    },
+    {
+      "label": "Post submits/sec",
+      "value": "~200/s",
+      "note": "Smallest write volume; each runs a spam check on submit."
+    },
+    {
+      "label": "Score-worker events/sec",
+      "value": "~12k/s",
+      "note": "Votes + comment events. One score change can fan out to several sorted sets (community + global + top window)."
+    },
+    {
+      "label": "Active communities / front-page candidates",
+      "value": "~100k active communities; ~5k front-page candidates",
+      "note": "Global front page aggregates top members of the most active communities, refreshed on a short cycle."
+    },
+    {
+      "label": "Listing-cache memory (raw members)",
+      "value": "~2.5 GB raw",
+      "note": "100k communities x 3 sorts x top-1000 ids x ~8 bytes ≈ 2.4 GB of bare member ids. This is the floor — it ignores everything Redis actually stores per member."
+    },
+    {
+      "label": "Listing-cache memory (realistic)",
+      "value": "~60–120 GB across replicas",
+      "note": "A real sorted set stores member string + score + skip-list/hash-index nodes + allocator overhead — call it ~60–100 bytes/member, not 8. Add top/day/week/all windows (~4x sets), global candidate sets, and 2–3 replicas: ~20–40 GB primary, 2–3x with replicas. So the design caps coverage: top-1000 for active communities, top-100 for cold ones, evict idle sort/window sets, and rebuild cold listings lazily (see Step 4)."
+    },
+    {
+      "label": "Ranking freshness target",
+      "value": "< 5 s p99",
+      "note": "Hot score recomputed continuously from events + a periodic drift pass; a vote need not reorder the listing instantly."
     }
   ],
   "api": [
@@ -408,16 +450,51 @@
     },
     {
       "method": "GET",
+      "path": "/v1/frontpage/{sort}",
+      "description": "Read the global front page for a sort mode (hot|top|new). top accepts ?window=day|week|all.",
+      "request": "?cursor=<opaque>&window=day",
+      "response": "{ \"posts\": [ ... ], \"nextCursor\": \"...\" }"
+    },
+    {
+      "method": "GET",
       "path": "/v1/posts/{id}/comments",
-      "description": "Read the threaded comment tree for a post.",
-      "request": "?sort=top",
-      "response": "{ \"comments\": [ { \"id\": \"c_1\", \"children\": [...] } ] }"
+      "description": "Read the threaded comment tree for a post; collapses removed/deleted subtrees to tombstones.",
+      "request": "?sort=top&cursor=<opaque>&depth=8",
+      "response": "{ \"comments\": [ { \"id\": \"c_1\", \"score\": 42, \"status\": \"visible\", \"children\": [...], \"moreChildrenCursor\": \"...\" } ], \"nextCursor\": \"...\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/posts/{id}/comments",
+      "description": "Add a comment (or reply, via parentId) to a post. Returns the created comment with its materialized path.",
+      "request": "{ \"parentId\": \"c_3\", \"body\": \"...\" }",
+      "response": "{ \"commentId\": \"c_88\", \"path\": \"12/47/88\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/comments/{id}/vote",
+      "description": "Vote on a comment. Idempotent per user, same contract as post voting; emits a vote event with item_type=comment.",
+      "request": "{ \"direction\": \"up\" }",
+      "response": "{ \"ok\": true, \"score\": 17 }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/mod/{itemType}/{id}/remove",
+      "description": "Moderator removes a post or comment (itemType = post|comment). Writes authoritative status, appends a moderation_actions audit record (actor, reason, prev_status), emits an invalidation event, evicts ranked/comment caches. Restore via the mirror endpoint /restore.",
+      "request": "{ \"reason\": \"spam\", \"shadow\": false }",
+      "response": "{ \"ok\": true, \"status\": \"removed\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/mod/{itemType}/{id}/restore",
+      "description": "Mirror of /remove: restores an item to its prev_status from the moderation_actions audit log, appends a restore audit record, re-emits events so the item re-enters listings and its subtree re-expands. Used for false-positive reversal and upheld appeals.",
+      "request": "{ \"reason\": \"appeal_overturned\" }",
+      "response": "{ \"ok\": true, \"status\": \"active\" }"
     }
   ],
   "dataModel": [
     {
       "name": "posts",
-      "note": "Authoritative posts with vote tallies and a precomputed score.",
+      "note": "Authoritative posts with vote tallies, a precomputed score, and moderation state.",
       "fields": [
         {
           "name": "post_id",
@@ -432,6 +509,18 @@
           "type": "bigint"
         },
         {
+          "name": "title",
+          "type": "text"
+        },
+        {
+          "name": "url",
+          "type": "text | null (link posts)"
+        },
+        {
+          "name": "body",
+          "type": "text | null (text posts)"
+        },
+        {
           "name": "ups",
           "type": "int"
         },
@@ -444,6 +533,14 @@
           "type": "double (precomputed)"
         },
         {
+          "name": "status",
+          "type": "enum(active, removed, spam, shadowed)"
+        },
+        {
+          "name": "removed_at",
+          "type": "timestamp | null (tombstone)"
+        },
+        {
           "name": "created_at",
           "type": "timestamp"
         }
@@ -451,7 +548,7 @@
     },
     {
       "name": "comments",
-      "note": "Threaded comments; materialized path enables subtree reads.",
+      "note": "Threaded comments; materialized path enables subtree reads, status drives tombstone collapse.",
       "fields": [
         {
           "name": "comment_id",
@@ -466,22 +563,50 @@
           "type": "bigint | null"
         },
         {
+          "name": "author_id",
+          "type": "bigint"
+        },
+        {
+          "name": "body",
+          "type": "text (or content-store pointer)"
+        },
+        {
           "name": "path",
           "type": "materialized path (e.g. 12/47/88) for subtree queries"
         },
         {
+          "name": "depth",
+          "type": "smallint (derived from path; caps very deep threads)"
+        },
+        {
           "name": "score",
           "type": "int"
+        },
+        {
+          "name": "status",
+          "type": "enum(visible, removed, deleted, shadowed)"
+        },
+        {
+          "name": "removed_at",
+          "type": "timestamp | null (tombstone)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp (sibling sort)"
         }
       ]
     },
     {
       "name": "votes",
-      "note": "One row per (user, item) for dedup and fraud analysis.",
+      "note": "One row per (user, item_type, item) for dedup and fraud analysis; version makes async updates idempotent.",
       "fields": [
         {
           "name": "user_id",
           "type": "bigint (PK part)"
+        },
+        {
+          "name": "item_type",
+          "type": "enum(post, comment) (PK part)"
         },
         {
           "name": "item_id",
@@ -492,10 +617,1040 @@
           "type": "enum(up, down, none)"
         },
         {
+          "name": "version",
+          "type": "bigint (bumped on each change; carried in the event)"
+        },
+        {
+          "name": "trust_status",
+          "type": "enum(counted, shadowed, discounted) (fraud verdict)"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp"
+        }
+      ]
+    },
+    {
+      "name": "moderation_actions",
+      "note": "Append-only audit log: who moderated what, why, and the prior state for restore. Source of truth for the mirror restore endpoint and for review/appeals.",
+      "fields": [
+        {
+          "name": "action_id",
+          "type": "bigint PK"
+        },
+        {
+          "name": "item_type",
+          "type": "enum(post, comment)"
+        },
+        {
+          "name": "item_id",
+          "type": "bigint (index)"
+        },
+        {
+          "name": "actor_id",
+          "type": "bigint (moderator/admin) | null (automated)"
+        },
+        {
+          "name": "action",
+          "type": "enum(remove, spam, shadow, restore, approve)"
+        },
+        {
+          "name": "reason",
+          "type": "text | enum(rule_code)"
+        },
+        {
+          "name": "prev_status",
+          "type": "enum (snapshot for restore)"
+        },
+        {
+          "name": "appeal_state",
+          "type": "enum(none, pending, upheld, overturned)"
+        },
+        {
           "name": "created_at",
           "type": "timestamp"
         }
       ]
+    },
+    {
+      "name": "abuse_signals (restricted)",
+      "note": "Sensitive fraud features (IP/ASN, device, vote-timing cohorts). Access-controlled, short retention (e.g. 30–90 days), prefer aggregated/hashed features over raw identifiers; not exposed on read paths.",
+      "fields": [
+        {
+          "name": "subject_id",
+          "type": "bigint (user or vote) (index)"
+        },
+        {
+          "name": "feature",
+          "type": "enum(account_age, ip_asn_hash, device_hash, timing_cohort, cohort_overlap)"
+        },
+        {
+          "name": "value",
+          "type": "aggregated/hashed (no raw IP stored long-term)"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamp (TTL-enforced retention)"
+        }
+      ]
+    },
+    {
+      "name": "listing_cache (derived)",
+      "note": "Rebuildable sorted sets in Redis, not a source-of-truth table. One ZSET per (scope, sort[, window]); key shape shown below.",
+      "fields": [
+        {
+          "name": "key",
+          "type": "(scope, sort, window) e.g. comm:42:hot, front:top:day, comm:42:new"
+        },
+        {
+          "name": "member_id",
+          "type": "post_id"
+        },
+        {
+          "name": "score",
+          "type": "double (hot_score | net | created_at depending on sort)"
+        }
+      ]
+    }
+  ],
+  "technologyChoices": [
+    {
+      "concern": "Edge routing, authentication, and request admission",
+      "steps": [
+        "naive",
+        "voting",
+        "listings",
+        "scale-mod"
+      ],
+      "selfHosted": [
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Kong",
+          "icon": "assets/tech-icons/kong.png"
+        },
+        {
+          "name": "HAProxy",
+          "icon": "assets/tech-icons/haproxy.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          },
+          {
+            "name": "ALB",
+            "icon": "assets/tech-icons/Arch_Elastic-Load-Balancing_64.png"
+          },
+          {
+            "name": "Cognito",
+            "icon": "assets/tech-icons/Arch_Amazon-Cognito_64.png"
+          },
+          {
+            "name": "Global Accelerator",
+            "icon": "assets/tech-icons/Arch_AWS-Global-Accelerator_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Load Balancing",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Endpoints",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Armor",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Identity Platform",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Application Gateway",
+            "icon": "assets/tech-icons/10076-icon-service-Application-Gateways.svg"
+          },
+          {
+            "name": "API Management",
+            "icon": "assets/tech-icons/10042-icon-service-API-Management-Services.svg"
+          },
+          {
+            "name": "Microsoft Entra ID",
+            "icon": "assets/tech-icons/10231-icon-service-Entra-ID-Protection.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Self-hosted proxies give precise control over routing, retries, and rate limits, but the team owns surge capacity and failover.",
+        "Managed gateways and identity services remove much of the edge operation, but provider quotas and per-request cost matter at Reddit/HN read volume.",
+        "Keeping API services stateless lets listing reads, votes, comments, and moderation actions scale independently."
+      ],
+      "makesIrrelevant": "A managed edge and identity layer removes most hand-built health checking, TLS termination, and login-token plumbing from the application services."
+    },
+    {
+      "concern": "Authoritative post, comment, and moderation store",
+      "steps": [
+        "naive",
+        "comments",
+        "scale-mod"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "MySQL",
+          "icon": "assets/tech-icons/mysql.png"
+        },
+        {
+          "name": "CockroachDB",
+          "icon": "assets/tech-icons/cockroach.png"
+        },
+        {
+          "name": "Apache Cassandra",
+          "icon": "assets/tech-icons/cassandra.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Aurora",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "RDS",
+            "icon": "assets/tech-icons/Arch_Amazon-RDS_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "Keyspaces",
+            "icon": "assets/tech-icons/Arch_Amazon-Keyspaces_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Firestore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          },
+          {
+            "name": "SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Relational stores make posts, moderation actions, constraints, and restore workflows straightforward early on.",
+        "Wide-column or distributed KV stores fit high-volume post/comment access once the system shards by community, post, or item id.",
+        "The ranked and comment caches remain derived state, so the source-of-truth store must preserve enough status, score, and tombstone data to rebuild them."
+      ],
+      "makesIrrelevant": "A globally replicated managed store can remove much of the custom replica promotion and cross-region failover work, but it does not remove the need for explicit partition keys and tombstone handling."
+    },
+    {
+      "concern": "Idempotent vote store and trust-weighted tally",
+      "steps": [
+        "voting",
+        "fraud",
+        "scale-mod"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Cassandra",
+          "icon": "assets/tech-icons/cassandra.png"
+        },
+        {
+          "name": "ScyllaDB",
+          "icon": "assets/tech-icons/scylladb.png"
+        },
+        {
+          "name": "CockroachDB",
+          "icon": "assets/tech-icons/cockroach.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "Keyspaces",
+            "icon": "assets/tech-icons/Arch_Amazon-Keyspaces_64.png"
+          },
+          {
+            "name": "Aurora",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "RDS",
+            "icon": "assets/tech-icons/Arch_Amazon-RDS_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          },
+          {
+            "name": "SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A conditional-write KV or wide-column store fits one row per (user, item_type, item) and absorbs vote retries without double counting.",
+        "Relational unique indexes are simpler for early correctness, but viral-post write bursts can force careful partitioning or a move to a wider table model.",
+        "Persisting vote version and trust_status makes downstream score workers idempotent and lets fraud verdicts be reversed cleanly."
+      ],
+      "makesIrrelevant": "Native conditional writes and unique keys remove the need for a separate dedup service in front of the vote pipeline."
+    },
+    {
+      "concern": "Vote/event queue and ranking event log",
+      "steps": [
+        "voting",
+        "ranking",
+        "scale-mod"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Redpanda",
+          "icon": "assets/tech-icons/redpanda.png"
+        },
+        {
+          "name": "RabbitMQ",
+          "icon": "assets/tech-icons/rabbitmq.png"
+        },
+        {
+          "name": "NATS (JetStream)",
+          "icon": "assets/tech-icons/nats.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "MSK",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Streaming-for-Apache-Kafka_64.png"
+          },
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Managed Service for Apache Kafka",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Event Grid",
+            "icon": "assets/tech-icons/10221-icon-service-Event-Grid-Subscriptions.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A partitioned log preserves per-item ordering and replay for score recalculation, while a queue is simpler for retry-oriented worker jobs.",
+        "Partitioning by item_id keeps vote versions ordered for one post or comment, but hot items still need score-update coalescing.",
+        "At-least-once delivery is acceptable only because the vote row version makes the ranker idempotent."
+      ],
+      "makesIrrelevant": "A managed stream with retention, lag metrics, and replay reduces custom offset bookkeeping and queue-age instrumentation."
+    },
+    {
+      "concern": "Ranking worker runtime and drift recompute",
+      "steps": [
+        "ranking",
+        "listings",
+        "scale-mod"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kubernetes",
+          "icon": "assets/tech-icons/kubernetes.png"
+        },
+        {
+          "name": "Apache Flink",
+          "icon": "assets/tech-icons/flink.png"
+        },
+        {
+          "name": "Apache Spark",
+          "icon": "assets/tech-icons/spark.png"
+        },
+        {
+          "name": "Temporal",
+          "icon": "assets/tech-icons/temporal.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "EKS",
+            "icon": "assets/tech-icons/Arch_Amazon-Elastic-Kubernetes-Service_64.png"
+          },
+          {
+            "name": "ECS",
+            "icon": "assets/tech-icons/Arch_Amazon-Elastic-Container-Service_64.png"
+          },
+          {
+            "name": "Lambda",
+            "icon": "assets/tech-icons/Arch_AWS-Lambda_64.png"
+          },
+          {
+            "name": "Managed Service for Apache Flink",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Service-for-Apache-Flink_64.png"
+          },
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "GKE",
+            "icon": "assets/tech-icons/Containers-512-color.png"
+          },
+          {
+            "name": "Cloud Run",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          },
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "AKS",
+            "icon": "assets/tech-icons/10023-icon-service-Kubernetes-Services.svg"
+          },
+          {
+            "name": "Container Apps",
+            "icon": "assets/tech-icons/02989-icon-service-Container-Apps-Environments.svg"
+          },
+          {
+            "name": "Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          },
+          {
+            "name": "Durable Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          },
+          {
+            "name": "Azure Databricks",
+            "icon": "assets/tech-icons/10787-icon-service-Azure-Databricks.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Containerized workers are flexible for custom hot-score math, backfill, and short-window vote coalescing.",
+        "Stream processors fit continuous score updates and drift passes, but they add operational complexity compared with simple consumers.",
+        "Workflow runtimes help coordinate rebuilds and moderation invalidation, but they are too heavy for the per-vote hot path."
+      ],
+      "makesIrrelevant": "Managed stream processing or autoscaled worker platforms remove much of the hand-built worker fleet and backpressure scaling logic."
+    },
+    {
+      "concern": "Ranked listing cache and sorted-set storage",
+      "steps": [
+        "ranking",
+        "listings",
+        "scale-mod"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "KeyDB",
+          "icon": "assets/tech-icons/keydb.png"
+        },
+        {
+          "name": "Dragonfly",
+          "icon": "assets/tech-icons/dragonfly.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          },
+          {
+            "name": "DynamoDB Accelerator",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Redis-style sorted sets map directly to (scope, sort, window) ranked listings and seek cursors.",
+        "The cache is fast but memory-expensive, so active-community coverage, idle eviction, and lazy rebuilds are part of the design.",
+        "Durable KV alternatives can store colder listing snapshots, but they do not replace the need for fast top-N reads on hot communities."
+      ],
+      "makesIrrelevant": "A managed cache cluster removes much of the replica, failover, and shard-rebalance work for derived ranked-list state."
+    },
+    {
+      "concern": "Comment-tree cache and hot-thread hydration",
+      "steps": [
+        "comments",
+        "scale-mod"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Memcached",
+          "icon": "assets/tech-icons/memcached.png"
+        },
+        {
+          "name": "Varnish",
+          "icon": "assets/tech-icons/varnish.png"
+        },
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "CloudFront",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudFront_64.png"
+          },
+          {
+            "name": "DynamoDB Accelerator",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "Lambda@Edge",
+            "icon": "assets/tech-icons/Arch_AWS-Lambda_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud CDN",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Run",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Azure CDN",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A hot-thread cache keeps popular comment trees under the read-latency target, but every comment write, vote, or moderation action must invalidate or patch it.",
+        "Rendered-response caches help anonymous reads, while structured tree caches make incremental subtree expansion and status filtering easier.",
+        "Because the cache is rebuildable, losing it should cause slower reads and rebuilds, not data loss."
+      ],
+      "makesIrrelevant": "A replicated managed cache plus edge caching reduces the need for bespoke hot-thread read fanout infrastructure."
+    },
+    {
+      "concern": "Fraud feature store, rules, and model serving",
+      "steps": [
+        "voting",
+        "fraud",
+        "scale-mod"
+      ],
+      "selfHosted": [
+        {
+          "name": "ClickHouse",
+          "icon": "assets/tech-icons/clickhouse.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "OpenSearch",
+          "icon": "assets/tech-icons/opensearch.png"
+        },
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SageMaker",
+            "icon": "assets/tech-icons/Arch_Amazon-SageMaker-AI_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "OpenSearch Service",
+            "icon": "assets/tech-icons/Arch_Amazon-OpenSearch-Service_64.png"
+          },
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Vertex AI",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          },
+          {
+            "name": "BigQuery",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Machine Learning",
+            "icon": "assets/tech-icons/10166-icon-service-Machine-Learning.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Low-latency feature reads let the vote service discount suspicious activity without blocking the user-visible write path.",
+        "Analytical stores are better for discovering brigading patterns, while online KV/cache stores serve the current trust decision.",
+        "Fraud signals are sensitive, so retention, hashing, access control, and appeal workflows matter as much as model accuracy."
+      ],
+      "makesIrrelevant": "Managed model serving and feature storage can remove a custom scoring service, but not the need for reversible trust_status updates."
+    },
+    {
+      "concern": "Moderation workflow, audit log, and cache invalidation",
+      "steps": [
+        "comments",
+        "fraud",
+        "scale-mod"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Temporal",
+          "icon": "assets/tech-icons/temporal.png"
+        },
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Aurora",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          },
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Durable Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Event Grid",
+            "icon": "assets/tech-icons/10221-icon-service-Event-Grid-Subscriptions.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "The moderation audit log needs strong correctness and restore semantics, while invalidation events need fast propagation.",
+        "Workflow engines help enforce remove, tombstone, invalidate, and restore steps, but the final source of truth remains item status in the store.",
+        "Cache invalidation can be asynchronous only if reads also filter authoritative status to hide removed content before caches catch up."
+      ],
+      "makesIrrelevant": "A managed workflow and event bus removes much of the hand-built retry, timeout, and invalidation orchestration."
+    },
+    {
+      "concern": "CDN and edge caching for hot public listings",
+      "steps": [
+        "listings",
+        "comments",
+        "scale-mod"
+      ],
+      "selfHosted": [
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "Varnish",
+          "icon": "assets/tech-icons/varnish.png"
+        },
+        {
+          "name": "Squid",
+          "icon": "assets/tech-icons/squid.png"
+        },
+        {
+          "name": "HAProxy",
+          "icon": "assets/tech-icons/haproxy.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudFront",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudFront_64.png"
+          },
+          {
+            "name": "Global Accelerator",
+            "icon": "assets/tech-icons/Arch_AWS-Global-Accelerator_64.png"
+          },
+          {
+            "name": "Lambda@Edge",
+            "icon": "assets/tech-icons/Arch_AWS-Lambda_64.png"
+          },
+          {
+            "name": "CloudFront Functions",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudFront_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud CDN",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Media CDN",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Armor",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Load Balancing",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Azure CDN",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Traffic Manager",
+            "icon": "assets/tech-icons/10065-icon-service-Traffic-Manager-Profiles.svg"
+          },
+          {
+            "name": "Application Gateway",
+            "icon": "assets/tech-icons/10076-icon-service-Application-Gateways.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Edge caching works best for anonymous front-page and community listing reads with short TTLs and stale-while-revalidate.",
+        "Personalized pages still need backend filtering and hydration, so the CDN should cache safe public fragments rather than every response.",
+        "Aggressive edge caching improves viral-read absorption but increases moderation-invalidation complexity."
+      ],
+      "makesIrrelevant": "A CDN with short TTLs and purge APIs reduces the need for a large custom regional read-through cache for public listing pages."
+    },
+    {
+      "concern": "Observability for rank freshness, cache health, and moderation lag",
+      "steps": [
+        "ranking",
+        "listings",
+        "comments",
+        "fraud",
+        "scale-mod"
+      ],
+      "selfHosted": [
+        {
+          "name": "Prometheus",
+          "icon": "assets/tech-icons/prometheus.png"
+        },
+        {
+          "name": "Grafana",
+          "icon": "assets/tech-icons/grafana.png"
+        },
+        {
+          "name": "Jaeger",
+          "icon": "assets/tech-icons/jaeger.png"
+        },
+        {
+          "name": "Fluentd/Fluent Bit",
+          "icon": "assets/tech-icons/fluentd.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "Managed Service for Prometheus",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Service-for-Prometheus_64.png"
+          },
+          {
+            "name": "Managed Grafana",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Grafana_64.png"
+          },
+          {
+            "name": "X-Ray",
+            "icon": "assets/tech-icons/Arch_AWS-X-Ray_64.png"
+          },
+          {
+            "name": "OpenSearch Service",
+            "icon": "assets/tech-icons/Arch_Amazon-OpenSearch-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Logging",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Trace",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Profiler",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Application Insights",
+            "icon": "assets/tech-icons/00012-icon-service-Application-Insights.svg"
+          },
+          {
+            "name": "Azure Managed Grafana",
+            "icon": "assets/tech-icons/02905-icon-service-Azure-Managed-Grafana.svg"
+          },
+          {
+            "name": "Log Analytics",
+            "icon": "assets/tech-icons/00009-icon-service-Log-Analytics-Workspaces.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Rank freshness, queue age, sorted-set memory, comment-cache hit rate, fraud false positives, and moderation propagation need first-class dashboards.",
+        "Self-hosted metrics and tracing preserve portability, while managed observability reduces retention, alerting, and storage operations.",
+        "Tracing is especially useful because one visible listing read crosses edge cache, listing cache, post hydration, status filtering, and sometimes comment hydration."
+      ],
+      "makesIrrelevant": "Managed metrics, logs, and traces remove much of the custom operational datastore needed to diagnose freshness and p99 regressions."
     }
   ],
   "patterns": [
@@ -561,7 +1716,7 @@
       "title": "1. Naive: Vote Counter + Sort-on-Read (the baseline)",
       "description": [
         "Start with the simplest thing that works. Posts and comments live in one store; a vote just increments a count column on the post; the listing is produced by sorting all posts by (votes / age) at read time.",
-        "This is correct and trivial — and it exposes two problems the rest of the design exists to solve. First, sorting every post by a recomputed score on every page load is far too slow once there are millions of posts and heavy read traffic. Second, a naked counter increment double-counts on retries and is wide open to vote manipulation.",
+        "This is correct and trivial — and it exposes the two problems the rest of the design exists to solve. First, sorting a community's posts by a recomputed score on every page load is far too slow at scale: with millions of posts and ~150k listing reads/sec (peak ~300k/sec), a per-request sort can't meet the p99 < 200 ms target, so the read path must serve precomputed results instead of sorting on read. Second, a naked counter increment double-counts on retries and is wide open to vote manipulation.",
         "So the baseline motivates everything that follows: make voting correct (idempotent), move ranking off the read path, and precompute the listing."
       ],
       "view": {
@@ -589,9 +1744,11 @@
         "Establishing the naive baseline first makes it obvious why ranking must be precomputed and why votes need protection — every later step removes a specific pain from here."
       ],
       "probeLinks": [
+        "reddit-architecture",
         "reddit-sorts",
         "hn-ranking",
-        "redis-sorted-sets",
+        "hn-pg-formula",
+        "redis-leaderboard",
         "twitter-algorithm"
       ],
       "recap": {
@@ -605,14 +1762,16 @@
           "why": "Re-sorting millions of posts per request is infeasible at scale, and a bare counter is neither idempotent nor abuse-resistant.",
           "instead": "Treat it as the baseline; make voting idempotent, score asynchronously, and precompute listings."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/01-naive.jpg"
     },
     {
       "id": "voting",
       "title": "2. Idempotent Voting",
       "description": [
-        "A vote must be one-per-user-per-item: store a row keyed by (user, item) so a repeat vote upserts (up -> down, or remove) rather than incrementing twice. This makes votes idempotent and safe to retry.",
+        "A vote must be one-per-user-per-item: store a row keyed by (user, item_type, item) so a repeat vote upserts (up -> down, or remove) rather than incrementing twice. This makes votes idempotent and safe to retry. Note the row is keyed by item_type too, so a post id and a comment id never collide.",
         "Record the vote fast and return an optimistic score; the authoritative tally and ranking update happen asynchronously. Emit a vote event onto a queue for downstream scoring and fraud checks.",
+        "Make the event idempotent end-to-end. The upsert bumps a per-row version and emits { user_id, item_type, item_id, version, prev_direction, new_direction, ts }. The ranker keys on (user, item, version): a duplicate delivery is a no-op, and a changed vote carries both directions so the worker applies the correct delta (flipping an up to a down moves net score by 2, not 1) or simply re-reads the authoritative tally. Retries can happen at both the HTTP vote request and the queue/ranker consumer, so both layers must be safe.",
         "The vote store (sharded by item) is both the dedup mechanism and the raw material for fraud analysis."
       ],
       "view": {
@@ -649,10 +1808,11 @@
         }
       ],
       "probeLinks": [
+        "dynamodb-condition-expressions",
+        "dynamodb-partition-keys",
         "kafka-design",
-        "reddit-sorts",
-        "hn-ranking",
-        "redis-sorted-sets"
+        "kafka-processing-guarantees",
+        "reddit-disrupting-communities"
       ],
       "patterns": [
         "Idempotent voting",
@@ -662,8 +1822,8 @@
         "Voting is the input to ranking; getting one-vote-per-user and async scoring right is the foundation for everything else."
       ],
       "recap": {
-        "before": "Nothing.",
-        "after": "Votes recorded idempotently; events queued for scoring.",
+        "before": "Non-idempotent counters and sort-on-read from the naive baseline.",
+        "after": "Votes recorded idempotently per (user, item_type, item); versioned events queued for scoring.",
         "newRisk": "Raw vote counts aren't a good ordering — fresh content must beat stale popular content."
       },
       "traps": [
@@ -671,6 +1831,20 @@
           "trap": "Incrementing a counter per vote request.",
           "why": "Retries and re-votes corrupt the tally and allow double-voting.",
           "instead": "Upsert one (user,item) vote row; derive the tally from it."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The event queue delivers the same vote event twice (at-least-once delivery, or a producer retry).",
+          "expectedBehavior": "The score worker applies each vote's effect exactly once. Because the event carries the vote row's version and the worker tracks the last-applied version per (user, item), a replayed event with an already-applied version is a no-op.",
+          "mitigation": "Make the delta idempotent on version, not on message identity. Persist last-applied version alongside the score so duplicates and out-of-order deliveries both collapse to the latest version.",
+          "lesson": "Idempotency must live in the consumer's own state (versioned rows), not in the queue's delivery guarantee — at-least-once is the realistic contract."
+        },
+        {
+          "scenario": "The ranker crashes after applying a vote delta to the score but before committing its consumer offset.",
+          "expectedBehavior": "On restart it re-reads the same event, but the version check sees that version already applied, so the score is not double-counted.",
+          "mitigation": "Apply the delta and advance offset under the same versioned guard; never trust the offset alone for correctness.",
+          "lesson": "Crash-between-apply-and-commit is the canonical reason at-least-once consumers need idempotent application, not just careful offset handling."
         }
       ],
       "flows": [
@@ -744,7 +1918,8 @@
             "VoteStore"
           ]
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/02-voting.jpg"
     },
     {
       "id": "ranking",
@@ -752,7 +1927,8 @@
       "description": [
         "Ordering by raw upvotes would freeze old viral posts at the top forever. Use a time-decay 'hot' score that blends vote signal with age — e.g. log(votes) plus a term that decreases as the post gets older — so fresh, well-received content rises and everything sinks over time.",
         "Recompute scores asynchronously from vote events (the score worker reads tally + age and writes hot_score). This decouples the cheap vote write from the heavier ranking math.",
-        "The exact formula is a tuning knob (gravity, vote weight); the key idea is score = f(votes, age), recomputed continuously."
+        "Crucially, time decay changes the score even when no new votes arrive, so vote-event-triggered updates alone aren't enough — an old post would keep its stale score forever. Add a periodic drift pass: the worker re-scores active items on a cadence (e.g. a rolling bucket of recently/actively-read posts every few minutes), and lets cold items age out naturally on next read. Only the working set needs continuous rescore, not every post ever submitted.",
+        "The exact formula is a tuning knob (gravity, vote weight); the key idea is score = f(votes, age), recomputed continuously. Treat ranking as tunable product logic, not a fixed constant: validate formula changes offline by replaying recorded vote events against the candidate formula, or shadow-score in production (compute the new score alongside the live one without serving it) and compare the resulting listings before rolling out — so a tweak that, say, buries fresh content is caught before users see it. (The follow-ups cover A/B testing the change once it's live.)"
       ],
       "view": {
         "nodes": [
@@ -807,7 +1983,8 @@
             "groups": [
               "score-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-ranking-opt1.jpg"
         },
         {
           "name": "Confidence (Wilson) ranking",
@@ -845,7 +2022,8 @@
             "groups": [
               "score-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-ranking-opt2.jpg"
         },
         {
           "name": "Raw net upvotes",
@@ -887,7 +2065,8 @@
             "groups": [
               "score-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-ranking-opt3.jpg"
         }
       ],
       "decisionPrompt": "Why not just sort posts by their net upvote count?",
@@ -902,9 +2081,12 @@
       ],
       "probeLinks": [
         "kafka-design",
+        "kafka-processing-guarantees",
         "reddit-sorts",
         "hn-ranking",
-        "redis-sorted-sets"
+        "hn-pg-formula",
+        "redis-sorted-sets",
+        "twitter-home-mixer"
       ],
       "patterns": [
         "Time-decay hot ranking",
@@ -980,6 +2162,8 @@
       "description": [
         "Sorting a community's posts by hot score on every read won't meet the latency target. Maintain a precomputed listing per (community, sort) — a sorted set of post ids the score worker updates as scores change.",
         "Reads become an O(1) cache read of the top-N ids, hydrated with post metadata and paginated by cursor. The front page is the same idea over an aggregate of communities.",
+        "Each sort mode is maintained differently: hot is the time-decay score with the periodic drift recompute; top is the net score within a time window (day/week/all) so it needs a windowed sorted set, not just one; new is simply ordered by created_at and is append-mostly (no rescore). The global front page is built by aggregating the top members of the most active communities (or a dedicated global sorted set the worker also pushes to) — it is candidate generation across communities, not a single big sort.",
+        "Pagination must be stable even though scores change while a user pages. Use a seek cursor of (score, post_id) rather than a numeric offset, and bound staleness by snapshotting against a short-lived listing version/token so a re-ranked post doesn't appear twice or get skipped mid-scroll; reads stay within a bounded staleness window.",
         "The listing cache is derived and rebuildable from posts' scores, so a cache loss is a recompute, not data loss."
       ],
       "view": {
@@ -991,7 +2175,11 @@
         ],
         "caption": "The post/comment service reads precomputed ranked listings from the ranked listing cache that the ranking worker keeps updated.",
         "links": [
-          "lb-post",
+          {
+            "from": "Client",
+            "to": "PostSvc",
+            "label": "read listing"
+          },
           "post-rankcache",
           "ranker-rankcache"
         ],
@@ -1009,7 +2197,7 @@
           "description": "The score worker maintains a sorted set of post ids per (community, sort), so a read is an O(1) top-N fetch from cache.",
           "pros": [
             "Per-(community, sort) sorted set the score worker updates as scores change; reads are an O(1) top-N fetch.",
-            "Meets the <200ms latency target without sorting the community per request.",
+            "Meets the p99 < 200 ms latency target without sorting the community per request.",
             "The cache is derived and rebuildable from posts' scores — a cache loss is a recompute, not data loss."
           ],
           "cons": [
@@ -1041,7 +2229,8 @@
               "read-path",
               "score-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-listings-opt1.jpg"
         },
         {
           "name": "Compute-on-read with short cache",
@@ -1087,17 +2276,22 @@
             "groups": [
               "read-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-listings-opt2.jpg"
         }
       ],
-      "decisionPrompt": "How do you serve a hot listing in <200 ms without sorting the whole community per request?",
+      "decisionPrompt": "How do you serve a hot listing in under 200 ms without sorting the whole community per request?",
       "patterns": [
         "Precomputed ranked listing"
       ],
       "probeLinks": [
+        "reddit-architecture",
         "tao-paper",
+        "facebook-memcache",
+        "redis-leaderboard",
         "redis-sorted-sets",
-        "twitter-algorithm"
+        "reddit-ios-feed",
+        "twitter-home-mixer"
       ],
       "whyNow": [
         "Precomputed listings are how the read-heavy latency target is met; framing the listing as derived/rebuildable is the reliability nuance."
@@ -1115,15 +2309,44 @@
         "before": "Sort per request.",
         "after": "O(1) listing reads from a maintained sorted set.",
         "newRisk": "Comments are the other big read — deep threads need their own model."
-      }
+      },
+      "traps": [
+        {
+          "trap": "Paginating ranked listings with a numeric offset (LIMIT/OFFSET or page numbers).",
+          "why": "Scores change while the user scrolls, so offset N shifts: a re-ranked post is shown twice or skipped.",
+          "instead": "Use a (score, post_id) seek cursor snapshotted against a short-lived listing version so the page is stable within a bounded staleness window."
+        },
+        {
+          "trap": "Caching top-1000 for all 100k communities, every sort and window, on one node.",
+          "why": "Real sorted-set overhead plus windows and replicas runs to tens of GB, not single-digit; cold communities waste most of it.",
+          "instead": "Cap coverage: top-1000 for active communities, top-100 for cold ones, evict idle sort/window sets, rebuild cold listings lazily on first read."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A user is mid-scroll on /hot when several posts on the page get re-ranked (a vote burst lands).",
+          "expectedBehavior": "The cursor snapshot pins the listing version, so the next page is computed against the snapshot the user started on — no duplicate or skipped posts within the bounded staleness window. A new session sees the fresh ranking.",
+          "mitigation": "Encode the listing version/token in the cursor; serve subsequent pages from that version until it expires, then transparently roll to the current version at a page boundary.",
+          "lesson": "Pagination stability is a snapshot/versioning problem, not a sort-order problem — bound staleness, don't chase perfect freshness mid-scroll."
+        },
+        {
+          "scenario": "A hot community's listing ZSET is lost (cache node eviction or failover).",
+          "expectedBehavior": "Reads briefly miss; the listing is rebuilt from posts' precomputed scores (it is derived state, not source of truth) while reads fall back to a read-through recompute of the top-N.",
+          "mitigation": "Rebuild on demand with a single-flight guard so one rebuild serves the thundering herd; serve a slightly stale replica copy meanwhile rather than recomputing per request.",
+          "lesson": "Framing the listing cache as rebuildable turns a 'cache outage' into a recompute latency blip, not a correctness or data-loss event."
+        }
+      ]
     },
     {
       "id": "comments",
       "title": "5. Threaded Comments",
       "description": [
         "Comments are nested arbitrarily deep. Storing only parent_id forces recursive queries to read a thread. Instead store a materialized path (the chain of ancestor ids) so any subtree is a prefix query and the whole thread sorts naturally.",
-        "Shard comments by post id so a thread lives together; sort siblings by their own (smaller) score. Cache hot threads' rendered/sorted trees since popular posts are read far more than written.",
-        "Load huge threads incrementally (top-level first, expand on demand) rather than shipping thousands of comments at once."
+        "Shard comments by post id so a thread lives together; sort siblings by their own (smaller) score, with created_at as a stable tiebreaker. Cache hot threads' rendered/sorted trees since popular posts are read far more than written; a new comment or comment vote invalidates (or patches) the affected thread-cache entry.",
+        "Comments are first-class voted items: a comment vote flows through the same idempotent vote pipeline with item_type=comment, so the comment score the sibling sort uses is maintained exactly like a post score.",
+        "Removed/deleted comments become tombstones rather than disappearing — a removed node collapses (its body hidden) but its visible-reply subtree is preserved, so children of a removed comment aren't orphaned. Reads filter on status.",
+        "Load huge threads incrementally rather than shipping thousands of comments at once: return top-level (and a shallow depth of) the highest-scored siblings first, with a moreChildren cursor per subtree so the client expands deeper branches on demand. The cursor is a (score, comment_id) seek within that parent's children.",
+        "Cap path length to keep prefix queries cheap and the encoding bounded: enforce a maximum reply depth (e.g. ~8–10, matching the read API's depth param). Beyond the cap, new replies don't deepen the path — they attach as 'continue this thread' continuation nodes (a flattened branch the client loads as a fresh subtree), so a pathological reply chain can't produce unbounded paths or recursive render blowups. Encode each path segment as a fixed-width id so the materialized path stays a compact, index-friendly prefix."
       ],
       "view": {
         "nodes": [
@@ -1134,7 +2357,11 @@
         ],
         "caption": "The post/comment service persists comments to the post store and reads the assembled comment tree from the comment tree cache for the client.",
         "links": [
-          "lb-post",
+          {
+            "from": "Client",
+            "to": "PostSvc",
+            "label": "read/write comment"
+          },
           "post-db",
           "post-commentcache"
         ],
@@ -1182,7 +2409,8 @@
             "groups": [
               "read-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-comments-opt1.jpg"
         },
         {
           "name": "Adjacency list (parent_id only)",
@@ -1227,7 +2455,8 @@
             "groups": [
               "read-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-comments-opt2.jpg"
         },
         {
           "name": "Closure table",
@@ -1274,7 +2503,8 @@
             "groups": [
               "read-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-comments-opt3.jpg"
         }
       ],
       "decisionPrompt": "A post has 10,000 nested comments. How do you store and read a subtree efficiently?",
@@ -1288,7 +2518,11 @@
         }
       ],
       "probeLinks": [
-        "tao-paper"
+        "reddit-architecture",
+        "tao-paper",
+        "facebook-memcache",
+        "postgres-ltree",
+        "cassandra-query-modeling"
       ],
       "patterns": [
         "Materialized-path comment tree"
@@ -1300,7 +2534,15 @@
         "before": "Recursive parent_id walks.",
         "after": "Subtree reads via path prefix; hot threads cached.",
         "newRisk": "Open voting invites manipulation — scores can be gamed."
-      }
+      },
+      "failureDrills": [
+        {
+          "scenario": "A new comment (or comment vote) lands on a post whose thread tree is in CommentCache being read by thousands of clients.",
+          "expectedBehavior": "The write invalidates or patches just the affected subtree-cache entry; concurrent readers either get the prior cached tree or the rebuilt one — never a half-updated tree. The new comment appears on the next read within the cache's staleness window.",
+          "mitigation": "Patch the cached subtree in place when cheap (insert one node, bump parent counts); fall back to invalidate-and-rebuild for the affected post under a single-flight guard so one rebuild serves the herd. Key the cache per post (and optionally per subtree) so a write to one thread never invalidates others.",
+          "lesson": "Hot-thread caches need write-time invalidation scoped to the smallest affected unit; coarse whole-post invalidation on every comment turns a popular thread into a rebuild storm."
+        }
+      ]
     },
     {
       "id": "fraud",
@@ -1308,7 +2550,9 @@
       "description": [
         "Open voting attracts ballot stuffing (sockpuppet accounts), brigading (coordinated external voting), and bots. The vote store's per-user records are the signal: detect anomalous patterns (many new accounts voting one post, correlated IPs/timing).",
         "Don't block synchronously — record the vote, then let the fraud service discount or strip illegitimate votes when scores recompute. Suspicious votes can be 'counted' to the voter but excluded from the real score (vote fuzzing / shadow handling).",
-        "Rate-limit voting and weight votes by account trust so manipulation is expensive and low-impact."
+        "Persist the verdict on the vote row (trust_status: counted | shadowed | discounted) alongside the signals that drove it — account age, IP/ASN, vote timing correlation, voter-cohort overlap. When a verdict changes (a vote previously counted is later judged fraudulent, or a flagged account is cleared), the fraud service re-emits a vote event with the new trust_status; the ranker re-reads the authoritative trust-weighted tally and the affected listings are recomputed and invalidated, so old scores don't stay poisoned.",
+        "Rate-limit voting and weight votes by account trust so manipulation is expensive and low-impact.",
+        "Govern the abuse signals: IP/ASN, device, and vote-timing-cohort features are sensitive (see the abuse_signals model). Access-control them, keep them short-retention (e.g. 30–90 days), prefer aggregated/hashed features over raw identifiers, and never expose them on read paths. Treat false positives as expected — bound and track the false-positive rate as an operational metric, and route appeals/reviews through the moderation audit log so a wrongly-discounted voter has a path to recovery."
       ],
       "view": {
         "nodes": [
@@ -1317,11 +2561,15 @@
           "VoteStore",
           "Ranker"
         ],
-        "caption": "The vote service asks the vote-fraud/abuse service whether each vote is legitimate while still recording votes to the store and feeding the ranking worker.",
+        "caption": "The vote service asks the vote-fraud/abuse service whether each vote is legitimate while still recording votes to the store; the fraud verdict feeds the ranking worker so suspicious votes are discounted at recompute.",
         "links": [
           "vote-fraud",
           "vote-store",
-          "eventq-ranker"
+          {
+            "from": "Fraud",
+            "to": "Ranker",
+            "label": "discount verdict"
+          }
         ],
         "highlight": [
           "Fraud"
@@ -1367,7 +2615,8 @@
             "groups": [
               "score-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-fraud-opt1.jpg"
         },
         {
           "name": "Synchronous block at vote time",
@@ -1406,7 +2655,8 @@
             "groups": [
               "score-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-fraud-opt2.jpg"
         },
         {
           "name": "Trust-weighted votes",
@@ -1451,7 +2701,8 @@
             "groups": [
               "score-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-fraud-opt3.jpg"
         }
       ],
       "decisionPrompt": "A post suddenly gets 5,000 upvotes from accounts created today. What should happen to its ranking?",
@@ -1459,10 +2710,11 @@
         "Abuse / fraud detection"
       ],
       "probeLinks": [
-        "reddit-sorts",
-        "hn-ranking",
-        "redis-sorted-sets",
-        "kafka-design"
+        "reddit-disrupting-communities",
+        "reddit-platform-safety",
+        "reddit-automoderator",
+        "kafka-design",
+        "dynamodb-condition-expressions"
       ],
       "whyNow": [
         "Vote integrity is an explicit requirement and the way ranking stays trustworthy; handling it asynchronously keeps the vote path fast."
@@ -1480,29 +2732,49 @@
         "before": "All votes counted equally.",
         "after": "Suspicious votes discounted in scoring; voting rate-limited.",
         "newRisk": "Viral posts and hot communities create read/recompute hotspots; moderation must reflect in listings."
-      }
+      },
+      "traps": [
+        {
+          "trap": "Treating a fraud verdict as permanent and never reversing a discount.",
+          "why": "False positives are unavoidable; a wrongly-discounted legit voter (or a cleared account) leaves listings permanently skewed and erodes trust.",
+          "instead": "Make verdicts reversible: re-emit a versioned vote event with the new trust_status, let the ranker re-read the authoritative trust-weighted tally, and recompute/invalidate affected listings. Keep a false-positive review/appeal path."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A batch of votes was discounted as a brigade, but review later clears the accounts (false positive).",
+          "expectedBehavior": "Flipping the verdict re-emits each affected vote with trust_status=counted at a new version; the ranker re-reads the trust-weighted tally and the post's score and listings are recomputed, so the post recovers its rightful rank without manual score editing.",
+          "mitigation": "Drive recovery through the same versioned vote-event pipeline as the original discount — never hand-patch scores. Track a false-positive rate metric and route appeals through the moderation audit log.",
+          "lesson": "Fraud handling must be a reversible, event-driven verdict layered over authoritative votes, not a destructive edit — recompute from source of truth on reversal."
+        }
+      ]
     },
     {
       "id": "scale-mod",
       "title": "7. Scaling, Hot Posts, and Moderation",
       "description": [
-        "Viral posts get extreme read and vote concurrency. Reads are already served from the listing/comment caches; for vote write bursts, the queue absorbs them and the score worker batches recompute (you don't need per-vote reordering).",
-        "Moderation (removals, spam, shadow bans) must reflect in listings: removing a post evicts it from the ranked cache and hides its comments. Run a spam check on submit and let mods act asynchronously, with listings updated by the same worker that maintains them.",
-        "Shard posts/comments by id/post; replicate caches for read volume. Treat all ranked/comment caches as rebuildable derived state."
+        "Viral posts get extreme read and vote concurrency. Reads are already served from the listing/comment caches; for vote write bursts, the queue absorbs them and the score worker batches recompute (you don't need per-vote reordering). The queue gives backpressure: if the ranker falls behind on a spike, votes are still durably recorded and freshness degrades gracefully (a few extra seconds of lag) rather than dropping votes or stalling the write path.",
+        "Moderation (removals, spam, shadow bans) is a workflow, not just a cache op. A mod action writes authoritative status (removed/spam/shadowed + tombstone) to the post/comment store, emits an invalidation event, evicts/penalizes the item in the ranked cache, and invalidates the affected comment-cache entries so a removed subtree collapses. Reads filter on status, so even before caches catch up a removed item is hidden. Run a spam check on submit and let mods act asynchronously; propagation has a bounded freshness target (sub-second to a few seconds).",
+        "Shard posts/comments by id/post; replicate caches for read volume (and key listings by community so a hot community's reads spread across replicas, not one shard). Treat all ranked/comment caches as rebuildable derived state over the authoritative store.",
+        "A single viral post is a hot key on every axis — vote writes, events, score updates, listing writes, and listing reads all concentrate on it — so 'use a queue' is only half the answer. Spread each axis explicitly: (1) Hot write keys — partition vote rows by (user, item) so idempotency stays local to a partition and no single row is the bottleneck; emit events partitioned by item_id so one post's events land on one ordered partition (preserving version order) but different posts spread across partitions. (2) Coalesce score updates — the ranker collapses many vote events for one post over a short window (e.g. 1–2 s) into a single score recompute and a single set of listing writes, so a 5k-votes/sec post produces a handful of score updates per second, not 5k. (3) Cap write fanout — a score change updates a bounded set of listings (its community + the global candidate set + the relevant top-window); cold sort/window sets are not maintained eagerly. (4) Hot read keys — a viral post's listing/comment pages are served from replicated read-through caches with stale-while-revalidate (serve slightly stale, refresh in the background), optionally a short-TTL local/process cache and CDN/edge cache for the anonymous front page, so one popular listing key is fanned out across replicas and edges rather than hammering a single cache node."
       ],
       "view": {
         "nodes": [
           "PostSvc",
           "ModSvc",
+          "PostDB",
           "RankCache",
+          "CommentCache",
           "EventQ",
           "Ranker"
         ],
-        "caption": "The post/comment service runs submissions through the moderation service, which removes or penalizes entries in the ranked listing cache that the ranking worker also updates.",
+        "caption": "The post/comment service runs submissions through the moderation service, which writes authoritative status to the store and invalidates both the ranked listing and comment-tree caches; the event queue feeds the ranking worker that maintains the ranked cache.",
         "links": [
           "post-mod",
+          "mod-db",
           "mod-rankcache",
-          "vote-eventq",
+          "mod-commentcache",
+          "eventq-ranker",
           "ranker-rankcache"
         ],
         "highlight": [
@@ -1518,10 +2790,14 @@
         "Closing on hot-post scaling + moderation ties the ranking pipeline to operational reality and the moderation requirement."
       ],
       "probeLinks": [
-        "reddit-sorts",
-        "hn-ranking",
-        "redis-sorted-sets",
-        "kafka-design"
+        "reddit-architecture",
+        "facebook-memcache",
+        "dynamodb-partition-keys",
+        "kafka-design",
+        "kafka-processing-guarantees",
+        "reddit-platform-safety",
+        "reddit-automoderator",
+        "sre-monitoring"
       ],
       "recap": {
         "before": "Functional ranking + comments.",
@@ -1531,11 +2807,64 @@
       "bottlenecks": [
         {
           "issue": "A viral post floods the vote queue.",
-          "mitigation": "Batch score recompute; reordering can lag a few seconds (acceptable)."
+          "mitigation": "Batch score recompute; reordering can lag a few seconds (acceptable). The queue is the backpressure buffer — votes are recorded durably even when the ranker is behind."
         },
         {
           "issue": "Hot comment thread read storm.",
           "mitigation": "Comment-tree cache + incremental loading; replicate cache."
+        },
+        {
+          "issue": "One viral post is a hot key for writes and reads simultaneously.",
+          "mitigation": "Partition vote rows by (user,item) and events by item_id (order preserved per post, load spread across posts); coalesce many vote events for the post into one score recompute per short window; cap listing write fanout to the bounded set of listings it's in; serve its hot listing/comment pages from replicated read-through caches with stale-while-revalidate (plus optional edge/CDN cache for the anonymous front page)."
+        }
+      ],
+      "flows": [
+        {
+          "name": "Moderator removes a front-page post",
+          "note": "A mod removal writes authoritative status, then invalidates ranked and comment caches so the item disappears from listings and its subtree collapses.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "ModSvc",
+                "label": "Moderation Service"
+              },
+              {
+                "id": "PostDB",
+                "label": "Post Store"
+              },
+              {
+                "id": "RankCache",
+                "label": "Listing Cache"
+              },
+              {
+                "id": "CommentCache",
+                "label": "Comment Cache"
+              }
+            ],
+            "messages": [
+              {
+                "from": "ModSvc",
+                "to": "PostDB",
+                "arrow": "->>",
+                "label": "set status=removed + tombstone"
+              },
+              {
+                "from": "ModSvc",
+                "to": "RankCache",
+                "arrow": "->>",
+                "label": "evict from every listing it's in"
+              },
+              {
+                "from": "ModSvc",
+                "to": "CommentCache",
+                "arrow": "->>",
+                "label": "invalidate thread / collapse subtree"
+              }
+            ]
+          },
+          "highlight": [
+            "ModSvc"
+          ]
         }
       ],
       "failureDrills": [
@@ -1543,13 +2872,51 @@
           "scenario": "The ranked listing cache is lost.",
           "expectedBehavior": "Listings are rebuilt from posts' hot_scores by the score worker; reads briefly fall back to a DB sort.",
           "mitigation": "Treat listings as rebuildable derived state."
+        },
+        {
+          "scenario": "The vote queue lags badly during a viral spike.",
+          "expectedBehavior": "Votes are still durably recorded; ranking freshness slips a few seconds past the < 5 s target but no votes are lost and the write path stays fast.",
+          "mitigation": "Queue absorbs the burst; batch recompute drains it; alert on queue lag and rank-freshness SLO."
+        },
+        {
+          "scenario": "A moderator removes a post but the cache eviction event is delayed.",
+          "expectedBehavior": "The authoritative status flips immediately, so status-filtered reads hide the item even while the ranked/comment caches are briefly stale.",
+          "mitigation": "Filter on status at read time; bound mod-propagation freshness and reconcile caches against authoritative state."
+        },
+        {
+          "scenario": "A listing-cache shard is lost during front-page traffic.",
+          "expectedBehavior": "Reads for that shard fall back to a DB sort (slower, within degraded latency) while the worker rebuilds the sorted sets from hot_scores.",
+          "mitigation": "Replicate the cache tier and rebuild derived listings from authoritative scores."
+        },
+        {
+          "scenario": "One post goes massively viral: it becomes a hot key for vote writes, events, score updates, and listing/comment reads all at once.",
+          "expectedBehavior": "Vote writes stay spread because rows are partitioned by (user,item); its events land on one ordered partition so version order holds, but other posts' events spread across partitions. The ranker coalesces the flood of vote events into a handful of score recomputes per second and a bounded set of listing writes. Its hot listing/comment pages are served from replicated read-through caches (and edge cache for the anonymous front page) with stale-while-revalidate, so no single cache node or DB row melts.",
+          "mitigation": "Coalesce per-post score updates over a short window; cap listing write fanout; partition vote rows by (user,item) and events by item_id; serve hot read keys from replicas/edge with stale-while-revalidate; alert when a single key's QPS or a partition's lag crosses threshold.",
+          "lesson": "A queue alone doesn't solve hot keys — you must explicitly spread each axis (write, event, recompute, fanout, read) so one viral item can't concentrate load on a single row, partition, or cache node."
         }
-      ]
+      ],
+      "deepDives": [
+        {
+          "title": "Operational contracts (measurable SLOs + degraded paths)",
+          "points": [
+            "Ranking freshness: p99 score reflected in listings < 5 s after the vote (continuous events + periodic drift pass). Degraded: on queue lag, freshness slips a bounded few seconds; votes stay durably recorded and the write path stays fast.",
+            "Queue lag: consumer lag < 2 s; page on sustained lag that would push rank freshness past 5 s. Degraded: batch/coalesce recompute to drain faster and shed only non-critical recompute (e.g. cold windows) — never vote durability.",
+            "Listing snapshot TTL: the cursor token pins a listing version valid ~30–60 s, guaranteeing no duplicate or skipped post within that window. Past TTL the cursor rolls to the current version at a page boundary; a fresh session sees fresh ranking.",
+            "Listing cursor token contents: an opaque token of { scope, sort, window, listing_version, last (score, post_id) } — it bounds staleness and encodes the seek key. An invalid/expired token restarts from the current listing head.",
+            "Moderation propagation SLO: a removed item is hidden from reads immediately via the status filter; ranked/comment caches reconcile < 5 s; page if propagation exceeds ~30 s. Status-filtered reads hide the item even while caches are briefly stale.",
+            "Cache rebuild target: a lost listing/comment cache rebuilds from authoritative scores in < 60 s under a single-flight guard, hot keys first. During rebuild, reads fall back to a read-through DB sort (degraded latency) with no data loss.",
+            "RankCache degraded-read path: while RankCache is rebuilding, serve from a replica or a read-through recompute of top-N; a single-flight rebuild serves the herd and a slightly stale replica copy is served meanwhile rather than recomputing per request.",
+            "Fraud false-positive rate: tracked and bounded, with reversible verdicts via re-emitted vote events and appeals logged in moderation_actions; cleared accounts' votes are re-counted by recompute from source of truth, never by hand-editing scores.",
+            "Observability: one dashboard ties p99 listing/comment read latency, rank freshness, queue lag, cache hit rate, moderation propagation delay, and fraud false-positive rate together — each with a page threshold mapped to the contract it protects."
+          ]
+        }
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/07-scale-mod.jpg"
     }
   ],
   "finalDesign": {
     "title": "Final Design — Voting & Ranking Aggregator",
-    "description": "Votes are recorded idempotently per (user,item) and emitted as events; a score worker consumes them, applies fraud discounting, computes a time-decay hot score, and maintains precomputed ranked listings (sorted sets) per community/front page. Listing reads are O(1) cache lookups; threaded comments use a materialized path (sharded by post) with hot threads cached and loaded incrementally. Vote bursts are absorbed by the queue with batched recompute; moderation removes items from listings/comments; all ranked and comment caches are rebuildable derived state over the authoritative post store.",
+    "description": "Votes are recorded idempotently per (user, item_type, item) with a version, and emitted as versioned events { prev_direction, new_direction, trust_status }; a score worker consumes them idempotently, applies fraud discounting, computes a time-decay hot score (with a periodic drift pass), and maintains precomputed ranked listings (sorted sets) per (scope, sort[, window]) for community and global front page. Listing reads are O(1) cache lookups paginated by a (score, id) seek cursor; threaded comments use a materialized path (sharded by post) with status-driven tombstones, hot threads cached and loaded incrementally. Vote bursts are absorbed by the queue with batched recompute and graceful freshness degradation; moderation writes authoritative post/comment status (with a moderation_actions audit log for who/why/restore) and invalidates both the ranked listing cache and the comment-tree cache. A single viral post is spread across every axis — vote rows partitioned by (user,item), events by item_id, per-post score updates coalesced over a short window, bounded listing write fanout, and hot read keys served from replicated/edge caches with stale-while-revalidate — so no one item becomes a hot key. The whole thing runs to measurable operational contracts (see Step 7): rank freshness < 5 s, bounded queue lag, listing-snapshot TTL on cursor tokens, sub-5 s moderation propagation, < 60 s cache rebuild, and a tracked fraud false-positive rate. The authoritative post/comment/vote stores are the source of truth; all ranked and comment caches are rebuildable derived state over them.",
     "view": {
       "nodes": [
         "Client",
@@ -1580,13 +2947,16 @@
         "ranker-db",
         "ranker-rankcache",
         "mod-rankcache",
+        "mod-db",
+        "mod-commentcache",
         "post-mod"
       ],
       "groups": [
         "read-path",
         "score-path"
       ]
-    }
+    },
+    "aiVisual": "assets/generated/ai-visuals/final-design.jpg"
   },
   "satisfies": {
     "functional": [
@@ -1595,14 +2965,16 @@
         "how": "Post service persists; spam-checked on submit.",
         "steps": [
           "scale-mod"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-01-submit-posts.jpg"
       },
       {
         "requirement": "Vote once per item",
         "how": "Idempotent per-(user,item) vote store.",
         "steps": [
           "voting"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-02-vote-once-per-item.jpg"
       },
       {
         "requirement": "Ranked listings (hot/top/new)",
@@ -1610,21 +2982,24 @@
         "steps": [
           "ranking",
           "listings"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-03-ranked-listings-hot-top-new.jpg"
       },
       {
         "requirement": "Threaded comments",
         "how": "Materialized-path tree, cached and incremental.",
         "steps": [
           "comments"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-04-threaded-comments.jpg"
       },
       {
         "requirement": "Moderation reflected",
-        "how": "Removals evict from ranked/comment caches.",
+        "how": "Mod action writes authoritative status + tombstone, then invalidates ranked and comment caches; reads filter on status.",
         "steps": [
           "scale-mod"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-05-moderation-reflected.jpg"
       }
     ],
     "nonFunctional": [
@@ -1633,7 +3008,8 @@
         "how": "Precomputed sorted-set listings, O(1) reads.",
         "steps": [
           "listings"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-01-fast-listing-reads.jpg"
       },
       {
         "requirement": "Vote integrity",
@@ -1641,21 +3017,35 @@
         "steps": [
           "voting",
           "fraud"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-02-vote-integrity.jpg"
       },
       {
         "requirement": "Eventually-consistent ranking",
         "how": "Async score recompute via queue.",
         "steps": [
           "ranking"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-03-eventually-consistent-ranking.jpg"
       },
       {
         "requirement": "Scale to viral posts",
         "how": "Caches for reads, batched recompute for vote bursts.",
         "steps": [
           "scale-mod"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-04-scale-to-viral-posts.jpg"
+      },
+      {
+        "requirement": "Read-heavy traffic mix (reads >> votes >> posts)",
+        "how": "Reads are served from derived caches — precomputed sorted-set listings and hot comment-tree caches — so the dominant ~150k listing + ~50k comment reads/sec never touch the authoritative store on the hot path. Writes (votes, comments) are recorded fast and processed asynchronously, with viral hot keys spread across partitions and replicated/edge caches so a single popular item can't concentrate load.",
+        "steps": [
+          "listings",
+          "comments",
+          "voting",
+          "scale-mod"
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-05-read-heavy-traffic-mix-reads-votes-posts.jpg"
       }
     ]
   },
@@ -1665,26 +3055,27 @@
       "time": "first 5 min",
       "say": [
         "Confirm read-heavy: listings + comments dominate votes dominate posts.",
-        "Pin fast precomputed listings and vote integrity as the hard goals.",
-        "Agree ranking is eventually consistent (seconds), not per-vote."
+        "Put numbers on it: ~150k listing reads/s, ~10k votes/s, viral-post bursts ~5k votes/s on one post — this justifies cache-served reads and async scoring.",
+        "Pin fast precomputed listings (p99 < 200 ms) and vote integrity as the hard goals.",
+        "Agree ranking is eventually consistent (< 5 s), not per-vote."
       ]
     },
     {
       "phase": "High-level design",
       "time": "next 10 min",
       "say": [
-        "Idempotent voting recorded fast, scored async.",
-        "Time-decay hot score from votes + age.",
-        "Precomputed ranked listings for O(1) reads."
+        "Idempotent voting recorded fast (one row per (user, item_type, item), versioned event), scored async.",
+        "Time-decay hot score from votes + age, with a periodic drift pass for score decay.",
+        "Precomputed ranked listings for O(1) reads; hot/top/new each maintained differently; (score, id) seek cursor for stable paging."
       ]
     },
     {
       "phase": "Deep dive",
       "time": "next 15 min",
       "say": [
-        "Threaded comments via materialized path.",
-        "Vote-fraud detection and discounting.",
-        "Viral-post scaling and moderation propagation."
+        "Threaded comments via materialized path; comments are voted items too; removed nodes tombstone and collapse.",
+        "Vote-fraud detection and discounting; persist the verdict and re-rank when it changes.",
+        "Viral-post scaling (queue backpressure) and moderation propagation: authoritative status write then ranked + comment cache invalidation."
       ]
     },
     {
@@ -1692,7 +3083,7 @@
       "time": "final 5 min",
       "say": [
         "Map requirements to mechanisms.",
-        "Tradeoffs: ranking formula tuning, recompute lag, fraud false positives.",
+        "Tradeoffs: ranking formula tuning, recompute lag, fraud false positives, cursor staleness bound.",
         "Mention personalization and per-community ranking as extensions."
       ]
     }
@@ -1718,8 +3109,9 @@
       "level": "Staff",
       "expectations": [
         "Reasons about vote-fraud discounting and recompute batching.",
-        "Treats listings as rebuildable derived state.",
-        "Discusses ranking-formula tradeoffs and hot-post scaling precisely."
+        "Treats listings as rebuildable derived state and specifies versioned, idempotent vote events.",
+        "Discusses ranking-formula tradeoffs and hot-post scaling precisely.",
+        "Operates the system under viral traffic: rank-freshness SLO + queue-lag backpressure, fraud false-positive rate, and bounded moderation-propagation delay with status-filtered reads."
       ]
     }
   ],
@@ -1734,18 +3126,18 @@
     "links": [
       {
         "id": "reddit-sorts",
-        "group": "Content and Feeds",
-        "groupDescription": "Feeds, social graphs, ranking, media fanout, and high-volume social storage references.",
+        "group": "Ranking and Feed Algorithms",
+        "groupDescription": "Primary ranking formulas, feed pipelines, and content-distribution references.",
         "title": "Reddit Ranking Algorithms",
-        "url": "https://github.com/reddit-archive/reddit/blob/master/r2/r2/lib/db/_sorts.py",
+        "url": "https://github.com/reddit-archive/reddit/blob/master/r2/r2/lib/db/_sorts.pyx",
         "source": "Reddit",
         "type": "Repository",
         "why": "Original Reddit ranking code for hot, controversy, confidence, and time-decay formulas."
       },
       {
         "id": "hn-ranking",
-        "group": "Content and Feeds",
-        "groupDescription": "Feeds, social graphs, ranking, media fanout, and high-volume social storage references.",
+        "group": "Ranking and Feed Algorithms",
+        "groupDescription": "Primary ranking formulas, feed pipelines, and content-distribution references.",
         "title": "Hacker News Ranking Formula Discussion",
         "url": "https://news.ycombinator.com/item?id=1781013",
         "source": "Hacker News",
@@ -1753,14 +3145,35 @@
         "why": "Primary HN community discussion pointing to the ranking formula and its tradeoffs."
       },
       {
+        "id": "hn-pg-formula",
+        "group": "Ranking and Feed Algorithms",
+        "groupDescription": "Primary ranking formulas, feed pipelines, and content-distribution references.",
+        "title": "News.YC Ranking Formula",
+        "url": "https://news.ycombinator.com/item?id=231209",
+        "source": "Hacker News / Paul Graham",
+        "type": "Discussion",
+        "why": "Gives the compact points-and-age formula that motivates HN-style gravity ranking.",
+        "year": "2008"
+      },
+      {
         "id": "redis-sorted-sets",
-        "group": "Distributed Data",
-        "groupDescription": "Primary papers and docs for storage, replication, partitioning, consistency, and caching.",
+        "group": "Storage, Caching, and Data Modeling",
+        "groupDescription": "Docs and papers for the stores, indexes, caches, and query-shaped data models behind ranked feeds.",
         "title": "Redis Sorted Sets",
         "url": "https://redis.io/docs/latest/develop/data-types/sorted-sets/",
         "source": "Redis",
         "type": "Docs",
         "why": "A concrete primitive for leaderboards, rankings, time windows, and ordered feeds."
+      },
+      {
+        "id": "redis-leaderboard",
+        "group": "Storage, Caching, and Data Modeling",
+        "groupDescription": "Docs and papers for the stores, indexes, caches, and query-shaped data models behind ranked feeds.",
+        "title": "Redis Leaderboard",
+        "url": "https://redis.io/docs/latest/develop/use-cases/leaderboard/",
+        "source": "Redis",
+        "type": "Docs",
+        "why": "Connects sorted sets to continuously changing rankings and top-N reads, the same access pattern as hot listings."
       },
       {
         "id": "kafka-design",
@@ -1773,9 +3186,41 @@
         "why": "Explains Kafka's log, partitions, consumer groups, replication, and operational model."
       },
       {
+        "id": "kafka-processing-guarantees",
+        "group": "Queues and Streams",
+        "groupDescription": "Messaging, event streaming, delivery semantics, and async processing references.",
+        "title": "Kafka Streams Processing Guarantees",
+        "url": "https://kafka.apache.org/33/streams/core-concepts/",
+        "source": "Apache Kafka",
+        "type": "Docs",
+        "why": "Clarifies at-least-once, idempotent producers, transactions, and why consumers still need idempotent application state."
+      },
+      {
+        "id": "reddit-architecture",
+        "group": "Company Implementations",
+        "groupDescription": "Real production architecture case studies for Reddit-like feeds and discussion systems.",
+        "title": "Reddit's Architecture",
+        "url": "https://archive.qconsf.com/system/files/presentation-slides/qconsf-20171113-reddits-architecture.pdf",
+        "source": "Reddit / QCon SF",
+        "type": "Case study",
+        "why": "Primary architecture deck covering listings, cached results, vote queues, anti-cheat processing, and comment-tree queues.",
+        "year": "2017"
+      },
+      {
+        "id": "reddit-ios-feed",
+        "group": "Company Implementations",
+        "groupDescription": "Real production architecture case studies for Reddit-like feeds and discussion systems.",
+        "title": "Building the Feed for the Reddit iOS App",
+        "url": "https://redditinc.com/news/building-the-feed-for-the-reddit-ios-app",
+        "source": "Reddit",
+        "type": "Case study",
+        "why": "Explains Reddit listing abstractions, pagination cursors, lightweight caching, and feed rendering performance.",
+        "year": "2017"
+      },
+      {
         "id": "tao-paper",
-        "group": "Content and Feeds",
-        "groupDescription": "Feeds, social graphs, ranking, media fanout, and high-volume social storage references.",
+        "group": "Storage, Caching, and Data Modeling",
+        "groupDescription": "Docs and papers for the stores, indexes, caches, and query-shaped data models behind ranked feeds.",
         "title": "TAO: Facebook's Distributed Data Store for the Social Graph",
         "url": "https://www.usenix.org/system/files/conference/atc13/atc13-bronson.pdf",
         "source": "Facebook / USENIX",
@@ -1784,9 +3229,60 @@
         "year": "2013"
       },
       {
+        "id": "facebook-memcache",
+        "group": "Storage, Caching, and Data Modeling",
+        "groupDescription": "Docs and papers for the stores, indexes, caches, and query-shaped data models behind ranked feeds.",
+        "title": "Scaling Memcache at Facebook",
+        "url": "https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala",
+        "source": "Facebook / USENIX",
+        "type": "Paper",
+        "why": "Shows production cache scaling, invalidation, replication, and operational tradeoffs for very read-heavy social systems.",
+        "year": "2013"
+      },
+      {
+        "id": "postgres-ltree",
+        "group": "Storage, Caching, and Data Modeling",
+        "groupDescription": "Docs and papers for the stores, indexes, caches, and query-shaped data models behind ranked feeds.",
+        "title": "PostgreSQL ltree",
+        "url": "https://www.postgresql.org/docs/current/ltree.html",
+        "source": "PostgreSQL",
+        "type": "Docs",
+        "why": "Official materialized-path data type reference for storing and querying hierarchical comment trees."
+      },
+      {
+        "id": "cassandra-query-modeling",
+        "group": "Storage, Caching, and Data Modeling",
+        "groupDescription": "Docs and papers for the stores, indexes, caches, and query-shaped data models behind ranked feeds.",
+        "title": "Cassandra Query-First Data Modeling",
+        "url": "https://cassandra.apache.org/doc/latest/cassandra/developing/data-modeling/data-modeling_rdbms.html",
+        "source": "Apache Cassandra",
+        "type": "Docs",
+        "why": "Explains query-shaped, denormalized tables and why prebuilt read models fit high-scale listing and thread reads."
+      },
+      {
+        "id": "dynamodb-condition-expressions",
+        "group": "Storage, Caching, and Data Modeling",
+        "groupDescription": "Docs and papers for the stores, indexes, caches, and query-shaped data models behind ranked feeds.",
+        "title": "DynamoDB Condition Expressions",
+        "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html",
+        "source": "AWS",
+        "type": "Docs",
+        "why": "Shows conditional writes such as attribute_not_exists, useful for idempotent vote rows and safe retries."
+      },
+      {
+        "id": "dynamodb-partition-keys",
+        "group": "Storage, Caching, and Data Modeling",
+        "groupDescription": "Docs and papers for the stores, indexes, caches, and query-shaped data models behind ranked feeds.",
+        "title": "DynamoDB Partition Key Best Practices",
+        "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html",
+        "source": "AWS",
+        "type": "Docs",
+        "why": "Grounds the hot-key discussion in partition-key design, uniform activity, and per-partition capacity limits."
+      },
+      {
         "id": "twitter-algorithm",
-        "group": "Content and Feeds",
-        "groupDescription": "Feeds, social graphs, ranking, media fanout, and high-volume social storage references.",
+        "group": "Ranking and Feed Algorithms",
+        "groupDescription": "Primary ranking formulas, feed pipelines, and content-distribution references.",
         "title": "The X Recommendation Algorithm",
         "url": "https://github.com/twitter/the-algorithm",
         "source": "X / Twitter",
@@ -1794,9 +3290,50 @@
         "why": "Public production-adjacent feed/ranking code for social timeline systems."
       },
       {
+        "id": "twitter-home-mixer",
+        "group": "Ranking and Feed Algorithms",
+        "groupDescription": "Primary ranking formulas, feed pipelines, and content-distribution references.",
+        "title": "Twitter Home Mixer",
+        "url": "https://github.com/twitter/the-algorithm/blob/main/home-mixer/README.md",
+        "source": "X / Twitter",
+        "type": "Repository",
+        "why": "Breaks a large feed into candidate generation, feature hydration, ranking, filters, pagination, observability, and serving stages."
+      },
+      {
+        "id": "reddit-platform-safety",
+        "group": "Abuse, Moderation, and Trust",
+        "groupDescription": "Sources for vote manipulation, automated moderation, safety tooling, and reversible enforcement workflows.",
+        "title": "Keeping Our Platform Safe",
+        "url": "https://redditinc.com/news/keeping-our-platform-safe",
+        "source": "Reddit",
+        "type": "Case study",
+        "why": "Describes Reddit's layered safety model, automated tooling, ML moderation, and moderator-facing safety tools.",
+        "year": "2024"
+      },
+      {
+        "id": "reddit-disrupting-communities",
+        "group": "Abuse, Moderation, and Trust",
+        "groupDescription": "Sources for vote manipulation, automated moderation, safety tooling, and reversible enforcement workflows.",
+        "title": "Disrupting Communities",
+        "url": "https://support.reddithelp.com/hc/en-us/articles/360043066412-Disrupting-Communities",
+        "source": "Reddit Help",
+        "type": "Docs",
+        "why": "Defines vote cheating, coordinated voting, ban evasion, and the signal aggregation model behind enforcement."
+      },
+      {
+        "id": "reddit-automoderator",
+        "group": "Abuse, Moderation, and Trust",
+        "groupDescription": "Sources for vote manipulation, automated moderation, safety tooling, and reversible enforcement workflows.",
+        "title": "Automoderator",
+        "url": "https://support.reddithelp.com/hc/en-us/articles/15484574206484-Automoderator",
+        "source": "Reddit Help",
+        "type": "Docs",
+        "why": "Concrete moderator workflow reference for automated filtering, review queues, action reasons, and community-specific rules."
+      },
+      {
         "id": "sre-monitoring",
-        "group": "Foundations",
-        "groupDescription": "Core system design references for scalability, reliability, and operating distributed services.",
+        "group": "Operations and Reliability",
+        "groupDescription": "Operating references for SLOs, monitoring, backpressure, cache health, and incident response.",
         "title": "Monitoring Distributed Systems",
         "url": "https://sre.google/sre-book/monitoring-distributed-systems/",
         "source": "Google SRE",
@@ -1807,5 +3344,10 @@
   },
   "assets": {
     "icon": "icon.png"
-  }
+  },
+  "aiVisuals": {
+    "requirements": "assets/generated/ai-visuals/requirements.jpg",
+    "capacity": "assets/generated/ai-visuals/capacity.jpg"
+  },
+  "explainerComic": "assets/generated/comic/interview-comic.jpg"
 }

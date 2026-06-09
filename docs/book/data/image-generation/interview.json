@@ -285,38 +285,58 @@
   },
   "capacity": [
     {
-      "label": "Requests",
-      "value": "high, bursty",
-      "note": "Far exceed instantaneous GPU capacity."
+      "label": "Example workload",
+      "value": "~2M images/day",
+      "note": "~1M requests/day, avg n≈2 images/request. Mix: ~70% free, ~25% paid, ~5% realtime; ~80% at 1024px, ~20% at 512px."
+    },
+    {
+      "label": "Peak submit QPS",
+      "value": "~200 submits/sec",
+      "note": "Bursty: ~24 images/sec average, but diurnal + viral peaks push 5–10× the mean for short windows. At ~200 submits/sec with n≈2 that's ~400 images/sec incoming."
+    },
+    {
+      "label": "Admission / backlog policy",
+      "value": "provision for SLO, queue the rest",
+      "note": "Serving 400 images/sec immediately would need ~357 GPUs (400 ÷ 1.6 ÷ 0.7) — far above the ~21-GPU steady fleet. We don't size for peak: reserve a realtime/paid slice (steady fleet + a burst pool to ~100 GPUs) and let free-tier queue or shed under burst. Realtime/paid are admission-limited to their reserved capacity; free is best-effort with ETA or throttling."
+    },
+    {
+      "label": "Seconds per image",
+      "value": "~4 s @ 1024px (30 steps), unbatched",
+      "note": "Diffusion is step-bound; a batch of 16 runs in ~10 s, so batching gives ~6× the per-GPU throughput of single-image passes."
+    },
+    {
+      "label": "Images/sec/GPU",
+      "value": "~0.25 unbatched → ~1.6 batched",
+      "note": "16-image batch in ~10 s ≈ 1.6 images/sec/GPU. At ~24 images/sec mean and 70% target utilization that's ~21 GPUs steady-state, headroom to ~100+ for peaks."
+    },
+    {
+      "label": "Queue wait by tier",
+      "value": "realtime <2 s p95 · paid <30 s p95 · free best-effort",
+      "note": "These SLOs are enforced by admission control, not by over-provisioning: realtime/paid are capped to their reserved GPU slice so their waits stay bounded; free drains from the remaining capacity and absorbs backlog (minutes under burst), with an ETA shown rather than dropped work."
+    },
+    {
+      "label": "Result size & storage",
+      "value": "~1.5 MB/image · ~3 TB/day written",
+      "note": "2M images/day × ~1.5 MB. 30-day retention ≈ ~90 TB object-store footprint before tier-based expiry."
+    },
+    {
+      "label": "CDN egress",
+      "value": "~3–10 MB read per image",
+      "note": "Each image fetched 2–5× (UI render, downloads, shares); CDN absorbs the read fanout so workers/origin never serve it."
     },
     {
       "label": "GPUs",
       "value": "scarce / costly",
       "note": "The bottleneck resource; utilization is the headline metric."
-    },
-    {
-      "label": "Time per image",
-      "value": "~seconds",
-      "note": "Diffusion steps; batching amortizes overhead."
-    },
-    {
-      "label": "Result size",
-      "value": "~MBs",
-      "note": "Stored in object storage, served via CDN."
-    },
-    {
-      "label": "Tiers",
-      "value": "free / paid / realtime",
-      "note": "Drive priority and fairness."
     }
   ],
   "api": [
     {
       "method": "POST",
       "path": "/v1/generations",
-      "description": "Submit a generation job. Returns a job id immediately; processing is async.",
-      "request": "{ \"prompt\": \"a red bicycle\", \"size\": \"1024\", \"n\": 1, \"tier\": \"paid\" }",
-      "response": "{ \"jobId\": \"j_9\", \"status\": \"queued\" }",
+      "description": "Submit a generation job. Returns a job id immediately; processing is async. An Idempotency-Key header dedupes client retries (same key + fingerprint returns the original job, never a new one). Optional callbackUrl registers a per-job completion webhook: on completion the service POSTs a signed event { eventId, jobId, status, images? } to that URL, HMAC-signed with the caller's secret and retried with backoff (dead-lettered after N attempts); consumers dedupe on eventId. For callers that prefer not to register a URL per request, an account-level endpoint can be configured out of band — the per-request callbackUrl is the in-scope path here.",
+      "request": "Idempotency-Key: c_4f2\n{ \"prompt\": \"a red bicycle\", \"size\": \"1024\", \"n\": 1, \"model\": \"sdxl\", \"tier\": \"paid\", \"callbackUrl\": \"https://caller/hook\" }",
+      "response": "{ \"jobId\": \"j_9\", \"status\": \"queued\", \"createdAt\": \"2026-06-08T10:00:00Z\" }",
       "sequence": {
         "participants": [
           {
@@ -393,15 +413,29 @@
     {
       "method": "GET",
       "path": "/v1/generations/{id}",
-      "description": "Poll job status / get result URLs when ready.",
-      "request": "(id in path)",
-      "response": "{ \"jobId\": \"j_9\", \"status\": \"done\", \"images\": [\"https://cdn/...\"] }"
+      "description": "Poll job status / get result URLs when ready. Authorized to the owning user (or API client); returns status, reason, timestamps, model version, and per-image delivery metadata. Image URLs are short-lived signed CDN links scoped to the owner.",
+      "request": "(id in path; Authorization: Bearer <token>)",
+      "response": "{ \"jobId\": \"j_9\", \"status\": \"done\", \"statusReason\": null, \"modelVersion\": \"sdxl-1.0.3\", \"createdAt\": \"...\", \"completedAt\": \"...\", \"images\": [{ \"url\": \"https://cdn/...?sig=...\", \"expiresAt\": \"2026-06-08T11:00:00Z\", \"contentType\": \"image/png\", \"sizeBytes\": 1572864 }] }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/generations/{id}:cancel",
+      "description": "Cancel a queued or running job (owner-authorized). If still queued, it's removed from the queue and marked canceled — no GPU is spent. If inference has already started, cancellation is best-effort: the current attempt's lease is allowed to finish (the GPU pass is non-preemptible mid-batch) but the result is discarded and not delivered. Idempotent: canceling an already-terminal job returns its current state.",
+      "request": "(id in path; Authorization: Bearer <token>)",
+      "response": "{ \"jobId\": \"j_9\", \"status\": \"canceled\", \"canceledAt\": \"...\" }"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/generations/{id}",
+      "description": "User-requested deletion of a generation and its images (owner-authorized). Tombstones the generated_images rows (sets deleted_at), purges the objects from the result store, and invalidates CDN cache / outstanding signed URLs. The job record is retained (in a deleted state) for audit/billing until its retention window expires.",
+      "request": "(id in path; Authorization: Bearer <token>)",
+      "response": "{ \"jobId\": \"j_9\", \"status\": \"deleted\", \"deletedAt\": \"...\" }"
     }
   ],
   "dataModel": [
     {
       "name": "jobs",
-      "note": "Authoritative job record and lifecycle.",
+      "note": "Authoritative job record and lifecycle; JobDB is the source of truth, not the queue or scheduler.",
       "fields": [
         {
           "name": "job_id",
@@ -416,38 +450,304 @@
           "type": "enum(free, paid, realtime)"
         },
         {
+          "name": "priority",
+          "type": "smallint (scheduler order)"
+        },
+        {
+          "name": "dedupe_key",
+          "type": "text (user_id + request fingerprint)"
+        },
+        {
           "name": "prompt",
           "type": "text"
         },
         {
           "name": "params",
-          "type": "json (size, n, model)"
+          "type": "json (size, n, model, lora/options)"
+        },
+        {
+          "name": "model_version",
+          "type": "text (pinned at submit or first run)"
         },
         {
           "name": "status",
-          "type": "enum(queued, running, done, blocked, failed)"
+          "type": "enum(queued, running, done, blocked_input, blocked_output, failed, canceled, deleted)"
         },
         {
-          "name": "result_keys",
-          "type": "list<object-store key>"
+          "name": "blocked_reason",
+          "type": "text null (policy/reason code)"
+        },
+        {
+          "name": "failure_reason",
+          "type": "text null"
+        },
+        {
+          "name": "queued_at / started_at / completed_at",
+          "type": "timestamptz"
+        },
+        {
+          "name": "retention_expires_at",
+          "type": "timestamptz (plan-driven)"
+        }
+      ]
+    },
+    {
+      "name": "job_attempts",
+      "note": "One row per execution try; supports lease/fencing, crash recovery, and dead-lettering.",
+      "fields": [
+        {
+          "name": "attempt_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "job_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "worker_id",
+          "type": "text"
+        },
+        {
+          "name": "model_version",
+          "type": "text (version actually run)"
+        },
+        {
+          "name": "status",
+          "type": "enum(running, succeeded, failed, lost)"
+        },
+        {
+          "name": "started_at / heartbeat_at / finished_at",
+          "type": "timestamptz"
+        },
+        {
+          "name": "lease_expires_at",
+          "type": "timestamptz (visibility timeout)"
+        },
+        {
+          "name": "attempt_no",
+          "type": "int (retry count; dead-letter past N)"
+        },
+        {
+          "name": "error_code",
+          "type": "text null (OOM, preempted, timeout)"
+        }
+      ]
+    },
+    {
+      "name": "idempotency_keys",
+      "note": "Submit-dedup so a retrying client never spawns a duplicate GPU job.",
+      "fields": [
+        {
+          "name": "key",
+          "type": "text PK (client Idempotency-Key)"
+        },
+        {
+          "name": "user_id",
+          "type": "bigint"
+        },
+        {
+          "name": "request_fingerprint",
+          "type": "text (hash of prompt+params)"
+        },
+        {
+          "name": "job_id",
+          "type": "uuid (job created for this key)"
+        },
+        {
+          "name": "created_at / expires_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "outbox_events",
+      "note": "Transactional outbox bridging the JobDB→queue gap: written in the same transaction as the job, so an accepted job always has a durable, recoverable path into scheduling even if the API crashes before publishing.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "job_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "payload",
+          "type": "json (job_id + tier only; worker fetches the rest from JobDB)"
+        },
+        {
+          "name": "status",
+          "type": "enum(pending, published)"
+        },
+        {
+          "name": "created_at / published_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "generated_images",
+      "note": "Per-image artifact metadata; replaces the opaque result_keys list.",
+      "fields": [
+        {
+          "name": "image_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "job_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "object_key",
+          "type": "text (result store key)"
+        },
+        {
+          "name": "size_bytes / mime_type / checksum",
+          "type": "bigint / text / text"
+        },
+        {
+          "name": "safety_status",
+          "type": "enum(safe, blocked, review)"
+        },
+        {
+          "name": "cdn_url_expires_at",
+          "type": "timestamptz (signed URL expiry)"
+        },
+        {
+          "name": "deleted_at",
+          "type": "timestamptz null (retention/user deletion)"
+        }
+      ]
+    },
+    {
+      "name": "safety_decisions",
+      "note": "Audit trail for input and output moderation; explainable for support, abuse review, and compliance.",
+      "fields": [
+        {
+          "name": "decision_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "job_id / image_id",
+          "type": "uuid (image_id null for input checks)"
+        },
+        {
+          "name": "stage",
+          "type": "enum(input, output)"
+        },
+        {
+          "name": "policy_version / classifier_version",
+          "type": "text"
+        },
+        {
+          "name": "decision",
+          "type": "enum(allow, block, uncertain, manual_review)"
+        },
+        {
+          "name": "reason_code / score",
+          "type": "text / float"
+        },
+        {
+          "name": "reviewer / appeal_state",
+          "type": "text null (if manual review)"
+        },
+        {
+          "name": "decided_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "model_versions",
+      "note": "Model catalog and rollout state; the model_version pinned on a job (at submit) resolves here so batching, safety policy, and reproducibility are version-aware.",
+      "fields": [
+        {
+          "name": "model_version",
+          "type": "text PK (e.g. sdxl-1.0.3)"
+        },
+        {
+          "name": "model_family",
+          "type": "text (sdxl, sd3, ...)"
+        },
+        {
+          "name": "status",
+          "type": "enum(active, canary, deprecated, disabled)"
+        },
+        {
+          "name": "safety_policy_version",
+          "type": "text (compatible output-safety policy)"
+        },
+        {
+          "name": "artifact_path",
+          "type": "text (weights in ModelStore)"
+        },
+        {
+          "name": "rollout_pct",
+          "type": "smallint (canary traffic share)"
+        },
+        {
+          "name": "worker_pool",
+          "type": "text (pinned pool for this version/size)"
+        }
+      ]
+    },
+    {
+      "name": "webhook_deliveries",
+      "note": "Reliable server-to-server completion callbacks with signing, retry, and dead-letter.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid PK (idempotency token for consumer)"
+        },
+        {
+          "name": "job_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "endpoint_url",
+          "type": "text"
+        },
+        {
+          "name": "status",
+          "type": "enum(pending, delivered, retrying, dead_letter)"
+        },
+        {
+          "name": "attempts / next_retry_at",
+          "type": "int / timestamptz (backoff schedule)"
+        },
+        {
+          "name": "signature",
+          "type": "text (HMAC of payload)"
         }
       ]
     },
     {
       "name": "quotas",
-      "note": "Per-user limits.",
+      "note": "Per-user limits and fair-share accounting; richer than a single remaining integer.",
       "fields": [
         {
           "name": "user_id",
           "type": "bigint PK"
         },
         {
-          "name": "remaining",
-          "type": "int (rate/credit)"
+          "name": "tier",
+          "type": "enum(free, paid, realtime)"
         },
         {
-          "name": "tier",
-          "type": "enum"
+          "name": "credits_remaining",
+          "type": "int (model-cost-weighted)"
+        },
+        {
+          "name": "rate_window",
+          "type": "json (limit, window, burst)"
+        },
+        {
+          "name": "gpu_seconds_used",
+          "type": "bigint (fair-share accounting)"
+        },
+        {
+          "name": "reset_at",
+          "type": "timestamptz"
         }
       ]
     }
@@ -514,7 +814,7 @@
       "title": "1. Naive: Run the Model Synchronously in the Request",
       "description": [
         "Start with the simplest thing: when a prompt arrives, the API calls the diffusion model right there inside the request handler, waits for the GPU to produce the image (seconds), and returns it in the HTTP response. No queue, no job id — request in, image out.",
-        "It collapses immediately because GPUs are slow and scarce. Each request holds an HTTP connection (and a GPU) for many seconds, so a burst of requests instantly exhausts the GPU pool while everyone else's connections pile up and time out. There's no place to absorb the burst, no way to prioritize a paying user over a flood of free traffic, and no safety gate before expensive compute.",
+        "This is acceptable only for a toy demo or internal prototype — a single user, no bursts, no safety requirements. For bursty user-facing traffic it collapses immediately because GPUs are slow and scarce. Each request holds an HTTP connection (and a GPU) for many seconds, so a burst instantly exhausts the GPU pool while everyone else's connections pile up and time out. There's no place to absorb the burst, no way to prioritize a paying user over a flood of free traffic, and no safety gate before expensive compute.",
         "So the synchronous call motivates the whole async pipeline: accept and enqueue a job fast, schedule scarce GPUs fairly, batch inference, and screen for safety before and after generation."
       ],
       "view": {
@@ -541,10 +841,13 @@
         "Running the model inline makes the GPU bottleneck visceral — connections pile up and time out — which is exactly why the design accepts a job fast, queues it, and schedules scarce GPUs."
       ],
       "probeLinks": [
-        "triton-docs",
+        "stable-diffusion-paper",
+        "dalle2-clip-latents",
+        "imagen-paper",
         "diffusers-docs",
-        "vllm-docs",
-        "k8s-device-plugin"
+        "diffusers-optimization",
+        "ray-serve-stable-diffusion",
+        "triton-stable-diffusion"
       ],
       "recap": {
         "before": "Nothing.",
@@ -557,7 +860,8 @@
           "why": "Multi-second GPU work holds connections open, a burst exhausts the GPU pool and times out, and there's nowhere to prioritize or screen.",
           "instead": "Accept + persist + enqueue a job, return a job id fast, and process on the GPU fleet asynchronously."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/01-naive.jpg"
     },
     {
       "id": "intake",
@@ -565,6 +869,8 @@
       "description": [
         "Generation takes seconds, so it can't be synchronous. The API validates the request, checks the user's quota, persists a job record, and enqueues it — returning a job id immediately (202).",
         "Persisting before enqueueing means a crash never loses an accepted job; the queue is rebuildable from queued jobs. The client polls or subscribes for completion.",
+        "Make submit idempotent: a client Idempotency-Key (or a user_id + prompt/params fingerprint) is stored with the job so a retry returns the original job id instead of spawning a duplicate GPU run.",
+        "The durability invariant: every accepted job (every 202) has exactly one durable JobDB record and at least one recoverable path into scheduling. JobDB is the source of truth; the queue is operational and rebuildable. The failure-prone part is the write→publish bridge — if the API writes the job but crashes before publishing to the queue, the job must not be stranded. Close that gap with a transactional outbox: write the job and an outbox_events row in one DB transaction, then have a relay publish pending outbox rows to the queue and mark them published. Back it with a periodic sweeper that re-enqueues jobs stuck in queued with no live attempt. The queue message carries only job_id (+ tier); the worker fetches the authoritative prompt/params from JobDB, so a duplicate or stale queue message can't desync the source of truth.",
         "This async-job shape is the backbone: it decouples request rate from the (much smaller) GPU throughput."
       ],
       "view": {
@@ -599,10 +905,11 @@
         }
       ],
       "probeLinks": [
-        "triton-docs",
-        "vllm-docs",
-        "k8s-device-plugin",
-        "nvidia-mig"
+        "sagemaker-async-inference",
+        "sagemaker-async-autoscale",
+        "ray-serve-stable-diffusion",
+        "kueue-clusterqueue",
+        "s3-presigned-urls"
       ],
       "patterns": [
         "Async job + status"
@@ -615,6 +922,13 @@
         "after": "Jobs durably accepted and queued; fast response.",
         "newRisk": "Running disallowed prompts wastes scarce GPU and risks policy violations — screen first."
       },
+      "traps": [
+        {
+          "trap": "Enqueueing on every submit with no dedup, and publishing to the queue outside the DB transaction.",
+          "why": "A retrying client spawns duplicate GPU jobs (expensive), and a crash between the DB write and the queue publish leaves an accepted job that never runs.",
+          "instead": "Dedupe on an idempotency key / request fingerprint, and bridge the write→publish gap with a transactional outbox or a re-enqueue sweeper."
+        }
+      ],
       "flows": [
         {
           "name": "Async intake: screen, persist, enqueue",
@@ -696,7 +1010,8 @@
             "Queues"
           ]
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/02-intake.jpg"
     },
     {
       "id": "safety",
@@ -704,7 +1019,9 @@
       "description": [
         "Safety is mandatory and bookends the pipeline. Screen the prompt before any GPU work: a disallowed prompt is rejected at intake, saving expensive compute and preventing policy violations.",
         "Screen the output too: classify the generated image and block/flag unsafe results before they're delivered, since a benign-looking prompt can still produce disallowed content.",
-        "Input screening is cheap and synchronous at intake; output screening runs right after inference, before the result is stored/served. Log decisions for audit."
+        "Input screening is cheap and synchronous at intake; output screening runs right after inference, before the result is stored/served. Blocked is a terminal state with reason codes: distinguish blocked_input from blocked_output, and store the policy version, classifier version, decision, score, and reason for each check in a safety_decisions audit log so support, abuse review, and compliance can explain any block.",
+        "Operational policy: handle adversarial/jailbreak prompts and throttle repeat violators using abuse telemetry. Decide what happens to an unsafe generated image — delete immediately, or route to a restricted review bucket keyed by classifier metadata. When the safety service is down, too slow, or returns uncertain, fail closed (block or route to review) rather than fail open; never ship an unscreened image.",
+        "Scope note: for this 45-minute case, keep the automated gates and the audit log (safety_decisions records the uncertain/manual_review outcome and reviewer/appeal_state) as first-class, but treat the human moderation console and the user-facing appeals workflow as a follow-up — the design routes to review and records the decision, and a separate ops surface acts on that bucket."
       ],
       "view": {
         "nodes": [
@@ -740,10 +1057,11 @@
         }
       ],
       "probeLinks": [
-        "triton-docs",
-        "vllm-docs",
-        "k8s-device-plugin",
-        "nvidia-mig"
+        "dalle3-system-card",
+        "dalle2-pretraining-mitigations",
+        "vertex-imagen-safety",
+        "azure-content-safety-image",
+        "stable-diffusion-red-team"
       ],
       "patterns": [
         "Pre-inference safety gate"
@@ -761,16 +1079,31 @@
           "trap": "Only screening the prompt.",
           "why": "Models can produce disallowed content from innocuous prompts.",
           "instead": "Screen outputs too, before storing/serving."
+        },
+        {
+          "trap": "Failing open when the output safety classifier is down or uncertain.",
+          "why": "An unscreened or ambiguous image can be delivered, violating policy exactly when the safety system is degraded.",
+          "instead": "Fail closed: block or route to manual review, record the uncertain decision, and keep the job out of the user's hands until resolved."
         }
-      ]
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The output safety service is down or too slow.",
+          "expectedBehavior": "The job holds in a non-terminal state (or routes to review) rather than delivering an unscreened image; the GPU result is retained pending the safety verdict.",
+          "mitigation": "Fail closed by policy; retry/queue the safety check; alert on classifier availability and uncertain-rate spikes."
+        }
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/03-safety.jpg"
     },
     {
       "id": "schedule",
       "title": "4. Priority and Fair Scheduling",
       "description": [
         "GPUs are the scarce bottleneck and demand is bursty and multi-tier. Use per-tier priority queues (realtime > paid > free) so high-value/latency-sensitive work goes first, with fair-share so a flood of free requests doesn't starve paid users entirely.",
-        "A scheduler pulls from the queues honoring priority + fairness and assigns work to GPU workers. Quotas/rate limits at intake keep any one user from monopolizing the fleet.",
-        "When demand exceeds capacity, queue depth grows and you communicate wait/ETA — or shed/deprioritize free-tier — rather than dropping work."
+        "A scheduler pulls from the queues honoring priority + fairness and assigns work to GPU workers. Its inputs per job: tier, remaining user quota, model + size (batchability), deadline/SLO, age in queue, and expected runtime. Quotas/rate limits at intake keep any one user from monopolizing the fleet.",
+        "Make fairness measurable, because one 'request' isn't one unit of work — n images, larger resolution, and pricier models cost very differently. Account fair-share in GPU-seconds (or normalized model cost), not raw request count, using per-tier weights with fair-share floors and per-user deficit counters / token buckets. Separate the concerns: priority policy, admission control (quota), batch formation, and worker leasing are distinct.",
+        "Assign work via leases, not permanent ownership: a job is leased to a worker with a visibility timeout (the assignment lease) and a scheduler epoch/fencing token; the worker heartbeats while running. If the lease expires (crash, hang), the job is reassigned, and a late completion from the original worker is rejected by epoch so the job isn't double-completed.",
+        "Tie the policy to the capacity numbers: realtime/paid get a reserved GPU slice sized to their SLOs (realtime <2 s, paid <30 s p95) and are admission-limited to it, while free gets a fair-share floor that drains from the remaining capacity. When incoming work exceeds the available GPU-seconds — e.g. a viral burst pushing ~400 images/sec against a ~21-GPU steady fleet plus burst pool — realtime/paid stay within their reserved slice and only the free-tier queue grows. Then communicate wait/ETA, throttle, or shed free work rather than dropping accepted jobs or letting free starve paid."
       ],
       "view": {
         "nodes": [
@@ -823,7 +1156,8 @@
               "intake",
               "inference"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-schedule-opt1.jpg"
         },
         {
           "name": "Single FIFO queue + per-user rate limit",
@@ -859,7 +1193,8 @@
             "highlight": [
               "FIFO"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-schedule-opt2.jpg"
         },
         {
           "name": "Weighted fair queuing (DRR/WFQ)",
@@ -899,7 +1234,8 @@
             "highlight": [
               "WFQ"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-schedule-opt3.jpg"
         }
       ],
       "decisionPrompt": "Free users send 100x the volume of paid users. How do you keep paid latency low without starving free entirely?",
@@ -913,10 +1249,11 @@
         }
       ],
       "probeLinks": [
-        "k8s-device-plugin",
-        "nvidia-mig",
-        "triton-docs",
-        "vllm-docs"
+        "kueue-clusterqueue",
+        "k8s-gpu-scheduling",
+        "nvidia-mig-k8s",
+        "sagemaker-async-autoscale",
+        "diffserve-paper"
       ],
       "patterns": [
         "Priority / fair scheduling"
@@ -936,7 +1273,9 @@
       "description": [
         "Running one prompt per GPU pass wastes the hardware: model load and per-call overhead dominate. The scheduler batches compatible jobs (same model/size) into one GPU pass, dramatically raising throughput per GPU.",
         "Workers keep the model weights resident (loaded from the model store once) and process batches; trade a little latency (waiting to fill a batch) for large utilization gains — a tunable batch window.",
-        "Output goes through the safety filter, then to the result store. Workers report status back to the job store."
+        "Batch compatibility is the real constraint: a batch must share model + version, image size, precision, and any LoRA/control settings — version, not just family, because a canary build or different precision can't share a forward pass. Mixed traffic batches poorly, so the scheduler groups by this compatibility key and falls back to smaller (even single-job) passes when no compatible peers are waiting. Cap the batch by GPU memory and close it on a fill-window timeout so the first arrival isn't starved waiting for a full batch; on an OOM, split the batch and retry with a smaller one.",
+        "Model version is part of the compatibility key, so it must be pinned before scheduling. Pin it at submit by resolving the model catalog entry (including any canary rollout_pct): this gives reproducibility and lets the scheduler form version-coherent batches. Route hot model+version+size combos to dedicated warm worker pools so common traffic always finds a compatible peer. A canary version draws a small rollout share onto its own pool without contaminating the active version's batches; rollback flips the catalog status so no new jobs schedule onto it while in-flight jobs finish.",
+        "Output then goes through the safety filter — typically a separate classifier fleet so the safety model doesn't compete for the diffusion GPUs (co-located only if it fits in spare memory), using the safety policy version compatible with the model that produced the image — and on to the result store. Workers report status back to the job store, recording the model_version actually run."
       ],
       "view": {
         "nodes": [
@@ -995,7 +1334,8 @@
             "groups": [
               "inference"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-inference-opt1.jpg"
         },
         {
           "name": "One prompt per GPU pass (no batching)",
@@ -1026,7 +1366,8 @@
             "highlight": [
               "Workers"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-inference-opt2.jpg"
         },
         {
           "name": "Continuous (in-flight) batching",
@@ -1058,7 +1399,8 @@
               "Scheduler",
               "Workers"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-inference-opt3.jpg"
         }
       ],
       "decisionPrompt": "How do you raise images-per-GPU-hour without buying more GPUs?",
@@ -1072,10 +1414,14 @@
         }
       ],
       "probeLinks": [
-        "triton-docs",
-        "k8s-device-plugin",
-        "nvidia-mig",
-        "diffusers-docs"
+        "triton-dynamic-batching",
+        "triton-stable-diffusion",
+        "nvidia-sdxl-triton",
+        "pinterest-canvas",
+        "diffserve-paper",
+        "approximate-caching-diffusion",
+        "tridentserve-paper",
+        "diffusers-optimization"
       ],
       "patterns": [
         "Inference batching"
@@ -1092,6 +1438,21 @@
         {
           "issue": "Cold model load stalls a worker.",
           "mitigation": "Keep weights resident; pin workers to a model; warm pools per model."
+        },
+        {
+          "issue": "Too-large batch exceeds GPU memory (OOM).",
+          "mitigation": "Cap batch size by GPU memory; on OOM, split and retry with a smaller batch."
+        },
+        {
+          "issue": "Mixed model/size/LoRA traffic batches poorly.",
+          "mitigation": "Group by compatibility key; fall back to smaller/single passes; route hot model+size combos to dedicated warm pools."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A canary model version spikes the blocked-output or OOM rate.",
+          "expectedBehavior": "Only the canary's rollout share is affected; the active version keeps serving normally. Rollback flips the catalog status to deprecated/disabled so no new jobs schedule onto the canary, while in-flight canary jobs finish (or re-queue onto the active version) — existing job semantics are preserved.",
+          "mitigation": "Per-version worker pools and rollout_pct isolate the canary; monitor blocked-output and OOM rate per model_version; rollback is a catalog status flip, not a redeploy."
         }
       ],
       "flows": [
@@ -1183,8 +1544,9 @@
       "title": "6. Result Delivery",
       "description": [
         "Generated images (MBs each) go to object storage; serve them via CDN so the read fanout doesn't hit the workers or origin. The job record holds the result keys/URLs.",
-        "Notify the client on completion: a push/stream for realtime UIs, or polling for simple clients. For interactive use, you can stream progress (intermediate diffusion previews).",
-        "Signed, expiring URLs protect results; keep them only as long as needed per the user's plan."
+        "Notify the client on completion: a push/stream for realtime UIs, or polling for simple clients. For interactive use, you can stream progress as intermediate diffusion previews. Treat push/SSE/WebSocket as a hint, not a guarantee — on reconnect the client replays state from job status (the durable JobDB record), never from an in-memory stream, so a dropped connection can't lose a completion.",
+        "For server-to-server webhooks, sign the payload (HMAC), include a stable event id for consumer idempotency, retry on failure with backoff, and dead-letter after N attempts with operator escalation. Make consumers idempotent on the event id.",
+        "Results are user data: serve them through short-lived signed CDN URLs scoped to the owner (per-user signed URLs minted by the API, not public guessable links), with an explicit expires_at returned in the API. Retention and deletion are part of the design — shorter windows for free than paid, and honor user-requested deletion by tombstoning the generated_images row and purging the object + CDN cache."
       ],
       "view": {
         "nodes": [
@@ -1249,7 +1611,8 @@
             "groups": [
               "delivery"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-deliver-opt1.jpg"
         },
         {
           "name": "Client polls job status",
@@ -1284,7 +1647,8 @@
             "highlight": [
               "JobDB"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-deliver-opt2.jpg"
         },
         {
           "name": "Server-to-server webhook callback",
@@ -1323,7 +1687,8 @@
             "highlight": [
               "Webhook"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-deliver-opt3.jpg"
         }
       ],
       "decisionPrompt": "Thousands of clients fetch their finished images. What keeps that load off the GPU workers?",
@@ -1331,10 +1696,10 @@
         "Result store + CDN delivery"
       ],
       "probeLinks": [
-        "triton-docs",
-        "vllm-docs",
-        "k8s-device-plugin",
-        "nvidia-mig"
+        "cloudfront-signed-urls",
+        "s3-presigned-urls",
+        "gcs-signed-urls",
+        "sagemaker-async-inference"
       ],
       "whyNow": [
         "Delivery completes the async loop; CDN offload + completion notification is the standard, expected result path."
@@ -1358,9 +1723,10 @@
       "id": "reliability",
       "title": "7. Reliability, Utilization, and Cost",
       "description": [
-        "Make jobs idempotent and retryable (keyed by job id + attempt): a worker crash returns the job to the queue and another worker re-runs it; the partial output is discarded. Dead-letter repeatedly-failing jobs.",
-        "Keep GPUs busy: autoscale workers from queue depth, keep warm model pools to avoid cold starts, and consider cheaper spot/preemptible GPUs for free-tier batch work (with re-queue on preemption).",
-        "Track utilization and queue wait as the core operational signals; the whole design exists to keep the scarce, expensive GPUs near-fully utilized while honoring fairness and safety."
+        "This step has two halves: crash-safe execution (don't lose or double-run a job) and fleet utilization/cost (keep the scarce GPUs busy and cheap). Present them in that order.",
+        "Crash-safe execution. Make jobs idempotent and retryable (keyed by job id + attempt): each run is a job_attempts row with a worker lease and heartbeat. A worker crash lets the lease expire, so the job re-enters the queue and another worker re-runs it; the partial output is discarded and a late completion from the dead worker is fenced out by epoch so the job isn't double-completed. Dead-letter jobs past a retry threshold for inspection.",
+        "Fleet utilization and cost. Keep GPUs busy: autoscale workers from queue depth (and queue age by tier), keep warm model pools to avoid cold starts — note model-load latency can dominate autoscale response, so scale on a leading signal and pre-warm — and consider cheaper spot/preemptible GPUs for free-tier batch work (with re-queue on preemption).",
+        "Track a full operational picture, not just GPU utilization and queue wait, and tie each signal to a concrete response: queue age by tier → scale up / preempt or shed free-tier; OOM rate → lower the batch cap; model cache miss (cold-start) rate → pre-warm the pool for that version/size; batch fill ratio low → widen the fill window or consolidate pools; blocked-output spike → safety incident / canary rollback; retry/dead-letter count → inspect the dead-letter queue; cost per image (attributed by tier and model) → rebalance spot vs on-demand. The whole design exists to keep the scarce, expensive GPUs near-fully utilized while honoring fairness and safety."
       ],
       "view": {
         "nodes": [
@@ -1389,10 +1755,12 @@
         "Idempotent retryable jobs"
       ],
       "probeLinks": [
-        "triton-docs",
-        "diffusers-docs",
-        "vllm-docs",
-        "k8s-device-plugin"
+        "sagemaker-async-autoscale",
+        "dcgm-exporter",
+        "opentelemetry-genai",
+        "nvidia-mig-k8s",
+        "kueue-clusterqueue",
+        "approximate-caching-diffusion"
       ],
       "whyNow": [
         "Closing on reliability + utilization + cost ties the design to the headline metric (don't idle/waste GPUs) and the resilience requirement."
@@ -1412,13 +1780,19 @@
           "scenario": "A spot GPU is preempted.",
           "expectedBehavior": "Its in-flight job is re-queued (and re-prioritized if needed).",
           "mitigation": "Treat spot capacity as preemptible; re-queue on loss."
+        },
+        {
+          "scenario": "A 'dead' worker finishes late after its job was reassigned.",
+          "expectedBehavior": "The stale completion is rejected so the job isn't double-completed or its result double-stored.",
+          "mitigation": "Lease epoch / fencing token checked on completion; idempotent result write keyed by attempt."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/07-reliability.jpg"
     }
   ],
   "finalDesign": {
     "title": "Final Design — Text-to-Image Generation Platform",
-    "description": "The API screens the prompt (input safety), enforces quota, persists a job, and enqueues it by tier — returning a job id fast. A fair-share priority scheduler pulls from per-tier queues and assigns batched, compatible jobs to GPU workers that keep model weights resident. Outputs pass the output-safety filter, land in object storage, and are served via CDN; the client is notified or polls. Jobs are idempotent and retryable so worker/spot failures re-queue without loss; the GPU fleet autoscales from queue depth with warm model pools to maximize utilization of the scarce, expensive hardware.",
+    "description": "The API screens the prompt (input safety), enforces quota, persists a job, and enqueues it by tier — returning a job id fast. Two invariants anchor the design: (1) every accepted job has exactly one durable JobDB record and a recoverable path into scheduling — the job and an outbox row are written in one transaction and a relay (plus a re-enqueue sweeper) bridges the write→publish gap, with JobDB as source of truth and the queue carrying only job_id; and (2) model_version is pinned at submit from a model catalog, so batches are version-coherent, output safety uses the matching policy version, and canary/rollback is a catalog status flip onto isolated worker pools rather than a redeploy. A fair-share priority scheduler pulls from per-tier queues and assigns batched, compatible jobs (same model+version+size) to GPU workers that keep model weights resident. Outputs pass the output-safety filter, land in object storage, and are served via CDN; the client is notified or polls. Jobs are idempotent and retryable so worker/spot failures re-queue without loss; the GPU fleet autoscales from queue depth with warm model pools to maximize utilization of the scarce, expensive hardware.\n\nWorked example — a paid request for 4 images at 1024px arrives while ~20K free-tier images are backlogged. Intake: idempotency-key checked (new), prompt screened by input safety (allowed), job + 4-image fan-out persisted, enqueued on the paid queue, 202 returned in ~50 ms. Scheduling: the fair-share scheduler favors the paid queue (realtime > paid > free) and charges the user's GPU-seconds budget; the free backlog keeps draining on its floor so it isn't starved but also can't block the paid job. Batch formation: the 4 images (same model + 1024px) coalesce with other compatible paid jobs into a ≤16-image batch, closed by a ~50 ms fill window or memory cap. Inference: a worker with resident weights runs the batch in ~10 s under an assignment lease with heartbeats. Output safety: each image is screened (fail-closed if the classifier is down); safe images are written to the result store with metadata. Delivery: the job is marked done, a push notification (backed by status replay) fires, and the client fetches via short-lived signed CDN URLs. Failure path: if the worker crashes mid-batch, the lease expires, the job re-queues, another worker re-runs it idempotently, and a late completion from the dead worker is fenced out.",
     "view": {
       "nodes": [
         "Client",
@@ -1456,7 +1830,8 @@
         "inference",
         "delivery"
       ]
-    }
+    },
+    "aiVisual": "assets/generated/ai-visuals/final-design.jpg"
   },
   "satisfies": {
     "functional": [
@@ -1538,6 +1913,758 @@
       }
     ]
   },
+  "technologyChoices": [
+    {
+      "concern": "API edge, quotas, and abuse controls",
+      "steps": [
+        "intake",
+        "schedule",
+        "safety"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kong",
+          "icon": "assets/tech-icons/kong.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          },
+          {
+            "name": "WAF",
+            "icon": "assets/tech-icons/Arch_AWS-WAF_64.png"
+          },
+          {
+            "name": "Cognito",
+            "icon": "assets/tech-icons/Arch_Amazon-Cognito_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Endpoints",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Armor",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Identity Platform",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "API Management",
+            "icon": "assets/tech-icons/10042-icon-service-API-Management-Services.svg"
+          },
+          {
+            "name": "Application Gateway",
+            "icon": "assets/tech-icons/10076-icon-service-Application-Gateways.svg"
+          },
+          {
+            "name": "Microsoft Entra ID",
+            "icon": "assets/tech-icons/10231-icon-service-Entra-ID-Protection.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A managed API edge is the fastest way to get TLS termination, request shaping, WAF rules, identity hooks, and coarse quota enforcement in front of expensive GPU work.",
+        "Application-owned idempotency and safety decisions still belong behind the edge because only the generation API can replay the original response and persist policy audit state."
+      ],
+      "makesIrrelevant": "Edge quotas and WAF rules remove most custom reverse-proxy and coarse abuse-control code, but not per-job quota accounting or safety decisions."
+    },
+    {
+      "concern": "Authoritative job store, idempotency keys, and transactional outbox",
+      "steps": [
+        "intake",
+        "reliability"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "CockroachDB",
+          "icon": "assets/tech-icons/cockroach.png"
+        },
+        {
+          "name": "MySQL",
+          "icon": "assets/tech-icons/mysql.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Aurora",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Firestore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure SQL",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A relational job store gives transactions for jobs, idempotency keys, attempts, generated_images, safety_decisions, and the outbox bridge to queues.",
+        "A durable KV store is attractive for very high-rate idempotency and quota counters, but it is weaker as the single lifecycle ledger unless the job state machine is simple."
+      ],
+      "makesIrrelevant": "Conditional writes, unique constraints, TTL, and transactional outbox support remove most hand-built duplicate suppression and stranded-job cleanup logic."
+    },
+    {
+      "concern": "Priority queue, leasing, and dead-letter dispatch",
+      "steps": [
+        "intake",
+        "schedule",
+        "reliability"
+      ],
+      "selfHosted": [
+        {
+          "name": "RabbitMQ",
+          "icon": "assets/tech-icons/rabbitmq.png"
+        },
+        {
+          "name": "Redis Streams",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "NATS (JetStream)",
+          "icon": "assets/tech-icons/nats.png"
+        },
+        {
+          "name": "Redpanda",
+          "icon": "assets/tech-icons/redpanda.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          },
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Queue Storage",
+            "icon": "assets/tech-icons/10840-icon-service-Storage-Queue.svg"
+          },
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Queues with visibility timeouts, DLQs, and per-tier streams fit job assignment, retry, and backpressure without making the queue the source of truth.",
+        "Kafka-style logs add replay and consumer fanout, but a simpler queue is usually enough when JobDB owns lifecycle and the message carries only job_id plus tier."
+      ],
+      "makesIrrelevant": "Native leases, redelivery, and DLQs remove most custom retry timers and stuck-message sweeper code."
+    },
+    {
+      "concern": "GPU model serving / inference runtime",
+      "steps": [
+        "inference"
+      ],
+      "selfHosted": [
+        {
+          "name": "NVIDIA Triton Inference Server",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "KServe",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Ray Serve",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "TorchServe",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Diffusers on custom workers",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SageMaker async/real-time endpoints",
+            "icon": "assets/tech-icons/Arch_Amazon-SageMaker-AI_64.png"
+          },
+          {
+            "name": "Bedrock (managed image models)",
+            "icon": "assets/tech-icons/Arch_Amazon-Bedrock_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Vertex AI prediction endpoints",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          },
+          {
+            "name": "Imagen on Vertex",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure ML managed endpoints",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Azure OpenAI GPT-image series",
+            "icon": "assets/tech-icons/03438-icon-service-Azure-OpenAI.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Self-hosted serving gives control over dynamic batching, resident weights, precision, GPU placement, and model compatibility keys.",
+        "Managed model endpoints reduce serving operations but can limit batching policy, GPU economics, custom weights, and safety-policy integration."
+      ],
+      "makesIrrelevant": "A fully managed image-model API can remove the worker fleet, scheduler, and batching logic entirely, at the cost of custom-model and utilization control."
+    },
+    {
+      "concern": "GPU scheduling, autoscaling, and warm pools",
+      "steps": [
+        "schedule",
+        "inference",
+        "reliability"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kubernetes + NVIDIA device plugin",
+          "icon": "assets/tech-icons/kubernetes.png"
+        },
+        {
+          "name": "Kueue / Volcano (batch GPU scheduling)",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Ray",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Slurm",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "NVIDIA DCGM",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "EKS + GPU nodes",
+            "icon": "assets/tech-icons/Arch_Amazon-Elastic-Kubernetes-Service_64.png"
+          },
+          {
+            "name": "AWS Batch",
+            "icon": "assets/tech-icons/Arch_AWS-Batch_64.png"
+          },
+          {
+            "name": "Auto Scaling",
+            "icon": "assets/tech-icons/Arch_AWS-Auto-Scaling_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "GKE + GPU node pools",
+            "icon": "assets/tech-icons/Containers-512-color.png"
+          },
+          {
+            "name": "Vertex AI custom training/serving",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          },
+          {
+            "name": "Managed Instance Groups",
+            "icon": "assets/tech-icons/Compute-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "AKS + GPU node pools",
+            "icon": "assets/tech-icons/10023-icon-service-Kubernetes-Services.svg"
+          },
+          {
+            "name": "Azure Batch",
+            "icon": "assets/tech-icons/10031-icon-service-Batch-Accounts.svg"
+          },
+          {
+            "name": "Virtual Machine Scale Sets",
+            "icon": "assets/tech-icons/10034-icon-service-VM-Scale-Sets.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Kubernetes plus a batch-aware scheduler makes tier priority, fair-share floors, GPU leases, and warm model pools explicit.",
+        "Managed batch services simplify fleet operations, but fair-share accounting and fill-window batching may need to live in an application scheduler anyway."
+      ],
+      "makesIrrelevant": "GPU-aware autoscaling and queue-age signals reduce the need for a hand-maintained capacity controller, but they do not replace admission control for realtime and paid tiers."
+    },
+    {
+      "concern": "Model registry, weights store, and rollout control",
+      "steps": [
+        "inference",
+        "reliability"
+      ],
+      "selfHosted": [
+        {
+          "name": "MLflow",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Harbor registry + Trivy scanning",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "OCI artifact registry",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SageMaker Model Registry",
+            "icon": "assets/tech-icons/Arch_Amazon-SageMaker-AI_64.png"
+          },
+          {
+            "name": "ECR",
+            "icon": "assets/tech-icons/Arch_Amazon-Elastic-Container-Registry_64.png"
+          },
+          {
+            "name": "S3",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Storage-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Vertex AI Model Registry",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          },
+          {
+            "name": "Artifact Registry",
+            "icon": "assets/tech-icons/DevOps-512-color.png"
+          },
+          {
+            "name": "Cloud Storage",
+            "icon": "assets/tech-icons/Storage-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Machine Learning registry",
+            "icon": "assets/tech-icons/10166-icon-service-Machine-Learning.svg"
+          },
+          {
+            "name": "Azure Container Registry",
+            "icon": "assets/tech-icons/10105-icon-service-Container-Registries.svg"
+          },
+          {
+            "name": "Blob Storage",
+            "icon": "assets/tech-icons/10781-icon-service-Blob-Page.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A model registry plus immutable weight artifacts makes model_version pinning, canary rollout, rollback, safety-policy compatibility, and reproducibility operational rather than tribal knowledge.",
+        "Treating weights as ordinary container or object-store artifacts is simple, but the API must still resolve rollout percentage and worker-pool routing from a catalog."
+      ],
+      "makesIrrelevant": "A registry with immutable versions and rollout status removes most custom bookkeeping around canary eligibility, rollback, and artifact provenance."
+    },
+    {
+      "concern": "Object storage, signed URLs, and CDN delivery",
+      "steps": [
+        "deliver"
+      ],
+      "selfHosted": [
+        {
+          "name": "MinIO",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Ceph",
+          "icon": "assets/tech-icons/ceph.png"
+        },
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "S3",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Storage-Service_64.png"
+          },
+          {
+            "name": "CloudFront",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudFront_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Storage",
+            "icon": "assets/tech-icons/Storage-512-color.png"
+          },
+          {
+            "name": "Cloud CDN",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Media CDN",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Blob Storage",
+            "icon": "assets/tech-icons/10781-icon-service-Blob-Page.svg"
+          },
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          },
+          {
+            "name": "Azure CDN",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Cloud object storage plus CDN gives durable image retention, signed URLs, lifecycle expiry, global read fanout, and cache invalidation with little operations work.",
+        "Self-hosted object storage controls data residency and raw storage cost, but durability, replication, origin shielding, and CDN integration become platform responsibilities."
+      ],
+      "makesIrrelevant": "Object-store lifecycle policies and signed CDN URLs remove most custom retention, expiry, and result-access code."
+    },
+    {
+      "concern": "Safety moderation and abuse review",
+      "steps": [
+        "safety",
+        "deliver"
+      ],
+      "selfHosted": [
+        {
+          "name": "In-house prompt + image classifiers",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Open NSFW/abuse models",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Review-queue tooling + audit store",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Elasticsearch",
+          "icon": "assets/tech-icons/elasticsearch.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Rekognition content moderation",
+            "icon": "assets/tech-icons/Arch_Amazon-Rekognition_64.png"
+          },
+          {
+            "name": "Bedrock Guardrails",
+            "icon": "assets/tech-icons/Arch_Amazon-Bedrock_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Vision AI SafeSearch",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          },
+          {
+            "name": "Perspective API",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Vertex AI",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure AI Content Safety",
+            "icon": "assets/tech-icons/03390-icon-service-Content-Safety.svg"
+          },
+          {
+            "name": "Azure AI Vision",
+            "icon": "assets/tech-icons/00792-icon-service-Computer-Vision.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Managed moderation APIs are fast to adopt and continuously updated, but their policy boundaries may not match product rules, latency targets, or appeal requirements.",
+        "In-house classifiers and a review queue give exact policy control and a durable audit trail, but require model maintenance and abuse-operations staffing."
+      ],
+      "makesIrrelevant": "A managed moderation service can remove early classifier development, but the product still needs safety_decisions, reason codes, and review/audit workflow."
+    },
+    {
+      "concern": "Completion notification, webhooks, and progress streams",
+      "steps": [
+        "deliver",
+        "reliability"
+      ],
+      "selfHosted": [
+        {
+          "name": "NATS (JetStream)",
+          "icon": "assets/tech-icons/nats.png"
+        },
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Redis Streams",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SNS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Notification-Service_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          },
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Firebase Cloud Messaging",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Cloud Run",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Event Grid",
+            "icon": "assets/tech-icons/10221-icon-service-Event-Grid-Subscriptions.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Notification Hubs",
+            "icon": "assets/tech-icons/10045-icon-service-Notification-Hubs.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Push, SSE, WebSocket, and webhooks improve perceived latency, but they must be treated as hints backed by durable job status replay.",
+        "A broker-backed delivery layer with signed payloads, event ids, retry, and DLQ support is better than relying on in-memory client connections for completion truth."
+      ],
+      "makesIrrelevant": "Managed pub/sub and event delivery remove most custom retry timers and connection fanout plumbing for completion notifications."
+    },
+    {
+      "concern": "Observability, GPU telemetry, and cost attribution",
+      "steps": [
+        "schedule",
+        "inference",
+        "reliability"
+      ],
+      "selfHosted": [
+        {
+          "name": "Prometheus",
+          "icon": "assets/tech-icons/prometheus.png"
+        },
+        {
+          "name": "Grafana",
+          "icon": "assets/tech-icons/grafana.png"
+        },
+        {
+          "name": "OpenTelemetry",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "NVIDIA DCGM",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "ELK Stack",
+          "icon": "assets/tech-icons/elasticsearch.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "X-Ray",
+            "icon": "assets/tech-icons/Arch_AWS-X-Ray_64.png"
+          },
+          {
+            "name": "Managed Grafana",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Grafana_64.png"
+          },
+          {
+            "name": "Cost Explorer / tags",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Trace",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Billing export to BigQuery",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Application Insights",
+            "icon": "assets/tech-icons/00012-icon-service-Application-Insights.svg"
+          },
+          {
+            "name": "Azure Managed Grafana",
+            "icon": "assets/tech-icons/02905-icon-service-Azure-Managed-Grafana.svg"
+          },
+          {
+            "name": "Cost Management",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ]
+      },
+      "tradeoff": [
+        "GPU utilization alone is insufficient; queue age by tier, batch fill ratio, model cache misses, OOM split rate, retry/dead-letter count, and blocked-output spikes need first-class dashboards.",
+        "Cloud monitoring is quick to wire, but per-image cost attribution by tier, model, size, and GPU pool still requires deliberate labels/tags and business metrics."
+      ],
+      "makesIrrelevant": "A unified metrics/tracing/cost stack removes most manual fleet inspection and lets autoscaling and incident response act on queue and GPU signals."
+    }
+  ],
   "interviewScript": [
     {
       "phase": "Scope & requirements",
@@ -1613,78 +2740,303 @@
     "links": [
       {
         "id": "stable-diffusion-paper",
-        "group": "AI and ML Systems",
-        "groupDescription": "Feature stores, model serving, RAG, recommendation, and ML operations references.",
+        "group": "Model Architecture and Prompt Following",
+        "groupDescription": "Model architecture, prompt-following, and practical diffusion references that explain what the service is running.",
         "title": "High-Resolution Image Synthesis with Latent Diffusion Models",
         "url": "https://arxiv.org/abs/2112.10752",
         "source": "CompVis / arXiv",
         "type": "Paper",
-        "why": "Foundational latent diffusion model paper behind many image-generation systems.",
+        "why": "Explains why latent-space diffusion makes high-resolution generation feasible enough to serve as an online product.",
         "year": "2021"
       },
       {
+        "id": "dalle2-clip-latents",
+        "group": "Model Architecture and Prompt Following",
+        "groupDescription": "Model architecture, prompt-following, and practical diffusion references that explain what the service is running.",
+        "title": "Hierarchical Text-Conditional Image Generation with CLIP Latents",
+        "url": "https://openai.com/index/hierarchical-text-conditional-image-generation-with-clip-latents/",
+        "source": "OpenAI",
+        "type": "Paper",
+        "year": "2022",
+        "why": "Shows a production-relevant two-stage text-to-image architecture that separates semantic conditioning from image decoding."
+      },
+      {
+        "id": "imagen-paper",
+        "group": "Model Architecture and Prompt Following",
+        "groupDescription": "Model architecture, prompt-following, and practical diffusion references that explain what the service is running.",
+        "title": "Imagen: Text-to-Image Diffusion Models",
+        "url": "https://imagen.research.google/",
+        "source": "Google Research",
+        "type": "Paper",
+        "year": "2022",
+        "why": "Useful for reasoning about text encoder scale, cascaded diffusion, and prompt-image alignment quality."
+      },
+      {
+        "id": "pinterest-canvas",
+        "group": "Model Architecture and Prompt Following",
+        "groupDescription": "Model architecture, prompt-following, and practical diffusion references that explain what the service is running.",
+        "title": "Pinterest Canvas: Large-Scale Image Generation at Pinterest",
+        "url": "https://arxiv.org/abs/2603.06453",
+        "source": "Pinterest / arXiv",
+        "type": "Paper",
+        "year": "2026",
+        "why": "Company-authored example of a large-scale image-generation model family and product-adjacent generation needs."
+      },
+      {
         "id": "diffusers-docs",
-        "group": "AI and ML Systems",
-        "groupDescription": "Feature stores, model serving, RAG, recommendation, and ML operations references.",
+        "group": "Model Architecture and Prompt Following",
+        "groupDescription": "Model architecture, prompt-following, and practical diffusion references that explain what the service is running.",
         "title": "Diffusers Documentation",
         "url": "https://huggingface.co/docs/diffusers/index",
         "source": "Hugging Face",
         "type": "Docs",
-        "why": "Practical diffusion model pipeline reference for generation, schedulers, and serving."
+        "why": "Practical reference for diffusion pipelines, schedulers, model files, adapters, and generation tasks."
       },
       {
-        "id": "triton-docs",
-        "group": "AI and ML Systems",
-        "groupDescription": "Feature stores, model serving, RAG, recommendation, and ML operations references.",
-        "title": "NVIDIA Triton Inference Server",
-        "url": "https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/",
-        "source": "NVIDIA",
+        "id": "diffusers-optimization",
+        "group": "Model Architecture and Prompt Following",
+        "groupDescription": "Model architecture, prompt-following, and practical diffusion references that explain what the service is running.",
+        "title": "Accelerate Inference",
+        "url": "https://huggingface.co/docs/diffusers/optimization/fp16",
+        "source": "Hugging Face",
         "type": "Docs",
-        "why": "Model-serving reference for batching, model repositories, backends, and GPU inference operations."
+        "why": "Concrete knobs for precision, memory, and speed tradeoffs before adding heavier serving infrastructure."
       },
       {
-        "id": "vllm-docs",
-        "group": "AI and ML Systems",
-        "groupDescription": "Feature stores, model serving, RAG, recommendation, and ML operations references.",
-        "title": "vLLM Documentation",
-        "url": "https://docs.vllm.ai/",
-        "source": "vLLM",
+        "id": "nvidia-sdxl-triton",
+        "group": "Serving, Batching, and Diffusion-Specific Optimization",
+        "groupDescription": "Serving frameworks, batching knobs, and diffusion-specific serving research for GPU throughput and latency.",
+        "title": "Generate Stunning Images with Stable Diffusion XL on the NVIDIA AI Inference Platform",
+        "url": "https://developer.nvidia.com/blog/generate-stunning-images-with-stable-diffusion-xl-on-the-nvidia-ai-inference-platform/",
+        "source": "NVIDIA Technical Blog",
+        "type": "Case study",
+        "year": "2024",
+        "why": "Production-oriented SDXL deployment walkthrough covering Triton, TensorRT, dynamic batching, GPU choice, and cost."
+      },
+      {
+        "id": "triton-dynamic-batching",
+        "group": "Serving, Batching, and Diffusion-Specific Optimization",
+        "groupDescription": "Serving frameworks, batching knobs, and diffusion-specific serving research for GPU throughput and latency.",
+        "title": "Batchers",
+        "url": "https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/batcher.html",
+        "source": "NVIDIA Triton Inference Server",
         "type": "Docs",
-        "why": "LLM serving reference for paged attention, batching, throughput, and latency tradeoffs."
+        "why": "Defines the dynamic batching, queue-delay, priority, and timeout controls behind the batch-window tradeoff."
       },
       {
-        "id": "k8s-device-plugin",
-        "group": "AI and ML Systems",
-        "groupDescription": "Feature stores, model serving, RAG, recommendation, and ML operations references.",
-        "title": "Device Plugins",
-        "url": "https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/",
+        "id": "triton-stable-diffusion",
+        "group": "Serving, Batching, and Diffusion-Specific Optimization",
+        "groupDescription": "Serving frameworks, batching knobs, and diffusion-specific serving research for GPU throughput and latency.",
+        "title": "Stable Diffusion Model Configuration Options",
+        "url": "https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/tutorials/Popular_Models_Guide/StableDiffusion/docs/model_configuration.html",
+        "source": "NVIDIA Triton Inference Server",
+        "type": "Docs",
+        "why": "Shows Stable Diffusion-specific model repository and batching configuration choices for Triton deployment."
+      },
+      {
+        "id": "ray-serve-stable-diffusion",
+        "group": "Serving, Batching, and Diffusion-Specific Optimization",
+        "groupDescription": "Serving frameworks, batching knobs, and diffusion-specific serving research for GPU throughput and latency.",
+        "title": "Serve a Stable Diffusion Model",
+        "url": "https://docs.ray.io/en/latest/serve/tutorials/stable-diffusion.html",
+        "source": "Ray Serve",
+        "type": "Docs",
+        "why": "Minimal serving example that maps the interview's API-to-GPU-worker shape onto a real deployment framework."
+      },
+      {
+        "id": "sagemaker-async-inference",
+        "group": "Serving, Batching, and Diffusion-Specific Optimization",
+        "groupDescription": "Serving frameworks, batching knobs, and diffusion-specific serving research for GPU throughput and latency.",
+        "title": "Asynchronous Inference",
+        "url": "https://docs.aws.amazon.com/sagemaker/latest/dg/async-inference.html",
+        "source": "Amazon SageMaker AI",
+        "type": "Docs",
+        "why": "Managed reference architecture for queuing long-running inference requests and returning results asynchronously."
+      },
+      {
+        "id": "diffserve-paper",
+        "group": "Serving, Batching, and Diffusion-Specific Optimization",
+        "groupDescription": "Serving frameworks, batching knobs, and diffusion-specific serving research for GPU throughput and latency.",
+        "title": "DiffServe: Efficiently Serving Text-to-Image Diffusion Models with Query-Aware Model Scaling",
+        "url": "https://openreview.net/forum?id=1N3ShLfcTf",
+        "source": "MLSys / OpenReview",
+        "type": "Paper",
+        "year": "2025",
+        "why": "Diffusion-serving paper focused on resource allocation, latency SLOs, and using lighter model variants for easier prompts."
+      },
+      {
+        "id": "approximate-caching-diffusion",
+        "group": "Serving, Batching, and Diffusion-Specific Optimization",
+        "groupDescription": "Serving frameworks, batching knobs, and diffusion-specific serving research for GPU throughput and latency.",
+        "title": "Approximate Caching for Efficiently Serving Diffusion Models",
+        "url": "https://arxiv.org/abs/2312.04429",
+        "source": "arXiv",
+        "type": "Paper",
+        "year": "2024",
+        "why": "Explores prompt similarity, intermediate-state reuse, and cost/latency tradeoffs on production text-to-image workloads."
+      },
+      {
+        "id": "tridentserve-paper",
+        "group": "Serving, Batching, and Diffusion-Specific Optimization",
+        "groupDescription": "Serving frameworks, batching knobs, and diffusion-specific serving research for GPU throughput and latency.",
+        "title": "TridentServe: A Stage-level Serving System for Diffusion Pipelines",
+        "url": "https://arxiv.org/abs/2510.02838",
+        "source": "arXiv",
+        "type": "Paper",
+        "year": "2025",
+        "why": "Frames diffusion inference as encode-diffuse-decode stages, which helps reason about placement beyond one monolithic worker."
+      },
+      {
+        "id": "k8s-gpu-scheduling",
+        "group": "GPU Scheduling, Capacity, and Telemetry",
+        "groupDescription": "Scheduling, quota, partitioning, autoscaling, and telemetry references for scarce accelerator fleets.",
+        "title": "Schedule GPUs",
+        "url": "https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/",
         "source": "Kubernetes",
         "type": "Docs",
-        "why": "Core Kubernetes mechanism for advertising GPUs and other accelerators to schedulers."
+        "why": "Explains how GPUs become schedulable resources in Kubernetes and what constraints pods can express."
       },
       {
-        "id": "nvidia-mig",
-        "group": "AI and ML Systems",
-        "groupDescription": "Feature stores, model serving, RAG, recommendation, and ML operations references.",
-        "title": "NVIDIA Multi-Instance GPU User Guide",
-        "url": "https://docs.nvidia.com/datacenter/tesla/mig-user-guide/",
+        "id": "nvidia-mig-k8s",
+        "group": "GPU Scheduling, Capacity, and Telemetry",
+        "groupDescription": "Scheduling, quota, partitioning, autoscaling, and telemetry references for scarce accelerator fleets.",
+        "title": "MIG Support in Kubernetes",
+        "url": "https://docs.nvidia.com/datacenter/cloud-native/kubernetes/latest/index.html",
         "source": "NVIDIA",
         "type": "Docs",
-        "why": "Reference for GPU partitioning, isolation, and placement constraints."
+        "why": "Reference for exposing GPU partitions to Kubernetes, useful when isolating small or lower-tier jobs."
       },
       {
-        "id": "openai-production",
-        "group": "AI and ML Systems",
-        "groupDescription": "Feature stores, model serving, RAG, recommendation, and ML operations references.",
-        "title": "Production Best Practices",
-        "url": "https://platform.openai.com/docs/guides/production-best-practices",
-        "source": "OpenAI",
+        "id": "kueue-clusterqueue",
+        "group": "GPU Scheduling, Capacity, and Telemetry",
+        "groupDescription": "Scheduling, quota, partitioning, autoscaling, and telemetry references for scarce accelerator fleets.",
+        "title": "Cluster Queue",
+        "url": "https://kueue.sigs.k8s.io/docs/concepts/cluster_queue/",
+        "source": "Kueue",
         "type": "Docs",
-        "why": "Operational reference for production LLM latency, reliability, safety, and cost control."
+        "why": "Shows how Kubernetes-native batch queues model quota, resource flavors, cohorts, and admission for scarce capacity."
+      },
+      {
+        "id": "sagemaker-async-autoscale",
+        "group": "GPU Scheduling, Capacity, and Telemetry",
+        "groupDescription": "Scheduling, quota, partitioning, autoscaling, and telemetry references for scarce accelerator fleets.",
+        "title": "Autoscale an Asynchronous Endpoint",
+        "url": "https://docs.aws.amazon.com/sagemaker/latest/dg/async-inference-autoscale.html",
+        "source": "Amazon SageMaker AI",
+        "type": "Docs",
+        "why": "Concrete managed example of scaling async inference from queue backlog, including scale-to-zero behavior."
+      },
+      {
+        "id": "dcgm-exporter",
+        "group": "GPU Scheduling, Capacity, and Telemetry",
+        "groupDescription": "Scheduling, quota, partitioning, autoscaling, and telemetry references for scarce accelerator fleets.",
+        "title": "DCGM-Exporter",
+        "url": "https://docs.nvidia.com/datacenter/dcgm/latest/gpu-telemetry/dcgm-exporter.html",
+        "source": "NVIDIA",
+        "type": "Docs",
+        "why": "GPU telemetry reference for tracking utilization, memory, health, and per-pod signals needed for cost and reliability loops."
+      },
+      {
+        "id": "dalle3-system-card",
+        "group": "Safety Gates and Responsible Release",
+        "groupDescription": "Primary references for input/output safety, training-data mitigations, and moderation failure modes.",
+        "title": "DALL·E 3 System Card",
+        "url": "https://openai.com/index/dall-e-3-system-card/",
+        "source": "OpenAI",
+        "type": "System card",
+        "year": "2023",
+        "why": "Deployment-focused source for red teaming, risk evaluation, prompt transformation, and mitigation layers in image generation."
+      },
+      {
+        "id": "dalle2-pretraining-mitigations",
+        "group": "Safety Gates and Responsible Release",
+        "groupDescription": "Primary references for input/output safety, training-data mitigations, and moderation failure modes.",
+        "title": "DALL·E 2 Pre-Training Mitigations",
+        "url": "https://openai.com/index/dall-e-2-pre-training-mitigations/",
+        "source": "OpenAI",
+        "type": "Case study",
+        "year": "2022",
+        "why": "Explains data filtering, bias side effects, and memorization mitigation before a model is deployed."
+      },
+      {
+        "id": "vertex-imagen-safety",
+        "group": "Safety Gates and Responsible Release",
+        "groupDescription": "Primary references for input/output safety, training-data mitigations, and moderation failure modes.",
+        "title": "Responsible AI and Usage Guidelines for Imagen",
+        "url": "https://docs.cloud.google.com/vertex-ai/generative-ai/docs/image/responsible-ai-imagen",
+        "source": "Google Cloud",
+        "type": "Docs",
+        "why": "Service documentation for prompt and output safety filters, safety attributes, and tunable filtering behavior."
+      },
+      {
+        "id": "azure-content-safety-image",
+        "group": "Safety Gates and Responsible Release",
+        "groupDescription": "Primary references for input/output safety, training-data mitigations, and moderation failure modes.",
+        "title": "Quickstart: Analyze Image Content",
+        "url": "https://learn.microsoft.com/en-us/azure/ai-services/content-safety/quickstart-image",
+        "source": "Microsoft Learn",
+        "type": "Docs",
+        "why": "Concrete image-moderation API reference for building the output safety gate in the design."
+      },
+      {
+        "id": "stable-diffusion-red-team",
+        "group": "Safety Gates and Responsible Release",
+        "groupDescription": "Primary references for input/output safety, training-data mitigations, and moderation failure modes.",
+        "title": "Red-Teaming the Stable Diffusion Safety Filter",
+        "url": "https://arxiv.org/abs/2210.04610",
+        "source": "arXiv",
+        "type": "Paper",
+        "year": "2022",
+        "why": "Useful counterexample showing why a single safety filter is brittle and why layered input/output gates matter."
+      },
+      {
+        "id": "cloudfront-signed-urls",
+        "group": "Result Delivery and API Operations",
+        "groupDescription": "References for delivering generated images securely and operating the system once jobs are asynchronous.",
+        "title": "Use Signed URLs",
+        "url": "https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-signed-urls.html",
+        "source": "Amazon CloudFront",
+        "type": "Docs",
+        "why": "Shows a common CDN pattern for time-limited access to generated private image objects."
+      },
+      {
+        "id": "s3-presigned-urls",
+        "group": "Result Delivery and API Operations",
+        "groupDescription": "References for delivering generated images securely and operating the system once jobs are asynchronous.",
+        "title": "Download and Upload Objects with Presigned URLs",
+        "url": "https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html",
+        "source": "Amazon S3",
+        "type": "Docs",
+        "why": "Object-store delivery reference for giving clients scoped, expiring access without routing image bytes through the API."
+      },
+      {
+        "id": "gcs-signed-urls",
+        "group": "Result Delivery and API Operations",
+        "groupDescription": "References for delivering generated images securely and operating the system once jobs are asynchronous.",
+        "title": "Signed URLs",
+        "url": "https://docs.cloud.google.com/storage/docs/access-control/signed-urls",
+        "source": "Google Cloud Storage",
+        "type": "Docs",
+        "why": "Provider-neutral comparison point for the same result-store pattern on Google Cloud."
+      },
+      {
+        "id": "opentelemetry-genai",
+        "group": "Result Delivery and API Operations",
+        "groupDescription": "References for delivering generated images securely and operating the system once jobs are asynchronous.",
+        "title": "Semantic Conventions for Generative AI Systems",
+        "url": "https://opentelemetry.io/docs/specs/semconv/gen-ai/",
+        "source": "OpenTelemetry",
+        "type": "Docs",
+        "why": "Gives a vocabulary for tracing generation requests, models, providers, and outcomes across async execution."
       }
     ]
   },
   "assets": {
     "icon": "icon.png"
-  }
+  },
+  "aiVisuals": {
+    "requirements": "assets/generated/ai-visuals/requirements.jpg",
+    "capacity": "assets/generated/ai-visuals/capacity.jpg"
+  },
+  "explainerComic": "assets/generated/comic/interview-comic.jpg"
 }

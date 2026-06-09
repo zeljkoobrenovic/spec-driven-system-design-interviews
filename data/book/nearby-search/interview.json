@@ -19,7 +19,7 @@
         "traits": [
           "stateless"
         ],
-        "description": "Routes and rate-limits incoming search and write requests."
+        "description": "Routes incoming search and write requests; enforces abuse controls at the edge — coordinate validation, max radius, max limit, and per-client/API-key rate limits — and routes reads to the nearest regional/cell-prefix index."
       },
       {
         "id": "SearchSvc",
@@ -231,9 +231,13 @@
     "graph LR",
     "  Places[~100M places]",
     "  Q[~10K searches/s]",
-    "  Read[Read-heavy]",
+    "  Cells[tens of cells/query]",
+    "  Cand[~50-200 candidates]",
+    "  Hydr[~30 cache reads/query]",
     "  Places --> Q",
-    "  Q --> Read"
+    "  Q --> Cells",
+    "  Cells --> Cand",
+    "  Cand --> Hydr"
   ],
   "requirements": {
     "functional": [
@@ -248,7 +252,10 @@
       "Low latency: search p99 < 200 ms including ranking.",
       "Scale to ~100M places worldwide and high query volume in dense cities.",
       "Highly available for search; place updates can be eventually consistent.",
-      "Correct geography: must handle radius queries that cross index-cell boundaries."
+      "Correct geography: must handle radius queries that cross index-cell boundaries.",
+      "Location privacy: user coordinates are sensitive — minimize and short-retain query-coordinate logs, restrict access, and keep analytics coarse-grained.",
+      "Abuse resistance: validate coordinates, cap radius and result limit, and rate-limit per client/API key on a public high-QPS endpoint.",
+      "Global reads: route users to a regional/cell-prefix index with read replicas and degrade gracefully if a regional shard is unavailable."
     ]
   },
   "capacity": [
@@ -276,14 +283,44 @@
       "label": "Result set",
       "value": "top 20-50",
       "note": "Ranked subset, not everything in radius."
+    },
+    {
+      "label": "Cells per query",
+      "value": "~9-60",
+      "note": "Cells touched ≈ query-circle area / cell area + boundary over-cover. At ~1.2 km cells a 0.5 km radius (1 km diameter) covers about a 3x3 block (center cell + one ring, ~9 cells); fine ~150 m cells need many more (~50-60) but trim candidates per cell. The precision policy (Step 4 / final design) picks a level per region so a 0.5-5 km radius stays in the low tens of cells."
+    },
+    {
+      "label": "Candidates per query",
+      "value": "~100-1,000 raw -> ~50-200 after exact filter",
+      "note": "Dense city cells dominate; variable precision keeps each cell's list bounded so the union stays in the low thousands before the haversine filter trims it."
+    },
+    {
+      "label": "Cache reads per query",
+      "value": "~20-50 hydrations",
+      "note": "Only the ranked top-K are hydrated. 10K qps x ~30 = ~300K PlaceCache reads/sec; at 90% hit rate ~30K/sec fall through to PlaceDB."
+    },
+    {
+      "label": "Geo-index size",
+      "value": "~100M entries, a few GB",
+      "note": "cell -> place_ids for 100M places. Sharded by cell-prefix/region; hot city prefixes get dedicated shards + read replicas."
+    },
+    {
+      "label": "Hot-region skew",
+      "value": "top metros >> global average",
+      "note": "A handful of city centers carry a large share of the 10K qps, so shard sizing follows peak per-region load, not the global mean."
+    },
+    {
+      "label": "Latency budget (p99 < 200 ms)",
+      "value": "~30 geo + ~40 filter/rank + ~30 ETA (top-N only) + ~40 hydrate + ~40 network",
+      "note": "Rough split in ms. ETA runs only for a small top-N with a timeout/fallback so it can't dominate; hydration is bounded by the top-K cache reads."
     }
   ],
   "api": [
     {
       "method": "GET",
       "path": "/v1/nearby",
-      "description": "Find ranked places near a location within a radius, with optional filters.",
-      "request": "?lat=37.77&lng=-122.41&radiusM=1000&category=cafe&openNow=true&limit=20",
+      "description": "Find ranked places near a location within a radius, with optional filters. The gateway validates that lat∈[-90,90] / lng∈[-180,180], caps radiusM (e.g. ≤ 50 km) and limit (e.g. ≤ 50), and rate-limits per client / API key; out-of-range coordinates or oversized radius/limit are rejected with 400 / clamped. Query coordinates are logged minimally and short-retained for privacy.",
+      "request": "?lat=37.77&lng=-122.41&radiusM=1000&category=cafe&openNow=true&limit=20  (radiusM ≤ 50000, limit ≤ 50; X-Api-Key for rate limiting)",
       "response": "{ \"places\": [ { \"id\": \"p_9\", \"name\": \"...\", \"distanceM\": 120, \"rating\": 4.5 } ] }",
       "sequence": {
         "participants": [
@@ -350,9 +387,9 @@
     {
       "method": "POST",
       "path": "/v1/places",
-      "description": "Create or update a place. Emits a change event that updates the geo index asynchronously.",
-      "request": "{ \"name\": \"...\", \"lat\": 37.77, \"lng\": -122.41, \"category\": \"cafe\" }",
-      "response": "{ \"placeId\": \"p_9\" }",
+      "description": "Create a place (upsert by client idempotency-key). Bumps version and writes a (place_id, version) outbox event in the same transaction (drained to the change queue by a relay / CDC) that updates the geo index asynchronously; retries with the same key are no-ops.",
+      "request": "Idempotency-Key: <uuid>  { \"name\": \"...\", \"lat\": 37.77, \"lng\": -122.41, \"category\": \"cafe\", \"priceLevel\": 2 }",
+      "response": "{ \"placeId\": \"p_9\", \"version\": 1 }",
       "sequence": {
         "participants": [
           {
@@ -415,12 +452,26 @@
       "description": "Fetch full details for one place.",
       "request": "(id in path)",
       "response": "{ \"id\": \"p_9\", \"name\": \"...\", \"hours\": \"...\", \"rating\": 4.5 }"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/places/{id}",
+      "description": "Update a place's fields (including location). A location change emits a move event carrying old_cell + new_cell so the indexer removes the old geo-index entry and adds the new one. Uses If-Match / expected version for optimistic concurrency.",
+      "request": "If-Match: \"3\"  { \"lat\": 37.78, \"lng\": -122.42, \"status\": \"active\" }",
+      "response": "{ \"placeId\": \"p_9\", \"version\": 4 }"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/places/{id}",
+      "description": "Remove a place. Soft-deletes by setting status=removed (tombstone) and emits a delete event; the indexer drops it from its cell. Reads filter tombstoned ids until async cleanup completes.",
+      "request": "(id in path)",
+      "response": "{ \"placeId\": \"p_9\", \"status\": \"removed\", \"version\": 5 }"
     }
   ],
   "dataModel": [
     {
       "name": "places",
-      "note": "Authoritative place records.",
+      "note": "Authoritative place records and lifecycle. status + tombstone let stale geo-index entries be filtered safely while async cleanup catches up; version drives idempotent indexing.",
       "fields": [
         {
           "name": "place_id",
@@ -447,26 +498,92 @@
           "type": "string (index)"
         },
         {
+          "name": "price_level",
+          "type": "smallint (1-4, index) — supports the price filter"
+        },
+        {
           "name": "rating",
           "type": "float"
         },
         {
           "name": "popularity",
           "type": "float"
+        },
+        {
+          "name": "status",
+          "type": "enum active|temp_closed|removed — drives open-now and tombstoning"
+        },
+        {
+          "name": "timezone",
+          "type": "varchar (IANA tz) — needed to evaluate 'open now' in local time"
+        },
+        {
+          "name": "opening_hours",
+          "type": "jsonb (normalized weekly schedule + exceptions/holidays)"
+        },
+        {
+          "name": "source",
+          "type": "varchar (ingest source / owner) — provenance for conflict resolution"
+        },
+        {
+          "name": "version",
+          "type": "bigint (monotonic per place) — idempotency key for indexing"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp"
         }
       ]
     },
     {
       "name": "geo_index",
-      "note": "Derived: cell key -> place ids. Backed by a spatial structure.",
+      "note": "Derived: cell key -> place ids, plus the minimal fields needed to filter and rank without hydrating every candidate. Backed by a spatial structure and rebuildable from places.",
       "fields": [
         {
           "name": "cell",
-          "type": "varchar (geohash prefix / S2 cell id) PK"
+          "type": "varchar (geohash prefix / S2 / H3 cell id) PK"
         },
         {
           "name": "place_ids",
           "type": "set<place_id>"
+        },
+        {
+          "name": "entry_meta",
+          "type": "per place_id: { lat, lng, category, price_level, popularity, status, place_version, timezone, open_state } — cheap pre-rank filters live here so only the top-K hydrate full details from PlaceCache/PlaceDB. place_version makes index updates idempotent on (place_id, version); open_state is a periodically-precomputed time-bucketed open/closed/closing-soon hint (with timezone) so open-now filters without a detail fetch — status (active|temp_closed|removed) is a lifecycle flag, not the business-hours source"
+        }
+      ]
+    },
+    {
+      "name": "place_change_events",
+      "note": "Change log streamed to the indexer (and the durable basis for replay/backfill). Carries old/new cell so a move reliably removes the old index entry.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid PK (dedup key)"
+        },
+        {
+          "name": "place_id",
+          "type": "uuid (index)"
+        },
+        {
+          "name": "place_version",
+          "type": "bigint — index updates are idempotent on (place_id, version)"
+        },
+        {
+          "name": "op",
+          "type": "enum create|update|move|delete"
+        },
+        {
+          "name": "old_cell",
+          "type": "varchar nullable — cell to remove from on a move/delete"
+        },
+        {
+          "name": "new_cell",
+          "type": "varchar nullable — cell to add to on a create/move"
+        },
+        {
+          "name": "event_time",
+          "type": "timestamp — for ordering and lag measurement"
         }
       ]
     }
@@ -483,7 +600,7 @@
     },
     {
       "name": "Cell neighbor expansion",
-      "what": "Query the target cell plus its neighbors so results near a cell boundary aren't missed.",
+      "what": "Query the covering set of cells for the radius (the target cell plus enough neighbor rings) so results near a cell boundary aren't missed; 'cell + 8 neighbors' is the small-radius special case.",
       "whenToUse": "Grid/geohash indexes where a radius can straddle cell edges.",
       "steps": [
         "boundaries"
@@ -523,7 +640,7 @@
       "id": "naive",
       "title": "1. Naive: Scan and Compute Distance",
       "description": [
-        "Start simply: store places with lat/lng, and on a search compute the distance from the query point to every place, keep those within the radius.",
+        "Start simply: store places with lat/lng, and on a search compute the distance from the query point to every place, keeping those within the radius.",
         "Correct, but it's a full table scan per query — O(all places) for every search. At 100M places and 10K searches/sec this is hopeless.",
         "Even a bounding-box filter on lat/lng (two range predicates) helps only modestly and indexes poorly on two independent dimensions."
       ],
@@ -538,7 +655,11 @@
         "links": [
           "client-lb",
           "lb-search",
-          "place-placedb"
+          {
+            "from": "SearchSvc",
+            "to": "PlaceDB",
+            "label": "scan all places + compute distance"
+          }
         ],
         "highlight": [
           "SearchSvc",
@@ -551,7 +672,11 @@
       ],
       "probeLinks": [
         "postgis-docs",
-        "elastic-geo"
+        "postgis-dwithin",
+        "postgis-knn",
+        "elastic-geo",
+        "mongo-geospatial",
+        "owasp-api4"
       ],
       "recap": {
         "before": "Nothing.",
@@ -564,7 +689,15 @@
           "why": "A bounding box still returns a huge strip; two 1D indexes don't compose into 2D locality.",
           "instead": "Map 2D space to a locality-preserving 1D cell key (geohash) or a spatial tree."
         }
-      ]
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A client sends garbage or abusive queries — out-of-range coordinates, a 10,000 km radius, limit=1,000,000, or a flood of requests.",
+          "expectedBehavior": "The system rejects or clamps the request cheaply and stays available for everyone else.",
+          "mitigation": "Validate lat/lng bounds and reject 400s at the gateway; cap radius and limit (clamp or 400); rate-limit per client/API key so one caller can't exhaust the read path."
+        }
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/01-naive.jpg"
     },
     {
       "id": "geohash",
@@ -584,7 +717,6 @@
         ],
         "caption": "The search service asks the geo index for the cells in the radius to get place ids, then hydrates details from the place cache, falling back to the place store on a miss.",
         "links": [
-          "lb-search",
           "search-geo",
           "search-cache",
           "cache-placedb"
@@ -601,7 +733,7 @@
           "name": "Geohash prefix index (default)",
           "description": "Interleaving latitude and longitude bits yields a string whose prefix length sets precision; lookups are prefix scans over cell-to-place-id entries.",
           "pros": [
-            "Interleaved lat/lng bits make a string whose prefix length sets precision — nearby points share a prefix.",
+            "Nearby points share a common prefix, so a radius query reduces to prefix matching.",
             "Cell -> place-id lookups are plain string-prefix scans, easy on any KV or sorted store.",
             "Cheap to compute and store one geohash per place at write time."
           ],
@@ -630,7 +762,8 @@
             "groups": [
               "query-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-geohash-opt1.jpg"
         },
         {
           "name": "S2 cells (Hilbert-curve hierarchy)",
@@ -662,7 +795,8 @@
             "highlight": [
               "GeoIndex"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-geohash-opt2.jpg"
         },
         {
           "name": "Quadtree (adaptive subdivision)",
@@ -701,7 +835,8 @@
             "highlight": [
               "QuadTree"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-geohash-opt3.jpg"
         }
       ],
       "decisionPrompt": "Geohash vs S2 vs a quadtree — what tradeoffs would push you to each?",
@@ -719,23 +854,41 @@
           "whyItMatters": "Adapts cell granularity and handles sphere geometry better than a flat grid.",
           "example": "Query a covering set of S2 cells at the right level for the radius.",
           "group": "Geospatial Index: Geohash / S2 Cells"
+        },
+        {
+          "term": "H3 (hexagonal grid)",
+          "definition": "Uber's hierarchical hexagonal cell system: uniform neighbor distances (6 neighbors, no diagonal edge case) and a tunable resolution.",
+          "whyItMatters": "A practical alternative to geohash/S2 with cleaner neighbor expansion; the same covering-set idea applies.",
+          "example": "k-ring(cell, 1) gives the 6 neighbors for a small-radius cover.",
+          "group": "Geospatial Index: Geohash / S2 Cells"
+        },
+        {
+          "term": "Where filters live",
+          "definition": "The geo index is cell -> place_ids plus light per-entry metadata (category, price_level, popularity, status, lat/lng, place_version, timezone, open_state); rich details stay in PlaceDB/PlaceCache.",
+          "whyItMatters": "Cheap filters (category/price/open-now) and the first-pass score resolve from index metadata, so only the top-K hydrate full details.",
+          "example": "open-now is evaluated from the entry's precomputed open_state + timezone without a detail fetch.",
+          "group": "Geospatial Index: Geohash / S2 Cells"
         }
       ],
       "probeLinks": [
+        "h3-docs",
+        "h3-traversal",
+        "uber-h3",
         "s2-docs",
-        "postgis-docs",
-        "elastic-geo",
-        "h3-docs"
+        "s2-covering",
+        "redis-geosearch",
+        "aws-dynamodb-geohash"
       ],
       "patterns": [
         "Geospatial indexing"
       ],
       "whyNow": [
-        "The spatial index is the heart of the problem; choosing and justifying geohash/S2 is the central senior signal."
+        "The spatial index is the heart of the problem; choosing and justifying geohash/S2 is the central senior signal.",
+        "Commit to one: introduce the geohash prefix index as the simplest baseline, then defend S2/H3 region covering (backed by a KV cell index) as the final choice because its per-query variable-level coverer gives a tighter cover for the 0.5-5 km radius range and adapts to density (Step 4) without prime-meridian/pole seams. The final design uses that S2/H3 choice consistently; geohash stays the simpler fallback."
       ],
       "recap": {
         "before": "Full scan.",
-        "after": "Radius search reads a few cells' place lists.",
+        "after": "Radius search reads a few cells' place lists (geohash baseline → S2/H3 region covering as the defended choice).",
         "newRisk": "A circle doesn't align to square cells — boundaries and false positives need handling."
       }
     },
@@ -743,9 +896,10 @@
       "id": "boundaries",
       "title": "3. Handle Cell Boundaries and the Radius",
       "description": [
-        "A search circle rarely sits inside one cell. Query the user's cell plus its 8 neighbors so a place just across a boundary isn't missed.",
+        "A search circle rarely sits inside one cell. The general rule is to compute the covering set: all cells that overlap the query circle, plus enough neighboring cells/rings for the chosen precision so a place just across a boundary isn't missed.",
+        "For a small radius on a fixed grid this reduces to the familiar 'target cell + its 8 neighbors', but that one-ring shortcut is only correct when the radius fits inside a cell. A larger radius (the dataset allows up to ~5 km) or finer cells span many cells, so the covering set can be several rings wide — compute it from the radius and cell size, don't assume one ring.",
         "Cells are squares and the query is a circle, so the cell union over-covers: after gathering candidates, do an exact distance filter (haversine) to drop those actually outside the radius.",
-        "Pick the cell precision so a few cells cover the typical radius — too coarse pulls in too many candidates, too fine means querying many cells."
+        "Pick the cell precision so the covering set stays a handful of cells for the typical radius — too coarse pulls in too many candidates per cell, too fine means querying many cells. Variable precision (Step 4) changes this covering logic: with mixed cell sizes you compute the cover at the level chosen for that region."
       ],
       "view": {
         "nodes": [
@@ -768,16 +922,27 @@
       "decisionPrompt": "A cafe is 50m away but in the cell next door. How do you make sure it's returned?",
       "concepts": [
         {
+          "term": "Covering set",
+          "definition": "The set of index cells that overlap the query circle, computed from the radius and the cell precision (one ring for a small radius, several rings or coarser levels for a larger one).",
+          "whyItMatters": "It's the general, correct way to find candidate cells; 'cell + 8 neighbors' is just the small-radius special case.",
+          "example": "S2/H3 region coverers return a covering cell set at the level matching the radius.",
+          "group": "Handle Cell Boundaries and the Radius"
+        },
+        {
           "term": "Neighbor expansion",
           "definition": "Including adjacent cells in a spatial query to cover boundary-straddling results.",
-          "whyItMatters": "Without it, results near a cell edge are silently dropped.",
-          "example": "Query target cell + its 8 neighbors, then exact-distance filter.",
+          "whyItMatters": "Without it, results near a cell edge are silently dropped — but one ring only suffices when the radius fits in a cell.",
+          "example": "Query target cell + its 8 neighbors when the radius is small, then exact-distance filter.",
           "group": "Handle Cell Boundaries and the Radius"
         }
       ],
       "probeLinks": [
-        "postgis-docs",
-        "elastic-geo"
+        "h3-traversal",
+        "s2-covering",
+        "postgis-dwithin",
+        "elastic-geo",
+        "mongo-geospatial",
+        "redis-geosearch"
       ],
       "patterns": [
         "Cell neighbor expansion"
@@ -795,12 +960,17 @@
           "trap": "Querying only the cell the point falls in.",
           "why": "Misses nearby places that happen to be in an adjacent cell.",
           "instead": "Expand to neighbor cells, then exact-distance filter."
+        },
+        {
+          "trap": "Assuming 'cell + 8 neighbors' always covers the requested radius.",
+          "why": "One neighbor ring only covers a radius that fits inside a cell. A 5 km radius, or a finer cell precision, spans many cells and several rings, so a fixed one-ring expansion silently drops places in the outer band.",
+          "instead": "Compute the covering set from the radius and cell size (or use an S2/H3 region coverer); treat 8-neighbors as the small-radius special case only."
         }
       ],
       "flows": [
         {
           "name": "Radius query: cover cells + neighbors + exact filter",
-          "note": "A search computes the covering cells plus neighbors, unions their place ids, then exact-distance filters because square cells over-cover a circular radius.",
+          "note": "A search computes the covering set of cells for the radius (one ring for a small radius, several for a larger one), unions their place ids, then exact-distance filters because square cells over-cover a circular radius.",
           "sequence": {
             "participants": [
               {
@@ -827,7 +997,7 @@
                 "from": "SearchSvc",
                 "to": "SearchSvc",
                 "arrow": "->>",
-                "label": "compute covering cell + 8 neighbors"
+                "label": "compute covering set for radius (cells + rings)"
               },
               {
                 "from": "SearchSvc",
@@ -859,7 +1029,8 @@
             "GeoIndex"
           ]
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/03-boundaries.jpg"
     },
     {
       "id": "density",
@@ -867,7 +1038,9 @@
       "description": [
         "Place density varies wildly: a downtown cell may hold thousands of places while a rural cell holds none. A single fixed cell size is wrong everywhere.",
         "Use variable precision: in dense areas use finer cells (longer geohash / deeper quadtree level) so candidate lists stay small; in sparse areas use coarser cells so a query still finds something nearby.",
-        "Tree structures (quadtree/S2) do this naturally by subdividing only where density is high; with geohash you adjust prefix length by region or expand outward until enough results are found."
+        "Tree structures (quadtree/S2) do this naturally by subdividing only where density is high; with geohash you adjust prefix length by region or expand outward until enough results are found.",
+        "Mixed precision needs explicit query rules: pick the level(s) covering the radius for that region; when the cover spans both parent and child cells, dedupe candidates so a place indexed at a child level isn't also pulled in via its parent; and cap fanout (max cells / max candidates) so a pathological query can't touch the whole tree — fall back to a coarser level or expanding rings when the cap is hit.",
+        "Concrete targets to defend: aim for ~50-100 candidates per cell and a covering set under ~60 cells, with a hard cap (e.g. max 64 cells / max ~2,000 raw candidates) per query. If the cover would exceed the cap (a huge radius over a dense metro), step to a coarser level or stop expanding rings and return a best-effort top-K rather than fanning out unbounded."
       ],
       "view": {
         "nodes": [
@@ -914,7 +1087,8 @@
             "groups": [
               "query-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-density-opt1.jpg"
         },
         {
           "name": "Fixed cell size everywhere",
@@ -941,7 +1115,8 @@
             "highlight": [
               "GeoIndex"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-density-opt2.jpg"
         },
         {
           "name": "Expanding-ring search (fixed cells, grow radius)",
@@ -972,7 +1147,8 @@
             "highlight": [
               "GeoIndex"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-density-opt3.jpg"
         }
       ],
       "decisionPrompt": "Manhattan vs rural Montana with the same cell size — what breaks in each?",
@@ -986,10 +1162,13 @@
         }
       ],
       "probeLinks": [
-        "postgis-docs",
         "h3-docs",
         "uber-h3",
-        "s2-docs"
+        "s2-covering",
+        "aws-dynamodb-geohash",
+        "yelp-core-search",
+        "yelp-coordinator",
+        "owasp-api4"
       ],
       "patterns": [
         "Adaptive cell size"
@@ -1001,15 +1180,23 @@
         "before": "Fixed cell size.",
         "after": "Cell granularity tracks density; bounded candidate counts.",
         "newRisk": "Variable cells complicate neighbor logic; ranking still needed to pick the best of many candidates."
-      }
+      },
+      "traps": [
+        {
+          "trap": "Querying parent and child cells together without deduping.",
+          "why": "With mixed precision a place can be reachable via both a coarse parent and a finer child cell, so the candidate union double-counts it.",
+          "instead": "Pick one consistent level per region for the cover, or dedupe place ids across levels before filtering."
+        }
+      ]
     },
     {
       "id": "ranking",
       "title": "5. Rank and Filter Candidates",
       "description": [
-        "The index gives candidates (recall); now produce the ordered result the user wants. Apply filters (category, open-now, price) first to shrink the set.",
-        "Score remaining candidates by a blend of exact distance, rating, and popularity — distance alone isn't what users want (a great cafe 400m away beats a mediocre one next door).",
-        "Hydrate full details for the top-K from a hot place cache (cache-aside to the place store) so only the results you return cost a detail lookup."
+        "The index gives candidates (recall); now produce the ordered result the user wants. Rank in stages so cost stays bounded. Stage 1 applies cheap filters (category, price, open-now) and a blended distance/rating/popularity score using fields carried in the geo index, with no per-candidate hydration.",
+        "Score remaining candidates by a blend of exact distance, rating, and popularity — distance alone isn't what users want (a great cafe 400m away beats a mediocre one next door). Most filters resolve from index/entry metadata; open-now reads the entry's precomputed open_state + timezone (refreshed periodically from the place's normalized hours) rather than hydrating every candidate.",
+        "Stage 2 runs expensive signals — routing/ETA or an ML re-rank — only over a small top-N (e.g. top 20-50), never every candidate. The ETA call has a tight timeout and falls back to straight-line distance, so the routing service can never blow the p99 budget. Travel distance is approximated or cached for ranking; full turn-by-turn routing is computed only when the UI asks for directions.",
+        "Hydrate full details for the top-K from a hot place cache (cache-aside to the place store) so only the results you return cost a detail lookup. Track ranker and ETA p95/p99 separately from overall search p99 so a slow optional stage is visible."
       ],
       "view": {
         "nodes": [
@@ -1074,7 +1261,8 @@
             "groups": [
               "query-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-ranking-opt1.jpg"
         },
         {
           "name": "Rank by raw distance only",
@@ -1105,7 +1293,8 @@
             "highlight": [
               "GeoIndex"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-ranking-opt2.jpg"
         },
         {
           "name": "Learned ranking model (ML re-rank)",
@@ -1147,7 +1336,8 @@
             "highlight": [
               "MLRanker"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-ranking-opt3.jpg"
         }
       ],
       "decisionPrompt": "Should you rank by raw distance, or something else? What signals matter?",
@@ -1155,10 +1345,19 @@
         "Candidate generation + ranking"
       ],
       "probeLinks": [
-        "postgis-docs",
+        "yelp-core-search",
+        "yelp-maptype",
+        "yelp-nrtsearch",
+        "yelp-filters",
+        "yelp-business-matching",
+        "postgis-knn",
         "elastic-geo",
-        "h3-docs",
-        "uber-h3"
+        "solr-spatial",
+        "google-routes",
+        "osrm-docs",
+        "valhalla-api",
+        "owasp-api4",
+        "ftc-location-privacy"
       ],
       "whyNow": [
         "Separating cheap candidate generation from a richer ranking pass is the standard search architecture and keeps the index simple."
@@ -1177,6 +1376,35 @@
         "after": "Filtered, ranked, hydrated top-K results.",
         "newRisk": "Ranking adds latency; index must stay fresh as places change."
       },
+      "traps": [
+        {
+          "trap": "Hydrating full details for every candidate before filtering and ranking.",
+          "why": "Dense cells can return hundreds of candidates; a detail lookup per candidate multiplies cache/DB load and breaks the bounded-cost story.",
+          "instead": "Filter and score from index/entry metadata first; hydrate full details only for the top-K you return."
+        },
+        {
+          "trap": "Calling the routing/ETA service for every candidate.",
+          "why": "Per-candidate ETA fanout turns a geo-search into a slow routing service and dominates the p99 budget.",
+          "instead": "Run ETA/ML only over a small top-N with a timeout and a straight-line-distance fallback."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The ETA/routing service is slow or down.",
+          "expectedBehavior": "Search still returns ranked results on time.",
+          "mitigation": "Tight per-call timeout; fall back to straight-line distance and rank without ETA; track ETA p99 separately."
+        },
+        {
+          "scenario": "The ranking service times out.",
+          "expectedBehavior": "User still gets a reasonable ordering.",
+          "mitigation": "Fall back to the cheap stage-1 score (distance + rating) and serve the top-K from that."
+        },
+        {
+          "scenario": "PlaceCache is down so details can't be hydrated.",
+          "expectedBehavior": "Results still return, possibly with leaner detail.",
+          "mitigation": "Fall back to PlaceDB reads for the bounded top-K (capacity-limited); shed optional fields rather than fail the query."
+        }
+      ],
       "flows": [
         {
           "name": "Candidates -> filter -> rank -> hydrate",
@@ -1277,9 +1505,13 @@
       "id": "indexing",
       "title": "6. Keep the Index Fresh (Async Write Path)",
       "description": [
-        "Place writes go to the authoritative store; the place service emits a change event onto a queue. An indexer consumes events and upserts the affected geo cells.",
-        "Decoupling indexing from the write path keeps writes fast and lets the read-heavy index scale independently; the index may lag writes by minutes, which the requirements allow.",
-        "Shard the geo index by cell-key prefix (region) so dense regions live on dedicated shards; replicate read replicas for query volume."
+        "Place writes go to the authoritative store; the change event {place_id, event_id, place_version, op, old_cell, new_cell, event_time} must be produced atomically with that write — not as a best-effort app publish after commit, which can lose the event if the process dies between commit and publish. The default is a transactional outbox: write the place row and an outbox row in one PlaceDB transaction, then a relay drains the outbox to the change queue; CDC off the place/change table is the equivalent log-based alternative. Either way the event is created if and only if the write committed.",
+        "An indexer consumes events and upserts the affected geo cells — removing old_cell and adding new_cell on a move.",
+        "The geo index is derived state, so correctness comes from replayability, not from the queue alone. Make index updates idempotent keyed by (place_id, version): apply an event only if its version is newer than what the cell already reflects, so duplicate or out-of-order deliveries are safe. Park poison events in a dead-letter queue and replay/backfill from the authoritative PlaceDB.",
+        "Support a full rebuild from PlaceDB: build a fresh index into a shadow namespace, verify counts/lag, then atomically swap it into service (alias flip) so reads never see a half-built index. Partial reconciliation jobs periodically diff cells against PlaceDB to repair drift.",
+        "Decoupling indexing from the write path keeps writes fast and lets the read-heavy index scale independently; the index may lag writes by minutes, which the requirements allow. Track that lag explicitly: queue lag, index age by region/cell-prefix, stale-result rate, and rebuild progress, with SLOs and alerts.",
+        "Shard the geo index by cell-key prefix (region) so dense regions live on dedicated shards; replicate read replicas for query volume, and split hot cells when a single cell's place list grows too large.",
+        "Globally, cell-prefix is the ownership key: a query routes to the shard owning the covering cells (usually the user's own region), reading from a nearby read replica. If a regional shard is unavailable, degrade gracefully — serve a slightly staler replica or a coarser/best-effort result rather than failing the search. Cross-region writes still go to the authoritative store and re-key cells; only the derived index is regionalized, so there is one source of truth, not conflicting regional masters."
       ],
       "view": {
         "nodes": [
@@ -1292,7 +1524,11 @@
         ],
         "caption": "When a place changes, the place service writes the place store and emits a change event; the change queue delivers it to the index builder, which upserts the geo index.",
         "links": [
-          "lb-place",
+          {
+            "from": "Client",
+            "to": "PlaceSvc",
+            "label": "place CRUD"
+          },
           "place-placedb",
           "place-changeq",
           "changeq-indexer",
@@ -1345,7 +1581,8 @@
             "groups": [
               "index-path"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-indexing-opt1.jpg"
         },
         {
           "name": "Synchronous dual write on the write path",
@@ -1379,42 +1616,99 @@
             "highlight": [
               "GeoIndex"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-indexing-opt2.jpg"
         }
       ],
       "decisionPrompt": "Why update the geo index asynchronously instead of synchronously on each place write?",
+      "concepts": [
+        {
+          "term": "Transactional outbox / CDC",
+          "definition": "Writing the change event in the same transaction as the place row (an outbox table a relay drains), or capturing it from the DB log via CDC, instead of publishing best-effort after commit.",
+          "whyItMatters": "Closes the dual-write hole: the event exists if and only if the write committed, so the derived index can't silently miss a place.",
+          "example": "PlaceDB txn writes places + outbox; a relay forwards outbox rows to ChangeQ at-least-once.",
+          "group": "Keep the Index Fresh (Async Write Path)"
+        },
+        {
+          "term": "Idempotent derived-index update",
+          "definition": "Applying a change event keyed by (place_id, version) so reprocessing the same or an out-of-order event has no extra effect.",
+          "whyItMatters": "Queues deliver at-least-once; without version-keyed idempotency replays would corrupt cell membership.",
+          "example": "Skip an event whose version <= the version already reflected in the cell.",
+          "group": "Keep the Index Fresh (Async Write Path)"
+        },
+        {
+          "term": "Rebuild + atomic swap",
+          "definition": "Building a fresh index from the source of truth into a shadow namespace and flipping an alias to it once verified.",
+          "whyItMatters": "Lets you recover from drift or schema changes without serving a half-built index.",
+          "example": "Reindex all of PlaceDB into geo_v2, verify, then point reads at geo_v2.",
+          "group": "Keep the Index Fresh (Async Write Path)"
+        }
+      ],
       "patterns": [
         "Async index update via change stream"
       ],
       "probeLinks": [
-        "postgis-docs",
+        "yelp-fast-order-search",
+        "yelp-nrtsearch",
+        "yelp-coordinator",
+        "debezium-outbox",
+        "transactional-outbox",
         "h3-docs",
-        "uber-h3",
-        "s2-docs"
+        "s2-docs",
+        "ftc-location-privacy"
       ],
       "whyNow": [
         "Tying the write path to async indexing closes the loop: reads stay fast, the index scales separately, and freshness is a tunable lag."
       ],
       "recap": {
         "before": "Index correctness assumed.",
-        "after": "Index updated off the write path; sharded by region; eventually fresh.",
-        "newRisk": "Index lag; a move re-keys a place across cells (delete-from-old + add-to-new must be atomic-ish)."
+        "after": "Index updated off the write path; change events created atomically with the write via outbox/CDC; idempotent on (place_id, version); sharded by region; rebuildable via atomic swap; lag observable.",
+        "newRisk": "Index lag; a move re-keys a place across cells (delete-from-old + add-to-new must be atomic-ish); needs lag SLOs and dead-letter handling."
       },
       "bottlenecks": [
         {
           "issue": "A dense-region index shard gets hammered by city queries.",
-          "mitigation": "Finer cells + dedicated shard + read replicas for hot regions."
+          "mitigation": "Finer cells + dedicated shard + read replicas for hot regions; split a hot cell whose place list grows too large."
         },
         {
           "issue": "A place moving location lingers in its old cell.",
-          "mitigation": "Indexer removes from the old cell and adds to the new on each change event."
+          "mitigation": "The move event carries old_cell + new_cell; the indexer removes from old and adds to new idempotently on (place_id, version)."
+        },
+        {
+          "issue": "PlaceCache serves stale details after a place update (renamed, hours changed, closed).",
+          "mitigation": "On the change event, invalidate or refresh the cached detail by place_id; use a short TTL as a backstop and filter tombstoned places at read time."
         }
       ],
       "failureDrills": [
         {
           "scenario": "The indexer falls behind during a bulk import.",
           "expectedBehavior": "Reads serve slightly stale results; the queue absorbs the backlog and catches up.",
-          "mitigation": "Eventually-consistent index + scalable consumers; bound the acceptable lag."
+          "mitigation": "Eventually-consistent index + scalable consumers; alert on queue-lag/index-age SLOs and bound the acceptable lag."
+        },
+        {
+          "scenario": "The place row commits but the change event never reaches the queue.",
+          "expectedBehavior": "The index still converges — no place is silently missing because of a lost publish.",
+          "mitigation": "Produce the event in the same transaction as the write (outbox table) or via CDC, so commit and event are atomic; a relay retries delivery, and reconciliation against PlaceDB repairs any residual drift."
+        },
+        {
+          "scenario": "A change event is delivered twice or out of order.",
+          "expectedBehavior": "The index stays correct — a stale or duplicate event is a no-op.",
+          "mitigation": "Idempotent upserts keyed by (place_id, version); apply only if the event version is newer than the cell's recorded version."
+        },
+        {
+          "scenario": "A poison event repeatedly fails to apply.",
+          "expectedBehavior": "It stops blocking the stream and is investigated out of band.",
+          "mitigation": "Dead-letter the event after N retries; replay/backfill the affected place from PlaceDB."
+        },
+        {
+          "scenario": "A regional geo-index shard (or its replicas) becomes unavailable.",
+          "expectedBehavior": "Searches in that region still return, possibly slightly staler or coarser, rather than erroring.",
+          "mitigation": "Read from a surviving replica or fail over to a coarser/global fallback index; the authoritative PlaceDB is unaffected, so the shard rebuilds from it on recovery."
+        },
+        {
+          "scenario": "The geo index is corrupted or its schema must change.",
+          "expectedBehavior": "Reads keep serving from the current index while a clean one is built.",
+          "mitigation": "Full rebuild from PlaceDB into a shadow namespace, verify, then atomic alias swap; reconciliation jobs repair drift continuously."
         }
       ],
       "flows": [
@@ -1459,19 +1753,19 @@
                 "from": "PlaceSvc",
                 "to": "PlaceDB",
                 "arrow": "->>",
-                "label": "persist place"
-              },
-              {
-                "from": "PlaceSvc",
-                "to": "ChangeQ",
-                "arrow": "->>",
-                "label": "emit change event"
+                "label": "persist place + outbox event (one txn)"
               },
               {
                 "from": "PlaceSvc",
                 "to": "Client",
                 "arrow": "-->>",
                 "label": "201 (indexed shortly)"
+              },
+              {
+                "from": "PlaceDB",
+                "to": "ChangeQ",
+                "arrow": "->>",
+                "label": "relay/CDC drains outbox"
               },
               {
                 "from": "ChangeQ",
@@ -1498,7 +1792,7 @@
   ],
   "finalDesign": {
     "title": "Final Design — Geo-Indexed Nearby Search",
-    "description": "Places persist to an authoritative store and emit change events; an indexer maintains a sharded geospatial index (geohash/S2) mapping cells to place ids. A search resolves a location+radius into a covering set of cells (plus neighbors), gathers candidate place ids, exact-distance filters, ranks by distance/rating/popularity, and hydrates the top-K from a hot place cache. Cell granularity adapts to density; indexing is async so reads stay fast.",
+    "description": "Places persist to an authoritative store and produce (place_id, version) change events atomically with the write via a transactional outbox / CDC; an indexer maintains a sharded geospatial index — the defended default is S2/H3 region covering backed by a KV cell index (geohash prefixes are the simpler baseline) — mapping cells to place ids with light per-entry filter metadata (category, price_level, open_state, timezone, place_version). A search resolves a location+radius into a covering set of cells, gathers candidate place ids, exact-distance filters, cheaply filters/scores from index metadata, runs ETA/ML only over a small top-N with a timeout fallback, and hydrates the top-K from a hot place cache. Cell granularity adapts to density with a fanout cap. The gateway validates coordinates and caps radius/limit and rate-limits per client/API key; coordinate logs are minimized and short-retained. Reads route by region/cell-prefix to read replicas and degrade gracefully if a regional shard is unavailable. Indexing is async and idempotent on (place_id, version), with dead-letter + replay/backfill from PlaceDB, full rebuild via shadow-namespace atomic swap, and lag/index-age SLOs by region so reads stay fast and the derived index stays correct.",
     "view": {
       "nodes": [
         "Client",
@@ -1533,38 +1827,242 @@
         "query-path",
         "index-path"
       ]
-    }
+    },
+    "flows": [
+      {
+        "name": "Search flow: request -> cells -> candidates -> filter/rank -> hydrate",
+        "note": "End-to-end read path: resolve the radius to a covering set of cells, fetch candidates, exact-distance filter, cheaply filter/rank from index metadata (ETA only for the top-N with a fallback), then hydrate the top-K from the place cache.",
+        "sequence": {
+          "participants": [
+            {
+              "id": "Client",
+              "label": "Client"
+            },
+            {
+              "id": "SearchSvc",
+              "label": "Search Service"
+            },
+            {
+              "id": "GeoIndex",
+              "label": "Geo Index"
+            },
+            {
+              "id": "Ranker",
+              "label": "Ranker"
+            },
+            {
+              "id": "ETA",
+              "label": "Routing / ETA"
+            },
+            {
+              "id": "PlaceCache",
+              "label": "Place Cache"
+            }
+          ],
+          "messages": [
+            {
+              "from": "Client",
+              "to": "SearchSvc",
+              "arrow": "->>",
+              "label": "GET /nearby (lat,lng,radius,filters)"
+            },
+            {
+              "from": "SearchSvc",
+              "to": "SearchSvc",
+              "arrow": "->>",
+              "label": "compute covering set for radius"
+            },
+            {
+              "from": "SearchSvc",
+              "to": "GeoIndex",
+              "arrow": "->>",
+              "label": "candidates for covering cells"
+            },
+            {
+              "from": "GeoIndex",
+              "to": "SearchSvc",
+              "arrow": "-->>",
+              "label": "place ids + filter metadata"
+            },
+            {
+              "from": "SearchSvc",
+              "to": "SearchSvc",
+              "arrow": "->>",
+              "label": "haversine filter + stage-1 score/filter"
+            },
+            {
+              "from": "SearchSvc",
+              "to": "Ranker",
+              "arrow": "->>",
+              "label": "rank candidates"
+            },
+            {
+              "type": "opt",
+              "label": "top-N only, with timeout",
+              "messages": [
+                {
+                  "from": "Ranker",
+                  "to": "ETA",
+                  "arrow": "->>",
+                  "label": "travel distance for top-N (fallback: straight-line)"
+                }
+              ]
+            },
+            {
+              "from": "Ranker",
+              "to": "SearchSvc",
+              "arrow": "-->>",
+              "label": "ranked top-K ids"
+            },
+            {
+              "from": "SearchSvc",
+              "to": "PlaceCache",
+              "arrow": "->>",
+              "label": "hydrate top-K details"
+            },
+            {
+              "from": "SearchSvc",
+              "to": "Client",
+              "arrow": "-->>",
+              "label": "200 ranked places"
+            }
+          ]
+        },
+        "highlight": [
+          "GeoIndex",
+          "Ranker"
+        ]
+      },
+      {
+        "name": "Write flow: create/update/delete -> event -> idempotent index update",
+        "note": "End-to-end write path: persist the authoritative record and bump version, emit a (place_id, version) event with old/new cell, and have the indexer apply it idempotently so the change becomes query-visible.",
+        "sequence": {
+          "participants": [
+            {
+              "id": "Client",
+              "label": "Client"
+            },
+            {
+              "id": "PlaceSvc",
+              "label": "Place Service"
+            },
+            {
+              "id": "PlaceDB",
+              "label": "Place Store"
+            },
+            {
+              "id": "ChangeQ",
+              "label": "Change Queue"
+            },
+            {
+              "id": "Indexer",
+              "label": "Indexer"
+            },
+            {
+              "id": "GeoIndex",
+              "label": "Geo Index"
+            }
+          ],
+          "messages": [
+            {
+              "from": "Client",
+              "to": "PlaceSvc",
+              "arrow": "->>",
+              "label": "POST/PATCH/DELETE /places"
+            },
+            {
+              "from": "PlaceSvc",
+              "to": "PlaceDB",
+              "arrow": "->>",
+              "label": "persist + bump version + outbox {place_id, version, op, old_cell, new_cell} (one txn; tombstone on delete)"
+            },
+            {
+              "from": "PlaceSvc",
+              "to": "Client",
+              "arrow": "-->>",
+              "label": "2xx (indexed shortly)"
+            },
+            {
+              "from": "PlaceDB",
+              "to": "ChangeQ",
+              "arrow": "->>",
+              "label": "relay / CDC drains outbox (at-least-once)"
+            },
+            {
+              "from": "ChangeQ",
+              "to": "Indexer",
+              "arrow": "->>",
+              "label": "deliver event"
+            },
+            {
+              "type": "alt",
+              "label": "event version newer than cell",
+              "messages": [
+                {
+                  "from": "Indexer",
+                  "to": "GeoIndex",
+                  "arrow": "->>",
+                  "label": "remove old_cell, add new_cell"
+                }
+              ],
+              "else": {
+                "label": "stale/duplicate",
+                "messages": [
+                  {
+                    "from": "Indexer",
+                    "to": "Indexer",
+                    "arrow": "->>",
+                    "label": "no-op (idempotent on place_id, version)"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "highlight": [
+          "ChangeQ",
+          "Indexer",
+          "GeoIndex"
+        ]
+      }
+    ],
+    "aiVisual": "assets/generated/ai-visuals/final-design.jpg"
   },
   "satisfies": {
     "functional": [
       {
         "requirement": "Find places within radius",
-        "how": "Covering cells + neighbor expansion + exact-distance filter.",
+        "how": "Covering set of cells for the radius + exact-distance (haversine) filter.",
         "steps": [
           "geohash",
           "boundaries"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-01-find-places-within-radius.jpg"
       },
       {
-        "requirement": "Filter by category / open-now",
-        "how": "Filters applied before ranking on the candidate set.",
+        "requirement": "Filter by category / price / open-now",
+        "how": "Cheap filters applied before ranking from geo_index.entry_meta (category, price_level); open-now from the entry's precomputed open_state + timezone, no per-candidate hydration.",
         "steps": [
+          "geohash",
           "ranking"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-02-filter-by-category-price-open-now.jpg"
       },
       {
         "requirement": "Rank by distance + rating",
-        "how": "Ranking service blends signals over candidates.",
+        "how": "Ranking service blends distance, rating, and popularity over the candidate set (ETA only for the top-N).",
         "steps": [
           "ranking"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-03-rank-by-distance-rating.jpg"
       },
       {
         "requirement": "Reflect place changes",
-        "how": "Change events update the geo index asynchronously.",
+        "how": "Change events update the geo index asynchronously, within the minutes-scale lag the requirements allow.",
         "steps": [
           "indexing"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-04-reflect-place-changes.jpg"
       }
     ],
     "nonFunctional": [
@@ -1574,31 +2072,877 @@
         "steps": [
           "geohash",
           "ranking"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-01-search-p99-200-ms.jpg"
       },
       {
         "requirement": "Scale to 100M places",
         "how": "Index sharded by region; read replicas for query volume.",
         "steps": [
           "indexing"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-02-scale-to-100m-places.jpg"
       },
       {
         "requirement": "Consistent across densities",
         "how": "Adaptive cell granularity bounds candidate counts everywhere.",
         "steps": [
           "density"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-03-consistent-across-densities.jpg"
       },
       {
         "requirement": "Highly available reads",
         "how": "Read path independent of writes; eventually-consistent index.",
         "steps": [
           "indexing"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-04-highly-available-reads.jpg"
+      },
+      {
+        "requirement": "Correct, recoverable derived index",
+        "how": "Change events created atomically with the write (transactional outbox / CDC), idempotent (place_id, version) updates, dead-letter + replay/backfill, and full rebuild via shadow-namespace atomic swap with lag/index-age SLOs.",
+        "steps": [
+          "indexing"
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-05-correct-recoverable-derived-index.jpg"
       }
     ]
   },
+  "technologyChoices": [
+    {
+      "concern": "API edge, coordinate validation, and abuse controls",
+      "steps": [
+        "naive",
+        "ranking",
+        "density"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kong",
+          "icon": "assets/tech-icons/kong.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "HAProxy",
+          "icon": "assets/tech-icons/haproxy.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          },
+          {
+            "name": "WAF",
+            "icon": "assets/tech-icons/Arch_AWS-WAF_64.png"
+          },
+          {
+            "name": "CloudFront",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudFront_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Load Balancing",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Armor",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Endpoints",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "API Management",
+            "icon": "assets/tech-icons/10042-icon-service-API-Management-Services.svg"
+          },
+          {
+            "name": "Application Gateway",
+            "icon": "assets/tech-icons/10076-icon-service-Application-Gateways.svg"
+          },
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "The edge should reject invalid coordinates, cap radius/result limits, and enforce per-client/API-key rate limits before hot geo shards see traffic.",
+        "A managed edge reduces operational work for TLS, WAF rules, quotas, and request logs, but application-level validation still protects internal callers and bypass paths."
+      ],
+      "makesIrrelevant": "A managed API edge with rate limiting and WAF policies removes most custom reverse-proxy glue for public nearby-search endpoints."
+    },
+    {
+      "concern": "Authoritative place store and transactional outbox",
+      "steps": [
+        "naive",
+        "indexing"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "CockroachDB",
+          "icon": "assets/tech-icons/cockroach.png"
+        },
+        {
+          "name": "MongoDB",
+          "icon": "assets/tech-icons/mongodb.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Aurora (PostgreSQL)",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "RDS",
+            "icon": "assets/tech-icons/Arch_Amazon-RDS_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "AlloyDB",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A relational place store makes lifecycle, versioning, idempotency keys, and outbox writes easy to keep in one transaction.",
+        "Document or key-value stores scale writes and flexible metadata well, but the app must enforce old-cell/new-cell move semantics and event atomicity carefully."
+      ],
+      "makesIrrelevant": "A database-native CDC feed or transactional outbox removes the unsafe dual-write pattern where a place update commits but its indexing event is lost."
+    },
+    {
+      "concern": "Geospatial index store",
+      "steps": [
+        "geohash",
+        "boundaries",
+        "density"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostGIS (GiST/SP-GiST on geometry)",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Elasticsearch / OpenSearch geo_point + geo_distance",
+          "icon": "assets/tech-icons/elasticsearch.png"
+        },
+        {
+          "name": "S2 / H3 cell ids over Redis/Valkey or a sorted KV",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "MongoDB 2dsphere",
+          "icon": "assets/tech-icons/mongodb.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "OpenSearch Service (geo queries)",
+            "icon": "assets/tech-icons/Arch_Amazon-OpenSearch-Service_64.png"
+          },
+          {
+            "name": "DynamoDB with geohash sort keys",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "Aurora PostgreSQL + PostGIS",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "AlloyDB / Cloud SQL + PostGIS",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Bigtable with cell-prefix row keys",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB (geospatial)",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Database for PostgreSQL + PostGIS",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "PostGIS/Elasticsearch give rich geo queries out of the box but you operate and shard them; raw S2/H3 over a KV is leaner and cheaper at scale but you build covering-set and neighbor logic yourself.",
+        "A managed geo-capable DB removes index sizing/sharding toil at higher cost and less control over hot-cell splitting."
+      ],
+      "makesIrrelevant": [
+        "A managed auto-sharding geo store can remove hand-rolled cell-prefix sharding for many scales."
+      ]
+    },
+    {
+      "concern": "Cell covering and adaptive precision library",
+      "steps": [
+        "geohash",
+        "boundaries",
+        "density"
+      ],
+      "selfHosted": [
+        {
+          "name": "S2 Geometry",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "H3",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Geohash library",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "PostGIS",
+          "icon": "assets/tech-icons/postgresql.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Amazon Location Service",
+            "icon": "assets/tech-icons/Arch_Amazon-Location-Service_64.png"
+          },
+          {
+            "name": "Aurora PostgreSQL + PostGIS",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Google Maps Platform",
+            "icon": "assets/tech-icons/MapsGeospatial-512-color.png"
+          },
+          {
+            "name": "AlloyDB / Cloud SQL + PostGIS",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Maps",
+            "icon": "assets/tech-icons/10185-icon-service-Azure-Maps-Accounts.svg"
+          },
+          {
+            "name": "Azure Database for PostgreSQL + PostGIS",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "S2/H3-style coverers make radius and boundary handling explicit and support density-aware levels, but the service owns fanout limits and neighbor expansion.",
+        "Database-native spatial functions are simpler to adopt, but large hot regions can force careful partitioning and query planning."
+      ],
+      "makesIrrelevant": "A robust covering library removes brittle hand-authored neighbor tables and one-off boundary cases in the search service."
+    },
+    {
+      "concern": "Search service runtime and regional read scaling",
+      "steps": [
+        "boundaries",
+        "density",
+        "ranking"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kubernetes",
+          "icon": "assets/tech-icons/kubernetes.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Anycast",
+          "icon": "assets/tech-icons/anycast.png"
+        },
+        {
+          "name": "GeoDNS (PowerDNS/CoreDNS)",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "EKS",
+            "icon": "assets/tech-icons/Arch_Amazon-Elastic-Kubernetes-Service_64.png"
+          },
+          {
+            "name": "ECS",
+            "icon": "assets/tech-icons/Arch_Amazon-Elastic-Container-Service_64.png"
+          },
+          {
+            "name": "Global Accelerator",
+            "icon": "assets/tech-icons/Arch_AWS-Global-Accelerator_64.png"
+          },
+          {
+            "name": "Route 53",
+            "icon": "assets/tech-icons/Arch_Amazon-Route-53_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "GKE",
+            "icon": "assets/tech-icons/Containers-512-color.png"
+          },
+          {
+            "name": "Cloud Run",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          },
+          {
+            "name": "Cloud Load Balancing",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "AKS",
+            "icon": "assets/tech-icons/10023-icon-service-Kubernetes-Services.svg"
+          },
+          {
+            "name": "Container Apps",
+            "icon": "assets/tech-icons/02989-icon-service-Container-Apps-Environments.svg"
+          },
+          {
+            "name": "Traffic Manager",
+            "icon": "assets/tech-icons/10065-icon-service-Traffic-Manager-Profiles.svg"
+          },
+          {
+            "name": "Front Door",
+            "icon": "assets/tech-icons/10073-icon-service-Front-Door-and-CDN-Profiles.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Stateless regional search workers scale horizontally and keep p99 bounded when they route to local cell-prefix shards.",
+        "Global active-active reads improve availability and latency, but the design must tolerate stale regional replicas and degraded shards."
+      ],
+      "makesIrrelevant": "Provider-managed global load balancing and autoscaling remove much of the custom regional router and capacity-drain logic."
+    },
+    {
+      "concern": "Candidate filtering and ranking pipeline",
+      "steps": [
+        "ranking"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Elasticsearch",
+          "icon": "assets/tech-icons/elasticsearch.png"
+        },
+        {
+          "name": "OpenSearch",
+          "icon": "assets/tech-icons/opensearch.png"
+        },
+        {
+          "name": "Redis / Valkey",
+          "icon": "assets/tech-icons/redis.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "OpenSearch Service",
+            "icon": "assets/tech-icons/Arch_Amazon-OpenSearch-Service_64.png"
+          },
+          {
+            "name": "SageMaker",
+            "icon": "assets/tech-icons/Arch_Amazon-SageMaker-AI_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Vertex AI",
+            "icon": "assets/tech-icons/AIMachineLearning-512-color.png"
+          },
+          {
+            "name": "Cloud Run",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure AI Search",
+            "icon": "assets/tech-icons/10044-icon-service-Cognitive-Search.svg"
+          },
+          {
+            "name": "Azure Machine Learning",
+            "icon": "assets/tech-icons/10166-icon-service-Machine-Learning.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A simple deterministic ranker is transparent and fast for distance, rating, popularity, open-now, and category filters.",
+        "A learned ranker can improve relevance, but it must run only on the bounded candidate set and have a timeout/fallback so it does not dominate p99."
+      ],
+      "makesIrrelevant": "A search platform with built-in geo distance sorting and filters can remove some custom rank-stage code, but it does not remove exact-distance trimming or top-K hydration."
+    },
+    {
+      "concern": "Change stream / indexing queue",
+      "steps": [
+        "indexing"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Debezium CDC off PlaceDB",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "RabbitMQ",
+          "icon": "assets/tech-icons/rabbitmq.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "MSK / Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Streaming-for-Apache-Kafka_64.png"
+          },
+          {
+            "name": "DynamoDB Streams",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "SQS + DLQ",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Datastream (CDC)",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "CDC off the place store guarantees no missed change without app-level dual-write, but couples to the DB; an app-emitted event is simpler but must be transactional with the write (outbox pattern).",
+        "A log (Kafka/Kinesis) makes replay/backfill and ordering natural; a plain queue is simpler but needs explicit replay tooling."
+      ],
+      "makesIrrelevant": "A managed stream with retention, consumer lag metrics, and DLQ integration removes much of the hand-built replay and offset bookkeeping."
+    },
+    {
+      "concern": "Indexer workers, replay, and shadow rebuilds",
+      "steps": [
+        "indexing",
+        "density"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kubernetes Jobs",
+          "icon": "assets/tech-icons/kubernetes.png"
+        },
+        {
+          "name": "Apache Spark",
+          "icon": "assets/tech-icons/spark.png"
+        },
+        {
+          "name": "Apache Flink",
+          "icon": "assets/tech-icons/flink.png"
+        },
+        {
+          "name": "Temporal",
+          "icon": "assets/tech-icons/temporal.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "EKS",
+            "icon": "assets/tech-icons/Arch_Amazon-Elastic-Kubernetes-Service_64.png"
+          },
+          {
+            "name": "Lambda",
+            "icon": "assets/tech-icons/Arch_AWS-Lambda_64.png"
+          },
+          {
+            "name": "EMR",
+            "icon": "assets/tech-icons/Arch_Amazon-EMR_64.png"
+          },
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "GKE",
+            "icon": "assets/tech-icons/Containers-512-color.png"
+          },
+          {
+            "name": "Cloud Run",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          },
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "AKS",
+            "icon": "assets/tech-icons/10023-icon-service-Kubernetes-Services.svg"
+          },
+          {
+            "name": "Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          },
+          {
+            "name": "Azure Databricks",
+            "icon": "assets/tech-icons/10787-icon-service-Azure-Databricks.svg"
+          },
+          {
+            "name": "Logic Apps",
+            "icon": "assets/tech-icons/10363-icon-service-Logic-Apps-Custom-Connector.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Long-running workers are a good fit for continuous indexing with backpressure, lag metrics, and idempotent retries.",
+        "Batch or workflow tooling is better for full rebuilds and shadow-namespace swaps because it makes progress, checkpoints, and rollback visible."
+      ],
+      "makesIrrelevant": "Managed batch/stream workers can remove custom rebuild schedulers, but not the version checks that keep index writes idempotent."
+    },
+    {
+      "concern": "Place detail cache",
+      "steps": [
+        "ranking"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis / Valkey",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Memcached",
+          "icon": "assets/tech-icons/memcached.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "ElastiCache (Redis/Valkey)",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A managed cache removes failover/scaling toil; self-hosted Redis gives more control over eviction and geo-replication."
+      ],
+      "makesIrrelevant": "A highly available managed cache removes most custom cache failover work, but the service still needs cache-miss bounds and stale-detail handling."
+    },
+    {
+      "concern": "Routing / ETA (optional ranking signal)",
+      "steps": [
+        "ranking"
+      ],
+      "selfHosted": [
+        {
+          "name": "OSRM",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Valhalla",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "GraphHopper",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Amazon Location Service (routes)",
+            "icon": "assets/tech-icons/Arch_Amazon-Location-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Google Maps Routes API",
+            "icon": "assets/tech-icons/MapsGeospatial-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Maps Route",
+            "icon": "assets/tech-icons/10185-icon-service-Azure-Maps-Accounts.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A managed routing API is fast to adopt but adds per-call cost and an external dependency on the hot path; self-hosted OSRM/Valhalla is cheaper per call but you host map data and tiles.",
+        "Either way, call only for the top-N with a timeout and a straight-line fallback so it can't dominate p99."
+      ],
+      "makesIrrelevant": [
+        "Caching/approximating travel distance can remove most live routing calls for ranking; live routing then only runs when the user opens directions."
+      ]
+    },
+    {
+      "concern": "Coordinate privacy, logs, and coarse analytics",
+      "steps": [
+        "ranking",
+        "indexing"
+      ],
+      "selfHosted": [
+        {
+          "name": "OpenTelemetry",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Loki / ELK logs",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "CloudTrail",
+            "icon": "assets/tech-icons/Arch_AWS-CloudTrail_64.png"
+          },
+          {
+            "name": "KMS",
+            "icon": "assets/tech-icons/Arch_AWS-Key-Management-Service_64.png"
+          },
+          {
+            "name": "Athena",
+            "icon": "assets/tech-icons/Arch_Amazon-Athena_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Logging",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud KMS",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          },
+          {
+            "name": "BigQuery",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Log Analytics",
+            "icon": "assets/tech-icons/00009-icon-service-Log-Analytics-Workspaces.svg"
+          },
+          {
+            "name": "Key Vault",
+            "icon": "assets/tech-icons/10245-icon-service-Key-Vaults.svg"
+          },
+          {
+            "name": "Azure Data Lake Storage",
+            "icon": "assets/tech-icons/10090-icon-service-Data-Lake-Storage-Gen1.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Precise coordinates are useful for debugging ranking and coverage, but they are sensitive and should be minimized, short-retained, encrypted, and access-controlled.",
+        "Aggregating to coarse cells supports traffic and capacity analysis without retaining user-level trails."
+      ],
+      "makesIrrelevant": "Strict log redaction and cell-level analytics remove the need for broad access to raw coordinate logs in normal operations."
+    },
+    {
+      "concern": "Geo index observability and SLO dashboards",
+      "steps": [
+        "density",
+        "ranking",
+        "indexing"
+      ],
+      "selfHosted": [
+        {
+          "name": "Prometheus",
+          "icon": "assets/tech-icons/prometheus.png"
+        },
+        {
+          "name": "Grafana",
+          "icon": "assets/tech-icons/grafana.png"
+        },
+        {
+          "name": "OpenTelemetry",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Jaeger",
+          "icon": "assets/tech-icons/jaeger.png"
+        },
+        {
+          "name": "Elasticsearch",
+          "icon": "assets/tech-icons/elasticsearch.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "Managed Service for Prometheus",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Service-for-Prometheus_64.png"
+          },
+          {
+            "name": "X-Ray",
+            "icon": "assets/tech-icons/Arch_AWS-X-Ray_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Trace",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Logging",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Application Insights",
+            "icon": "assets/tech-icons/00012-icon-service-Application-Insights.svg"
+          },
+          {
+            "name": "Log Analytics",
+            "icon": "assets/tech-icons/00009-icon-service-Log-Analytics-Workspaces.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Nearby search needs region/cell-prefix metrics such as p99 latency, candidate fanout, cache hit rate, queue lag, index age, and stale-result filters.",
+        "Managed observability suites reduce setup work, but the application still needs domain metrics that generic infrastructure dashboards do not infer."
+      ],
+      "makesIrrelevant": "Good index-age and cell-hotspot dashboards remove many manual audit scripts used to discover stale shards after incidents."
+    }
+  ],
   "interviewScript": [
     {
       "phase": "Scope & requirements",
@@ -1633,6 +2977,9 @@
       "say": [
         "Map requirements to mechanisms.",
         "Tradeoffs: cell-size tuning, index lag, dense-region hotspots.",
+        "Operational closure: idempotent events, replay/backfill, full rebuild via atomic swap, lag/index-age SLOs.",
+        "Validation & abuse: cap radius and result limits, validate coordinates, rate-limit per client/API key.",
+        "Location privacy: minimize and short-retain user-coordinate logs, restrict access.",
         "Extensions: moving objects (drivers), ETA/routing, personalization."
       ]
     }
@@ -1668,45 +3015,68 @@
     "Geohash vs S2 vs quadtree — when would you pick each in production?",
     "How do you handle a place that changes location (re-keying across cells)?",
     "How would you add ETA-aware ranking using a routing service without blowing the latency budget?",
-    "How do you keep dense-city index shards from becoming hotspots?"
+    "How do you keep dense-city index shards from becoming hotspots?",
+    "How do you rebuild the geo index from scratch (or after corruption) without serving a half-built index?",
+    "How do you protect user-location privacy — log minimization, retention, and access controls for coordinates?",
+    "How do you defend the search endpoint from abuse — radius caps, result limits, and per-client rate limits?"
   ],
   "toProbeFurther": {
     "links": [
       {
         "id": "h3-docs",
-        "group": "Location and Marketplace",
-        "groupDescription": "Geospatial indexing, routing, dispatch, and marketplace operations references.",
+        "group": "Geospatial Indexing and Cell Covering",
+        "groupDescription": "Grid systems and covering mechanics for radius queries, boundary handling, and uneven spatial density.",
         "title": "H3 Documentation",
         "url": "https://h3geo.org/docs/",
         "source": "H3",
         "type": "Docs",
-        "why": "Hexagonal geospatial index reference for proximity, coverage, and bucketing."
+        "why": "Reference for H3's hierarchical hexagonal cells, resolutions, and index operations."
+      },
+      {
+        "id": "h3-traversal",
+        "group": "Geospatial Indexing and Cell Covering",
+        "groupDescription": "Grid systems and covering mechanics for radius queries, boundary handling, and uneven spatial density.",
+        "title": "Grid traversal functions",
+        "url": "https://h3geo.org/docs/api/traversal/",
+        "source": "H3",
+        "type": "Docs",
+        "why": "Shows gridDisk/gridRing-style neighbor expansion, which maps directly to covering nearby cells around a query point."
       },
       {
         "id": "uber-h3",
-        "group": "Location and Marketplace",
-        "groupDescription": "Geospatial indexing, routing, dispatch, and marketplace operations references.",
+        "group": "Geospatial Indexing and Cell Covering",
+        "groupDescription": "Grid systems and covering mechanics for radius queries, boundary handling, and uneven spatial density.",
         "title": "H3: Uber's Hexagonal Hierarchical Spatial Index",
         "url": "https://www.uber.com/blog/h3/",
         "source": "Uber Engineering",
         "type": "Case study",
-        "why": "Production motivation for geospatial indexing in ride-sharing and marketplace systems.",
+        "why": "Explains why Uber adopted hierarchical hex cells for marketplace analysis, neighbor lookup, and density-aware aggregation.",
         "year": "2018"
       },
       {
         "id": "s2-docs",
-        "group": "Location and Marketplace",
-        "groupDescription": "Geospatial indexing, routing, dispatch, and marketplace operations references.",
+        "group": "Geospatial Indexing and Cell Covering",
+        "groupDescription": "Grid systems and covering mechanics for radius queries, boundary handling, and uneven spatial density.",
         "title": "S2 Geometry",
         "url": "https://s2geometry.io/",
         "source": "S2",
         "type": "Docs",
-        "why": "Spherical geometry and cell hierarchy reference for geo indexing and map systems."
+        "why": "Spherical geometry and cell hierarchy reference for building globe-scale spatial indexes without planar edge cases."
+      },
+      {
+        "id": "s2-covering",
+        "group": "Geospatial Indexing and Cell Covering",
+        "groupDescription": "Grid systems and covering mechanics for radius queries, boundary handling, and uneven spatial density.",
+        "title": "S2 Covering Examples",
+        "url": "https://s2geometry.io/devguide/examples/coverings.html",
+        "source": "S2Geometry",
+        "type": "Docs",
+        "why": "Demonstrates covering regions with S2 cells, including the precision/fanout tradeoff behind radius-query cell sets."
       },
       {
         "id": "postgis-docs",
-        "group": "Location and Marketplace",
-        "groupDescription": "Geospatial indexing, routing, dispatch, and marketplace operations references.",
+        "group": "Spatial Query Engines",
+        "groupDescription": "Database and search-engine implementations of indexed geospatial filtering, sorting, and retrieval.",
         "title": "PostGIS Documentation",
         "url": "https://postgis.net/documentation/",
         "source": "PostGIS",
@@ -1714,28 +3084,231 @@
         "why": "Spatial database reference for geospatial queries, indexing, and geometry operations."
       },
       {
+        "id": "postgis-dwithin",
+        "group": "Spatial Query Engines",
+        "groupDescription": "Database and search-engine implementations of indexed geospatial filtering, sorting, and retrieval.",
+        "title": "ST_DWithin",
+        "url": "https://postgis.net/docs/manual-3.1/ST_DWithin.html",
+        "source": "PostGIS",
+        "type": "Docs",
+        "why": "Shows an index-aware distance predicate for finding records within a radius without scanning every row."
+      },
+      {
+        "id": "postgis-knn",
+        "group": "Spatial Query Engines",
+        "groupDescription": "Database and search-engine implementations of indexed geospatial filtering, sorting, and retrieval.",
+        "title": "Nearest-Neighbour Searching",
+        "url": "https://postgis.net/docs/manual-dev/en/geometry_distance_knn.html",
+        "source": "PostGIS",
+        "type": "Docs",
+        "why": "Explains index-assisted nearest-neighbor ordering, useful when comparing radius filters with top-K distance ranking."
+      },
+      {
         "id": "elastic-geo",
-        "group": "Search and Retrieval",
-        "groupDescription": "Indexing, ranking, crawling, geo search, and vector retrieval references.",
-        "title": "Elasticsearch Geo Queries",
-        "url": "https://www.elastic.co/guide/en/elasticsearch/reference/current/geo-queries.html",
+        "group": "Spatial Query Engines",
+        "groupDescription": "Database and search-engine implementations of indexed geospatial filtering, sorting, and retrieval.",
+        "title": "Geo-distance query",
+        "url": "https://www.elastic.co/docs/reference/query-languages/query-dsl/query-dsl-geo-distance-query",
         "source": "Elastic",
         "type": "Docs",
-        "why": "Concrete geo-search API reference for distance, bounding boxes, and indexed spatial queries."
+        "why": "Concrete reference for geo_point distance filters in a search engine that also supports text and ranking signals."
+      },
+      {
+        "id": "mongo-geospatial",
+        "group": "Spatial Query Engines",
+        "groupDescription": "Database and search-engine implementations of indexed geospatial filtering, sorting, and retrieval.",
+        "title": "Geospatial Queries",
+        "url": "https://www.mongodb.com/docs/manual/geospatial-queries/",
+        "source": "MongoDB",
+        "type": "Docs",
+        "why": "Documents 2dsphere indexes and spherical geospatial operators for document-store implementations."
+      },
+      {
+        "id": "redis-geosearch",
+        "group": "Spatial Query Engines",
+        "groupDescription": "Database and search-engine implementations of indexed geospatial filtering, sorting, and retrieval.",
+        "title": "GEOSEARCH",
+        "url": "https://redis.io/docs/latest/commands/geosearch/",
+        "source": "Redis",
+        "type": "Docs",
+        "why": "Useful reference for bounded in-memory geo lookups and the complexity of circle/box searches over a sorted-set-backed index."
+      },
+      {
+        "id": "solr-spatial",
+        "group": "Spatial Query Engines",
+        "groupDescription": "Database and search-engine implementations of indexed geospatial filtering, sorting, and retrieval.",
+        "title": "Spatial Search",
+        "url": "https://solr.apache.org/guide/solr/latest/query-guide/spatial-search.html",
+        "source": "Apache Solr",
+        "type": "Docs",
+        "why": "Shows another Lucene-family approach to geo filters, distance sort/boost, and spatial field types."
+      },
+      {
+        "id": "aws-dynamodb-geohash",
+        "group": "Spatial Query Engines",
+        "groupDescription": "Database and search-engine implementations of indexed geospatial filtering, sorting, and retrieval.",
+        "title": "Implementing geohashing at scale in serverless web applications",
+        "url": "https://aws.amazon.com/blogs/compute/implementing-geohashing-at-scale-in-serverless-web-applications/",
+        "source": "AWS Compute Blog",
+        "type": "Tutorial",
+        "why": "Walks through a geohash/S2-backed DynamoDB pattern, useful when weighing managed KV storage against a spatial database."
+      },
+      {
+        "id": "yelp-core-search",
+        "group": "Production Search and Ranking",
+        "groupDescription": "Company engineering writeups about local search, ranking, geo sharding, and indexing at production scale.",
+        "title": "Moving Yelp's Core Business Search to Elasticsearch",
+        "url": "https://engineeringblog.yelp.com/2017/06/moving-yelps-core-business-search-to-elasticsearch.html",
+        "source": "Yelp Engineering",
+        "type": "Case study",
+        "year": "2017",
+        "why": "Describes Yelp business-search migration details, including ranking extensibility, real-time indexing goals, and geo sharding."
+      },
+      {
+        "id": "yelp-maptype",
+        "group": "Production Search and Ranking",
+        "groupDescription": "Company engineering writeups about local search, ranking, geo sharding, and indexing at production scale.",
+        "title": "Maptype - fast doc-value lookups for map data in Elasticsearch",
+        "url": "https://engineeringblog.yelp.com/2019/07/maptype-fast-doc-value-lookups-for-map-data-in-elasticsearch.html",
+        "source": "Yelp Engineering",
+        "type": "Case study",
+        "year": "2019",
+        "why": "Shows how Yelp optimized per-document map-like features used by ranking models, a close match for open-now, delivery-area, and local feature lookups."
+      },
+      {
+        "id": "yelp-nrtsearch",
+        "group": "Production Search and Ranking",
+        "groupDescription": "Company engineering writeups about local search, ranking, geo sharding, and indexing at production scale.",
+        "title": "Nrtsearch: Yelp's Fast, Scalable and Cost Effective Search Engine",
+        "url": "https://engineeringblog.yelp.com/2021/09/nrtsearch-yelps-fast-scalable-and-cost-effective-search-engine.html",
+        "source": "Yelp Engineering",
+        "type": "Case study",
+        "year": "2021",
+        "why": "Explains Yelp's Lucene-based replacement for Elasticsearch and the operational pressure from many ranking/search use cases."
+      },
+      {
+        "id": "yelp-filters",
+        "group": "Production Search and Ranking",
+        "groupDescription": "Company engineering writeups about local search, ranking, geo sharding, and indexing at production scale.",
+        "title": "How We Made Yelp Search Filters Data Driven",
+        "url": "https://engineeringblog.yelp.com/2015/12/how-we-made-yelp-search-filters-data-driven.html",
+        "source": "Yelp Engineering",
+        "type": "Case study",
+        "year": "2015",
+        "why": "Connects category/filter selection to measured search quality, useful for discussing how filters affect ranking and UX."
+      },
+      {
+        "id": "yelp-business-matching",
+        "group": "Production Search and Ranking",
+        "groupDescription": "Company engineering writeups about local search, ranking, geo sharding, and indexing at production scale.",
+        "title": "Learning to Rank for Business Matching",
+        "url": "https://engineeringblog.yelp.com/2014/12/learning-to-rank-for-business-matching.html",
+        "source": "Yelp Engineering",
+        "type": "Case study",
+        "year": "2014",
+        "why": "Shows the recall-then-rerank pattern over business candidates, including location and other signals in the scoring pipeline."
+      },
+      {
+        "id": "yelp-coordinator",
+        "group": "Production Search and Ranking",
+        "groupDescription": "Company engineering writeups about local search, ranking, geo sharding, and indexing at production scale.",
+        "title": "Coordinator - The Gateway For Nrtsearch",
+        "url": "https://engineeringblog.yelp.com/2023/10/coordinator-the-gateway-for-nrtsearch.html",
+        "source": "Yelp Engineering",
+        "type": "Case study",
+        "year": "2023",
+        "why": "Covers gateway concerns around metrics, client isolation, rate limiting, scatter-gather, and geo sharding for a production search backend."
+      },
+      {
+        "id": "yelp-fast-order-search",
+        "group": "Index Freshness and Rebuildability",
+        "groupDescription": "Patterns for keeping derived indexes current, replayable, and safe to rebuild while the source of truth remains authoritative.",
+        "title": "Fast Order Search Using Yelp's Data Pipeline and Elasticsearch",
+        "url": "https://engineeringblog.yelp.com/2018/06/fast-order-search.html",
+        "source": "Yelp Engineering",
+        "type": "Case study",
+        "year": "2018",
+        "why": "A practical example of decoupling a transactional source of truth from a near-real-time search index through a data pipeline."
       },
       {
         "id": "google-routes",
-        "group": "Location and Marketplace",
-        "groupDescription": "Geospatial indexing, routing, dispatch, and marketplace operations references.",
+        "group": "Routing and ETA Signals",
+        "groupDescription": "Routing engines and APIs used when ranking needs travel time rather than straight-line distance.",
         "title": "Routes API Documentation",
         "url": "https://developers.google.com/maps/documentation/routes",
         "source": "Google Maps Platform",
         "type": "Docs",
         "why": "Concrete route computation API reference for routing, ETA, waypoints, and traffic-aware paths."
+      },
+      {
+        "id": "osrm-docs",
+        "group": "Routing and ETA Signals",
+        "groupDescription": "Routing engines and APIs used when ranking needs travel time rather than straight-line distance.",
+        "title": "OSRM Documentation",
+        "url": "https://project-osrm.org/docs/",
+        "source": "Project OSRM",
+        "type": "Docs",
+        "why": "Open-source routing reference for route, table, nearest, and map-matching services that can feed ETA-aware ranking."
+      },
+      {
+        "id": "valhalla-api",
+        "group": "Routing and ETA Signals",
+        "groupDescription": "Routing engines and APIs used when ranking needs travel time rather than straight-line distance.",
+        "title": "API Overview",
+        "url": "https://valhalla.github.io/valhalla/api/",
+        "source": "Valhalla",
+        "type": "Docs",
+        "why": "Documents turn-by-turn, matrix, isochrone, and map-matching APIs for self-hosted routing and ETA enrichment."
+      },
+      {
+        "id": "debezium-outbox",
+        "group": "Index Freshness and Rebuildability",
+        "groupDescription": "Patterns for keeping derived indexes current, replayable, and safe to rebuild while the source of truth remains authoritative.",
+        "title": "Outbox Event Router",
+        "url": "https://debezium.io/documentation/reference/2.6/transformations/outbox-event-router.html",
+        "source": "Debezium",
+        "type": "Docs",
+        "why": "Implementation reference for turning committed outbox rows into ordered Kafka events without dual-writing directly to the broker."
+      },
+      {
+        "id": "transactional-outbox",
+        "group": "Index Freshness and Rebuildability",
+        "groupDescription": "Patterns for keeping derived indexes current, replayable, and safe to rebuild while the source of truth remains authoritative.",
+        "title": "Pattern: Transactional outbox",
+        "url": "https://microservices.io/patterns/data/transactional-outbox",
+        "source": "microservices.io",
+        "type": "Explainer",
+        "why": "Clarifies the dual-write failure that the nearby-search indexing path avoids by writing place changes and outbox events in one transaction."
+      },
+      {
+        "id": "owasp-api4",
+        "group": "Privacy and Abuse Controls",
+        "groupDescription": "Security and privacy references for public location-search endpoints and sensitive coordinate data.",
+        "title": "API4:2023 Unrestricted Resource Consumption",
+        "url": "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/",
+        "source": "OWASP",
+        "type": "Reference",
+        "why": "Supports the design choice to cap radius/result limits and rate-limit clients before expensive geo, ranking, or routing work."
+      },
+      {
+        "id": "ftc-location-privacy",
+        "group": "Privacy and Abuse Controls",
+        "groupDescription": "Security and privacy references for public location-search endpoints and sensitive coordinate data.",
+        "title": "FTC Order Prohibits Data Broker X-Mode Social and Outlogic from Selling Sensitive Location Data",
+        "url": "https://www.ftc.gov/news-events/news/press-releases/2024/01/ftc-order-prohibits-data-broker-x-mode-social-outlogic-selling-sensitive-location-data",
+        "source": "Federal Trade Commission",
+        "type": "Reference",
+        "year": "2024",
+        "why": "Concrete regulatory example showing why precise location data should be minimized, short-retained, and access-controlled."
       }
     ]
   },
   "assets": {
     "icon": "icon.png"
-  }
+  },
+  "aiVisuals": {
+    "requirements": "assets/generated/ai-visuals/requirements.jpg",
+    "capacity": "assets/generated/ai-visuals/capacity.jpg"
+  },
+  "explainerComic": "assets/generated/comic/interview-comic.jpg"
 }

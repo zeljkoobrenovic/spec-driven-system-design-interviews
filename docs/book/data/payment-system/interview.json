@@ -36,7 +36,15 @@
         "type": "worker",
         "category": "compute",
         "traits": [],
-        "description": "Capture Worker: Asynchronous or background compute component that processes jobs, events, batches, or scheduled work."
+        "description": "Capture Worker: drives our own outbound capture of authorized payments against the PSP, then posts ledger entries once the capture result is known."
+      },
+      {
+        "id": "EventWorker",
+        "label": "PSP Event Worker",
+        "type": "worker",
+        "category": "compute",
+        "traits": [],
+        "description": "PSP Event Worker: consumes signature-verified inbound PSP events (settlement, dispute, chargeback, refund result, late failure) from the queue and applies external truth to the payment state machine and ledger — distinct from the outbound Capture Worker."
       },
       {
         "id": "Client",
@@ -200,6 +208,17 @@
         "description": "Ledger Router: Traffic boundary component that routes, balances, admits, or gates requests."
       },
       {
+        "id": "Snapshot",
+        "label": "Balance Snapshot Store",
+        "type": "database",
+        "category": "state",
+        "traits": [
+          "stateful",
+          "derived"
+        ],
+        "description": "Balance Snapshot Store: Periodic per-account balance checkpoints; a read returns the latest snapshot plus the delta of entries posted since it."
+      },
+      {
         "id": "Statement",
         "label": "PSP Settlement File",
         "type": "external",
@@ -339,9 +358,28 @@
         "label": "enqueue"
       },
       {
-        "id": "capture-db",
-        "from": "Capture",
-        "to": "DB"
+        "id": "queue-eventworker",
+        "from": "Queue",
+        "to": "EventWorker",
+        "label": "PSP events"
+      },
+      {
+        "id": "eventworker-db",
+        "from": "EventWorker",
+        "to": "DB",
+        "label": "apply transition"
+      },
+      {
+        "id": "eventworker-ledger",
+        "from": "EventWorker",
+        "to": "Ledger",
+        "label": "post (dedupe on event_id)"
+      },
+      {
+        "id": "eventworker-router",
+        "from": "EventWorker",
+        "to": "Router",
+        "label": "apply via"
       },
       {
         "id": "psp-statement-daily-settlement-file",
@@ -394,19 +432,25 @@
         "id": "payout-balance-available-only",
         "from": "Payout",
         "to": "Balance",
-        "label": "available only"
+        "label": "1. preflight (available)"
+      },
+      {
+        "id": "payout-ledger-reserve",
+        "from": "Payout",
+        "to": "Ledger",
+        "label": "2. reserve (strong)"
       },
       {
         "id": "payout-bank-transfer",
         "from": "Payout",
         "to": "Bank",
-        "label": "transfer"
+        "label": "3. transfer (bank ref)"
       },
       {
         "id": "payout-ledger-entries",
         "from": "Payout",
         "to": "Ledger",
-        "label": "entries"
+        "label": "4. finalize / reverse"
       },
       {
         "id": "router-ledgera-account-a",
@@ -537,13 +581,15 @@
   ],
   "capacityDiagram": [
     "graph LR",
-    "  Reads[Balance / status reads<br/>~50k rps]",
     "  Writes[Charges & refunds<br/>~2k tps]",
     "  LedgerW[Ledger entries<br/>2x writes = ~4k tps]",
     "  Recon[Daily reconciliation<br/>~150M entries/day]",
+    "  ReadModel[Balance read model]",
+    "  Reads[Balance / status reads<br/>~50k rps]",
     "  Writes --> LedgerW",
     "  LedgerW --> Recon",
-    "  Reads -.->|served from read model| LedgerW"
+    "  LedgerW -.->|project| ReadModel",
+    "  ReadModel --> Reads"
   ],
   "requirements": {
     "functional": [
@@ -571,8 +617,8 @@
     },
     {
       "label": "Ledger writes",
-      "value": "~4,000 tps",
-      "note": "Double-entry: each money movement writes at least two balanced rows."
+      "value": "~4,000+ tps",
+      "note": "Double-entry: at least two balanced rows per movement — more once fees, reserves, refunds, chargebacks, payouts, and corrections are counted."
     },
     {
       "label": "Status / balance reads",
@@ -582,7 +628,12 @@
     {
       "label": "Ledger growth",
       "value": "~150M entries/day",
-      "note": "Append-only; never updated or deleted — sized for years of retention."
+      "note": "Daily-average write/retention sizing (vs the peak tps above); append-only, never updated or deleted — sized for years of retention."
+    },
+    {
+      "label": "Webhooks / payouts / recon",
+      "value": "Bursty, separately sized",
+      "note": "Webhook spikes stress inbound dedupe; payout batches and daily settlement files stress finance-ops workflows — size these apart from the charge path."
     },
     {
       "label": "Reconciliation window",
@@ -599,9 +650,9 @@
     {
       "method": "POST",
       "path": "/v1/payments",
-      "description": "Create (authorize+capture or authorize-only) a payment. Requires an Idempotency-Key header so retries are safe.",
+      "description": "Create (authorize+capture or authorize-only) a payment. Requires an Idempotency-Key header (scoped per merchant) so retries are safe. Because capture runs asynchronously through the outbox + capture worker (Step 4), the create call does NOT promise a synchronously-final captured state: it returns 202 Accepted with a non-final status (authorized, capturing, or — if the PSP outcome is ambiguous — capture_unknown) plus the psp_reference used for in-doubt recovery. The terminal state (captured, failed) arrives later via GET /payments/{id} or a webhook. A simple synchronous gateway variant may instead return 201 captured, but this design intentionally exposes the async state machine.",
       "request": "Idempotency-Key: 7c1f...\n{\n  \"order_id\": \"ord_123\",\n  \"amount\": 4200,\n  \"currency\": \"USD\",\n  \"capture\": true,\n  \"source\": \"tok_visa\"\n}",
-      "response": "201 Created\n{\n  \"payment_id\": \"pay_456\",\n  \"status\": \"captured\",\n  \"amount\": 4200,\n  \"currency\": \"USD\"\n}",
+      "response": "202 Accepted\n{\n  \"payment_id\": \"pay_456\",\n  \"status\": \"capturing\",\n  \"amount\": 4200,\n  \"currency\": \"USD\",\n  \"psp_reference\": \"ch_3Pq...\",\n  \"poll\": \"GET /v1/payments/pay_456\"\n}\n\n// status is one of: authorized | capturing | capture_unknown.\n// Final state (captured | failed) is observed via GET /payments/{id} or webhook.",
       "sequence": {
         "participants": [
           {
@@ -654,7 +705,7 @@
                 "from": "PaySvc",
                 "to": "C",
                 "arrow": "-->>",
-                "label": "replay original 201"
+                "label": "replay original response"
               }
             ],
             "else": {
@@ -664,31 +715,37 @@
                   "from": "PaySvc",
                   "to": "X",
                   "arrow": "->>",
-                  "label": "authorize + capture"
+                  "label": "authorize (sync)"
                 },
                 {
                   "from": "X",
                   "to": "PaySvc",
                   "arrow": "-->>",
-                  "label": "captured"
-                },
-                {
-                  "from": "PaySvc",
-                  "to": "L",
-                  "arrow": "->>",
-                  "label": "post balanced entries"
+                  "label": "authorized + psp_reference"
                 },
                 {
                   "from": "PaySvc",
                   "to": "Idem",
                   "arrow": "->>",
-                  "label": "store response"
+                  "label": "store 202 response"
                 },
                 {
                   "from": "PaySvc",
                   "to": "C",
                   "arrow": "-->>",
-                  "label": "201 captured"
+                  "label": "202 capturing (poll for final state)"
+                },
+                {
+                  "from": "PaySvc",
+                  "to": "X",
+                  "arrow": "->>",
+                  "label": "capture worker: capture later (Step 4)"
+                },
+                {
+                  "from": "PaySvc",
+                  "to": "L",
+                  "arrow": "->>",
+                  "label": "post balanced entries once capture confirmed"
                 }
               ]
             }
@@ -699,9 +756,9 @@
     {
       "method": "POST",
       "path": "/v1/payments/{id}/refunds",
-      "description": "Refund a captured payment, fully or partially. Also idempotent.",
-      "request": "Idempotency-Key: 9a2b...\n{ \"amount\": 4200, \"reason\": \"customer_request\" }",
-      "response": "201 Created\n{ \"refund_id\": \"ref_789\", \"status\": \"refunded\", \"amount\": 4200 }",
+      "description": "Refund a captured payment, fully or partially. Idempotent; multiple refunds may target one payment up to the remaining refundable amount (captured - already refunded). Over-refund is rejected.",
+      "request": "Idempotency-Key: 9a2b...\n{ \"amount\": 1500, \"reason\": \"customer_request\" }",
+      "response": "201 Created\n{\n  \"refund_id\": \"ref_789\",\n  \"payment_id\": \"pay_456\",\n  \"status\": \"succeeded\",\n  \"amount\": 1500,\n  \"remaining_refundable\": 2700,\n  \"psp_reference\": \"re_3Pq...\"\n}",
       "sequence": {
         "participants": [
           {
@@ -765,9 +822,9 @@
     {
       "method": "GET",
       "path": "/v1/payments/{id}",
-      "description": "Fetch a payment's current status and history.",
+      "description": "Fetch a payment's aggregate status plus its transition history (from payment_events).",
       "request": "GET /v1/payments/pay_456",
-      "response": "200 OK\n{ \"payment_id\": \"pay_456\", \"status\": \"captured\", \"events\": [ ... ] }"
+      "response": "200 OK\n{\n  \"payment_id\": \"pay_456\",\n  \"status\": \"partially_refunded\",\n  \"captured_amount\": 4200,\n  \"refunded_amount\": 1500,\n  \"events\": [\n    { \"type\": \"captured\", \"source\": \"capture_worker\", \"at\": \"...\" },\n    { \"type\": \"refund\", \"source\": \"api\", \"amount\": 1500, \"at\": \"...\" }\n  ]\n}"
     },
     {
       "method": "GET",
@@ -911,7 +968,7 @@
     },
     {
       "name": "payments",
-      "note": "The lifecycle state machine of one payment. Points at the ledger transactions it produced.",
+      "note": "Aggregate lifecycle state of one payment. The flat status is a roll-up; the detailed transition history lives in payment_events. Points at the ledger transactions it produced.",
       "fields": [
         {
           "name": "payment_id",
@@ -920,6 +977,14 @@
         {
           "name": "merchant_id",
           "type": "uuid"
+        },
+        {
+          "name": "order_id",
+          "type": "varchar null (correlates to the adjacent orders system; carried from the create request)"
+        },
+        {
+          "name": "source_token",
+          "type": "varchar null (tokenized payment method from the tokenization/vault system — never raw PAN)"
         },
         {
           "name": "amount",
@@ -931,11 +996,19 @@
         },
         {
           "name": "status",
-          "type": "enum(authorized, captured, refunded, failed)"
+          "type": "enum(authorized, capturing, captured, capture_unknown, partially_refunded, refunded, disputed, charged_back, failed)"
+        },
+        {
+          "name": "captured_amount",
+          "type": "bigint (supports partial / multiple captures)"
+        },
+        {
+          "name": "refunded_amount",
+          "type": "bigint (remaining refundable = captured - refunded)"
         },
         {
           "name": "psp_reference",
-          "type": "varchar"
+          "type": "varchar (correlation id for in-doubt lookup)"
         },
         {
           "name": "updated_at",
@@ -944,24 +1017,40 @@
       ]
     },
     {
-      "name": "idempotency_keys",
-      "note": "Deduplicates client and webhook retries. Stores the first response so retries replay it instead of re-executing.",
+      "name": "payment_events",
+      "note": "Append-only status-transition history for a payment: who/what moved it from old to new status. Backs GET /payments/{id}.events and makes lifecycle edge cases (disputed weeks later, partial refund) auditable.",
       "fields": [
         {
-          "name": "key",
-          "type": "varchar PK"
+          "name": "event_id",
+          "type": "uuid PK"
         },
         {
-          "name": "scope",
-          "type": "varchar (endpoint + account)"
+          "name": "payment_id",
+          "type": "uuid FK -> payments"
         },
         {
-          "name": "status",
-          "type": "enum(in_progress, completed)"
+          "name": "type",
+          "type": "enum(authorized, captured, refund, dispute, chargeback, late_failure, ...)"
         },
         {
-          "name": "response",
-          "type": "jsonb"
+          "name": "source",
+          "type": "enum(api, capture_worker, webhook, reconciliation, operator)"
+        },
+        {
+          "name": "psp_event_id",
+          "type": "varchar null (links to psp_events when externally driven)"
+        },
+        {
+          "name": "old_status",
+          "type": "varchar"
+        },
+        {
+          "name": "new_status",
+          "type": "varchar"
+        },
+        {
+          "name": "ledger_transaction_id",
+          "type": "uuid null (the entries this transition posted)"
         },
         {
           "name": "created_at",
@@ -970,8 +1059,318 @@
       ]
     },
     {
+      "name": "ledger_transactions",
+      "note": "Balanced-transaction header that groups ledger_entries sharing a transaction_id. The dedupe and audit anchor: a unique (idempotency_key) and (psp_event_id) guarantee a movement posts at most once.",
+      "fields": [
+        {
+          "name": "transaction_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "reason_code",
+          "type": "enum(charge, capture, refund, payout, fee, dispute, correction, ...)"
+        },
+        {
+          "name": "source_type",
+          "type": "varchar (payment, refund, payout, reconciliation_break)"
+        },
+        {
+          "name": "source_id",
+          "type": "uuid"
+        },
+        {
+          "name": "idempotency_key",
+          "type": "varchar UNIQUE null (dedupes API-driven posts)"
+        },
+        {
+          "name": "psp_event_id",
+          "type": "varchar UNIQUE null (dedupes webhook/settlement posts)"
+        },
+        {
+          "name": "reverses_transaction_id",
+          "type": "uuid null (links a reversal to what it reverses)"
+        },
+        {
+          "name": "status",
+          "type": "enum(balanced, pending)"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "refunds",
+      "note": "One row per refund attempt against a captured payment. Supports full and partial refunds and multiple refunds per payment; each links to its reversing ledger transaction.",
+      "fields": [
+        {
+          "name": "refund_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "payment_id",
+          "type": "uuid FK -> payments"
+        },
+        {
+          "name": "amount",
+          "type": "bigint"
+        },
+        {
+          "name": "status",
+          "type": "enum(pending, succeeded, failed)"
+        },
+        {
+          "name": "idempotency_key",
+          "type": "varchar UNIQUE"
+        },
+        {
+          "name": "psp_reference",
+          "type": "varchar null"
+        },
+        {
+          "name": "ledger_transaction_id",
+          "type": "uuid null FK -> ledger_transactions"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "payouts",
+      "note": "Payout as an explicit state machine, not a one-off service call. Funds are reserved in the ledger before the bank call; the row drives recovery on bank failure or callback.",
+      "fields": [
+        {
+          "name": "payout_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "merchant_id",
+          "type": "uuid"
+        },
+        {
+          "name": "amount",
+          "type": "bigint"
+        },
+        {
+          "name": "status",
+          "type": "enum(requested, reserved, sent, paid, failed, reversed)"
+        },
+        {
+          "name": "idempotency_key",
+          "type": "varchar UNIQUE"
+        },
+        {
+          "name": "bank_reference",
+          "type": "varchar null (stable id sent to bank rails)"
+        },
+        {
+          "name": "reserve_transaction_id",
+          "type": "uuid null (available -> payout-pending)"
+        },
+        {
+          "name": "settle_transaction_id",
+          "type": "uuid null (finalize or reversal)"
+        },
+        {
+          "name": "bank_callback_event_id",
+          "type": "varchar null (bank/ACH return or settlement event that finalized or failed this payout)"
+        },
+        {
+          "name": "failure_reason",
+          "type": "varchar null (e.g. account_closed, insufficient_funds, returned — drives reverse vs retry)"
+        },
+        {
+          "name": "attempts",
+          "type": "int (bank-call retry count)"
+        },
+        {
+          "name": "last_error",
+          "type": "text null"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "psp_events",
+      "note": "Webhook inbox: every signature-verified inbound PSP event is persisted raw before processing, deduped by event id, so out-of-order or replayed events are retried, not lost. Also the audit/replay source for external truth.",
+      "fields": [
+        {
+          "name": "psp_event_id",
+          "type": "varchar PK (PSP's event id)"
+        },
+        {
+          "name": "type",
+          "type": "varchar (charge.settled, charge.dispute.created, ...)"
+        },
+        {
+          "name": "payment_id",
+          "type": "uuid null (may be unknown if out-of-order)"
+        },
+        {
+          "name": "signature_verified",
+          "type": "boolean"
+        },
+        {
+          "name": "raw_payload",
+          "type": "jsonb (kept for audit and replay)"
+        },
+        {
+          "name": "status",
+          "type": "enum(received, processed, deferred, dead_letter)"
+        },
+        {
+          "name": "attempts",
+          "type": "int (processing retry count)"
+        },
+        {
+          "name": "last_error",
+          "type": "text null"
+        },
+        {
+          "name": "deferred_until",
+          "type": "timestamptz null (re-attempt time for out-of-order/held events)"
+        },
+        {
+          "name": "escalated",
+          "type": "boolean (flagged for finance-ops once retries are exhausted / dead-lettered)"
+        },
+        {
+          "name": "received_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "statement_files",
+      "note": "One row per ingested PSP settlement/statement import. Tracks provider, sequence, and completeness so a late or partial file defers its window instead of flagging mass breaks, and gives every reconciliation_break a file to point back to.",
+      "fields": [
+        {
+          "name": "statement_file_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "provider",
+          "type": "varchar (which PSP / rail produced the file)"
+        },
+        {
+          "name": "period",
+          "type": "date (settlement date the file covers)"
+        },
+        {
+          "name": "sequence_no",
+          "type": "bigint (per-provider monotonic; a gap means a missing file)"
+        },
+        {
+          "name": "file_hash",
+          "type": "varchar (content hash — dedupes re-delivered files, proves integrity)"
+        },
+        {
+          "name": "row_count",
+          "type": "bigint null (expected vs ingested line count for completeness)"
+        },
+        {
+          "name": "status",
+          "type": "enum(received, ingesting, complete, partial, failed)"
+        },
+        {
+          "name": "ingested_at",
+          "type": "timestamptz null"
+        }
+      ]
+    },
+    {
+      "name": "reconciliation_breaks",
+      "note": "One work item per unmatched/mismatched settlement line. Carries the break lifecycle, owner, and the correcting ledger transaction that resolved it — the audit evidence finance ops needs.",
+      "fields": [
+        {
+          "name": "break_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "statement_file_id",
+          "type": "uuid FK -> statement_files (which settlement import surfaced it)"
+        },
+        {
+          "name": "psp_reference",
+          "type": "varchar null"
+        },
+        {
+          "name": "kind",
+          "type": "enum(missing_in_ledger, missing_in_psp, amount_mismatch)"
+        },
+        {
+          "name": "amount_delta",
+          "type": "bigint (signed, in minor units)"
+        },
+        {
+          "name": "currency",
+          "type": "char(3)"
+        },
+        {
+          "name": "state",
+          "type": "enum(detected, timing, investigating, auto_corrected, manual_approved, resolved, written_off)"
+        },
+        {
+          "name": "owner",
+          "type": "varchar null (assigned finance-ops user)"
+        },
+        {
+          "name": "resolution_transaction_id",
+          "type": "uuid null FK -> ledger_transactions"
+        },
+        {
+          "name": "detected_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "idempotency_keys",
+      "note": "Deduplicates client and webhook retries. Stores the first response so retries replay it instead of re-executing. The request fingerprint catches a key reused with a different body; locked_until guards the in-progress window after a crash.",
+      "fields": [
+        {
+          "name": "key",
+          "type": "varchar PK"
+        },
+        {
+          "name": "scope",
+          "type": "varchar (endpoint + merchant_id)"
+        },
+        {
+          "name": "request_fingerprint",
+          "type": "varchar (hash of method+path+body)"
+        },
+        {
+          "name": "status",
+          "type": "enum(in_progress, completed)"
+        },
+        {
+          "name": "locked_until",
+          "type": "timestamptz null (lease for in-progress recovery)"
+        },
+        {
+          "name": "response",
+          "type": "jsonb"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamptz (covers the client/PSP retry window)"
+        }
+      ]
+    },
+    {
       "name": "outbox",
-      "note": "Events written in the same DB transaction as the state change, then relayed to the queue exactly once (transactional outbox).",
+      "note": "Events written in the same DB transaction as the state change, then relayed to the queue exactly once (transactional outbox). Per-aggregate sequence preserves order; retry/error columns drive the relay's backoff and surface poison rows.",
       "fields": [
         {
           "name": "id",
@@ -982,12 +1381,24 @@
           "type": "uuid"
         },
         {
+          "name": "aggregate_seq",
+          "type": "bigint (per-aggregate ordering)"
+        },
+        {
           "name": "type",
           "type": "varchar"
         },
         {
           "name": "payload",
           "type": "jsonb"
+        },
+        {
+          "name": "attempts",
+          "type": "int (relay retry count)"
+        },
+        {
+          "name": "last_error",
+          "type": "text null"
         },
         {
           "name": "published_at",
@@ -1075,7 +1486,11 @@
         "stripe-idempotency",
         "stripe-payment-intents",
         "stripe-webhooks",
-        "debezium-outbox"
+        "debezium-outbox",
+        "stripe-idempotency-blog",
+        "aws-idempotent-apis",
+        "paypal-idempotency",
+        "stripe-integration-security"
       ],
       "decisionPrompt": "What goes wrong the first time this request times out or the client retries?",
       "concepts": [
@@ -1107,6 +1522,13 @@
         {
           "issue": "A timeout leaves the outcome unknown — retrying may double-charge.",
           "mitigation": "Introduce idempotency keys (next step) so retries are safe."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "The service crashes after the PSP charges the card but before it writes the status to the DB.",
+          "expectedBehavior": "Money moved but we have no record — the motivating failure for the whole case.",
+          "mitigation": "Record intent before calling the PSP and reconcile after; later steps make this an explicit in-doubt state recovered by idempotency, webhooks, and reconciliation."
         }
       ],
       "interviewerSignals": {
@@ -1144,7 +1566,8 @@
           "PSP",
           "DB"
         ]
-      }
+      },
+      "aiVisual": "assets/generated/ai-visuals/steps/01-sync-charge.jpg"
     },
     {
       "id": "idempotency",
@@ -1156,7 +1579,10 @@
       ],
       "probeLinks": [
         "stripe-idempotency",
-        "stripe-webhooks"
+        "stripe-webhooks",
+        "stripe-idempotency-blog",
+        "aws-idempotent-apis",
+        "paypal-idempotency"
       ],
       "decisionPrompt": "Where do you store the key, and what do you do when a retry arrives while the first request is still in flight?",
       "concepts": [
@@ -1204,7 +1630,8 @@
             "highlight": [
               "Idem"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-idempotency-opt1.jpg"
         },
         {
           "name": "Dedicated key store (e.g. Redis with persistence)",
@@ -1236,7 +1663,8 @@
             "highlight": [
               "Idem"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-idempotency-opt2.jpg"
         }
       ],
       "flows": [
@@ -1346,7 +1774,11 @@
         "square-books",
         "modern-treasury-ledgers",
         "kafka-design",
-        "spanner-paper"
+        "spanner-paper",
+        "modern-treasury-scale-ledger",
+        "tigerbeetle-financial-accounting",
+        "uber-ledgerstore-indexes",
+        "airbnb-payment-platform"
       ],
       "decisionPrompt": "Why is an append-only ledger safer than incrementing a balance column, and what invariant must every write preserve?",
       "concepts": [
@@ -1469,7 +1901,8 @@
             "highlight": [
               "Ledger"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-ledger-opt1.jpg"
         },
         {
           "name": "Mutable balance column (increment in place)",
@@ -1508,14 +1941,15 @@
             "highlight": [
               "DB"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-ledger-opt2.jpg"
         }
       ]
     },
     {
       "id": "async-capture",
       "title": "4. Asynchronous Capture & State Machine",
-      "description": "Decouple authorization from capture. The payment becomes an explicit state machine (authorized → capturing → captured / failed), and a capture worker drives it via a queue. Events are published using a transactional outbox so state and events never diverge.",
+      "description": "Decouple authorization from capture. The payment becomes an explicit state machine (authorized → capturing → captured / failed, plus capture_unknown for the in-doubt window when a PSP call times out), and a capture worker drives it via a queue. Events are published using a transactional outbox so state and events never diverge.",
       "patterns": [
         "Saga / state machine",
         "Transactional outbox",
@@ -1525,7 +1959,11 @@
         "stripe-idempotency",
         "stripe-webhooks",
         "debezium-outbox",
-        "kafka-design"
+        "kafka-design",
+        "temporal-saga-pattern",
+        "airbnb-payment-orchestration",
+        "aws-idempotent-apis",
+        "stripe-idempotency-blog"
       ],
       "decisionPrompt": "How do you publish a 'payment authorized' event and write the payment state without a distributed transaction?",
       "concepts": [
@@ -1571,7 +2009,8 @@
             "highlight": [
               "Outbox"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-async-capture-opt1.jpg"
         },
         {
           "name": "Dual write (publish to queue, then write DB)",
@@ -1597,7 +2036,8 @@
             "highlight": [
               "Queue"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-async-capture-opt2.jpg"
         }
       ],
       "flows": [
@@ -1688,6 +2128,108 @@
             "Outbox",
             "Capture"
           ]
+        },
+        {
+          "name": "In-doubt capture: PSP call times out",
+          "note": "When the PSP call times out we don't know whether money moved. We never re-capture blindly; we move to capture_unknown and let recovery (status lookup, webhook, or settlement) resolve it, posting the ledger once keyed by the PSP reference.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Capture",
+                "label": "Capture Worker",
+                "alias": "W"
+              },
+              {
+                "id": "DB",
+                "label": "Payments DB",
+                "alias": "D"
+              },
+              {
+                "id": "X",
+                "label": "PSP"
+              },
+              {
+                "id": "L",
+                "label": "Ledger"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Capture",
+                "to": "DB",
+                "arrow": "->>",
+                "label": "record intent (status=capturing, psp_idempotency_key)"
+              },
+              {
+                "from": "Capture",
+                "to": "X",
+                "arrow": "->>",
+                "label": "capture (Idempotency-Key=K)"
+              },
+              {
+                "from": "X",
+                "to": "Capture",
+                "arrow": "--x",
+                "label": "timeout (outcome unknown)"
+              },
+              {
+                "from": "Capture",
+                "to": "DB",
+                "arrow": "->>",
+                "label": "status = capture_unknown"
+              },
+              {
+                "type": "alt",
+                "label": "recover: query PSP by key K (or consume webhook)",
+                "messages": [
+                  {
+                    "from": "Capture",
+                    "to": "X",
+                    "arrow": "->>",
+                    "label": "GET charge status (key=K)"
+                  },
+                  {
+                    "from": "X",
+                    "to": "Capture",
+                    "arrow": "-->>",
+                    "label": "captured (psp_reference=R)"
+                  },
+                  {
+                    "from": "Capture",
+                    "to": "L",
+                    "arrow": "->>",
+                    "label": "post entries once (dedupe on R)"
+                  }
+                ],
+                "else": {
+                  "label": "still unknown",
+                  "messages": [
+                    {
+                      "from": "Capture",
+                      "to": "DB",
+                      "arrow": "->>",
+                      "label": "leave capture_unknown -> reconciliation"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Capture",
+            "DB"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "The in-doubt window (every PSP call is ambiguous)",
+          "points": [
+            "Persist intent (status=capturing) before the PSP call, and send a stable PSP idempotency key / correlation id so the call itself is safe to retry.",
+            "On timeout or unknown response, move to capture_unknown — do NOT assume success or re-capture blindly.",
+            "Recover by querying PSP status by the same key, consuming the settlement webhook, or reconciling the settlement file.",
+            "Post ledger entries at most once, keyed by the PSP reference / event id, so whichever recovery path wins doesn't double-post."
+          ]
         }
       ],
       "traps": [
@@ -1773,7 +2315,11 @@
         "stripe-webhooks",
         "kafka-design",
         "stripe-idempotency",
-        "square-books"
+        "square-books",
+        "razorpay-webhook-validation",
+        "adyen-webhooks",
+        "aws-idempotent-apis",
+        "stripe-integration-security"
       ],
       "decisionPrompt": "A PSP delivers the same webhook three times. How do you ensure the ledger reflects it once?",
       "concepts": [
@@ -1853,6 +2399,74 @@
             "WebhookSvc",
             "Idem"
           ]
+        },
+        {
+          "name": "Dispute / chargeback weeks later",
+          "note": "A dispute is just another inbound PSP event applied through the same exactly-once pipeline: verify, persist, transition the payment, post a reversing ledger transaction, and let reconciliation confirm it against the settlement file.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "X",
+                "label": "PSP"
+              },
+              {
+                "id": "WebhookSvc",
+                "label": "Webhook Receiver",
+                "alias": "W"
+              },
+              {
+                "id": "EventWorker",
+                "label": "PSP Event Worker",
+                "alias": "E"
+              },
+              {
+                "id": "DB",
+                "label": "Payments DB",
+                "alias": "D"
+              },
+              {
+                "id": "L",
+                "label": "Ledger"
+              }
+            ],
+            "messages": [
+              {
+                "from": "X",
+                "to": "WebhookSvc",
+                "arrow": "->>",
+                "label": "charge.dispute.created (event_id=E)"
+              },
+              {
+                "from": "WebhookSvc",
+                "to": "EventWorker",
+                "arrow": "->>",
+                "label": "verified + persisted, enqueue"
+              },
+              {
+                "from": "EventWorker",
+                "to": "DB",
+                "arrow": "->>",
+                "label": "transition captured -> disputed (payment_events row)"
+              },
+              {
+                "from": "EventWorker",
+                "to": "L",
+                "arrow": "->>",
+                "label": "post reversing transaction (dedupe on E)"
+              },
+              {
+                "from": "EventWorker",
+                "to": "X",
+                "arrow": "-->>",
+                "label": "200 ack"
+              }
+            ]
+          },
+          "highlight": [
+            "EventWorker",
+            "DB",
+            "L"
+          ]
         }
       ],
       "traps": [
@@ -1865,6 +2479,22 @@
           "trap": "Processing webhooks synchronously inside the HTTP handler",
           "why": "Slow ledger work makes you miss the PSP's ack deadline, triggering even more retries.",
           "instead": "Verify + dedupe + enqueue quickly, ack immediately, and process off the request path."
+        },
+        {
+          "trap": "Routing every PSP event into the same generic capture handler",
+          "why": "A settlement, a dispute, a refund result, and a late failure each demand different state transitions; one handler conflates capture execution with PSP event application.",
+          "instead": "Persist the raw event (psp_events inbox), then dispatch by event type to a handler that owns that transition — capture result, settlement, dispute/chargeback, late failure."
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Persisted webhook inbox and event-type dispatch",
+          "points": [
+            "Every signature-verified event is written to a psp_events inbox (raw payload kept for audit and replay) before any processing, deduped by the PSP event id.",
+            "Out-of-order events (a settlement before we recorded the authorization) are held as 'deferred' and retried, not dropped.",
+            "A dispatcher routes by event type — charge.settled, charge.dispute.created, refund.updated, charge.failed — to the handler that owns that state transition.",
+            "Capture execution lives in the outbound Capture Worker (driving our own requested capture); PSP event application lives in a separate inbound PSP Event Worker (reacting to the PSP's truth — settlement, dispute, chargeback, refund result, late failure). Two distinct workers off the same queue keep the roles — and their ledger posts — from being conflated."
+          ]
         }
       ],
       "failureDrills": [
@@ -1898,21 +2528,22 @@
           "WebhookSvc",
           "Idem",
           "Queue",
-          "Capture",
+          "EventWorker",
           "DB",
           "Ledger"
         ],
-        "caption": "Inbound PSP webhooks hit the receiver, which dedupes by event_id in the idempotency store and enqueues; the capture worker then updates the DB and ledger.",
+        "caption": "Inbound PSP webhooks hit the receiver, which dedupes by event_id in the idempotency store and enqueues; a dedicated PSP event worker (distinct from the outbound capture worker) then applies the transition to the DB and ledger.",
         "links": [
           "psp-webhooksvc-webhook",
           "webhooksvc-idem-dedupe-by-event-id",
           "webhooksvc-queue-enqueue",
-          "queue-capture",
-          "capture-db",
-          "capture-ledger-entries"
+          "queue-eventworker",
+          "eventworker-db",
+          "eventworker-ledger"
         ],
         "highlight": [
-          "WebhookSvc"
+          "WebhookSvc",
+          "EventWorker"
         ]
       },
       "options": [
@@ -1935,23 +2566,24 @@
               "WebhookSvc",
               "Idem",
               "Queue",
-              "Capture",
+              "EventWorker",
               "DB",
               "Ledger"
             ],
-            "caption": "The webhook receiver dedupes each inbound event by event_id before enqueuing, so a redelivered webhook is processed once by the capture worker.",
+            "caption": "The webhook receiver dedupes each inbound event by event_id before enqueuing, so a redelivered webhook is processed once by the PSP event worker.",
             "links": [
               "psp-webhooksvc-webhook",
               "webhooksvc-idem-dedupe-by-event-id",
               "webhooksvc-queue-enqueue",
-              "queue-capture",
-              "capture-db",
-              "capture-ledger-entries"
+              "queue-eventworker",
+              "eventworker-db",
+              "eventworker-ledger"
             ],
             "highlight": [
               "WebhookSvc"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-webhooks-opt1.jpg"
         },
         {
           "name": "Idempotent ledger writes (rely on unique constraint)",
@@ -1971,16 +2603,16 @@
               "PSP",
               "WebhookSvc",
               "Queue",
-              "Capture",
+              "EventWorker",
               "Ledger"
             ],
-            "caption": "No inbound dedupe: webhooks are enqueued straight through and the capture worker relies on a unique event_id constraint when inserting ledger entries.",
+            "caption": "No inbound dedupe: webhooks are enqueued straight through and the PSP event worker relies on a unique event_id constraint when inserting ledger entries.",
             "links": [
               "psp-webhooksvc-webhook",
               "webhooksvc-queue",
-              "queue-capture",
+              "queue-eventworker",
               {
-                "from": "Capture",
+                "from": "EventWorker",
                 "to": "Ledger",
                 "label": "insert keyed by event_id"
               }
@@ -1988,7 +2620,8 @@
             "highlight": [
               "Ledger"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-webhooks-opt2.jpg"
         }
       ]
     },
@@ -2003,7 +2636,11 @@
       "probeLinks": [
         "square-books",
         "modern-treasury-ledgers",
-        "spanner-paper"
+        "spanner-paper",
+        "stripe-reporting-reconciliation",
+        "airbnb-payment-platform",
+        "uber-ledgerstore-indexes",
+        "modern-treasury-scale-ledger"
       ],
       "decisionPrompt": "Your ledger says you collected $1,000,000 today; the PSP file says $999,300. What do you do?",
       "concepts": [
@@ -2027,6 +2664,16 @@
             "Auto-match by PSP reference; classify unmatched lines as missing-in-ledger or missing-in-PSP.",
             "Some breaks are timing (settles tomorrow) and clear themselves; others need a compensating ledger entry.",
             "Never silently edit history — corrections are new entries with a reason code."
+          ]
+        },
+        {
+          "title": "Break lifecycle (reconciliation is an operating model, not a job)",
+          "points": [
+            "Each settlement file import is recorded as a statement_files row (provider, sequence_no, file_hash, row_count, status) so a late or partial file defers its window instead of flagging mass breaks, and a sequence gap is itself an alert.",
+            "Every unmatched/mismatched line becomes a reconciliation_breaks work item with a state machine: detected -> timing -> investigating -> auto_corrected / manual_approved -> resolved -> written_off.",
+            "Breaks have an owner and an escalation path; auto-correctable timing breaks resolve without a human, while high-value or ambiguous breaks require finance-ops approval.",
+            "Resolution always links to the correcting ledger_transaction (reason-coded), so the fix is auditable evidence — never an in-place edit.",
+            "Alert thresholds: break count, total unmatched amount, stale unprocessed files, and aging of open breaks past SLA."
           ]
         }
       ],
@@ -2087,12 +2734,13 @@
           "Statement",
           "Recon"
         ]
-      }
+      },
+      "aiVisual": "assets/generated/ai-visuals/steps/06-reconciliation.jpg"
     },
     {
       "id": "payouts",
       "title": "7. Payouts & Balance Read Model",
-      "description": "Merchants need their money and fast balance reads. We derive a balance read model from the ledger (CQRS) for 50k rps lookups, and a payout service moves available balances to bank rails — itself idempotent and ledger-recorded.",
+      "description": "Merchants need their money and fast balance reads. We derive a balance read model from the ledger (CQRS) for 50k rps lookups. A payout service moves available balances to bank rails — but it reserves funds in the authoritative ledger before the bank call, never trusting the lagging read model to authorize money movement.",
       "patterns": [
         "Read model (CQRS)",
         "Idempotency key",
@@ -2102,7 +2750,11 @@
         "stripe-idempotency",
         "square-books",
         "modern-treasury-ledgers",
-        "spanner-paper"
+        "spanner-paper",
+        "stripe-reporting-reconciliation",
+        "airbnb-payment-platform",
+        "paypal-idempotency",
+        "stripe-integration-security"
       ],
       "decisionPrompt": "Why not compute balances by summing the ledger on every read, and how do you keep the read model correct?",
       "concepts": [
@@ -2121,8 +2773,8 @@
       ],
       "flows": [
         {
-          "name": "Payout draws only available balance",
-          "note": "Pending funds are excluded so disputes can't create a negative balance.",
+          "name": "Payout reserves in the ledger before paying the bank",
+          "note": "The read model is only a preflight hint; the authoritative guard is a strong ledger reservation that moves funds from available to payout-pending before any bank call.",
           "sequence": {
             "participants": [
               {
@@ -2140,12 +2792,12 @@
                 "alias": "B"
               },
               {
-                "id": "K",
-                "label": "Bank Rails"
-              },
-              {
                 "id": "L",
                 "label": "Ledger"
+              },
+              {
+                "id": "K",
+                "label": "Bank Rails"
               }
             ],
             "messages": [
@@ -2159,30 +2811,53 @@
                 "from": "Payout",
                 "to": "Balance",
                 "arrow": "->>",
-                "label": "read available balance"
-              },
-              {
-                "from": "Balance",
-                "to": "Payout",
-                "arrow": "-->>",
-                "label": "available = X"
-              },
-              {
-                "from": "Payout",
-                "to": "K",
-                "arrow": "->>",
-                "label": "transfer min(requested, X)"
+                "label": "1. preflight: read available (hint only)"
               },
               {
                 "from": "Payout",
                 "to": "L",
                 "arrow": "->>",
-                "label": "post payout entries"
+                "label": "2. reserve (strong): available -> payout-pending"
+              },
+              {
+                "type": "alt",
+                "label": "reservation succeeds",
+                "messages": [
+                  {
+                    "from": "Payout",
+                    "to": "K",
+                    "arrow": "->>",
+                    "label": "3. transfer (stable bank reference)"
+                  },
+                  {
+                    "from": "K",
+                    "to": "Payout",
+                    "arrow": "-->>",
+                    "label": "accepted / callback"
+                  },
+                  {
+                    "from": "Payout",
+                    "to": "L",
+                    "arrow": "->>",
+                    "label": "4. finalize: payout-pending -> paid"
+                  }
+                ],
+                "else": {
+                  "label": "insufficient funds or transfer fails",
+                  "messages": [
+                    {
+                      "from": "Payout",
+                      "to": "L",
+                      "arrow": "->>",
+                      "label": "reverse reservation (funds back to available)"
+                    }
+                  ]
+                }
               }
             ]
           },
           "highlight": [
-            "Balance",
+            "L",
             "K"
           ]
         }
@@ -2197,29 +2872,41 @@
           "trap": "Letting the read model be the source of truth",
           "why": "A projection bug then becomes lost money with no recovery.",
           "instead": "Keep the ledger authoritative; the read model is rebuildable by replaying entries."
+        },
+        {
+          "trap": "Transferring to the bank first, then recording the payout",
+          "why": "A crash after the bank call but before posting leaves money gone with no ledger record — and a retry can double-pay.",
+          "instead": "Reserve funds in the ledger (available -> payout-pending) before the bank call; send a stable bank reference so the transfer itself is idempotent; finalize or reverse on the result."
         }
       ],
       "failureDrills": [
         {
           "scenario": "The balance read model lags the ledger.",
           "expectedBehavior": "Payout decisions stay safe.",
-          "mitigation": "Payout re-checks against the authoritative ledger transactionally before transferring; the read model is for fast reads, not the final guard."
+          "mitigation": "The read-model check is only a preflight hint; the authoritative guard is a strong ledger reservation taken transactionally before the bank call, so a stale projection can never authorize a double-spend."
+        },
+        {
+          "scenario": "Bank transfer times out after reservation (in-doubt).",
+          "expectedBehavior": "Funds stay reserved; the payout is neither lost nor double-sent.",
+          "mitigation": "The payout row sits in 'sent' with a stable bank_reference; reconcile via bank statement or status lookup, then finalize to 'paid' or reverse the reservation — keyed by bank_reference so a retry is a no-op."
         }
       ],
       "interviewerSignals": {
         "strong": [
           "Keeps the ledger authoritative and the read model rebuildable.",
-          "Separates available from pending to prevent clawback negatives."
+          "Separates available from pending to prevent clawback negatives.",
+          "Reserves funds in the ledger before the bank call and uses a stable bank reference, so payout is never authorized off the read model."
         ],
         "weak": [
           "Computes balances by scanning the ledger per request.",
-          "Pays out pending funds."
+          "Pays out pending funds.",
+          "Transfers to the bank based on the read-model balance, then records the ledger afterward."
         ]
       },
       "recap": {
         "before": "Balance reads would scan the whole ledger; no payout path.",
-        "after": "Fast balance reads from a projection, and safe idempotent payouts.",
-        "newRisk": "The read model can lag or have bugs — it must be rebuildable and never the final authority."
+        "after": "Fast balance reads from a projection, and safe idempotent payouts guarded by a strong ledger reservation before the bank call.",
+        "newRisk": "The read model can lag or have bugs — it must be rebuildable and never the final authority; the in-doubt bank transfer needs reconciliation."
       },
       "whyNow": [
         "With money correctly recorded, merchants need to see and withdraw it without overloading the ledger."
@@ -2233,18 +2920,19 @@
           "Payout",
           "Bank"
         ],
-        "caption": "Payouts read available funds from the balance read model (projected from the ledger), and the payout service transfers via the bank while posting offsetting ledger entries.",
+        "caption": "Payouts preflight against the balance read model but reserve funds in the authoritative ledger (available -> payout-pending) before transferring via the bank, then finalize or reverse based on the bank result.",
         "links": [
           "gw-balance-get-balance",
           "ledger-balance-project-entries",
           "paysvc-payout-request-payout",
           "payout-balance-available-only",
+          "payout-ledger-reserve",
           "payout-bank-transfer",
           "payout-ledger-entries"
         ],
         "highlight": [
-          "Balance",
           "Payout",
+          "Ledger",
           "Bank"
         ]
       },
@@ -2271,21 +2959,23 @@
               "Payout",
               "Bank"
             ],
-            "caption": "A maintained balance read model is projected from the ledger so GET balance and the payout service read available funds without summing entries.",
+            "caption": "A maintained balance read model is projected from the ledger for fast preflight, but the payout service reserves funds in the ledger before the bank transfer and finalizes after.",
             "links": [
               "gw-balance-get-balance",
               "ledger-balance-project-entries",
               "paysvc-payout-request-payout",
               "payout-balance-available-only",
+              "payout-ledger-reserve",
               "payout-bank-transfer",
               "payout-ledger-entries"
             ],
             "highlight": [
-              "Balance",
               "Payout",
+              "Ledger",
               "Bank"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/07-payouts-opt1.jpg"
         },
         {
           "name": "Sum the ledger on every read",
@@ -2322,7 +3012,8 @@
             "highlight": [
               "Ledger"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/07-payouts-opt2.jpg"
         },
         {
           "name": "Periodic balance snapshots + delta",
@@ -2364,7 +3055,8 @@
             "highlight": [
               "Snapshot"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/07-payouts-opt3.jpg"
         }
       ]
     },
@@ -2379,7 +3071,10 @@
       "probeLinks": [
         "square-books",
         "modern-treasury-ledgers",
-        "spanner-paper"
+        "spanner-paper",
+        "uber-ledgerstore-indexes",
+        "modern-treasury-scale-ledger",
+        "tigerbeetle-financial-accounting"
       ],
       "decisionPrompt": "If you shard the ledger by account, what happens to a transaction that touches two accounts on different shards?",
       "concepts": [
@@ -2421,7 +3116,8 @@
             "highlight": [
               "Router"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/08-scale-ledger-opt1.jpg"
         },
         {
           "name": "Single primary, scale vertically + read replicas",
@@ -2442,16 +3138,28 @@
             "links": [
               "paysvc-ledger"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/08-scale-ledger-opt2.jpg"
         }
       ],
       "deepDives": [
         {
-          "title": "Cross-shard transactions",
+          "title": "Cross-shard transactions: the pending-visibility rule",
           "points": [
-            "Keep entries balanced per transaction_id even when split across shards.",
-            "Use a saga: write the debit on shard A and the credit on shard B, both tagged with the same transaction_id.",
-            "Reconciliation verifies that every transaction_id nets to zero across shards — a missing side is a detectable break."
+            "Keep entries balanced per transaction_id even when split across shards: each side writes a shard-local entry carrying the same global transaction_id.",
+            "Both sides post with ledger_transactions.status = pending. The write protocol is a saga (debit on shard A, credit on shard B); a coordinator/outbox record owns retrying whichever side is missing.",
+            "Visibility rule: a transaction is only flipped to balanced once BOTH sides are observed. Balance projections ignore pending/incomplete transactions, so a cross-shard half-write can never become available money before its matching side lands.",
+            "Reconciliation verifies that every transaction_id nets to zero across shards — a missing side is a detectable break — and pages immediately on aged half-transactions that have not completed within their SLA.",
+            "Net effect: half-written cross-shard transfers are invisible to spendable balance, are actively retried, and are alerted if they stall — never silently lost or prematurely available."
+          ]
+        },
+        {
+          "title": "Hot accounts, resharding, and shard-local ordering",
+          "points": [
+            "Hot merchants/accounts can overload a single shard; isolate them onto their own shard or split their activity across sub-accounts that roll up.",
+            "Use shard-local sequence numbers (not a global counter) so each shard orders its own entries without cross-shard coordination.",
+            "Reshard online by routing new writes to the new mapping while backfilling history; a consistent hash or directory keeps the move incremental.",
+            "Reconciliation must read all shards (and the settlement file) to prove global balance — every transaction_id is checked across the full shard set, not per shard."
           ]
         }
       ],
@@ -2521,7 +3229,10 @@
         "spanner-paper",
         "stripe-webhooks",
         "square-books",
-        "modern-treasury-ledgers"
+        "modern-treasury-ledgers",
+        "uber-ledgerstore-indexes",
+        "aws-idempotent-apis",
+        "modern-treasury-scale-ledger"
       ],
       "decisionPrompt": "Which operations may return slightly stale data, and which must never?",
       "concepts": [
@@ -2530,6 +3241,29 @@
           "definition": "Strong: reads see the latest committed write. Eventual: reads may lag but converge.",
           "whyItMatters": "Money correctness needs strong guarantees on the critical path; not everywhere, or you pay needless latency/availability.",
           "group": "Where Money Demands Strong Consistency"
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Security & compliance controls",
+          "points": [
+            "PCI / tokenization: never store raw card data — the PSP tokenizes the source; we only ever hold a token and the psp_reference.",
+            "Fraud / risk checks run before authorization and before payout, and payout holds gate withdrawals during the dispute window.",
+            "Merchant onboarding carries KYC/AML and sanctions screening; failing checks freeze payouts, not charges already taken.",
+            "PSP credentials and webhook signing secrets live in a KMS/HSM and rotate on a schedule with overlapping keys for zero-downtime rotation.",
+            "Operator/admin money actions (manual corrections, forced payouts) require approval workflows and land in an immutable audit log."
+          ]
+        },
+        {
+          "title": "Observability: signals, thresholds, and operator actions",
+          "points": [
+            "Stuck idempotency keys (in_progress past lease) — page if rising; action: re-drive or expire safely.",
+            "Outbox relay lag / queue lag — page above SLA; action: scale relay/consumers, check poison rows (last_error).",
+            "PSP timeout rate and capture_unknown count — alert on spike; action: trigger status-lookup reconciliation.",
+            "Ledger imbalance (any transaction_id not netting to zero) — page immediately; action: halt posting, investigate.",
+            "Projection lag (balance read model) — warn; action: throttle dependent reads, rebuild if diverging.",
+            "Payout failure rate and aging reconciliation breaks — alert; action: finance-ops escalation and freeze if systemic."
+          ]
         }
       ],
       "traps": [
@@ -2606,7 +3340,8 @@
             "highlight": [
               "Balance"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/09-consistency-choices-opt1.jpg"
         },
         {
           "name": "Strong consistency everywhere",
@@ -2648,14 +3383,15 @@
             "highlight": [
               "Balance"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/09-consistency-choices-opt2.jpg"
         }
       ]
     }
   ],
   "finalDesign": {
     "title": "Final Design",
-    "description": "End-to-end: idempotent APIs, a sharded append-only double-entry ledger as the source of truth, asynchronous capture via outbox + queue, signature-verified deduplicated webhooks, daily reconciliation against the PSP, a balance read model, and idempotent payouts.",
+    "description": "End-to-end, the pieces fit together as follows. Idempotent APIs sit in front of a sharded, append-only double-entry ledger (with balanced-transaction headers) as the source of truth. Capture runs asynchronously via outbox + queue, with an explicit in-doubt (capture_unknown) state driven by an outbound capture worker. Inbound PSP webhooks are signature-verified, deduplicated, and persisted in a psp_events inbox, then applied by a separate inbound PSP event worker. Daily line-item reconciliation runs a break-lifecycle workflow against the PSP. A rebuildable balance read model serves fast reads, and payouts run as a state machine that reserves funds in the ledger before the bank call. Lifecycle state (payment_events, refunds, payouts, reconciliation_breaks, statement_files) lives in the data model and step deep dives, so the diagram stays a clean overview.",
     "view": {
       "nodes": [
         "Client",
@@ -2666,6 +3402,7 @@
         "Outbox",
         "Queue",
         "Capture",
+        "EventWorker",
         "PSP",
         "WebhookSvc",
         "Router",
@@ -2677,7 +3414,7 @@
         "Payout",
         "Bank"
       ],
-      "caption": "End to end: the gateway and payment service take charges idempotently, an outbox/queue drives async capture and webhooks, sharded ledgers feed reconciliation, the balance read model, and bank payouts.",
+      "caption": "End to end: the gateway and payment service take charges idempotently; an outbox/queue drives async capture (outbound Capture Worker) while inbound PSP webhooks are deduped and applied by a separate PSP Event Worker; payouts reserve funds in the ledger before the bank transfer; sharded ledgers feed reconciliation and the balance read model.",
       "links": [
         "client-gw",
         "gw-paysvc",
@@ -2693,6 +3430,8 @@
         "router-ledgerb",
         "psp-webhooksvc-webhook",
         "webhooksvc-queue",
+        "queue-eventworker",
+        "eventworker-router",
         "psp-statement-settlement",
         "statement-recon",
         "recon-ledgera",
@@ -2704,7 +3443,8 @@
         "payout-bank-transfer",
         "payout-router"
       ]
-    }
+    },
+    "aiVisual": "assets/generated/ai-visuals/final-design.jpg"
   },
   "satisfies": {
     "functional": [
@@ -2715,14 +3455,17 @@
           "sync-charge",
           "idempotency",
           "async-capture"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-01-charge-a-customer-for-an-order.jpg"
       },
       {
         "requirement": "Refund fully or partially",
-        "how": "Refunds are new reversing ledger transactions, never edits to history.",
+        "how": "Each refund is a tracked row (full/partial, multiple per payment up to the remaining refundable amount) that posts a new reversing ledger transaction — never an edit to history.",
         "steps": [
-          "ledger"
-        ]
+          "ledger",
+          "webhooks"
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-02-refund-fully-or-partially.jpg"
       },
       {
         "requirement": "Auditable record of every movement",
@@ -2730,14 +3473,16 @@
         "steps": [
           "ledger",
           "scale-ledger"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-03-auditable-record-of-every-movement.jpg"
       },
       {
         "requirement": "Pay out merchant balances",
         "how": "Idempotent payout service draws only available balance and records the transfer in the ledger.",
         "steps": [
           "payouts"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-04-pay-out-merchant-balances.jpg"
       },
       {
         "requirement": "Expose status and balance",
@@ -2745,14 +3490,16 @@
         "steps": [
           "async-capture",
           "payouts"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-05-expose-status-and-balance.jpg"
       },
       {
         "requirement": "Process async PSP outcomes",
-        "how": "Signature-verified, deduplicated webhooks enqueue work processed exactly-once.",
+        "how": "Signature-verified, deduplicated webhooks land in a psp_events inbox and dispatch by type (settlement, dispute/chargeback, late failure) to handlers that transition state and post reversing entries exactly-once.",
         "steps": [
           "webhooks"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/func-06-process-async-psp-outcomes.jpg"
       }
     ],
     "nonFunctional": [
@@ -2762,7 +3509,8 @@
         "steps": [
           "ledger",
           "consistency-choices"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-01-correctness-over-availability.jpg"
       },
       {
         "requirement": "Exactly-once effect under retries",
@@ -2771,7 +3519,8 @@
           "idempotency",
           "async-capture",
           "webhooks"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-02-exactly-once-effect-under-retries.jpg"
       },
       {
         "requirement": "Durable and auditable",
@@ -2779,14 +3528,25 @@
         "steps": [
           "ledger",
           "reconciliation"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-03-durable-and-auditable.jpg"
       },
       {
         "requirement": "Provably consistent with the PSP",
         "how": "Daily line-item reconciliation surfaces and repairs any drift with audit trails.",
         "steps": [
           "reconciliation"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-04-provably-consistent-with-the-psp.jpg"
+      },
+      {
+        "requirement": "Idempotent APIs for safe retries",
+        "how": "Client-supplied Idempotency-Key on payments, refunds, and payouts, claimed atomically and replayed on retry; a request fingerprint rejects key reuse with a different body.",
+        "steps": [
+          "idempotency",
+          "payouts"
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-05-idempotent-apis-for-safe-retries.jpg"
       },
       {
         "requirement": "Scales with volume",
@@ -2794,10 +3554,919 @@
         "steps": [
           "scale-ledger",
           "payouts"
-        ]
+        ],
+        "aiVisual": "assets/generated/design-vs-requirements/nonfunc-06-scales-with-volume.jpg"
       }
     ]
   },
+  "technologyChoices": [
+    {
+      "concern": "API edge, merchant auth, and abuse controls",
+      "steps": [
+        "sync-charge",
+        "idempotency",
+        "webhooks"
+      ],
+      "selfHosted": [
+        {
+          "name": "Kong",
+          "icon": "assets/tech-icons/kong.png"
+        },
+        {
+          "name": "Envoy",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Nginx",
+          "icon": "assets/tech-icons/nginx.png"
+        },
+        {
+          "name": "HAProxy",
+          "icon": "assets/tech-icons/haproxy.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          },
+          {
+            "name": "WAF",
+            "icon": "assets/tech-icons/Arch_AWS-WAF_64.png"
+          },
+          {
+            "name": "Cognito",
+            "icon": "assets/tech-icons/Arch_Amazon-Cognito_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Endpoints",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Cloud Armor",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          },
+          {
+            "name": "Identity Platform",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "API Management",
+            "icon": "assets/tech-icons/10042-icon-service-API-Management-Services.svg"
+          },
+          {
+            "name": "Application Gateway",
+            "icon": "assets/tech-icons/10076-icon-service-Application-Gateways.svg"
+          },
+          {
+            "name": "Microsoft Entra ID",
+            "icon": "assets/tech-icons/10231-icon-service-Entra-ID-Protection.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Putting auth, TLS termination, request shaping, and merchant-level quotas at the edge keeps payment workers focused on money-state transitions.",
+        "The edge can reject obviously invalid or abusive traffic, but idempotency still belongs in the application because only it can replay the original response."
+      ],
+      "makesIrrelevant": "A managed API edge with WAF, auth integration, quotas, and request logs removes most custom reverse-proxy and rate-limit glue for the public endpoints."
+    },
+    {
+      "concern": "PSP connector and capture state-machine orchestration",
+      "steps": [
+        "sync-charge",
+        "async-capture",
+        "webhooks",
+        "reconciliation"
+      ],
+      "selfHosted": [
+        {
+          "name": "Temporal",
+          "icon": "assets/tech-icons/temporal.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          },
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Run",
+            "icon": "assets/tech-icons/ServerlessComputing-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Durable Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          },
+          {
+            "name": "Event Grid",
+            "icon": "assets/tech-icons/10221-icon-service-Event-Grid-Subscriptions.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A database-backed state machine is simple and auditable when each transition is local and explicit.",
+        "Workflow engines make retries, timers, and compensation visible, but every activity still needs idempotent PSP calls and ledger posts.",
+        "Queues and logs decouple capture workers from the create-payment request; they do not make external PSP calls transactional."
+      ],
+      "makesIrrelevant": "A managed workflow engine with durable timers and history can remove hand-built retry tables for capture_unknown recovery, but not reconciliation."
+    },
+    {
+      "concern": "Authoritative ledger and payments store",
+      "steps": [
+        "ledger",
+        "async-capture",
+        "scale-ledger",
+        "consistency-choices"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "CockroachDB",
+          "icon": "assets/tech-icons/cockroach.png"
+        },
+        {
+          "name": "Citus",
+          "icon": "assets/tech-icons/citus.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Aurora (PostgreSQL)",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "RDS",
+            "icon": "assets/tech-icons/Arch_Amazon-RDS_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "AlloyDB",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          },
+          {
+            "name": "SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          },
+          {
+            "name": "Cosmos DB for PostgreSQL",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A single strongly consistent SQL primary is the simplest correct ledger; shard only when write volume forces it.",
+        "Distributed SQL buys horizontal scale and multi-zone durability, but every cross-region write pays latency and every schema change is more expensive.",
+        "A general document or key-value store can hold payment state, but the double-entry ledger still needs transaction-level invariants and immutable audit history."
+      ],
+      "makesIrrelevant": "A managed distributed SQL database can remove much of the hand-built ledger router and shard-map machinery, as long as its consistency and latency fit the money path."
+    },
+    {
+      "concern": "Idempotency keys, request fingerprints, and locks",
+      "steps": [
+        "idempotency",
+        "webhooks",
+        "payouts"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Firestore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A unique constraint in the primary DB keeps the idempotency claim and stored response in one transaction, which is safest for low to moderate volume.",
+        "A separate fast store isolates dedupe traffic from the ledger, but crash recovery must handle a claimed key whose payment transaction did not commit.",
+        "TTL support matters because keys must cover the client and PSP retry window without accumulating forever."
+      ],
+      "makesIrrelevant": "A store with conditional writes plus native TTL removes most custom lock tables and cleanup jobs for stale idempotency keys."
+    },
+    {
+      "concern": "Transactional outbox, relay, and event queue",
+      "steps": [
+        "async-capture",
+        "webhooks",
+        "payouts"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Redpanda",
+          "icon": "assets/tech-icons/redpanda.png"
+        },
+        {
+          "name": "RabbitMQ",
+          "icon": "assets/tech-icons/rabbitmq.png"
+        },
+        {
+          "name": "NATS (JetStream)",
+          "icon": "assets/tech-icons/nats.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "MSK",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Streaming-for-Apache-Kafka_64.png"
+          },
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "EventBridge",
+            "icon": "assets/tech-icons/Arch_Amazon-EventBridge_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Managed Service for Apache Kafka",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          },
+          {
+            "name": "Event Grid",
+            "icon": "assets/tech-icons/10221-icon-service-Event-Grid-Subscriptions.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A log-style stream fits ordered lifecycle events, replay, and multiple consumer groups for capture, webhooks, and projection.",
+        "A work queue is simpler for capture jobs and payout retries because it gives per-message acknowledgement, visibility timeouts, and DLQs.",
+        "Managed queues drop broker operations, but consumers must still be idempotent because delivery is at-least-once."
+      ],
+      "makesIrrelevant": "A managed queue with native DLQ, visibility timeout, redrive, and autoscaling consumers removes most hand-built retry and lease machinery from the capture and webhook workers."
+    },
+    {
+      "concern": "Webhook inbox, dead-lettering, and replay",
+      "steps": [
+        "webhooks",
+        "reconciliation"
+      ],
+      "selfHosted": [
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Redis Streams",
+          "icon": "assets/tech-icons/redis.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "S3",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Storage-Service_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Firestore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Pub/Sub",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Storage",
+            "icon": "assets/tech-icons/Storage-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Blob Storage",
+            "icon": "assets/tech-icons/10781-icon-service-Blob-Page.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Persisting the raw signature-verified PSP event creates an audit and replay source before any business handler runs.",
+        "A relational inbox is easiest to query by payment_id and event_id; a stream or queue gives simpler retry fan-out and DLQ mechanics.",
+        "Object storage is cheap for immutable raw payload retention, but it should complement an indexed inbox rather than replace it."
+      ],
+      "makesIrrelevant": "A durable inbox plus provider-managed DLQ removes most custom retry ledgers for out-of-order or poison PSP events."
+    },
+    {
+      "concern": "Reconciliation ingestion and break workflow",
+      "steps": [
+        "reconciliation",
+        "ledger",
+        "consistency-choices"
+      ],
+      "selfHosted": [
+        {
+          "name": "Ceph",
+          "icon": "assets/tech-icons/ceph.png"
+        },
+        {
+          "name": "Apache Spark",
+          "icon": "assets/tech-icons/spark.png"
+        },
+        {
+          "name": "Apache Flink",
+          "icon": "assets/tech-icons/flink.png"
+        },
+        {
+          "name": "Apache Airflow",
+          "icon": "assets/tech-icons/airflow.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "S3",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Storage-Service_64.png"
+          },
+          {
+            "name": "AWS Glue",
+            "icon": "assets/tech-icons/Arch_AWS-Glue_64.png"
+          },
+          {
+            "name": "EMR",
+            "icon": "assets/tech-icons/Arch_Amazon-EMR_64.png"
+          },
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Storage",
+            "icon": "assets/tech-icons/Storage-512-color.png"
+          },
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Cloud Composer",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Blob Storage",
+            "icon": "assets/tech-icons/10781-icon-service-Blob-Page.svg"
+          },
+          {
+            "name": "Azure Synapse Analytics",
+            "icon": "assets/tech-icons/00606-icon-service-Azure-Synapse-Analytics.svg"
+          },
+          {
+            "name": "Logic Apps",
+            "icon": "assets/tech-icons/10363-icon-service-Logic-Apps-Custom-Connector.svg"
+          },
+          {
+            "name": "Event Hubs",
+            "icon": "assets/tech-icons/00039-icon-service-Event-Hubs.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Batch jobs over immutable settlement files are cheap and auditable for daily reconciliation.",
+        "Streaming reconciliation catches drift sooner, but it increases state-management complexity and still needs daily file completeness checks.",
+        "Break resolution is an operating workflow with owners, SLAs, approvals, and correcting ledger entries, not just a compare job."
+      ],
+      "makesIrrelevant": "A managed batch/workflow stack with file manifests, retries, and lineage removes much of the custom settlement-import scheduler."
+    },
+    {
+      "concern": "Balance projection and read model",
+      "steps": [
+        "payouts",
+        "scale-ledger",
+        "consistency-choices"
+      ],
+      "selfHosted": [
+        {
+          "name": "Apache Kafka",
+          "icon": "assets/tech-icons/kafka.png"
+        },
+        {
+          "name": "Apache Flink",
+          "icon": "assets/tech-icons/flink.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Kinesis",
+            "icon": "assets/tech-icons/Arch_Amazon-Kinesis_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Dataflow",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Bigtable",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Stream Analytics",
+            "icon": "assets/tech-icons/00042-icon-service-Stream-Analytics-Jobs.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          },
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A stream processor feeding a read-optimized store serves the 50k rps balance path cheaply, but it is eventually consistent.",
+        "A projection must be rebuildable by replaying ledger entries from a known checkpoint; pick stores that support fast backfill and snapshot replacement.",
+        "A direct ledger sum is simpler for small accounts, but it does not survive high fan-out balance reads or multi-year ledger growth."
+      ],
+      "makesIrrelevant": "At low volume, summing the ledger directly or using periodic snapshots can remove the separate streaming projection."
+    },
+    {
+      "concern": "Payout workflow and bank-rail retries",
+      "steps": [
+        "payouts",
+        "consistency-choices",
+        "reconciliation"
+      ],
+      "selfHosted": [
+        {
+          "name": "Temporal",
+          "icon": "assets/tech-icons/temporal.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "RabbitMQ",
+          "icon": "assets/tech-icons/rabbitmq.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Step Functions",
+            "icon": "assets/tech-icons/Arch_AWS-Step-Functions_64.png"
+          },
+          {
+            "name": "SQS",
+            "icon": "assets/tech-icons/Arch_Amazon-Simple-Queue-Service_64.png"
+          },
+          {
+            "name": "DynamoDB",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Workflows",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Cloud Tasks",
+            "icon": "assets/tech-icons/IntegrationServices-512-color.png"
+          },
+          {
+            "name": "Firestore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Durable Functions",
+            "icon": "assets/tech-icons/10029-icon-service-Function-Apps.svg"
+          },
+          {
+            "name": "Service Bus",
+            "icon": "assets/tech-icons/10836-icon-service-Azure-Service-Bus.svg"
+          },
+          {
+            "name": "Cosmos DB",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A payout is a state machine: reserve funds, call the bank with a stable reference, then finalize or reverse based on the result.",
+        "Workflow tools make retries and timeouts explicit, but the ledger reservation remains the source of truth for whether money can move.",
+        "Queue-only retries are simple, but operator visibility and manual repair are weaker unless every attempt is persisted."
+      ],
+      "makesIrrelevant": "A durable workflow service with retries, timers, and execution history removes many bespoke payout-attempt tables, but not the ledger reservation."
+    },
+    {
+      "concern": "Ledger sharding, routing, and resharding",
+      "steps": [
+        "scale-ledger",
+        "consistency-choices",
+        "payouts"
+      ],
+      "selfHosted": [
+        {
+          "name": "Citus",
+          "icon": "assets/tech-icons/citus.png"
+        },
+        {
+          "name": "CockroachDB",
+          "icon": "assets/tech-icons/cockroach.png"
+        },
+        {
+          "name": "Apache ShardingSphere",
+          "icon": "assets/tech-icons/sharding_sphere.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Aurora Global Database",
+            "icon": "assets/tech-icons/Arch_Amazon-Aurora_64.png"
+          },
+          {
+            "name": "RDS",
+            "icon": "assets/tech-icons/Arch_Amazon-RDS_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Spanner",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "AlloyDB",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Database for PostgreSQL",
+            "icon": "assets/tech-icons/02827-icon-service-Azure-Database-PostgreSQL-Server-Group.svg"
+          },
+          {
+            "name": "SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          },
+          {
+            "name": "Cosmos DB for PostgreSQL",
+            "icon": "assets/tech-icons/10121-icon-service-Azure-Cosmos-DB.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Application-level account sharding keeps balanced entries local, but resharding hot accounts and cross-shard transfers become product problems.",
+        "Distributed SQL simplifies shard maps and failover, but strong writes across regions can be slower than a carefully scoped single-region ledger shard.",
+        "Read-model scaling is easier than write-ledger scaling; do not shard the ledger just to serve balance reads."
+      ],
+      "makesIrrelevant": "A distributed SQL ledger can remove a custom router for many workloads, but the design still needs clear account affinity and cross-shard transaction semantics."
+    },
+    {
+      "concern": "Secrets, keys, tokenization, and PCI boundary",
+      "steps": [
+        "sync-charge",
+        "webhooks",
+        "consistency-choices"
+      ],
+      "selfHosted": [
+        {
+          "name": "HashiCorp Vault",
+          "icon": "assets/tech-icons/hashicorp_vault.png"
+        },
+        {
+          "name": "HSM (PKCS#11)",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "JWT (stateless tokens)",
+          "icon": "assets/tech-icons/jwt.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "KMS",
+            "icon": "assets/tech-icons/Arch_AWS-Key-Management-Service_64.png"
+          },
+          {
+            "name": "CloudHSM",
+            "icon": "assets/tech-icons/Arch_AWS-CloudHSM_64.png"
+          },
+          {
+            "name": "Secrets Manager",
+            "icon": "assets/tech-icons/Arch_AWS-Secrets-Manager_64.png"
+          },
+          {
+            "name": "CloudTrail",
+            "icon": "assets/tech-icons/Arch_AWS-CloudTrail_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud KMS",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          },
+          {
+            "name": "Secret Manager",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          },
+          {
+            "name": "Identity Platform",
+            "icon": "assets/tech-icons/SecurityIdentity-512-color.png"
+          },
+          {
+            "name": "Cloud Logging",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Key Vault",
+            "icon": "assets/tech-icons/10245-icon-service-Key-Vaults.svg"
+          },
+          {
+            "name": "Managed HSM",
+            "icon": "assets/tech-icons/02322-icon-service-Dedicated-HSM.svg"
+          },
+          {
+            "name": "Microsoft Entra ID",
+            "icon": "assets/tech-icons/10231-icon-service-Entra-ID-Protection.svg"
+          },
+          {
+            "name": "Log Analytics",
+            "icon": "assets/tech-icons/00009-icon-service-Log-Analytics-Workspaces.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Managed KMS/HSM reduces key-custody burden and simplifies audit evidence, but it locks key policy and availability to the provider.",
+        "Self-hosted Vault is portable and expressive, but the team owns high availability, rotation, break-glass, and audit integrity.",
+        "Tokenization keeps raw payment instruments outside the payment-service data model; webhook signature secrets still need explicit rotation and scoped access."
+      ],
+      "makesIrrelevant": "A managed tokenization and KMS boundary can remove raw card data from this system entirely, shrinking the PCI surface."
+    },
+    {
+      "concern": "Observability, audit logging, and money SLOs",
+      "steps": [
+        "async-capture",
+        "webhooks",
+        "reconciliation",
+        "payouts",
+        "consistency-choices"
+      ],
+      "selfHosted": [
+        {
+          "name": "Prometheus",
+          "icon": "assets/tech-icons/prometheus.png"
+        },
+        {
+          "name": "Grafana",
+          "icon": "assets/tech-icons/grafana.png"
+        },
+        {
+          "name": "Jaeger",
+          "icon": "assets/tech-icons/jaeger.png"
+        },
+        {
+          "name": "ELK Stack",
+          "icon": "assets/tech-icons/elasticsearch.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "X-Ray",
+            "icon": "assets/tech-icons/Arch_AWS-X-Ray_64.png"
+          },
+          {
+            "name": "CloudTrail",
+            "icon": "assets/tech-icons/Arch_AWS-CloudTrail_64.png"
+          },
+          {
+            "name": "Managed Service for Prometheus",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Service-for-Prometheus_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Trace",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          },
+          {
+            "name": "Cloud Logging",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Application Insights",
+            "icon": "assets/tech-icons/00012-icon-service-Application-Insights.svg"
+          },
+          {
+            "name": "Log Analytics",
+            "icon": "assets/tech-icons/00009-icon-service-Log-Analytics-Workspaces.svg"
+          },
+          {
+            "name": "Azure Managed Grafana",
+            "icon": "assets/tech-icons/02905-icon-service-Azure-Managed-Grafana.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Money systems need audit-grade retention for state transitions, ledger posts, PSP callbacks, and operator actions; storage cost often dominates metrics cost.",
+        "Alert on money invariants and business lag: unbalanced ledger transactions, capture_unknown age, webhook DLQ depth, recon-break aging, and payout failure rates.",
+        "Tracing is most valuable across external PSP and bank calls where latency and ambiguity create the in-doubt cases."
+      ],
+      "makesIrrelevant": "Provider-native tracing and immutable audit logs reduce the amount of custom correlation and evidence storage needed for incident review."
+    }
+  ],
   "interviewScript": [
     {
       "phase": "Frame correctness-first",
@@ -2822,14 +4491,20 @@
       "say": [
         "Start with the naive synchronous charge and immediately name the double-charge-on-retry hazard.",
         "Add idempotency, then the double-entry ledger, then async capture via outbox, then webhooks.",
-        "Go deep on whichever the interviewer pushes: exactly-once, the ledger invariant, or reconciliation."
+        "Make capture honest about being asynchronous: name the capture_unknown in-doubt state and how you recover it (PSP reference lookup, webhook, settlement reconciliation, deduped ledger post).",
+        "Distinguish the outbound capture worker (drives our own capture) from the inbound PSP event worker (applies settlement/dispute/chargeback/late-failure) — one node for both reintroduces double-posting.",
+        "Describe the webhook inbox: verify signature, persist raw psp_events, dedupe by event id, defer out-of-order, dispatch by event type.",
+        "Go deep on whichever the interviewer pushes: exactly-once, the ledger invariant, in-doubt recovery, or reconciliation."
       ]
     },
     {
       "phase": "Reconcile & wrap",
       "time": "final 5 min",
       "say": [
-        "Cover reconciliation against the PSP and how breaks are resolved with compensating entries.",
+        "Cover reconciliation as an operating model: statement-file imports, the break lifecycle (detected -> investigating -> auto/manual resolution), and compensating entries — not just a compare job.",
+        "Name the payout consistency guard: reserve funds strongly in the ledger before the bank rails, then finalize or reverse on the bank callback.",
+        "If sharding came up, state the cross-shard pending-visibility rule: half-written transfers stay pending, are excluded from available balance, retried, and alerted.",
+        "Call out money-movement observability signals (in-doubt count, break aging, stuck payouts, dead-lettered events).",
         "Summarize how each requirement is met and name the consistency budget explicitly."
       ]
     }
@@ -2847,6 +4522,8 @@
       "expectations": [
         "Drives the double-entry invariant and exactly-once-effect reasoning.",
         "Uses a transactional outbox to avoid dual writes; makes async consumers idempotent.",
+        "Explains PSP in-doubt recovery: the capture_unknown state and how it resolves via PSP reference, webhook, and settlement, posting the ledger exactly once.",
+        "Distinguishes the outbound capture worker from the inbound PSP event worker and explains why conflating them double-posts.",
         "Designs reconciliation at line-item grain with compensating corrections."
       ]
     },
@@ -2854,18 +4531,21 @@
       "level": "Staff+",
       "expectations": [
         "Allocates the consistency budget deliberately (strong on writes/payout, eventual on reads).",
-        "Shards the ledger by account and handles cross-shard transfers as reconciled sagas.",
-        "Quantifies failure modes and frames money loss as the metric that dominates all others."
+        "Defines the payout consistency guard: reserve in the ledger before the bank call, finalize or reverse on callback.",
+        "Specifies the reconciliation break operating model (statement-file imports, break lifecycle, owners, alert thresholds), not just a compare job.",
+        "Shards the ledger by account and states the cross-shard pending-visibility rule (half-transactions stay pending, are excluded from available balance, retried, and alerted).",
+        "Names the money-movement observability signals (in-doubt count, break aging, stuck payouts, dead-lettered events) and frames money loss as the metric that dominates all others."
       ]
     }
   ],
   "followUps": [
-    "How would you handle multi-currency charges and FX, and where does the rate get fixed?",
-    "How do disputes and chargebacks flow through the ledger weeks after the original charge?",
-    "How would you support partial captures and multiple captures against one authorization?",
-    "What's your strategy for a PSP outage — queue and retry, fail closed, or fail over to a second PSP?",
-    "How do you prevent and detect internal fraud given the system can move money?",
-    "How would you rebuild the balance read model from scratch, and how long would it take at this scale?"
+    "Covered in the main design — push for depth: How does an in-doubt capture (capture_unknown) get recovered, and how do you guarantee the ledger posts exactly once across PSP-reference lookup, webhook, and settlement?",
+    "Covered in the main design — push for depth: How do disputes and chargebacks flow through the inbound PSP event worker and the ledger weeks after the original charge, without touching the outbound capture path?",
+    "Covered in the main design — push for depth: How do you rebuild the balance read model from scratch, and how long would it take at this scale?",
+    "Extension topic: How would you handle multi-currency charges and FX, and where does the rate get fixed?",
+    "Extension topic: How would you route across multiple PSPs and handle a PSP outage — queue and retry, fail closed, or fail over to a second PSP?",
+    "Extension topic: How do you prevent and detect internal fraud and meet KYC/AML given the system can move money?",
+    "Extension topic: How would you support partial captures and multiple captures against one authorization as a product feature?"
   ],
   "toProbeFurther": {
     "links": [
@@ -2951,10 +4631,150 @@
         "type": "Paper",
         "why": "Reference for globally replicated transactions, external consistency, and geographically distributed state.",
         "year": "2012"
+      },
+      {
+        "id": "stripe-idempotency-blog",
+        "group": "Payments and Commerce",
+        "groupDescription": "Payment correctness, idempotency, ledgers, checkout, orders, and reconciliation references.",
+        "title": "Designing robust and predictable APIs with idempotency",
+        "url": "https://stripe.com/blog/idempotency",
+        "source": "Stripe",
+        "type": "Explainer",
+        "year": "2017",
+        "why": "Explains how Stripe uses caller-provided idempotency keys, cached results, retries, backoff, and jitter to make ambiguous payment failures safe to retry."
+      },
+      {
+        "id": "paypal-idempotency",
+        "group": "Payments and Commerce",
+        "groupDescription": "Payment correctness, idempotency, ledgers, checkout, orders, and reconciliation references.",
+        "title": "Idempotency",
+        "url": "https://developer.paypal.com/reference/guidelines/idempotency/",
+        "source": "PayPal",
+        "type": "Docs",
+        "why": "Shows another PSP's request-id contract for retrying POST operations without creating duplicate money movement."
+      },
+      {
+        "id": "airbnb-payment-platform",
+        "group": "Company Implementations",
+        "groupDescription": "Production payment-platform and financial-data architecture case studies.",
+        "title": "Scaling Airbnb's Payment Platform",
+        "url": "https://medium.com/airbnb-engineering/scaling-airbnbs-payment-platform-43ebfc99b324",
+        "source": "Airbnb Engineering",
+        "type": "Case study",
+        "year": "2016",
+        "why": "Production marketplace-payments case study covering a unified payment gateway, append-only payment events, Kafka, financial reporting, and double-entry bookkeeping."
+      },
+      {
+        "id": "airbnb-payment-orchestration",
+        "group": "Company Implementations",
+        "groupDescription": "Production payment-platform and financial-data architecture case studies.",
+        "title": "Rebuilding Payment Orchestration at Airbnb",
+        "url": "https://medium.com/airbnb-engineering/rebuilding-payment-orchestration-at-airbnb-341d194a781b",
+        "source": "Airbnb Engineering",
+        "type": "Case study",
+        "year": "2022",
+        "why": "Describes a payment-orchestration migration, product-agnostic workflows, idempotent event processing, integration tests, and matchup jobs for validating money movement."
+      },
+      {
+        "id": "uber-ledgerstore-indexes",
+        "group": "Company Implementations",
+        "groupDescription": "Production payment-platform and financial-data architecture case studies.",
+        "title": "How LedgerStore Supports Trillions of Indexes at Uber",
+        "url": "https://www.uber.com/ca/en/blog/how-ledgerstore-supports-trillions-of-indexes/",
+        "source": "Uber Engineering",
+        "type": "Case study",
+        "year": "2024",
+        "why": "Shows why financial ledgers need immutable storage, verifiable completeness, strongly consistent indexes, and access-pattern-specific indexing at very high scale."
+      },
+      {
+        "id": "modern-treasury-scale-ledger",
+        "group": "Ledgers, Reconciliation, and Money State",
+        "groupDescription": "Ledger modeling, immutability, indexing, reconciliation, and money-state correctness references.",
+        "title": "How to Scale a Ledger, Part V: Immutability and Double-Entry",
+        "url": "https://www.moderntreasury.com/journal/how-to-scale-a-ledger-part-v",
+        "source": "Modern Treasury",
+        "type": "Guide",
+        "year": "2023",
+        "why": "Deepens the ledger step with practical guarantees around immutable logs, point-in-time reconstruction, double-entry balancing, audit logs, and currency-level constraints."
+      },
+      {
+        "id": "tigerbeetle-financial-accounting",
+        "group": "Ledgers, Reconciliation, and Money State",
+        "groupDescription": "Ledger modeling, immutability, indexing, reconciliation, and money-state correctness references.",
+        "title": "Financial Accounting",
+        "url": "https://docs.tigerbeetle.com/coding/financial-accounting/",
+        "source": "TigerBeetle",
+        "type": "Docs",
+        "why": "Explains debit and credit modeling for financial transaction databases and why signed balance deltas are the wrong primitive for money state."
+      },
+      {
+        "id": "stripe-reporting-reconciliation",
+        "group": "Ledgers, Reconciliation, and Money State",
+        "groupDescription": "Ledger modeling, immutability, indexing, reconciliation, and money-state correctness references.",
+        "title": "Reporting and reconciliation",
+        "url": "https://docs.stripe.com/plan-integration/get-started/reporting-reconciliation",
+        "source": "Stripe",
+        "type": "Docs",
+        "why": "Shows how payout reconciliation, immutable balance transactions, reporting APIs, and webhook-driven report generation support accounting close and dispute investigation."
+      },
+      {
+        "id": "razorpay-webhook-validation",
+        "group": "Webhook Delivery and PSP Events",
+        "groupDescription": "Provider-specific delivery, signature, duplicate-event, and asynchronous processing behavior.",
+        "title": "Validate and Test Webhooks",
+        "url": "https://razorpay.com/docs/webhooks/validate-test/",
+        "source": "Razorpay",
+        "type": "Docs",
+        "why": "Provider reference for raw-body HMAC verification, duplicate event IDs, idempotent webhook consumers, and out-of-order event handling."
+      },
+      {
+        "id": "adyen-webhooks",
+        "group": "Webhook Delivery and PSP Events",
+        "groupDescription": "Provider-specific delivery, signature, duplicate-event, and asynchronous processing behavior.",
+        "title": "Webhooks",
+        "url": "https://docs.adyen.com/development-resources/webhooks",
+        "source": "Adyen",
+        "type": "Docs",
+        "why": "Shows a PSP webhook contract where receivers acknowledge quickly, store the message, and process long-running payment status changes asynchronously."
+      },
+      {
+        "id": "aws-idempotent-apis",
+        "group": "Reliability Patterns for Payments",
+        "groupDescription": "Retry, saga, and durable-workflow patterns for ambiguous failures and long-running money movement.",
+        "title": "Making retries safe with idempotent APIs",
+        "url": "https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-apis/",
+        "source": "Amazon Builders' Library",
+        "type": "Guide",
+        "why": "Generalizes the payment idempotency pattern with caller request identifiers, semantic equivalence, retry policy behavior, and late-arriving request handling."
+      },
+      {
+        "id": "temporal-saga-pattern",
+        "group": "Reliability Patterns for Payments",
+        "groupDescription": "Retry, saga, and durable-workflow patterns for ambiguous failures and long-running money movement.",
+        "title": "The Saga Pattern Made Easy",
+        "url": "https://pages.temporal.io/rs/250-WIU-007/images/tech-guide-saga-pattern-made-easy.pdf",
+        "source": "Temporal",
+        "type": "Guide",
+        "why": "Useful model for asynchronous capture and payout workflows where each committed step needs a durable compensating action instead of a distributed transaction."
+      },
+      {
+        "id": "stripe-integration-security",
+        "group": "Security and Compliance",
+        "groupDescription": "PCI scope, hosted or tokenized collection, and payment-integration security references.",
+        "title": "Integration security guide",
+        "url": "https://docs.stripe.com/security/guide",
+        "source": "Stripe",
+        "type": "Docs",
+        "why": "Connects hosted/tokenized card collection choices to PCI scope, secure customer-server communication, and payment-integration responsibility boundaries."
       }
     ]
   },
   "assets": {
     "icon": "icon.png"
-  }
+  },
+  "aiVisuals": {
+    "requirements": "assets/generated/ai-visuals/requirements.jpg",
+    "capacity": "assets/generated/ai-visuals/capacity.jpg"
+  },
+  "explainerComic": "assets/generated/comic/interview-comic.jpg"
 }

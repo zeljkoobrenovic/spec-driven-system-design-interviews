@@ -106,6 +106,16 @@
           "stateless"
         ],
         "description": "Per-node policy (LRU/LFU/TTL) reclaiming memory under pressure."
+      },
+      {
+        "id": "Metrics",
+        "label": "Metrics & Alerting",
+        "type": "observability",
+        "category": "compute",
+        "traits": [
+          "stateless"
+        ],
+        "description": "Collects hit rate, DB-fallback QPS, shard skew, evictions, replica lag, and epoch drift; drives alerts and backpressure."
       }
     ],
     "links": [
@@ -149,7 +159,7 @@
         "id": "a-db",
         "from": "CacheA",
         "to": "DB",
-        "label": "miss -> load"
+        "label": "load on miss (read-through)"
       },
       {
         "id": "app-db",
@@ -158,16 +168,28 @@
         "label": "read on miss / write"
       },
       {
+        "id": "app-backfill",
+        "from": "App",
+        "to": "CacheA",
+        "label": "set (backfill)"
+      },
+      {
         "id": "a-replica",
         "from": "CacheA",
         "to": "Replica",
-        "label": "replicate"
+        "label": "replicate (async)"
       },
       {
-        "id": "replica-app",
+        "id": "replica-clientlib",
         "from": "Replica",
-        "to": "App",
+        "to": "ClientLib",
         "label": "serve on failover"
+      },
+      {
+        "id": "clientlib-config",
+        "from": "ClientLib",
+        "to": "Config",
+        "label": "refresh ring epoch"
       },
       {
         "id": "config-clientlib",
@@ -191,7 +213,25 @@
         "id": "app-cachea",
         "from": "App",
         "to": "CacheA",
-        "label": "write-through"
+        "label": "write value"
+      },
+      {
+        "id": "cachea-metrics",
+        "from": "CacheA",
+        "to": "Metrics",
+        "label": "hit rate, evictions, QPS, lag"
+      },
+      {
+        "id": "app-metrics",
+        "from": "App",
+        "to": "Metrics",
+        "label": "DB-fallback QPS, p99"
+      },
+      {
+        "id": "metrics-clientlib",
+        "from": "Metrics",
+        "to": "ClientLib",
+        "label": "backpressure: shed / serve-stale / throttle"
       }
     ],
     "types": [
@@ -212,7 +252,8 @@
           "ClientLib",
           "Router",
           "Config",
-          "Eviction"
+          "Eviction",
+          "Metrics"
         ]
       }
     ]
@@ -277,6 +318,31 @@
       "label": "Hit latency",
       "value": "sub-ms",
       "note": "In-memory + network round trip."
+    },
+    {
+      "label": "Residual DB miss load",
+      "value": "~50k reads/s",
+      "note": "At 1M reads/s and 95% hit rate the DB still sees ~50k misses/s — before adding writes or stampede spikes — so 95% may be too low if the DB can't absorb that."
+    },
+    {
+      "label": "Node count (memory)",
+      "value": "~20-40 nodes",
+      "note": "A few TB usable / ~64-128 GB RAM per node, derated ~30% for fragmentation/metadata, then ×2 for replication and ~25% headroom. Sizing is driven by value bytes + per-entry overhead, not key count."
+    },
+    {
+      "label": "Per-node QPS",
+      "value": "~25-50k ops/s",
+      "note": "1M ops/s spread across ~20-40 nodes under uniform load — but provision extra headroom because hot keys and skew concentrate load on a few nodes."
+    },
+    {
+      "label": "Network bandwidth",
+      "value": "multiple GB/s",
+      "note": "1M ops/s × ~KB values ≈ several GB/s aggregate across clients, cache nodes, replicas, and DB backfills — often the binding constraint before CPU."
+    },
+    {
+      "label": "Latency budget (p99)",
+      "value": "sub-ms p50, low-ms p99",
+      "note": "A hit is same-AZ RTT + client serialization + cache CPU + connection-pool wait; the tail (p99) is dominated by queuing and GC, not the in-memory lookup."
     }
   ],
   "api": [
@@ -362,6 +428,20 @@
       "description": "Invalidate a key (e.g. after a DB write).",
       "request": "delete(\"user:42\")",
       "response": "OK"
+    },
+    {
+      "method": "MGET",
+      "path": "cache.multiGet(keys[])",
+      "description": "Batch/pipelined read of many keys in one round trip (the high-throughput read path). The client groups keys by owning node, issues one request per node in parallel, and returns hits plus the list of missing keys to load from the DB.",
+      "request": "multiGet([\"user:42\", \"user:43\", \"user:99\"])",
+      "response": "{ user:42: value, user:43: value, user:99: MISS }"
+    },
+    {
+      "method": "CTRL",
+      "path": "Advanced controls (namespace, CAS, TTL, limits)",
+      "description": "Production knobs layered on get/set/delete. namespace/key-prefix (e.g. \"tenantA:user:42\") scopes auth, quotas, metrics, and bulk invalidation per tenant. set(..., ttl, jitter) takes a relative TTL bounded by a max TTL with server-side jitter to de-synchronize expiries; reads do not refresh the TTL by default. set(..., cas=version) is a compare-and-set that only writes if the caller's version token still matches, so a stale read-miss backfill is rejected instead of clobbering a newer value. Value-size limits (e.g. reject > 1 MB, compress large values) keep one entry from skewing a shard.",
+      "request": "set(\"tenantA:user:42\", value, ttl=300, jitter=10%, cas=v7)",
+      "response": "OK | VERSION_CONFLICT | TOO_LARGE"
     }
   ],
   "dataModel": [
@@ -371,42 +451,658 @@
       "fields": [
         {
           "name": "key",
-          "type": "string"
+          "type": "string (namespace/tenant-prefixed)"
         },
         {
           "name": "value",
-          "type": "bytes (serialized)"
+          "type": "bytes (serialized, optionally compressed)"
+        },
+        {
+          "name": "size_bytes",
+          "type": "int (entry footprint; drives sizing + value-size limits)"
         },
         {
           "name": "expires_at",
-          "type": "timestamp (TTL)"
+          "type": "timestamp (relative TTL + jitter, bounded by max TTL)"
         },
         {
-          "name": "lru_meta",
-          "type": "recency/frequency bookkeeping for eviction"
+          "name": "version",
+          "type": "monotonic token for CAS / stale-backfill rejection"
+        },
+        {
+          "name": "created_at / last_accessed",
+          "type": "timestamps for eviction + age metrics"
+        },
+        {
+          "name": "frequency_count",
+          "type": "int (LFU/TinyLFU access counter, aged)"
+        },
+        {
+          "name": "flags",
+          "type": "negative-cache marker (cached miss), compressed bit"
         }
       ]
     },
     {
-      "name": "ring / topology",
-      "note": "Control-plane mapping of key ranges to nodes.",
+      "name": "ring / topology (config epoch)",
+      "note": "Control-plane mapping of key ranges to nodes; versioned by an epoch so clients can detect a stale ring.",
       "fields": [
+        {
+          "name": "epoch",
+          "type": "monotonic version of the whole ring; clients fence on it"
+        },
         {
           "name": "token",
           "type": "ring position"
         },
         {
-          "name": "node_id",
-          "type": "owner"
+          "name": "primary_owner / replica_owner",
+          "type": "node_ids (placed in different fault domains)"
         },
         {
           "name": "vnodes",
-          "type": "list<token>"
+          "type": "list<token> (virtual nodes for even load)"
         },
         {
-          "name": "health",
-          "type": "up | down"
+          "name": "zone / rack",
+          "type": "fault domain of each node"
+        },
+        {
+          "name": "node_state",
+          "type": "up | suspect | down | joining | draining"
+        },
+        {
+          "name": "last_transition",
+          "type": "timestamp of last health/state change"
         }
+      ]
+    }
+  ],
+  "technologyChoices": [
+    {
+      "concern": "Cache engine / server",
+      "steps": [
+        "cache-aside",
+        "eviction",
+        "failover"
+      ],
+      "selfHosted": [
+        {
+          "name": "Memcached",
+          "icon": "assets/tech-icons/memcached.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "Dragonfly",
+          "icon": "assets/tech-icons/dragonfly.png"
+        },
+        {
+          "name": "KeyDB",
+          "icon": "assets/tech-icons/keydb.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Azure Managed Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Memcached is a lean multithreaded slab cache for plain key-value reads; Redis, Valkey, Dragonfly, and KeyDB add richer data structures, replication, persistence options, and cluster behavior at more operational surface.",
+        "Self-hosting gives full control over version, eviction tuning, and cost; a managed service trades that for patching, failover automation, and backups you don't run yourself."
+      ],
+      "makesIrrelevant": [
+        "A managed cluster with built-in primary/replica failover removes much of the hand-rolled replication/promotion machinery in the failover step.",
+        "MemoryDB's durable, replicated log makes write-back-style durability a product feature rather than something you build."
+      ]
+    },
+    {
+      "concern": "Local L1 and near-cache layer",
+      "steps": [
+        "naive",
+        "hotkeys"
+      ],
+      "selfHosted": [
+        {
+          "name": "Caffeine",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Ristretto",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Guava Cache",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "cachetools",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "In-process map with TTL",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "DynamoDB Accelerator",
+            "icon": "assets/tech-icons/Arch_Amazon-DynamoDB_64.png"
+          },
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "An L1 cache removes the network hop for the hottest keys and cushions hot-key spikes, but every application instance now has its own stale, duplicated copy.",
+        "Keep the shared L2 cache as the authoritative cache tier for size, cross-instance reuse, and centralized invalidation; use L1 only for tiny, short-TTL, high-read keys."
+      ],
+      "makesIrrelevant": [
+        "For a small set of ultra-hot keys, a short-TTL L1 can reduce the need to replicate those same keys across many L2 cache nodes."
+      ]
+    },
+    {
+      "concern": "Sharding / routing",
+      "steps": [
+        "sharding"
+      ],
+      "selfHosted": [
+        {
+          "name": "Client-side consistent hashing",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Redis Cluster",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Twemproxy",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "mcrouter",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Envoy Redis proxy",
+          "icon": "assets/tech-icons/envoy.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "ElastiCache cluster mode",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB cluster mode",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Memorystore Redis Cluster",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Managed Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A client library avoids an extra hop but puts ring/topology logic in every client and language; a proxy (mcrouter/Twemproxy/Envoy) keeps clients thin and centralizes pooling, coalescing, and metrics at the cost of a hop and an HA tier.",
+        "Cluster-native slot routing bakes resharding and failover into the engine but constrains multi-key operations to the same slot."
+      ],
+      "makesIrrelevant": [
+        "Using a cache product with native slots and client redirection removes most custom ring math from the application, though clients still need topology refresh and retry behavior."
+      ]
+    },
+    {
+      "concern": "Topology / membership & config",
+      "steps": [
+        "sharding",
+        "failover"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis Cluster gossip",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "ZooKeeper",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "etcd",
+          "icon": "assets/tech-icons/etcd.png"
+        },
+        {
+          "name": "Consul",
+          "icon": "assets/tech-icons/consul.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Azure Managed Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "A coordination service (ZooKeeper/etcd/Consul) gives you an authoritative, epoch-versioned ring and health source but is itself a service to run and keep available; gossip avoids a central dependency at the cost of weaker, eventually-consistent membership.",
+        "Managed caches hide this entirely; the trade-off becomes less control over failover timing and epoch semantics."
+      ],
+      "makesIrrelevant": [
+        "A managed cache's built-in topology/health management removes the need to operate your own config/membership service."
+      ]
+    },
+    {
+      "concern": "Eviction, admission, and TTL policy",
+      "steps": [
+        "eviction",
+        "hotkeys"
+      ],
+      "selfHosted": [
+        {
+          "name": "Memcached LRU",
+          "icon": "assets/tech-icons/memcached.png"
+        },
+        {
+          "name": "Redis maxmemory policies",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Caffeine TinyLFU",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Ristretto TinyLFU",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Azure Managed Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "LRU is simple and cheap but vulnerable to scans; LFU/TinyLFU-style admission protects the true working set but needs counters, aging, and careful memory accounting.",
+        "TTL jitter is not an engine choice, but it must be implemented in clients or cache writes so expirations do not synchronize into a miss storm."
+      ],
+      "makesIrrelevant": [
+        "A product with configurable eviction/admission policies reduces custom eviction-manager code, but it does not remove the need to size the working set and alert on evictions/sec."
+      ]
+    },
+    {
+      "concern": "Cache/DB consistency and invalidation",
+      "steps": [
+        "cache-aside",
+        "consistency"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "Memcached CAS",
+          "icon": "assets/tech-icons/memcached.png"
+        },
+        {
+          "name": "PostgreSQL",
+          "icon": "assets/tech-icons/postgresql.png"
+        },
+        {
+          "name": "MySQL",
+          "icon": "assets/tech-icons/mysql.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          },
+          {
+            "name": "RDS",
+            "icon": "assets/tech-icons/Arch_Amazon-RDS_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud SQL",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Azure SQL Database",
+            "icon": "assets/tech-icons/10130-icon-service-SQL-Database.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Delete-on-write with lazy refill is usually the most robust cache-aside contract because the database stays authoritative and stale cache entries disappear quickly.",
+        "Write-through keeps the cache warm but adds write latency; write-back absorbs write bursts but needs durable buffering and replay, which is a much stronger operational promise than an ordinary cache."
+      ],
+      "makesIrrelevant": [
+        "A cache engine with CAS/Lua/transactions can reject stale backfills, but it does not eliminate the need for a database-side version token."
+      ]
+    },
+    {
+      "concern": "Hot-key and stampede protection",
+      "steps": [
+        "hotkeys",
+        "operations"
+      ],
+      "selfHosted": [
+        {
+          "name": "singleflight",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Redis",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "Envoy rate limit",
+          "icon": "assets/tech-icons/envoy.png"
+        },
+        {
+          "name": "Nginx rate limiting",
+          "icon": "assets/tech-icons/nginx.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "ElastiCache",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "CloudFront Functions",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudFront_64.png"
+          },
+          {
+            "name": "API Gateway",
+            "icon": "assets/tech-icons/Arch_Amazon-API-Gateway_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          },
+          {
+            "name": "Cloud Load Balancing",
+            "icon": "assets/tech-icons/Networking-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Application Gateway",
+            "icon": "assets/tech-icons/10076-icon-service-Application-Gateways.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Request coalescing is best implemented near the caller or cache client so duplicate misses collapse before they reach the database.",
+        "Replicating hot keys spreads read QPS but complicates invalidation and wastes memory if the promotion/demotion threshold is too sticky."
+      ],
+      "makesIrrelevant": [
+        "A mature edge or proxy rate-limit layer can shed abusive traffic before it reaches the cache, but it does not replace per-key single-flight for legitimate hot keys."
+      ]
+    },
+    {
+      "concern": "Replication, failover, and warm replicas",
+      "steps": [
+        "failover",
+        "operations"
+      ],
+      "selfHosted": [
+        {
+          "name": "Redis Sentinel",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Redis Cluster",
+          "icon": "assets/tech-icons/redis.png"
+        },
+        {
+          "name": "Valkey Cluster",
+          "icon": "assets/tech-icons/valkey.png"
+        },
+        {
+          "name": "KeyDB Active Replication",
+          "icon": "assets/tech-icons/keydb.png"
+        },
+        {
+          "name": "Dragonfly Cluster",
+          "icon": "assets/tech-icons/dragonfly.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "ElastiCache Multi-AZ",
+            "icon": "assets/tech-icons/Arch_Amazon-ElastiCache_64.png"
+          },
+          {
+            "name": "MemoryDB",
+            "icon": "assets/tech-icons/Arch_Amazon-MemoryDB_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Memorystore",
+            "icon": "assets/tech-icons/Databases-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Cache for Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          },
+          {
+            "name": "Azure Managed Redis",
+            "icon": "assets/tech-icons/10137-icon-service-Cache-Redis.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Async cache replication is acceptable because the database is the source of truth; the goal is warm failover and lower DB shock, not perfect durability.",
+        "Managed failover improves recovery time and patching discipline, but you still need client retry, epoch refresh, replica-lag alerts, and controlled rewarming."
+      ],
+      "makesIrrelevant": [
+        "Managed Multi-AZ failover removes most custom promotion orchestration, but not the application requirement to remain correct with an empty or stale cache."
+      ]
+    },
+    {
+      "concern": "Observability & backpressure",
+      "steps": [
+        "operations",
+        "failover",
+        "hotkeys"
+      ],
+      "selfHosted": [
+        {
+          "name": "Prometheus",
+          "icon": "assets/tech-icons/prometheus.png"
+        },
+        {
+          "name": "Grafana",
+          "icon": "assets/tech-icons/grafana.png"
+        },
+        {
+          "name": "OpenTelemetry",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "redis_exporter",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "memcached_exporter",
+          "icon": "assets/tech-icons/tech.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "Managed Service for Prometheus",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Service-for-Prometheus_64.png"
+          },
+          {
+            "name": "Managed Grafana",
+            "icon": "assets/tech-icons/Arch_Amazon-Managed-Grafana_64.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          },
+          {
+            "name": "Azure Managed Prometheus",
+            "icon": "assets/tech-icons/02905-icon-service-Azure-Managed-Grafana.svg"
+          },
+          {
+            "name": "Azure Managed Grafana",
+            "icon": "assets/tech-icons/02905-icon-service-Azure-Managed-Grafana.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Self-hosted Prometheus/Grafana gives high-cardinality per-key/per-shard metrics and custom alerting at the cost of running the stack; cloud monitoring is turnkey but can be coarser and metered.",
+        "Backpressure actions such as DB-fallback budgets, serve-stale, load shedding, and paced warmup live in the application/client control loop; the metrics stack only feeds those decisions."
+      ],
+      "makesIrrelevant": [
+        "Managed monitoring removes most metrics-storage and dashboard operations, but not the need to define cache-specific SLOs and automated responses."
       ]
     }
   ],
@@ -472,7 +1168,7 @@
       "title": "1. Naive: An In-Process Local Cache",
       "description": [
         "Start with the simplest cache that helps: each application instance keeps a plain in-process map (a dict) of recently-read values. On a read, check the local map; on a miss, query the database and stash the result in the map. No extra infrastructure, microsecond hits.",
-        "It works for one process, but it doesn't solve the real problem. The cache isn't shared: every app instance has its own copy, so the same key is loaded and stored N times and an invalidation on one instance leaves the others stale. The map is bounded by one process's heap, so it can't hold a large working set. And it starts cold on every deploy/restart, hammering the DB until it warms.",
+        "It works for one process, but it doesn't solve the real problem. The cache isn't shared: every app instance has its own copy, so the same key is loaded and stored N times, and an invalidation on one instance leaves the others stale. The map is bounded by one process's heap, so it can't hold a large working set. And it starts cold on every deploy/restart, hammering the DB until it warms.",
         "So the local map motivates a shared, dedicated cache tier: one logical cache all instances read through, sized far beyond a single heap, that survives app restarts."
       ],
       "view": {
@@ -494,9 +1190,10 @@
         "Starting from a per-process dict makes the value of a shared cache tier obvious — every later step (sharding, eviction, consistency, failover) exists because the cache is shared and bounded, not local."
       ],
       "probeLinks": [
-        "redis-cluster",
-        "memcache-facebook",
         "redis-cache",
+        "memcached-overview",
+        "caffeine-efficiency",
+        "aws-caching-strategies",
         "tail-at-scale"
       ],
       "recap": {
@@ -510,7 +1207,8 @@
           "why": "It can't be shared, sized, or invalidated across instances, and dies on every restart — hit rate and consistency both suffer at scale.",
           "instead": "Move to a shared cache tier all instances read through (cache-aside), then shard, evict, and replicate it."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/01-naive.jpg"
     },
     {
       "id": "cache-aside",
@@ -527,12 +1225,12 @@
           "CacheA",
           "DB"
         ],
-        "caption": "The application calls the cache client library, which hashes to cache node A; on a miss the node loads from the backing database.",
+        "caption": "The application calls the cache client library to read node A; on a miss the application itself loads from the backing database and backfills the cache.",
         "links": [
           "app-clientlib",
           "clientlib-a",
-          "a-db",
-          "app-db"
+          "app-db",
+          "app-backfill"
         ],
         "highlight": [
           "CacheA"
@@ -543,7 +1241,7 @@
       },
       "options": [
         {
-          "name": "Cache-aside (lazy loading) (default)",
+          "name": "Cache-aside (default)",
           "description": "The application checks the cache, loads from the database on a miss, and writes the value back into the cache with a TTL.",
           "pros": [
             "App controls the read path: on a miss it loads from the DB and backfills with a TTL, so the cache holds only what's actually requested.",
@@ -562,12 +1260,12 @@
               "CacheA",
               "DB"
             ],
-            "caption": "On a miss the application loads from the backing database through cache node A and populates the cache itself, so app code manages fills.",
+            "caption": "On a miss the application loads directly from the backing database and then backfills cache node A itself, so app code (not the cache) manages fills.",
             "links": [
               "app-clientlib",
               "clientlib-a",
-              "a-db",
-              "app-db"
+              "app-db",
+              "app-backfill"
             ],
             "highlight": [
               "CacheA"
@@ -575,10 +1273,11 @@
             "groups": [
               "cache-tier"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-cache-aside-opt1.jpg"
         },
         {
-          "name": "Read-through cache",
+          "name": "Read-through",
           "description": "Callers ask the cache node for a key and the cache node itself loads from the database on a miss and backfills.",
           "pros": [
             "The cache node itself loads from the DB on a miss, so callers never touch the DB directly — one clean code path.",
@@ -613,7 +1312,8 @@
             "groups": [
               "cache-tier"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/02-cache-aside-opt2.jpg"
         }
       ],
       "decisionPrompt": "On a miss, who loads from the DB and backfills — the app or the cache node?",
@@ -627,9 +1327,10 @@
         }
       ],
       "probeLinks": [
-        "redis-cluster",
+        "aws-caching-strategies",
         "memcache-facebook",
         "redis-cache",
+        "evcache-features",
         "tail-at-scale"
       ],
       "patterns": [
@@ -652,8 +1353,8 @@
       ],
       "flows": [
         {
-          "name": "Read-through with hit/miss",
-          "note": "The app asks the client lib for a key; on a hit the cache node returns it, on a miss the app loads from the DB and backfills the cache.",
+          "name": "Cache-aside read with backfill",
+          "note": "The app asks the client lib for a key; on a hit the cache node returns it, on a miss the app itself loads from the DB and backfills the cache.",
           "sequence": {
             "participants": [
               {
@@ -734,7 +1435,9 @@
       "description": [
         "To exceed one node's memory and throughput, partition keys across many cache nodes. Hash each key to a node on a consistent-hashing ring (with virtual nodes for even load).",
         "Consistent hashing means adding or removing a node only remaps that node's share of keys — not the whole keyspace — so a scaling event doesn't blow away the entire cache and stampede the DB.",
-        "Routing can live in a client library (client hashes and talks to nodes directly) or a proxy/router tier; both read the ring topology from a config/membership service."
+        "Routing can live in a client library (client hashes and talks to nodes directly) or a proxy/router tier; both read the ring topology from a config/membership service.",
+        "Topology-change rollout matters as much as the hash function. Adding or removing a node is staged: the config service publishes a new ring epoch, token ranges move gradually rather than all at once, and the remapped keys refill lazily on miss by default — with active warming reserved for known-hot ranges. Throttle DB fallback during a planned reshard so the unavoidable miss wave doesn't stampede the DB, and alert on clients lagging the current epoch (a straggler routes to the old owner).",
+        "Placement rule: assign a key's virtual nodes — and especially its primary and replica — to different fault domains (host, rack, AZ) so a single zone event can't remove a primary and its replica together."
       ],
       "view": {
         "nodes": [
@@ -767,7 +1470,7 @@
       },
       "options": [
         {
-          "name": "Client-side hashing in a library (default)",
+          "name": "Client-side hashing (default)",
           "description": "Each client embeds the ring and consistent-hashes a key locally, then talks straight to the owning cache node with no intermediary.",
           "pros": [
             "No extra network hop: the client library hashes the key and talks to the owning cache node directly.",
@@ -813,10 +1516,11 @@
               "cache-tier",
               "control"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-sharding-opt1.jpg"
         },
         {
-          "name": "Proxy / router tier",
+          "name": "Proxy routing",
           "description": "A proxy tier owns the ring; clients hit one endpoint and the proxy hashes each key and forwards it to the owning node.",
           "pros": [
             "Clients stay thin — they hit one endpoint and the proxy owns the ring and routing.",
@@ -852,7 +1556,8 @@
               "cache-tier",
               "control"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/03-sharding-opt2.jpg"
         }
       ],
       "decisionPrompt": "With plain key % N hashing, what happens to the hit rate when one node dies?",
@@ -866,10 +1571,12 @@
         }
       ],
       "probeLinks": [
+        "consistent-hashing-random-trees",
+        "jump-consistent-hash",
         "memcache-facebook",
         "redis-cluster",
-        "tail-at-scale",
-        "sre-overload"
+        "mcrouter",
+        "elasticache-resharding"
       ],
       "patterns": [
         "Consistent hashing"
@@ -887,6 +1594,89 @@
           "trap": "Sharding with key modulo node-count.",
           "why": "Changing node count remaps almost every key, causing a near-total cache miss and a DB stampede.",
           "instead": "Consistent hashing with virtual nodes."
+        },
+        {
+          "trap": "Flipping the whole ring to a new topology in one step.",
+          "why": "All remapped keys miss at once, so a routine scale-up turns into a DB stampede.",
+          "instead": "Publish a new epoch, move token ranges gradually, refill lazily (warm hot ranges), and throttle DB fallback during the reshard."
+        }
+      ],
+      "flows": [
+        {
+          "name": "Add a node (staged reshard)",
+          "note": "Scaling up is rolled out, not flipped: the new node joins, config publishes a new epoch, a slice of token ranges moves to it, clients refresh the ring, and the moved keys refill lazily on miss under a throttle so the DB isn't stampeded.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "NewNode",
+                "label": "New Cache Node"
+              },
+              {
+                "id": "Config",
+                "label": "Config / Membership"
+              },
+              {
+                "id": "ClientLib",
+                "label": "Cache Client"
+              },
+              {
+                "id": "DB",
+                "label": "Database"
+              }
+            ],
+            "messages": [
+              {
+                "from": "NewNode",
+                "to": "Config",
+                "arrow": "->>",
+                "label": "join (state: joining)"
+              },
+              {
+                "from": "Config",
+                "to": "Config",
+                "arrow": "->>",
+                "label": "assign vnodes in fresh fault domains; advance epoch"
+              },
+              {
+                "from": "ClientLib",
+                "to": "Config",
+                "arrow": "->>",
+                "label": "refresh ring (new epoch)"
+              },
+              {
+                "type": "alt",
+                "label": "moved key (lazy refill)",
+                "messages": [
+                  {
+                    "from": "ClientLib",
+                    "to": "NewNode",
+                    "arrow": "->>",
+                    "label": "get(key) -> miss"
+                  },
+                  {
+                    "from": "ClientLib",
+                    "to": "DB",
+                    "arrow": "->>",
+                    "label": "throttled load + backfill"
+                  }
+                ],
+                "else": {
+                  "label": "unmoved key",
+                  "messages": [
+                    {
+                      "from": "ClientLib",
+                      "to": "ClientLib",
+                      "arrow": "->>",
+                      "label": "still routes to existing owner (hit)"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Config"
+          ]
         }
       ]
     },
@@ -896,6 +1686,7 @@
       "description": [
         "Cache memory is bounded, so when a node fills up it must evict entries. The policy determines which entries survive and therefore the hit rate.",
         "LRU (least-recently-used) is the common default; LFU (least-frequently-used) better protects truly hot keys from a burst of one-offs; TTL expiry bounds staleness regardless.",
+        "Production caches often use scan-resistant variants — segmented LRU (SLRU) or TinyLFU (the admission policy in Caffeine) — that combine recency with a cheap frequency sketch so a one-time scan can't flush the hot working set, getting LFU's scan resistance at close to LRU's cost.",
         "Eviction is per-node and continuous. Size values and TTLs so the working set fits; monitor evictions/sec as an early warning that the tier is undersized."
       ],
       "view": {
@@ -905,11 +1696,15 @@
           "Eviction",
           "DB"
         ],
-        "caption": "The eviction manager evicts entries from cache node A under memory pressure, which then reloads from the backing database on the next miss.",
+        "caption": "The eviction manager evicts entries from cache node A under memory pressure; the next miss reloads via the application from the backing database and backfills.",
         "links": [
-          "clientlib-a",
+          {
+            "from": "App",
+            "to": "CacheA",
+            "label": "read / backfill"
+          },
           "eviction-a",
-          "a-db"
+          "app-db"
         ],
         "highlight": [
           "Eviction"
@@ -921,7 +1716,7 @@
       },
       "options": [
         {
-          "name": "LRU eviction (default)",
+          "name": "LRU (default)",
           "description": "When memory fills, the node drops the entry whose last access is oldest, tracked cheaply via an intrusive recency list.",
           "pros": [
             "Evicts the least-recently-used entry — a good general proxy for what won't be needed soon.",
@@ -940,11 +1735,15 @@
               "Eviction",
               "DB"
             ],
-            "caption": "The eviction manager drops the least-recently-used entries from cache node A under pressure, reloading from the database on a later miss.",
+            "caption": "The eviction manager drops the least-recently-used entries from cache node A under pressure; a later miss reloads via the application from the database.",
             "links": [
-              "app-cachea",
+              {
+                "from": "App",
+                "to": "CacheA",
+                "label": "read / backfill"
+              },
               "eviction-a",
-              "a-db"
+              "app-db"
             ],
             "highlight": [
               "Eviction"
@@ -953,10 +1752,11 @@
               "cache-tier",
               "control"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-eviction-opt1.jpg"
         },
         {
-          "name": "LFU eviction",
+          "name": "LFU",
           "description": "Each entry carries an access-frequency counter and the node evicts the least-frequently-used entry when memory is full.",
           "pros": [
             "Keeps truly hot keys resident even when a scan floods the cache with one-off reads.",
@@ -975,11 +1775,15 @@
               "Eviction",
               "DB"
             ],
-            "caption": "The eviction manager removes the least-frequently-used entries from cache node A, reloading evicted keys from the backing database on demand.",
+            "caption": "The eviction manager removes the least-frequently-used entries from cache node A; evicted keys reload via the application from the backing database on demand.",
             "links": [
-              "app-cachea",
+              {
+                "from": "App",
+                "to": "CacheA",
+                "label": "read / backfill"
+              },
               "eviction-a",
-              "a-db"
+              "app-db"
             ],
             "highlight": [
               "Eviction"
@@ -991,7 +1795,7 @@
           }
         },
         {
-          "name": "TTL-only expiry",
+          "name": "TTL-only",
           "description": "Entries simply expire at their TTL with no recency or frequency tracking; nothing else decides what to drop.",
           "pros": [
             "Bounds staleness regardless of access pattern — every entry expires on a clock.",
@@ -1010,11 +1814,15 @@
               "Eviction",
               "DB"
             ],
-            "caption": "The eviction manager lets entries in cache node A expire by TTL rather than by access, refilling from the database after they lapse.",
+            "caption": "The eviction manager lets entries in cache node A expire by TTL rather than by access; the application refills from the database after they lapse.",
             "links": [
-              "app-cachea",
+              {
+                "from": "App",
+                "to": "CacheA",
+                "label": "read / backfill"
+              },
               "eviction-a",
-              "a-db"
+              "app-db"
             ],
             "highlight": [
               "Eviction"
@@ -1023,7 +1831,8 @@
               "cache-tier",
               "control"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/04-eviction-opt3.jpg"
         }
       ],
       "decisionPrompt": "A scan reads a million cold keys once. Why might that hurt your hit rate under LRU, and what helps?",
@@ -1037,10 +1846,12 @@
         }
       ],
       "probeLinks": [
-        "sre-overload",
-        "memcache-facebook",
-        "redis-cluster",
-        "redis-cache"
+        "redis-eviction",
+        "memcached-overview",
+        "caffeine-efficiency",
+        "tinylfu",
+        "pelikan-segcache",
+        "memcached-extstore"
       ],
       "patterns": [
         "Eviction policy (LRU/LFU/TTL)"
@@ -1060,7 +1871,7 @@
       "description": [
         "The cache and DB can disagree after a write. Pick a strategy: cache-aside with invalidation (delete the key on DB write, repopulate lazily), write-through (write cache + DB synchronously), or write-back (write cache now, flush to DB async).",
         "Invalidate-on-write is the common, robust choice: it avoids serving the old value and lets the next read repopulate. Write-through keeps the cache warm but adds write latency; write-back is fast but risks loss on node failure.",
-        "Name the race: a read-miss can backfill a stale value if it interleaves with a write. Mitigate with delete (not update) on write, short TTLs, or versioned keys."
+        "Name the race: a read-miss can backfill a stale value if it interleaves with a write. Mitigate with delete (not update) on write, short TTLs, or a version token — backfill with compare-and-set so a fill carrying an older version than the current entry (or than the DB row it read) is rejected instead of clobbering fresh data."
       ],
       "view": {
         "nodes": [
@@ -1068,11 +1879,14 @@
           "CacheA",
           "DB"
         ],
-        "caption": "The application writes through to cache node A and the backing database, and node A reloads from the database on a miss.",
+        "caption": "On a write the application updates the backing database and deletes (invalidates) the key from cache node A; the next read misses and reloads via the application.",
         "links": [
-          "app-cachea",
           "app-db",
-          "a-db"
+          {
+            "from": "App",
+            "to": "CacheA",
+            "label": "delete key (invalidate)"
+          }
         ],
         "highlight": [
           "CacheA",
@@ -1102,11 +1916,14 @@
               "CacheA",
               "DB"
             ],
-            "caption": "On a write the application updates the backing database and deletes the key from cache node A, which reloads it on the next read.",
+            "caption": "On a write the application updates the backing database and deletes the key from cache node A; the next read misses and the application reloads it.",
             "links": [
-              "app-cachea",
               "app-db",
-              "a-db"
+              {
+                "from": "App",
+                "to": "CacheA",
+                "label": "delete key (invalidate)"
+              }
             ],
             "highlight": [
               "CacheA",
@@ -1115,7 +1932,8 @@
             "groups": [
               "cache-tier"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-consistency-opt1.jpg"
         },
         {
           "name": "Write-through cache",
@@ -1156,7 +1974,8 @@
             "groups": [
               "cache-tier"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-consistency-opt2.jpg"
         },
         {
           "name": "Write-back (write-behind)",
@@ -1192,7 +2011,8 @@
             "groups": [
               "cache-tier"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/05-consistency-opt3.jpg"
         }
       ],
       "decisionPrompt": "Update the DB then the cache, or delete the cache then update the DB? What can go wrong in each order?",
@@ -1213,10 +2033,12 @@
         }
       ],
       "probeLinks": [
-        "redis-cluster",
+        "meta-cache-consistency",
+        "tao-graph",
         "memcache-facebook",
         "redis-cache",
-        "tail-at-scale"
+        "aws-caching-strategies",
+        "dynamo-paper"
       ],
       "patterns": [
         "Write-through / write-back"
@@ -1226,6 +2048,8 @@
       ],
       "flows": [
         {
+          "name": "Invalidate-on-write",
+          "note": "On a write the app updates the DB, then deletes the cached key; the next read misses and reloads the fresh value from the source of truth.",
           "sequence": {
             "participants": [
               {
@@ -1264,6 +2088,65 @@
           "highlight": [
             "CacheA"
           ]
+        },
+        {
+          "name": "Stale backfill rejected by version (CAS)",
+          "note": "A read-miss reads version v6 from the DB, but a concurrent write advances the row to v7 and deletes the key before the slow reader backfills. The backfill is a compare-and-set tagged v6; the cache (now empty or holding v7) rejects it, so the stale value never lands.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Reader",
+                "label": "Reader (miss)"
+              },
+              {
+                "id": "Writer",
+                "label": "Writer"
+              },
+              {
+                "id": "DB",
+                "label": "Database"
+              },
+              {
+                "id": "CacheA",
+                "label": "Cache Node"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Reader",
+                "to": "DB",
+                "arrow": "->>",
+                "label": "load -> value@v6"
+              },
+              {
+                "from": "Writer",
+                "to": "DB",
+                "arrow": "->>",
+                "label": "UPDATE -> value@v7"
+              },
+              {
+                "from": "Writer",
+                "to": "CacheA",
+                "arrow": "->>",
+                "label": "DELETE key (invalidate)"
+              },
+              {
+                "from": "Reader",
+                "to": "CacheA",
+                "arrow": "->>",
+                "label": "set(key, v6, cas=v6)"
+              },
+              {
+                "from": "CacheA",
+                "to": "Reader",
+                "arrow": "-->>",
+                "label": "VERSION_CONFLICT (stale, dropped)"
+              }
+            ]
+          },
+          "highlight": [
+            "CacheA"
+          ]
         }
       ],
       "recap": {
@@ -1285,7 +2168,8 @@
       "description": [
         "A single very popular key (a celebrity profile, a flash-sale item) concentrates traffic on one node — a hot shard the ring can't spread.",
         "When that key expires or is evicted, all concurrent readers miss at once and hammer the DB: a cache stampede / thundering herd. Coalesce concurrent misses so only one request loads from the DB and the rest wait for it.",
-        "For extreme hot keys, replicate the key across multiple nodes (or add a tiny local in-process cache) so reads spread; refresh popular keys slightly before expiry to avoid synchronized misses."
+        "For extreme hot keys, replicate the key across multiple nodes (or add a tiny local in-process cache) so reads spread; refresh popular keys slightly before expiry to avoid synchronized misses.",
+        "Make the control loop explicit: detect hot keys from per-key/per-shard request counters (a sampled top-K sketch on each node); promote a key to replicated status once it crosses a QPS threshold, sizing the replica count by how far it exceeds one node's budget; fan invalidation out to every replica on write; and demote (drop the extra copies) once the key cools below the threshold, so memory isn't wasted on yesterday's hot key."
       ],
       "view": {
         "nodes": [
@@ -1295,12 +2179,13 @@
           "Replica",
           "DB"
         ],
-        "caption": "A hot key on cache node A is copied to a cache replica, while the node still loads from the backing database on a miss.",
+        "caption": "A hot key on cache node A is copied to a cache replica so reads spread; on a miss the application still loads from the backing database and backfills.",
         "links": [
           "app-clientlib",
           "clientlib-a",
           "a-replica",
-          "a-db"
+          "app-db",
+          "app-backfill"
         ],
         "highlight": [
           "Replica"
@@ -1330,15 +2215,16 @@
               "CacheA",
               "DB"
             ],
-            "caption": "Cache node A issues a single load to the backing database for a hot missing key while concurrent requests wait for that one result.",
+            "caption": "On a hot-key miss the client library lets a single in-flight request load from the backing database while concurrent readers wait for that one backfill.",
             "links": [
               "app-clientlib",
               "clientlib-a",
               {
-                "from": "CacheA",
+                "from": "App",
                 "to": "DB",
                 "label": "single load (others wait)"
-              }
+              },
+              "app-backfill"
             ],
             "highlight": [
               "CacheA"
@@ -1346,7 +2232,8 @@
             "groups": [
               "cache-tier"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-hotkeys-opt1.jpg"
         },
         {
           "name": "Replicate the hot key across nodes",
@@ -1369,12 +2256,13 @@
               "Replica",
               "DB"
             ],
-            "caption": "The hot key is replicated from cache node A to a cache replica so reads spread across both copies.",
+            "caption": "The hot key is replicated from cache node A to a cache replica so reads spread across both copies; the application backfills from the database on a miss.",
             "links": [
               "app-clientlib",
               "clientlib-a",
               "a-replica",
-              "a-db"
+              "app-db",
+              "app-backfill"
             ],
             "highlight": [
               "Replica"
@@ -1382,7 +2270,8 @@
             "groups": [
               "cache-tier"
             ]
-          }
+          },
+          "aiVisual": "assets/generated/ai-visuals/steps/06-hotkeys-opt2.jpg"
         },
         {
           "name": "Tiny local in-process cache (L1) in front",
@@ -1408,7 +2297,7 @@
               "CacheA",
               "DB"
             ],
-            "caption": "Each application instance checks a tiny local L1 cache first and only falls through to the shared tier and database on an L1 miss.",
+            "caption": "Each application instance checks a tiny local L1 cache first and only falls through to the shared tier, then the application loads from the database on a full miss.",
             "links": [
               {
                 "from": "App",
@@ -1421,7 +2310,7 @@
                 "label": "miss -> shared tier"
               },
               "clientlib-a",
-              "a-db"
+              "app-db"
             ],
             "highlight": [
               "L1"
@@ -1450,10 +2339,12 @@
         }
       ],
       "probeLinks": [
-        "redis-cluster",
         "memcache-facebook",
-        "redis-cache",
-        "dynamo-paper"
+        "mcrouter",
+        "consistent-hashing-random-trees",
+        "redis-observability",
+        "sre-overload",
+        "tail-at-scale"
       ],
       "patterns": [
         "Request coalescing (anti-stampede)"
@@ -1541,7 +2432,9 @@
       "title": "7. Replication, Failover, and Failure Modes",
       "description": [
         "If a cache node dies, its entire shard is suddenly cold and every key on it misses to the DB — potentially a load spike that takes the DB down. Mitigate by keeping a replica per primary that can take over warm.",
-        "A membership/config service tracks node health; clients/routers refresh the ring and route around a dead node. With virtual nodes, a failed node's keys spread across many peers rather than dogpiling one.",
+        "Replication contract: because the DB is authoritative, cache replication can be asynchronous (replicas lag the primary by a bounded amount). Staleness is capped by TTL/version and the cache-aside miss fallback, so a slightly stale warm replica is still better than a cold shard. The client writes to the primary; the primary streams to its replica. Promotion is driven by the config/membership service, not by the client or replica unilaterally: a health check fails, the config service advances the ring epoch, and clients/routers refresh and reroute. Reads then go to the promoted replica (or, with virtual nodes, the failed node's keys spread across many peers rather than dogpiling one).",
+        "Guard against the dangerous middle state: a primary suspected dead but still serving. Fence with the config epoch so clients converge on one owner instead of split-brain routing, and prefer a brief miss-to-DB over reading two divergent copies.",
+        "Placement and warmup decide how cheap failover really is. A primary and its replica must sit in different fault domains (host, rack, AZ) so one zone event can't take both. After a promotion or a node add, admit traffic gradually and rate-limit rewarming rather than slamming the DB to refill a cold range all at once.",
         "Treat the cache as best-effort: the app must remain correct (if slower) with the cache empty. Add jittered TTLs and rate-limited backfill so a cold start doesn't stampede the DB."
       ],
       "view": {
@@ -1553,13 +2446,15 @@
           "Config",
           "DB"
         ],
-        "caption": "Cache node A replicates to a cache replica that serves the application on failover, with cluster config tracking ring and health.",
+        "caption": "Cache node A replicates asynchronously to a replica; when A fails, config advances the ring epoch, the client library refreshes and reroutes reads to the replica, and the application backfills from the database for anything still cold.",
         "links": [
+          "app-clientlib",
           "clientlib-a",
           "a-replica",
-          "replica-app",
+          "replica-clientlib",
           "config-clientlib",
-          "a-db"
+          "clientlib-config",
+          "app-db"
         ],
         "highlight": [
           "Replica",
@@ -1576,9 +2471,11 @@
       ],
       "probeLinks": [
         "redis-cluster",
+        "evcache-features",
+        "dynamo-paper",
+        "mcrouter",
         "sre-overload",
-        "memcache-facebook",
-        "redis-cache"
+        "memcache-facebook"
       ],
       "whyNow": [
         "Closing on failure modes shows the cache improves performance without becoming a new SPOF — the reliability requirement."
@@ -1588,52 +2485,330 @@
         "after": "Replicas warm-failover; ring routes around failures; cold starts are cushioned.",
         "newRisk": "Replication doubles memory cost; stale replicas — bounded by acceptable cache staleness."
       },
+      "flows": [
+        {
+          "name": "Primary failure -> epoch-driven failover",
+          "note": "A health check fails, the config service advances the ring epoch, clients refresh and reroute to the warm replica, and rate-limited backfill from the DB fills anything still cold.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "App"
+              },
+              {
+                "id": "ClientLib",
+                "label": "Cache Client"
+              },
+              {
+                "id": "Config",
+                "label": "Config / Membership"
+              },
+              {
+                "id": "Replica",
+                "label": "Replica"
+              },
+              {
+                "id": "DB",
+                "label": "Database"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Config",
+                "to": "Config",
+                "arrow": "->>",
+                "label": "health check fails on primary; advance ring epoch"
+              },
+              {
+                "from": "ClientLib",
+                "to": "Config",
+                "arrow": "->>",
+                "label": "refresh ring (new epoch)"
+              },
+              {
+                "from": "App",
+                "to": "ClientLib",
+                "arrow": "->>",
+                "label": "get(key)"
+              },
+              {
+                "type": "alt",
+                "label": "replica warm",
+                "messages": [
+                  {
+                    "from": "Replica",
+                    "to": "App",
+                    "arrow": "-->>",
+                    "label": "value (bounded-stale)"
+                  }
+                ],
+                "else": {
+                  "label": "still cold",
+                  "messages": [
+                    {
+                      "from": "App",
+                      "to": "DB",
+                      "arrow": "->>",
+                      "label": "rate-limited load + backfill"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Replica",
+            "Config"
+          ]
+        }
+      ],
       "failureDrills": [
         {
           "scenario": "A primary cache node fails.",
-          "expectedBehavior": "Its replica serves the shard warm; the ring updates so clients route to it; the DB sees little extra load.",
-          "mitigation": "Per-primary replica + health-driven routing + virtual nodes."
+          "expectedBehavior": "Its replica serves the shard warm; the config epoch advances and clients route to it; the DB sees little extra load.",
+          "mitigation": "Per-primary async replica + health-driven epoch routing + virtual nodes."
         },
         {
           "scenario": "The entire cache tier is unavailable.",
           "expectedBehavior": "The app still works (correctly) by reading the DB directly, just slower.",
           "mitigation": "Cache-aside keeps the DB authoritative; rate-limit/jitter backfill to avoid stampede on recovery."
+        },
+        {
+          "scenario": "Config-service staleness / split-brain routing (the subtle client-side-hashing failure).",
+          "expectedBehavior": "Clients on an old ring epoch route to a removed or wrong owner; some keys are read/written against two different owners.",
+          "mitigation": "Version the ring with a config epoch and fence on it; converge clients on one owner, prefer a brief miss-to-DB over serving two divergent copies, and alert on epoch drift across clients."
         }
-      ]
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/07-failover.jpg"
+    },
+    {
+      "id": "operations",
+      "title": "8. Operations, Backpressure, and Warmup",
+      "description": [
+        "A distributed cache rarely fails by losing data — it fails by overload and feedback loops. A miss storm can take the DB down, a bad config epoch can split traffic, uncontrolled hot-key replication wastes memory, and a 'warm' failover becomes cold if backfill is unbounded. The interview-level skill is naming what the system does when a metric crosses a threshold, not just which metrics exist.",
+        "Backpressure actions (what the system does under stress): rate-limit DB backfill to a fallback budget, shed optional cache-fill work, serve stale for eligible keys when the DB is the bottleneck, jitter TTLs to de-synchronize expiries, cap per-key single-flight waiters so one slow load can't pile up unbounded, and throttle rewarming after a node add or failover.",
+        "Alerts named by symptom and owner: DB-fallback QPS over budget (cache team — risk of DB overload), per-shard QPS skew (hot shard), high evictions/sec or low memory headroom (undersized tier), replica lag (failover won't be warm), stale config epoch across clients (split-brain risk), and rising p99 cache-hit latency (queuing/GC, not the lookup). Each should map to one of the backpressure actions above.",
+        "The hardest case is the cold start: cache empty and the DB fallback budget already exhausted. Degrade deliberately rather than collapsing — admit refill traffic gradually, serve stale where allowed, and shed or queue non-critical reads — so the DB recovers instead of being held down by the very traffic trying to rewarm the cache."
+      ],
+      "view": {
+        "nodes": [
+          "App",
+          "ClientLib",
+          "CacheA",
+          "Metrics",
+          "DB"
+        ],
+        "caption": "Cache nodes and the application emit signals (hit rate, evictions, DB-fallback QPS, replica lag, p99) to metrics & alerting, which feeds backpressure back to the client library — shed optional fills, serve stale, and throttle DB backfill before the DB is overloaded.",
+        "links": [
+          "app-clientlib",
+          "clientlib-a",
+          "app-db",
+          "cachea-metrics",
+          "app-metrics",
+          "metrics-clientlib"
+        ],
+        "highlight": [
+          "Metrics"
+        ],
+        "groups": [
+          "cache-tier",
+          "control"
+        ]
+      },
+      "decisionPrompt": "Your DB-fallback budget is 60k QPS and a cold start is generating 200k misses/sec. What does the cache do so the DB recovers instead of staying down?",
+      "concepts": [
+        {
+          "term": "DB-fallback budget",
+          "definition": "A cap on how much miss/backfill traffic the cache is allowed to send the DB per second.",
+          "whyItMatters": "It converts an unbounded miss storm into a known, survivable load — excess is shed, served stale, or queued.",
+          "example": "Budget 60k QPS; a cold start wanting 200k is throttled to 60k and the rest serve stale or wait.",
+          "group": "Operations, Backpressure, and Warmup"
+        },
+        {
+          "term": "Serve-stale (graceful degradation)",
+          "definition": "Returning an expired-but-recent value when the backing store is overloaded, instead of forcing a miss.",
+          "whyItMatters": "Trades a little extra staleness for keeping the DB alive during a spike — the cache stays useful when it's needed most.",
+          "example": "DB-fallback over budget -> eligible keys serve their last value past TTL until load drops.",
+          "group": "Operations, Backpressure, and Warmup"
+        }
+      ],
+      "probeLinks": [
+        "sre-overload",
+        "sre-monitoring",
+        "redis-observability",
+        "elasticache-resharding",
+        "netflix-cache-warming",
+        "memcached-extstore",
+        "tail-at-scale"
+      ],
+      "whyNow": [
+        "Once the architecture is complete, what separates a senior answer is describing the operating model — backpressure, budgets, and warmup — that keeps the whole thing from taking down the DB it was meant to protect."
+      ],
+      "recap": {
+        "before": "The mechanisms exist but their failure-under-load behavior is implicit.",
+        "after": "Explicit backpressure actions, symptom-named alerts, and a deliberate cold-start degradation path.",
+        "newRisk": "Backpressure policy itself must be tuned and tested — wrong thresholds either overload the DB or shed traffic needlessly."
+      },
+      "traps": [
+        {
+          "trap": "Treating the DB as infinitely able to absorb cache misses.",
+          "why": "A cold start or mass eviction sends a miss storm that exceeds DB capacity and causes an outage the cache was meant to prevent.",
+          "instead": "Set an explicit DB-fallback budget and rate-limit/serve-stale/shed once it's exceeded."
+        },
+        {
+          "trap": "Rewarming a cold shard at full speed after a node add or failover.",
+          "why": "Uncontrolled refill of a whole range stampedes the DB exactly when it's already stressed.",
+          "instead": "Admit traffic gradually and throttle backfill so warming is paced, not instantaneous."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "DB-fallback budget exhausted during a cache cold start.",
+          "expectedBehavior": "The cache caps DB backfill at the budget; excess reads serve stale where eligible, are coalesced per key, or shed/queued. Hit rate climbs gradually as the working set rewarms; the DB stays within capacity instead of being driven into overload.",
+          "mitigation": "Explicit DB-fallback budget + per-key single-flight + serve-stale eligibility + paced rewarming, with an alert when sustained miss demand exceeds the budget."
+        },
+        {
+          "scenario": "Per-shard QPS skew (one hot shard) while the rest are idle.",
+          "expectedBehavior": "The skew alert fires; the hot key is promoted to replicated status (or pulled into the local L1) so its reads spread, and coalescing caps its DB load.",
+          "mitigation": "Top-K hot-key detection -> replicate/L1 promotion -> demote when it cools."
+        }
+      ],
+      "aiVisual": "assets/generated/ai-visuals/steps/08-operations.jpg"
     }
   ],
   "finalDesign": {
     "title": "Final Design — Sharded, Replicated Cache Tier",
-    "description": "Applications read cache-aside through a client library (or proxy) that consistent-hashes keys across many in-memory cache nodes, with virtual nodes for even load and a config service tracking topology/health. Each node evicts under memory pressure (LRU/LFU + TTL). Writes invalidate cached keys to bound staleness. Hot keys are replicated and concurrent misses coalesced to prevent stampedes; per-primary replicas provide warm failover so a node loss doesn't cold-spike the database, which always remains the source of truth.",
+    "description": "Default design: applications read cache-aside through a client library that consistent-hashes keys directly across many in-memory cache nodes, with virtual nodes for even load and a config service tracking topology/health (epoch-versioned). On a miss the application loads from the database and backfills the cache; the database always remains the source of truth. Each node evicts under memory pressure (LRU/LFU + TTL with jitter). Writes invalidate cached keys to bound staleness, with an optional version/CAS to reject stale backfills. Hot keys are replicated and concurrent misses coalesced to prevent stampedes; per-primary async replicas in separate fault domains provide warm failover so a node loss doesn't cold-spike the database, with rate-limited backfill cushioning cold starts. Operationally, metrics drive backpressure: a DB-fallback budget, per-shard QPS and hot-key alerts, evictions/sec and memory headroom, replica lag, and config-epoch drift across clients, with serve-stale and paced rewarming under load. The proxy-routing variant (thin clients, central metrics/quotas, at the cost of a hop and another HA tier) and read-through/write-through (cache tier owns DB loading) are deliberate alternatives, shown as option tabs rather than the default.",
+    "options": [
+      {
+        "name": "Client-library routing (default)",
+        "description": "Apps read cache-aside through a client library that consistent-hashes keys directly to the owning cache node — no proxy hop. This is the default design.",
+        "view": {
+          "nodes": [
+            "App",
+            "ClientLib",
+            "CacheA",
+            "CacheB",
+            "CacheC",
+            "Replica",
+            "Config",
+            "Eviction",
+            "Metrics",
+            "DB"
+          ],
+          "caption": "Default path: the application calls the client library, which consistent-hashes keys directly to cache nodes A/B/C; on a miss the application loads from the database and backfills. Nodes replicate to a warm replica in another fault domain, the eviction manager reclaims memory, config tracks the epoch-versioned ring/health, and metrics drive backpressure. No proxy tier.",
+          "links": [
+            "app-clientlib",
+            "clientlib-a",
+            {
+              "from": "ClientLib",
+              "to": "CacheB",
+              "label": "hash -> node B"
+            },
+            {
+              "from": "ClientLib",
+              "to": "CacheC",
+              "label": "hash -> node C"
+            },
+            "app-db",
+            "app-backfill",
+            "a-replica",
+            "replica-clientlib",
+            "config-clientlib",
+            "clientlib-config",
+            "eviction-a",
+            "cachea-metrics",
+            "metrics-clientlib"
+          ],
+          "highlight": [
+            "ClientLib"
+          ],
+          "groups": [
+            "cache-tier",
+            "control"
+          ]
+        },
+        "aiVisual": "assets/generated/ai-visuals/final-design-opt1.jpg"
+      },
+      {
+        "name": "Proxy-routing variant",
+        "description": "A proxy/router tier owns the ring; clients hit one endpoint and the proxy forwards each key to the owning node. Thin clients and centralized metrics/quotas, at the cost of an extra hop and another HA tier.",
+        "view": {
+          "nodes": [
+            "App",
+            "ClientLib",
+            "Router",
+            "CacheA",
+            "CacheB",
+            "CacheC",
+            "Replica",
+            "Config",
+            "Eviction",
+            "Metrics",
+            "DB"
+          ],
+          "caption": "Proxy variant: the client sends keys to a shard router that consistent-hashes and forwards them to cache node A/B/C; config feeds the router the epoch-versioned ring/health. The cache tier (replicas, eviction, metrics, DB fallback) is otherwise identical to the default.",
+          "links": [
+            "app-clientlib",
+            "clientlib-router",
+            "router-a",
+            "router-b",
+            "router-c",
+            "app-db",
+            "app-backfill",
+            "a-replica",
+            "config-router",
+            "config-clientlib",
+            "eviction-a",
+            "cachea-metrics",
+            "metrics-clientlib"
+          ],
+          "highlight": [
+            "Router"
+          ],
+          "groups": [
+            "cache-tier",
+            "control"
+          ]
+        },
+        "aiVisual": "assets/generated/ai-visuals/final-design-opt2.jpg"
+      }
+    ],
     "view": {
       "nodes": [
         "App",
         "ClientLib",
-        "Router",
         "CacheA",
         "CacheB",
         "CacheC",
         "Replica",
         "Config",
         "Eviction",
+        "Metrics",
         "DB"
       ],
-      "caption": "The application calls the client library, which routes keys through the shard router to cache nodes A/B/C; nodes replicate to a replica, an eviction manager reclaims memory, cluster config tracks health, and misses load from the backing database.",
+      "caption": "Default path: the application calls the client library, which consistent-hashes keys directly to cache nodes A/B/C; on a miss the application loads from the database and backfills. Nodes replicate to a warm replica in another fault domain, the eviction manager reclaims memory, config tracks the epoch-versioned ring/health, and metrics drive backpressure. The proxy-routing variant is on the option tab above.",
       "links": [
         "app-clientlib",
-        "clientlib-router",
-        "router-a",
-        "router-b",
-        "router-c",
         "clientlib-a",
-        "a-db",
+        {
+          "from": "ClientLib",
+          "to": "CacheB",
+          "label": "hash -> node B"
+        },
+        {
+          "from": "ClientLib",
+          "to": "CacheC",
+          "label": "hash -> node C"
+        },
         "app-db",
+        "app-backfill",
         "a-replica",
-        "replica-app",
+        "replica-clientlib",
         "config-clientlib",
-        "config-router",
+        "clientlib-config",
         "eviction-a",
-        "app-cachea"
+        "cachea-metrics",
+        "metrics-clientlib"
       ],
       "groups": [
         "cache-tier",
@@ -1703,6 +2878,14 @@
         "steps": [
           "hotkeys"
         ]
+      },
+      {
+        "requirement": "Survivable residual DB load",
+        "how": "DB-fallback budget with rate-limited backfill, serve-stale, single-flight, and paced rewarming so misses can't overload the DB.",
+        "steps": [
+          "operations",
+          "failover"
+        ]
       }
     ]
   },
@@ -1729,9 +2912,10 @@
       "phase": "Deep dive",
       "time": "next 15 min",
       "say": [
-        "Cache/DB consistency: invalidate-on-write and the read-miss race.",
+        "Cache/DB consistency: invalidate-on-write and the read-miss race (version/CAS to reject stale backfills).",
         "Hot keys and thundering herds: coalescing + key replication.",
-        "Replication/failover so node loss doesn't cold-spike the DB."
+        "Replication/failover so node loss doesn't cold-spike the DB.",
+        "Operations: DB-fallback budget, backpressure (serve-stale, throttle), and paced warmup."
       ]
     },
     {
@@ -1765,7 +2949,8 @@
       "level": "Staff",
       "expectations": [
         "Reasons about cold-shard DB spikes on failover and cushions them.",
-        "Discusses write-through vs write-back tradeoffs, multi-tier caching, and consistency races precisely."
+        "Discusses write-through vs write-back tradeoffs, multi-tier caching, and consistency races precisely.",
+        "Defines an operating model: DB-fallback budget, backpressure actions, symptom-named alerts, replica placement across fault domains, and staged resharding/warmup."
       ]
     }
   ],
@@ -1780,19 +2965,93 @@
     "links": [
       {
         "id": "memcache-facebook",
-        "group": "Distributed Data",
-        "groupDescription": "Primary papers and docs for storage, replication, partitioning, consistency, and caching.",
+        "group": "Production Cache Architectures",
+        "groupDescription": "Real production cache systems, routers, and operational case studies.",
         "title": "Scaling Memcache at Facebook",
         "url": "https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala",
         "source": "Facebook / USENIX",
         "type": "Paper",
-        "why": "Production cache architecture with regional pools, invalidation, leases, and hot-key handling.",
-        "year": "2013"
+        "year": "2013",
+        "why": "Production cache architecture with regional pools, invalidation, leases, and hot-key handling."
+      },
+      {
+        "id": "mcrouter",
+        "group": "Production Cache Architectures",
+        "groupDescription": "Real production cache systems, routers, and operational case studies.",
+        "title": "Introducing mcrouter: A memcached protocol router for scaling memcached deployments",
+        "url": "https://engineering.fb.com/2014/09/15/web/introducing-mcrouter-a-memcached-protocol-router-for-scaling-memcached-deployments/",
+        "source": "Meta",
+        "type": "Case study",
+        "year": "2014",
+        "why": "Shows why a cache proxy can centralize routing, connection pooling, failover, and observability across many cache clusters."
+      },
+      {
+        "id": "evcache-features",
+        "group": "Production Cache Architectures",
+        "groupDescription": "Real production cache systems, routers, and operational case studies.",
+        "title": "EVCache Features",
+        "url": "https://netflix.github.io/EVCache/features/",
+        "source": "Netflix",
+        "type": "Docs",
+        "why": "Documents a replicated, topology-aware memcached-based cache with zone fallback, retries, and global replication."
+      },
+      {
+        "id": "netflix-cache-warming",
+        "group": "Production Cache Architectures",
+        "groupDescription": "Real production cache systems, routers, and operational case studies.",
+        "title": "Cache warming: Leveraging EBS for moving petabytes of data",
+        "url": "https://netflixtechblog.medium.com/cache-warming-leveraging-ebs-for-moving-petabytes-of-data-adcf7a4a78c3",
+        "source": "Netflix Technology Blog",
+        "type": "Case study",
+        "year": "2021",
+        "why": "Explains large-scale cache warmup, network isolation, and restart planning for a tier-0 cache fleet."
+      },
+      {
+        "id": "pelikan",
+        "group": "Production Cache Architectures",
+        "groupDescription": "Real production cache systems, routers, and operational case studies.",
+        "title": "Pelikan",
+        "url": "https://github.com/twitter/pelikan",
+        "source": "Twitter / X",
+        "type": "Repository",
+        "why": "Open source cache framework informed by Twitter production operations, useful for server-side cache design choices."
+      },
+      {
+        "id": "aws-caching-strategies",
+        "group": "Caching Patterns and Consistency",
+        "groupDescription": "Patterns and consistency references for cache-aside, write-through, invalidation, and near caching.",
+        "title": "Caching strategies for Memcached",
+        "url": "https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/Strategies.html",
+        "source": "Amazon ElastiCache",
+        "type": "Docs",
+        "why": "Covers lazy loading, write-through, TTLs, stale data, and node-failure behavior in a cache-aside design."
+      },
+      {
+        "id": "meta-cache-consistency",
+        "group": "Caching Patterns and Consistency",
+        "groupDescription": "Patterns and consistency references for cache-aside, write-through, invalidation, and near caching.",
+        "title": "Cache made consistent",
+        "url": "https://engineering.fb.com/2022/06/08/core-infra/cache-made-consistent/",
+        "source": "Meta",
+        "type": "Case study",
+        "year": "2022",
+        "why": "Deep production discussion of invalidation correctness, stale cache detection, and measuring cache consistency."
+      },
+      {
+        "id": "tao-graph",
+        "group": "Caching Patterns and Consistency",
+        "groupDescription": "Patterns and consistency references for cache-aside, write-through, invalidation, and near caching.",
+        "title": "TAO: The power of the graph",
+        "url": "https://engineering.fb.com/2013/06/25/core-infra/tao-the-power-of-the-graph/",
+        "source": "Meta",
+        "type": "Case study",
+        "year": "2013",
+        "why": "Shows a production write-through cache that coordinates reads, writes, shard placement, and read-after-write consistency."
       },
       {
         "id": "redis-cluster",
-        "group": "Distributed Data",
-        "groupDescription": "Primary papers and docs for storage, replication, partitioning, consistency, and caching.",
+        "group": "Sharding, Routing, and Failover",
+        "groupDescription": "How keyspaces are partitioned, routed, resized, replicated, and recovered.",
         "title": "Redis Cluster Specification",
         "url": "https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/",
         "source": "Redis",
@@ -1800,41 +3059,145 @@
         "why": "Covers hash slots, failover, and operational constraints for sharded cache-like systems."
       },
       {
+        "id": "elasticache-resharding",
+        "group": "Sharding, Routing, and Failover",
+        "groupDescription": "How keyspaces are partitioned, routed, resized, replicated, and recovered.",
+        "title": "Online cluster resizing",
+        "url": "https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/best-practices-online-resharding.html",
+        "source": "Amazon ElastiCache",
+        "type": "Docs",
+        "why": "Gives operational guardrails for resharding, including CPU, memory, connection, and timeout considerations."
+      },
+      {
+        "id": "consistent-hashing-random-trees",
+        "group": "Sharding, Routing, and Failover",
+        "groupDescription": "How keyspaces are partitioned, routed, resized, replicated, and recovered.",
+        "title": "Consistent Hashing and Random Trees: Distributed Caching Protocols for Relieving Hot Spots on the World Wide Web",
+        "url": "https://www.akamai.com/site/en/documents/research-paper/consistent-hashing-and-random-trees-distributed-caching-protocols-for-relieving-hot-spots-on-the-world-wide-web-technical-publication.pdf",
+        "source": "MIT / Akamai",
+        "type": "Paper",
+        "year": "1997",
+        "why": "The foundational paper for consistent hashing and hot-spot-aware distributed cache placement."
+      },
+      {
+        "id": "jump-consistent-hash",
+        "group": "Sharding, Routing, and Failover",
+        "groupDescription": "How keyspaces are partitioned, routed, resized, replicated, and recovered.",
+        "title": "A Fast, Minimal Memory, Consistent Hash Algorithm",
+        "url": "https://arxiv.org/abs/1406.2294",
+        "source": "arXiv",
+        "type": "Paper",
+        "year": "2014",
+        "why": "Explains a compact consistent-hash alternative that avoids storing a large virtual-node ring."
+      },
+      {
         "id": "redis-cache",
-        "group": "Distributed Data",
-        "groupDescription": "Primary papers and docs for storage, replication, partitioning, consistency, and caching.",
-        "title": "Redis Client-Side Caching",
+        "group": "Caching Patterns and Consistency",
+        "groupDescription": "Patterns and consistency references for cache-aside, write-through, invalidation, and near caching.",
+        "title": "Client-side caching introduction",
         "url": "https://redis.io/docs/latest/develop/clients/client-side-caching/",
         "source": "Redis",
         "type": "Docs",
         "why": "Shows cache invalidation and coherence mechanics for low-latency read paths."
       },
       {
+        "id": "memcached-overview",
+        "group": "Eviction, TTL, and Memory Efficiency",
+        "groupDescription": "Policies and storage designs that decide what remains in a bounded-memory cache.",
+        "title": "Memcached Overview",
+        "url": "https://docs.memcached.org/",
+        "source": "Memcached",
+        "type": "Docs",
+        "why": "Summarizes the shared-nothing server model, client-side hashing, LRU behavior, and cache invalidation basics."
+      },
+      {
+        "id": "memcached-extstore",
+        "group": "Eviction, TTL, and Memory Efficiency",
+        "groupDescription": "Policies and storage designs that decide what remains in a bounded-memory cache.",
+        "title": "Flash Storage",
+        "url": "https://docs.memcached.org/features/flashstorage/",
+        "source": "Memcached",
+        "type": "Docs",
+        "why": "Useful for reasoning about larger values, flash-backed cache tiers, write pressure, and avoiding blocking on storage."
+      },
+      {
+        "id": "redis-eviction",
+        "group": "Eviction, TTL, and Memory Efficiency",
+        "groupDescription": "Policies and storage designs that decide what remains in a bounded-memory cache.",
+        "title": "Key eviction",
+        "url": "https://redis.io/docs/latest/develop/reference/eviction/",
+        "source": "Redis",
+        "type": "Docs",
+        "why": "Explains maxmemory behavior, LRU/LFU/TTL policies, and memory accounting concerns for a Redis-style cache."
+      },
+      {
+        "id": "caffeine-efficiency",
+        "group": "Eviction, TTL, and Memory Efficiency",
+        "groupDescription": "Policies and storage designs that decide what remains in a bounded-memory cache.",
+        "title": "Caffeine Efficiency",
+        "url": "https://github.com/ben-manes/caffeine/wiki/Efficiency",
+        "source": "Caffeine",
+        "type": "Docs",
+        "why": "Compares LRU, scan resistance, W-TinyLFU admission, and the recency/frequency tradeoff used in strong local caches."
+      },
+      {
+        "id": "tinylfu",
+        "group": "Eviction, TTL, and Memory Efficiency",
+        "groupDescription": "Policies and storage designs that decide what remains in a bounded-memory cache.",
+        "title": "TinyLFU: A Highly Efficient Cache Admission Policy",
+        "url": "https://arxiv.org/abs/1512.00727",
+        "source": "arXiv",
+        "type": "Paper",
+        "year": "2015",
+        "why": "Foundational admission-policy paper for protecting the working set under skewed and scan-heavy workloads."
+      },
+      {
+        "id": "pelikan-segcache",
+        "group": "Eviction, TTL, and Memory Efficiency",
+        "groupDescription": "Policies and storage designs that decide what remains in a bounded-memory cache.",
+        "title": "Segcache: a memory-efficient, scalable cache for small objects with TTL",
+        "url": "https://pelikan.io/blog/segcache/",
+        "source": "Twitter / Pelikan",
+        "type": "Case study",
+        "year": "2021",
+        "why": "Shows a production-inspired cache storage design optimized for TTL-heavy small-object workloads and metadata efficiency."
+      },
+      {
         "id": "dynamo-paper",
-        "group": "Distributed Data",
-        "groupDescription": "Primary papers and docs for storage, replication, partitioning, consistency, and caching.",
+        "group": "Foundations",
+        "groupDescription": "Foundational distributed-systems papers and SRE references that explain the underlying tradeoffs.",
         "title": "Dynamo: Amazon's Highly Available Key-value Store",
         "url": "https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf",
         "source": "Amazon",
         "type": "Paper",
-        "why": "Canonical production design for partitioning, replication, hinted handoff, vector clocks, and tunable consistency.",
-        "year": "2007"
+        "year": "2007",
+        "why": "Canonical production design for partitioning, replication, hinted handoff, vector clocks, and tunable consistency."
+      },
+      {
+        "id": "redis-observability",
+        "group": "Hot Keys, Overload, and Operations",
+        "groupDescription": "Practical reliability references for hot keys, overload, warmup, and observability.",
+        "title": "Redis Software observability and monitoring guidance",
+        "url": "https://redis.io/docs/latest/operate/rs/monitoring/observability/",
+        "source": "Redis",
+        "type": "Docs",
+        "why": "Covers cache hit rate, evictions, latency, hot-key detection, and local-cache remediation for overloaded shards."
       },
       {
         "id": "tail-at-scale",
         "group": "Foundations",
-        "groupDescription": "Core system design references for scalability, reliability, and operating distributed services.",
+        "groupDescription": "Foundational distributed-systems papers and SRE references that explain the underlying tradeoffs.",
         "title": "The Tail at Scale",
         "url": "https://research.google/pubs/the-tail-at-scale/",
         "source": "Google Research",
         "type": "Paper",
-        "why": "Explains why p99 latency dominates large fanout systems and motivates hedging, caching, and bounded work.",
-        "year": "2013"
+        "year": "2013",
+        "why": "Explains why p99 latency dominates large fanout systems and motivates hedging, caching, and bounded work."
       },
       {
         "id": "sre-overload",
-        "group": "Foundations",
-        "groupDescription": "Core system design references for scalability, reliability, and operating distributed services.",
+        "group": "Hot Keys, Overload, and Operations",
+        "groupDescription": "Practical reliability references for hot keys, overload, warmup, and observability.",
         "title": "Handling Overload",
         "url": "https://sre.google/sre-book/handling-overload/",
         "source": "Google SRE",
@@ -1843,8 +3206,8 @@
       },
       {
         "id": "sre-monitoring",
-        "group": "Foundations",
-        "groupDescription": "Core system design references for scalability, reliability, and operating distributed services.",
+        "group": "Hot Keys, Overload, and Operations",
+        "groupDescription": "Practical reliability references for hot keys, overload, warmup, and observability.",
         "title": "Monitoring Distributed Systems",
         "url": "https://sre.google/sre-book/monitoring-distributed-systems/",
         "source": "Google SRE",
@@ -1855,5 +3218,10 @@
   },
   "assets": {
     "icon": "icon.png"
-  }
+  },
+  "aiVisuals": {
+    "requirements": "assets/generated/ai-visuals/requirements.jpg",
+    "capacity": "assets/generated/ai-visuals/capacity.jpg"
+  },
+  "explainerComic": "assets/generated/comic/interview-comic.jpg"
 }

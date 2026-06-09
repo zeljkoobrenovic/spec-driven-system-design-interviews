@@ -326,13 +326,18 @@
     },
     {
       "label": "Raw ingest",
-      "value": "~5 TB/day",
-      "note": "Drives object-storage throughput + small-file/compaction pressure in the lake."
+      "value": "~5 TB/day (~210 GB/hr)",
+      "note": "5 TB/day ≈ 210 GB/hr ≈ 60 MB/s average, bursting higher at peak. Spread over ~50 hot tables that's ~4 GB/hr/hot-table average; the largest connectors dominate, so size connector parallelism to them, not to the mean."
     },
     {
       "label": "Stored volume",
       "value": "2-4x raw",
-      "note": "Raw + staging + modeled + snapshots + compaction overhead. 5 TB/day raw -> ~10-20 TB/day landed across layers."
+      "note": "Raw + staging + modeled + snapshots + compaction overhead, so 5 TB/day raw becomes ~10-20 TB/day landed across layers."
+    },
+    {
+      "label": "File/compaction",
+      "value": "target ~128-512 MB files",
+      "note": "Micro-batch landing creates many small files (a CDC table emitting every few minutes can produce 100s of files/day/table). Compact to ~128-512 MB targets so query planners scan fewer files; small-file count, not bytes, is what blows up planning/listing cost."
     },
     {
       "label": "Retention",
@@ -342,17 +347,22 @@
     {
       "label": "Freshness",
       "value": "minutes (CDC) to daily (batch)",
-      "note": "Per-dataset SLA; sizes transform cluster and orchestrator cadence."
+      "note": "Per-dataset SLA; sizes transform cluster and orchestrator cadence. To keep a minutes SLA, each hot table's load+transform+validate+publish cycle must fit inside its interval — so concurrency scales with (tables on tight SLAs) × (cycle time ÷ interval), and a slow table gets its own slot rather than blocking the queue."
     },
     {
       "label": "Query load",
       "value": "~200 queries/min peak",
-      "note": "Plus ~20 long-running dashboard queries — needs warehouse concurrency controls / queue isolation."
+      "note": "~200 short queries/min ≈ 3-4/s; at a few seconds each that's ~10-30 concurrent — fits one bounded interactive queue. The ~20 long dashboards run minutes each, so give them their own isolated warehouse/queue (~20-30 slots) and reserve separate capacity for ad-hoc so neither class starves the other."
     },
     {
       "label": "Backfill",
-      "value": "e.g. 90d x 5 TB/day",
-      "note": "Bounded parallel partitions, admission-controlled below fresh-data priority so SLAs hold."
+      "value": "90d x 5 TB/day = ~450 TB scanned",
+      "note": "A 90-day reprocess re-reads ~450 TB of raw. Cap it at N concurrent partitions or M TB/hr (e.g. ≤8 partitions / ≤10 TB/hr) on a low-priority queue so it finishes in days without preempting fresh-data SLAs; fresh data always wins admission."
+    },
+    {
+      "label": "Metadata",
+      "value": "run/snapshot/quality/lineage records",
+      "note": "~500 tables x runs/day x a few years of run records, output snapshots, quality results, and lineage edges = millions of small rows. Small but high-cardinality — keep it in an indexed operational store, not the columnar warehouse."
     },
     {
       "label": "Load semantics",
@@ -454,7 +464,7 @@
     {
       "method": "GET",
       "path": "/v1/query",
-      "description": "Run an analytical query over modeled warehouse tables.",
+      "description": "Minimal synchronous query over modeled warehouse tables (small results). For governed, queued, cancellable work with cost attribution, use the async query-job contract below.",
       "request": "{ \"sql\": \"SELECT ... FROM fct_orders WHERE dt = '2026-06-01'\" }",
       "response": "{ \"rows\": [ ... ] }",
       "sequence": {
@@ -485,25 +495,82 @@
       }
     },
     {
+      "method": "POST",
+      "path": "/v1/query-jobs",
+      "description": "Submit an analytical query as a governed job. The platform resolves the caller's effective access (deny / allow / column-masked) before admitting it to a workload queue, estimates bytes to scan against the budget policy, and returns a job id to poll. This is what makes workload isolation, quotas, and cost attribution from step 5 a real contract rather than prose.",
+      "request": "{ \"sql\": \"SELECT ... FROM fct_orders WHERE dt >= '2026-06-01'\", \"workloadClass\": \"dashboard\", \"principal\": \"team:analytics\", \"budgetPolicy\": \"analytics-monthly\" }",
+      "response": "{ \"queryJobId\": \"q_42\", \"state\": \"queued\", \"queue\": \"dashboard\", \"estimatedBytes\": \"3.1 GB\", \"access\": \"column-masked\", \"maskedColumns\": [ \"email\" ] }",
+      "sequence": {
+        "participants": [
+          {
+            "id": "Query",
+            "label": "Query Layer"
+          },
+          {
+            "id": "Governance",
+            "label": "Governance"
+          },
+          {
+            "id": "Warehouse",
+            "label": "Warehouse"
+          }
+        ],
+        "messages": [
+          {
+            "from": "Query",
+            "to": "Governance",
+            "arrow": "->>",
+            "label": "authorize principal -> allow | masked | deny"
+          },
+          {
+            "from": "Query",
+            "to": "Warehouse",
+            "arrow": "->>",
+            "label": "estimate bytes; admit to workload queue"
+          },
+          {
+            "from": "Warehouse",
+            "to": "Query",
+            "arrow": "-->>",
+            "label": "queryJobId, state=queued"
+          }
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/query-jobs/{id}",
+      "description": "Poll a query job: lifecycle state, queue/warehouse it ran on, bytes scanned vs estimate, compute seconds, and cost attribution back to the principal/budget. State walks queued -> running -> succeeded | failed | cancelled.",
+      "request": "—",
+      "response": "{ \"queryJobId\": \"q_42\", \"state\": \"succeeded\", \"queue\": \"dashboard\", \"principal\": \"team:analytics\", \"bytesScanned\": \"2.8 GB\", \"computeSeconds\": 11.4, \"costAttribution\": { \"budgetPolicy\": \"analytics-monthly\", \"estCost\": \"$0.014\" }, \"access\": \"column-masked\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/query-jobs/{id}/cancel",
+      "description": "Cancel a running or queued query job so a runaway scan can't exhaust a queue's concurrency or blow the budget. Returns the bytes scanned so far for cost attribution.",
+      "request": "{ \"reason\": \"runaway scan\" }",
+      "response": "{ \"queryJobId\": \"q_42\", \"state\": \"cancelled\", \"bytesScanned\": \"40 GB\" }"
+    },
+    {
       "method": "GET",
       "path": "/v1/runs/{runId}",
-      "description": "Get run status, attempt, watermark, published snapshot, and quality results. State walks submitted -> loading -> transforming -> validating -> publishing -> succeeded | failed | cancelled.",
+      "description": "Get run status, attempt, watermark, published snapshot, and quality results. State walks queued -> loading -> transforming -> validating -> publishing -> succeeded | failed | cancelled (or blocked while waiting on a dependency). The terminal payload also carries failureReason/blockedBy, cancelRequestedAt, and completedAt; only the publishing step makes output visible (a committed snapshot).",
       "request": "—",
-      "response": "{ \"runId\": \"r_9\", \"state\": \"succeeded\", \"attempt\": 2, \"transformVersion\": \"v42\", \"inputWatermark\": \"lsn:48211\", \"outputSnapshot\": \"snap_77\", \"quality\": [ { \"check\": \"row_count\", \"status\": \"pass\", \"mode\": \"blocking\" } ] }"
+      "response": "{ \"runId\": \"r_9\", \"state\": \"succeeded\", \"attempt\": 2, \"transformVersion\": \"v42\", \"inputWatermark\": \"lsn:48211\", \"outputSnapshot\": \"snap_77\", \"completedAt\": \"2026-06-01T04:12:09Z\", \"quality\": [ { \"check\": \"row_count\", \"status\": \"pass\", \"mode\": \"blocking\" } ] }"
     },
     {
       "method": "POST",
       "path": "/v1/runs/{runId}/cancel",
-      "description": "Cancel an in-flight run; the unpublished temp output is discarded, last good snapshot stays.",
+      "description": "Request cancel of an in-flight run. A cancel only takes effect before the atomic publish: stamping cancelRequestedAt aborts the unpublished temp snapshot (state=aborted) and the last good committed snapshot stays visible. Once publishing has committed, the run is already succeeded and there is nothing to cancel.",
       "request": "{ \"reason\": \"superseded by fix\" }",
-      "response": "{ \"runId\": \"r_9\", \"state\": \"cancelled\" }"
+      "response": "{ \"runId\": \"r_9\", \"state\": \"cancelled\", \"cancelRequestedAt\": \"2026-06-01T04:02:00Z\" }"
     },
     {
       "method": "POST",
       "path": "/v1/runs/{runId}/retry",
-      "description": "Retry a failed run idempotently (same idempotency key re-publishes the partition, no duplicates).",
+      "description": "Retry a failed run idempotently (same idempotency key re-publishes the partition, no duplicates). The retry re-enters the lifecycle at loading.",
       "request": "{}",
-      "response": "{ \"runId\": \"r_10\", \"state\": \"running\", \"attempt\": 3 }"
+      "response": "{ \"runId\": \"r_10\", \"state\": \"loading\", \"attempt\": 3 }"
     },
     {
       "method": "POST",
@@ -522,9 +589,9 @@
     {
       "method": "GET",
       "path": "/v1/lineage?dataset=fct_orders",
-      "description": "Trace upstream/downstream lineage for a dataset (sources, transform versions, outputs).",
+      "description": "Trace lineage for a dataset at run/snapshot granularity: which run, source offsets, transform version, and input snapshots produced the current committed output, plus upstream/downstream edges.",
       "request": "—",
-      "response": "{ \"upstream\": [ \"stg_orders\", \"raw.orders\" ], \"transformVersion\": \"v42\", \"downstream\": [ \"mart_revenue\" ] }"
+      "response": "{ \"dataset\": \"fct_orders\", \"runId\": \"r_9\", \"outputSnapshot\": \"snap_2026-06-01_v42\", \"transformVersion\": \"v42\", \"sourceOffsets\": { \"raw.orders\": \"lsn:0/3A9F210\" }, \"inputSnapshots\": [ \"stg_orders@snap_2026-06-01\" ], \"upstream\": [ \"stg_orders\", \"raw.orders\" ], \"downstream\": [ \"mart_revenue\" ] }"
     },
     {
       "method": "GET",
@@ -538,7 +605,7 @@
       "path": "/v1/governance/deletion-requests",
       "description": "Request deletion of a subject/key across raw + modeled layers; rejected while a legal hold is in force, otherwise crypto-shreds and records an audit event.",
       "request": "{ \"subjectKey\": \"user:42\", \"reason\": \"gdpr-erasure\", \"scope\": [ \"raw.orders\", \"mart_revenue\" ] }",
-      "response": "{ \"requestId\": \"del_5\", \"state\": \"scheduled\", \"blockedByLegalHold\": false }"
+      "response": "{ \"requestId\": \"del_5\", \"state\": \"scheduled\", \"blockedByLegalHold\": false, \"affectedSnapshots\": [ \"raw.orders@all\", \"mart_revenue@90d\" ], \"rewriteJobId\": \"rw_7\" }"
     },
     {
       "method": "POST",
@@ -663,7 +730,15 @@
         },
         {
           "name": "state",
-          "type": "enum(running, succeeded, failed, cancelled)"
+          "type": "enum(queued, loading, transforming, validating, publishing, succeeded, failed, cancelled, blocked)"
+        },
+        {
+          "name": "failure_reason / blocked_by",
+          "type": "why it failed; run/dep ids it waits on"
+        },
+        {
+          "name": "cancel_requested_at / completed_at",
+          "type": "cancel signal time; terminal time"
         },
         {
           "name": "input_watermark",
@@ -689,7 +764,7 @@
         },
         {
           "name": "state",
-          "type": "enum(pending, committed, superseded)"
+          "type": "enum(pending, committed, superseded, aborted)"
         },
         {
           "name": "committed_at / produced_by_run",
@@ -782,6 +857,36 @@
       ]
     },
     {
+      "name": "query_job",
+      "note": "A governed analytical query: admitted to a workload queue, access-resolved, and cost-attributed.",
+      "fields": [
+        {
+          "name": "query_job_id / principal",
+          "type": "uuid + caller identity (team/user/service)"
+        },
+        {
+          "name": "workload_class / queue",
+          "type": "dashboard | adhoc | etl; isolated warehouse/queue"
+        },
+        {
+          "name": "state",
+          "type": "enum(queued, running, succeeded, failed, cancelled)"
+        },
+        {
+          "name": "access_decision / masked_columns",
+          "type": "allow | column-masked | denied; columns masked"
+        },
+        {
+          "name": "estimated_bytes / bytes_scanned",
+          "type": "admission estimate vs actual scan"
+        },
+        {
+          "name": "compute_seconds / cost_attribution",
+          "type": "compute used; charged to principal/budget policy"
+        }
+      ]
+    },
+    {
       "name": "data_classification",
       "note": "Tags a column/dataset with a sensitivity class that drives masking + access rules.",
       "fields": [
@@ -836,6 +941,32 @@
       ]
     },
     {
+      "name": "deletion_request",
+      "note": "A per-subject erasure (e.g. GDPR) tracked across raw + modeled layers; blocked while a legal hold is in force.",
+      "fields": [
+        {
+          "name": "request_id / subject_key",
+          "type": "uuid + the key being erased (e.g. user:42)"
+        },
+        {
+          "name": "scope",
+          "type": "datasets covered (raw + modeled)"
+        },
+        {
+          "name": "state",
+          "type": "enum(scheduled, rewriting, completed, blocked)"
+        },
+        {
+          "name": "blocked_by_legal_hold",
+          "type": "bool — pauses erasure while a hold is set"
+        },
+        {
+          "name": "created_by / completed_at",
+          "type": "requester; terminal time"
+        }
+      ]
+    },
+    {
       "name": "audit_event",
       "note": "Immutable record of who read/changed sensitive data, for compliance + investigation.",
       "fields": [
@@ -883,6 +1014,25 @@
       "group": "Idempotent Loads and ELT Transformation"
     },
     {
+      "name": "Atomic snapshot publish",
+      "what": "Write a temp/unpublished snapshot, validate it, then commit it atomically; only committed snapshots are queryable and only then does the watermark advance.",
+      "whenToUse": "Any time readers must never see a half-written partition and failed runs must leave the last good data in place.",
+      "steps": [
+        "transform",
+        "orchestrate"
+      ],
+      "group": "Idempotent Loads and ELT Transformation"
+    },
+    {
+      "name": "Governed raw lake",
+      "what": "Encrypt raw, classify sensitive columns on landing, enforce least-privilege + audited access, mask/tokenize modeled outputs per class, and propagate retention/deletion/legal-hold across raw and modeled.",
+      "whenToUse": "ELT platforms that retain unmodified raw, which concentrates sensitivity and erasure risk in the lake.",
+      "steps": [
+        "ingest"
+      ],
+      "group": "Ingest into a Raw Lake (ELT, not ETL)"
+    },
+    {
       "name": "Schema registry + evolution",
       "what": "Track table schemas/versions and evolve them safely (additive, typed).",
       "whenToUse": "Sources whose schemas change over time.",
@@ -901,6 +1051,15 @@
       "group": "Partitioning and Columnar Serving"
     },
     {
+      "name": "Workload isolation + cost controls",
+      "what": "Run dashboards and ad-hoc analysts on separate warehouses/queues with concurrency limits, quotas/budgets, kill/cancel, and per-query cost attribution.",
+      "whenToUse": "Mixed interactive + heavy workloads where one scan could starve others or blow the budget.",
+      "steps": [
+        "serve"
+      ],
+      "group": "Partitioning and Columnar Serving"
+    },
+    {
       "name": "Reprocessing / backfill",
       "what": "Rebuild outputs from retained raw data when logic/schema changes.",
       "whenToUse": "Fixing bugs or applying new transforms to history.",
@@ -908,12 +1067,30 @@
         "backfill"
       ],
       "group": "Reprocessing and Backfills"
+    },
+    {
+      "name": "Quality-gated orchestration",
+      "what": "Run DAG nodes only when dependencies are fresh, transform to a temp snapshot, then let blocking quality checks gate the atomic publish (advisory checks warn but allow).",
+      "whenToUse": "Multi-pipeline platforms where a bad partition must never become queryable or propagate to dependents.",
+      "steps": [
+        "orchestrate"
+      ],
+      "group": "Orchestration, Quality, and Lineage"
+    },
+    {
+      "name": "Run/snapshot lineage",
+      "what": "Record, per run, which source offsets and transform version produced which output snapshot — lineage at run/snapshot granularity, not just table-to-table edges.",
+      "whenToUse": "Debugging, impact analysis, and audit across an evolving pipeline.",
+      "steps": [
+        "orchestrate"
+      ],
+      "group": "Orchestration, Quality, and Lineage"
     }
   ],
   "steps": [
     {
       "id": "naive",
-      "title": "1. Naive Baseline: One Script Transforms Then Loads Into the Operational DB",
+      "title": "1. Naive Baseline: One Script Transforms, Then Loads the Operational DB",
       "description": [
         "Start with the simplest thing that works. A nightly cron script reads from the source systems, transforms the rows in memory (joins, type casts, business logic), and loads the result straight into one operational database that analysts query directly. Classic transform-then-load ETL into a single DB.",
         "This is correct for a small shop and exposes two problems the rest of the design exists to solve. First, the transform throws away the raw data — once a transform has a bug or the business logic changes, there is nothing to reprocess from; you can only re-pull whatever the source still has. Second, pointing analysts' heavy scans at the same database the application writes to means analytical queries contend with operational load and don't scale to TBs.",
@@ -985,7 +1162,8 @@
         "Crucially, load raw first and transform later (ELT), not transform-then-load (classic ETL). Keeping the untouched raw data is what makes reprocessing possible: any modeled output can be rebuilt from the raw lake when logic changes.",
         "Get the CDC contract right, because it determines correctness downstream. Persist source offsets/LSNs and connector checkpoints so a connector can resume or replay exactly. Stamp every raw record with primary key, event time, ingest time, source version, and operation type (insert/update/delete) — and represent deletes explicitly as tombstones rather than just absence, so downstream can apply them. Watermarks here track completeness (we have everything up to time T), not merely what was processed.",
         "Out-of-order and late events are normal. The default micro-batch path handles them by reopening the affected output partitions and MERGEing keyed rows, or routing very late corrections to the backfill path; only the lowest-latency sources need a true streaming transform. Different sources also have different cadences (CDC near-real-time; batch periodic) — the lake normalizes them into a common landing zone.",
-        "Because ELT deliberately keeps unmodified raw, the raw lake is the most sensitive part of the system, so governance must cover it from the moment data lands — not just the modeled outputs. Raw is encrypted at rest, access is least-privilege and every read is audited, and a classification step tags sensitive columns (PII/secret) as they arrive. Modeled outputs then apply masking/tokenization per class so analysts see only what their access policy allows, while retention and deletion policies (including legal hold and per-subject erasure / crypto-shred) are enforced over both raw and modeled layers."
+        "Because ELT deliberately keeps unmodified raw, the raw lake is the most sensitive part of the system, so governance must cover it from the moment data lands — not just the modeled outputs. Raw is encrypted at rest, access is least-privilege and every read is audited, and a classification step tags sensitive columns (PII/secret) as they arrive. Modeled outputs then apply masking/tokenization per class so analysts see only what their access policy allows, while retention and deletion policies (including legal hold and per-subject erasure / crypto-shred) are enforced over both raw and modeled layers.",
+        "Erasure must propagate, or ELT's retained raw will quietly defeat it. A deletion request either records a tombstone for the subject or crypto-shreds its per-subject key, then schedules rewrites of the modeled partitions that contained it (marking the superseded snapshots expired) — and the same erasure policy is recorded so that any future backfill from raw applies it too. A legal hold blocks the request until the hold is lifted. Deleting only modeled rows is not enough: retained raw would re-create the subject the next time those partitions are reprocessed."
       ],
       "view": {
         "nodes": [
@@ -1111,18 +1289,23 @@
       ],
       "probeLinks": [
         "linkedin-gobblin-ingestion",
+        "uber-dbevents-ingestion",
+        "uber-marmaray-ingestion",
         "debezium-cdc-features",
+        "confluent-schema-evolution",
         "kafka-connect-docs",
         "grammarly-event-store",
         "beam-guide",
         "dataflow-paper",
         "parquet-docs",
         "delta-lake-paper",
-        "iceberg-docs"
+        "iceberg-docs",
+        "aws-lake-formation-filtering"
       ],
       "patterns": [
         "ELT (load raw, transform in-warehouse)",
-        "CDC + batch ingestion"
+        "CDC + batch ingestion",
+        "Governed raw lake"
       ],
       "whyNow": [
         "ELT + an immutable raw lake is the foundational decision; reprocessing, schema flexibility, and decoupling all flow from keeping raw data."
@@ -1131,7 +1314,14 @@
         "before": "A transform-first script loading into the operational DB.",
         "after": "Heterogeneous sources (CDC + batch + stream) landed immutably in a raw lake, with offsets, op types, and tombstones captured.",
         "newRisk": "Raw data isn't queryable/modeled — it must be loaded and transformed, reliably and without duplicates."
-      }
+      },
+      "traps": [
+        {
+          "trap": "Honoring a deletion request by deleting only the modeled rows.",
+          "why": "ELT retains the subject in immutable raw, so the next backfill that reprocesses those partitions re-creates the 'erased' rows — the deletion silently regresses.",
+          "instead": "Crypto-shred the subject's key (or tombstone it) in raw, schedule rewrites of the affected modeled partitions, and record the erasure so future backfills apply the same policy — unless a legal hold blocks it."
+        }
+      ]
     },
     {
       "id": "transform",
@@ -1140,6 +1330,7 @@
         "Load raw into typed staging tables, then transform staging into modeled analytical tables (fact/dimension marts) with SQL/Spark inside the warehouse. Process by partition (e.g. per day) so work is bounded and parallelizable.",
         "Make loads idempotent: a load for a given partition replaces that partition's output rather than appending — so re-running a failed/late load doesn't create duplicates. A run watermark records what's been processed. Be precise about what the watermark means here: it is the output-partition-completion marker (this partition is published), distinct from the source offset/LSN the ingest layer tracks and from a freshness timestamp — those are not interchangeable.",
         "Publish atomically so a reader never sees a half-written partition: the transform writes its output to a temporary table/location (an unpublished snapshot), runs validation (row counts, schema, freshness, quality gates), then publishes via an atomic partition swap, a warehouse transaction, or a table-format snapshot commit. Only after that commit does the watermark advance, and queries are pinned to committed snapshots — so a failed run leaves the last good partition in place and a retry simply re-publishes.",
+        "The visibility boundary is the run state: only committed snapshots are queryable. A run walks queued → loading → transforming → validating → publishing → succeeded, and the output is invisible until the publish step commits. A failed or cancelled run aborts its temp snapshot (it never becomes visible), the last committed snapshot stays in place, and dependents stay blocked until a committed snapshot exists.",
         "This idempotent, partition-at-a-time, publish-then-advance design is what makes the pipeline reliable and retryable, and is the precondition for clean backfills later."
       ],
       "view": {
@@ -1284,6 +1475,7 @@
       "probeLinks": [
         "dbt-incremental-models",
         "dbt-docs",
+        "lakefs-docs",
         "delta-lake-paper",
         "iceberg-docs",
         "hudi-spec",
@@ -1292,7 +1484,8 @@
         "beam-guide"
       ],
       "patterns": [
-        "Idempotent partitioned loads"
+        "Idempotent partitioned loads",
+        "Atomic snapshot publish"
       ],
       "whyNow": [
         "Idempotent partitioned processing is the reliability backbone; it's what makes retries and backfills correct."
@@ -1444,7 +1637,10 @@
         "grammarly-event-store",
         "airbnb-iceberg-warehouse",
         "parquet-docs",
-        "debezium-cdc-features"
+        "debezium-cdc-features",
+        "confluent-schema-evolution",
+        "odcs-spec",
+        "datahub-docs"
       ],
       "patterns": [
         "Schema registry + evolution"
@@ -1546,8 +1742,8 @@
         "Analysts query huge modeled tables. Two techniques make this fast: partition tables by a natural key (usually date) so queries prune to relevant partitions, and store data columnar so a query reads only the columns it needs.",
         "Partition pruning + columnar scanning means a 'last 7 days, 3 columns' query touches a tiny fraction of the table. Pre-aggregate common rollups (daily summaries) for dashboards. The query/BI layer runs SQL over these modeled, partitioned tables.",
         "Keeping those tables fast over time is an operational job, not a one-time layout choice — and it ties directly to the capacity numbers (5 TB/day landed, ~200 queries/min, ~20 long dashboards). The 5 TB/day ingest produces many small files, so a compaction job rewrites them into right-sized files and expires old snapshots. Table statistics are refreshed so the planner prunes well, clustering/sorting within a partition (e.g. by customer or region) keeps scans tight, and materialized rollups/views are refreshed on a schedule with a clear owner.",
-        "For the ~200 queries/min plus ~20 long-running dashboards, isolate workloads: dashboards and ad-hoc analysts run on separate warehouses/queues so a heavy scan can't starve interactive queries, with per-queue concurrency limits, quotas/budgets, and kill/cancel controls. Cost telemetry attributes bytes-scanned and compute back to pipeline runs, backfills, and query workloads so spend is visible and capped.",
-        "This is the same time-bucketing/columnar idea as analytics/logging systems, applied to the warehouse's modeled tables."
+        "For the ~200 queries/min plus ~20 long-running dashboards, isolate workloads: dashboards and ad-hoc analysts run on separate warehouses/queues so a heavy scan can't starve interactive queries, with per-queue concurrency limits, quotas/budgets, and kill/cancel controls. Cost telemetry attributes bytes-scanned and compute back to pipeline runs, backfills, and query workloads so spend is visible and capped. Concretely this is an async query-job contract (submit, poll, cancel): a job carries a workload class/queue, the caller's principal, an access decision (allow / column-masked / denied), an estimated-vs-scanned byte count, and compute/cost attribution — so isolation, budgets, cancellation, and governance masking become an operable API rather than aspirational prose.",
+        "This is the same time-bucketing and columnar idea that analytics and logging systems use, applied here to the warehouse's modeled tables."
       ],
       "view": {
         "nodes": [
@@ -1705,10 +1901,12 @@
         "parquet-docs",
         "iceberg-docs",
         "airbnb-iceberg-warehouse",
-        "aws-redshift-elt-patterns"
+        "aws-redshift-elt-patterns",
+        "aws-lake-formation-filtering"
       ],
       "patterns": [
-        "Partitioning + columnar"
+        "Partitioning + columnar",
+        "Workload isolation + cost controls"
       ],
       "whyNow": [
         "Query performance is the warehouse's reason to exist; partitioning + columnar is the standard mechanism analysts feel directly."
@@ -1769,6 +1967,67 @@
           "highlight": [
             "Warehouse"
           ]
+        },
+        {
+          "name": "Governed async query job (authorize, admit, attribute)",
+          "note": "Beyond raw pruning, a submitted query is a governed job: governance resolves the caller's effective access (allow / column-masked / deny), the warehouse estimates bytes and admits it to the right workload queue, and on completion the bytes scanned and compute are attributed back to the principal's budget — the control plane behind workload isolation and cost caps.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Query",
+                "label": "Query / BI Layer"
+              },
+              {
+                "id": "Governance",
+                "label": "Governance"
+              },
+              {
+                "id": "Warehouse",
+                "label": "Warehouse (Columnar)"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Query",
+                "to": "Governance",
+                "arrow": "->>",
+                "label": "authorize principal -> allow | column-masked | deny"
+              },
+              {
+                "type": "alt",
+                "label": "allowed (possibly masked)",
+                "messages": [
+                  {
+                    "from": "Query",
+                    "to": "Warehouse",
+                    "arrow": "->>",
+                    "label": "estimate bytes; admit to workload queue (dashboard | adhoc)"
+                  },
+                  {
+                    "from": "Warehouse",
+                    "to": "Query",
+                    "arrow": "-->>",
+                    "label": "results; attribute bytes scanned + compute to budget"
+                  }
+                ],
+                "else": {
+                  "label": "denied",
+                  "messages": [
+                    {
+                      "from": "Governance",
+                      "to": "Query",
+                      "arrow": "-->>",
+                      "label": "reject before admission; audit the attempt"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Governance",
+            "Query"
+          ]
         }
       ]
     },
@@ -1817,6 +2076,7 @@
       ],
       "probeLinks": [
         "airflow-docs",
+        "lakefs-docs",
         "beam-guide",
         "dataflow-paper",
         "grammarly-event-store",
@@ -1959,14 +2219,38 @@
       "whyNow": [
         "Closing on orchestration + data quality + lineage shows the platform is operable, trustworthy, and dependency-aware — the production reality."
       ],
+      "patterns": [
+        "Quality-gated orchestration",
+        "Run/snapshot lineage"
+      ],
+      "concepts": [
+        {
+          "term": "Blocking vs advisory quality gates",
+          "definition": "Blocking checks (freshness, row count, schema) must pass before the atomic publish, so a failure leaves the last good snapshot in place and alerts the owner; advisory checks (e.g. anomaly) warn but still allow publish.",
+          "whyItMatters": "Wiring quality into the publish boundary is what keeps a bad partition from ever becoming queryable or propagating to dependents — without it, validation is just an after-the-fact alarm.",
+          "example": "A row-count check fails -> publish is blocked, dependents stay blocked, owner is paged; an anomaly check warns -> publish proceeds with a flagged snapshot.",
+          "group": "Orchestration, Quality, and Lineage"
+        },
+        {
+          "term": "Lineage granularity",
+          "definition": "Record provenance per run/snapshot — which source offsets/LSNs and transform version produced which output snapshot — not merely table-to-table edges.",
+          "whyItMatters": "Run/snapshot-level lineage is what makes impact analysis and audit precise: you can answer 'which transform version and inputs produced this exact bad partition?' instead of just 'these tables are related'.",
+          "example": "fct_orders snap_77 -> produced by run r_9, transformVersion v42, from raw.orders up to lsn:48211.",
+          "group": "Orchestration, Quality, and Lineage"
+        }
+      ],
       "probeLinks": [
         "airflow-docs",
         "netflix-genie",
         "netflix-data-bridge",
+        "netflix-lineage",
         "linkedin-pipeline-monitoring",
         "dbt-data-tests",
         "great-expectations-validations",
         "openlineage-docs",
+        "datahub-docs",
+        "apache-atlas-governance",
+        "odcs-spec",
         "netflix-metacat"
       ],
       "recap": {
@@ -1989,6 +2273,18 @@
           "scenario": "A transform job fails mid-partition.",
           "expectedBehavior": "The orchestrator retries; idempotent partition processing means the re-run overwrites cleanly with no duplicates.",
           "mitigation": "Idempotent partitions + run watermarks + orchestrator retry."
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Treating lineage as table-level metadata only.",
+          "why": "Table-to-table edges can't answer 'which inputs and transform version produced this exact bad partition?', so impact analysis and audit stay coarse and a backfill can't be reasoned about precisely.",
+          "instead": "Record lineage per run/snapshot: source offsets/LSNs consumed, the pinned transform version, and the output snapshot produced."
+        },
+        {
+          "trap": "Running advisory quality checks as if they were blocking (or vice versa).",
+          "why": "Blocking on a noisy anomaly check stalls fresh data on false positives; treating a freshness/row-count check as advisory lets a bad partition publish and propagate to dependents.",
+          "instead": "Classify each check explicitly: correctness checks (freshness, row count, schema) block the publish; observational checks (anomaly/drift) warn but allow it, each with an owner and alert route."
         }
       ],
       "flows": [
@@ -2596,6 +2892,82 @@
       "makesIrrelevant": "A warehouse with native materialized views and workload queues can remove separate OLAP cube products for many dashboard workloads."
     },
     {
+      "concern": "Query admission, workload isolation, and cost controls",
+      "steps": [
+        "serve",
+        "backfill",
+        "orchestrate"
+      ],
+      "selfHosted": [
+        {
+          "name": "Trino/Presto",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "ClickHouse",
+          "icon": "assets/tech-icons/clickhouse.png"
+        },
+        {
+          "name": "Open Policy Agent",
+          "icon": "assets/tech-icons/tech.png"
+        },
+        {
+          "name": "Prometheus",
+          "icon": "assets/tech-icons/prometheus.png"
+        }
+      ],
+      "cloud": {
+        "aws": [
+          {
+            "name": "Redshift",
+            "icon": "assets/tech-icons/Arch_Amazon-Redshift_64.png"
+          },
+          {
+            "name": "Athena",
+            "icon": "assets/tech-icons/Arch_Amazon-Athena_64.png"
+          },
+          {
+            "name": "CloudWatch",
+            "icon": "assets/tech-icons/Arch_Amazon-CloudWatch_64.png"
+          },
+          {
+            "name": "Cost Explorer / tags",
+            "icon": "assets/tech-icons/tech.png"
+          }
+        ],
+        "gcp": [
+          {
+            "name": "BigQuery",
+            "icon": "assets/tech-icons/DataAnalytics-512-color.png"
+          },
+          {
+            "name": "Cloud Monitoring",
+            "icon": "assets/tech-icons/Operations-512-color.png"
+          }
+        ],
+        "azure": [
+          {
+            "name": "Azure Synapse Analytics",
+            "icon": "assets/tech-icons/00606-icon-service-Azure-Synapse-Analytics.svg"
+          },
+          {
+            "name": "Microsoft Fabric",
+            "icon": "assets/tech-icons/tech.png"
+          },
+          {
+            "name": "Azure Monitor",
+            "icon": "assets/tech-icons/00001-icon-service-Monitor.svg"
+          }
+        ]
+      },
+      "tradeoff": [
+        "Workload queues, reservations, or warehouses isolate dashboards, ad-hoc analysts, ETL, and backfills so one scan cannot starve fresh-data SLAs.",
+        "Admission control and cancellation require query metadata before execution: principal, workload class, estimated bytes, budget policy, and access decision.",
+        "Provider-native warehouses make queues, metering, and budget alerts faster to adopt; self-hosted engines need explicit resource groups, observability, and policy integration."
+      ],
+      "makesIrrelevant": "A serving layer with native workload queues, cost attribution, and kill/cancel controls removes most custom semaphore tables and manual runaway-query cleanup."
+    },
+    {
       "concern": "BI / semantic layer and dashboard serving",
       "steps": [
         "serve"
@@ -2931,18 +3303,19 @@
       "phase": "High-level design",
       "time": "next 10 min",
       "say": [
-        "ELT: land raw immutably, transform in-warehouse.",
-        "Idempotent partitioned loads + transforms.",
-        "Partitioned columnar serving."
+        "ELT into a governed, immutable raw lake; transform in-warehouse.",
+        "Idempotent partitioned loads + transforms with atomic publish: write a temp snapshot, validate, swap, then advance the watermark — queries only ever read committed snapshots.",
+        "Partitioned columnar serving with workload isolation."
       ]
     },
     {
       "phase": "Deep dive",
       "time": "next 15 min",
       "say": [
-        "Schema registry + evolution.",
-        "Backfills from retained raw (idempotent).",
-        "Orchestration DAGs, data quality, lineage."
+        "Run lifecycle and retry/cancel boundaries: cancel is only safe before publish commits; a failed run leaves the last good snapshot visible.",
+        "Schema registry + evolution; backfills from retained raw, admission-controlled below fresh-data priority.",
+        "Async query jobs with queues, budgets, and per-query cost attribution.",
+        "Quality gates (blocking vs advisory) on publish, run/snapshot lineage, and deletion that propagates into raw so erased subjects don't resurrect on backfill."
       ]
     },
     {
@@ -2966,17 +3339,18 @@
     {
       "level": "Senior",
       "expectations": [
-        "Designs ELT + idempotent partitioned loads.",
-        "Schema registry + partitioned columnar serving.",
-        "Orchestration + backfills."
+        "Designs ELT + idempotent partitioned loads with atomic publish (temp snapshot -> validate -> swap -> advance watermark).",
+        "Schema registry + partitioned columnar serving with workload isolation.",
+        "Orchestration + admission-controlled backfills."
       ]
     },
     {
       "level": "Staff",
       "expectations": [
-        "Reasons about reprocessability and idempotency precisely.",
-        "Handles schema evolution and lineage/quality.",
-        "Discusses CDC vs batch, backfill priority, and cost tradeoffs deeply."
+        "Reasons precisely about source offsets vs output watermarks vs committed snapshots, and the run lifecycle (retry/cancel only before publish commits).",
+        "Treats governance as part of the data path: classification/masking, retention/legal-hold, and deletion that propagates into raw so backfills can't resurrect erased subjects.",
+        "Designs the query control plane: async query jobs, isolated queues, budgets, and per-query cost attribution.",
+        "Discusses quality gates (blocking vs advisory), run/snapshot lineage for impact analysis, and CDC vs batch / backfill-priority / cost tradeoffs deeply."
       ]
     }
   ],
@@ -2985,7 +3359,10 @@
     "How do you keep backfills from starving fresh-data pipelines?",
     "When would you go streaming-first (kappa) instead of batch ELT?",
     "How do you guarantee a query never reads a half-written partition?",
-    "How would you enforce data contracts/quality before data reaches analysts?"
+    "How would you enforce data contracts/quality before data reaches analysts?",
+    "How do you cancel a run safely while it's publishing?",
+    "How does a deletion request avoid resurrecting an erased subject during a later backfill?",
+    "How do query queues and budgets keep dashboards, ad-hoc, and backfills from starving each other?"
   ],
   "toProbeFurther": {
     "links": [
@@ -3118,6 +3495,17 @@
         "year": "2026"
       },
       {
+        "id": "netflix-lineage",
+        "group": "Company Implementations",
+        "groupDescription": "Production data-platform case studies and operational lessons from engineering teams.",
+        "title": "Building and Scaling Data Lineage at Netflix to Improve Data Infrastructure Reliability and Efficiency",
+        "url": "https://medium.com/netflix-techblog/building-and-scaling-data-lineage-at-netflix-to-improve-data-infrastructure-reliability-and-1a52526a7977",
+        "source": "Netflix Technology Blog",
+        "type": "Case study",
+        "why": "Shows a production lineage service that maps upstream and downstream dependencies for SLA alerts, impact analysis, data lifecycle management, and trust.",
+        "year": "2019"
+      },
+      {
         "id": "linkedin-pipeline-monitoring",
         "group": "Company Implementations",
         "groupDescription": "Production data-platform case studies and operational lessons from engineering teams.",
@@ -3129,6 +3517,26 @@
         "year": "2019"
       },
       {
+        "id": "uber-dbevents-ingestion",
+        "group": "Company Implementations",
+        "groupDescription": "Production data-platform case studies and operational lessons from engineering teams.",
+        "title": "DBEvents: A Standardized Framework for Efficiently Ingesting Data into Uber's Apache Hadoop Data Lake",
+        "url": "https://www.uber.com/us/en/blog/dbevents-ingestion-framework/",
+        "source": "Uber Engineering",
+        "type": "Case study",
+        "why": "Explains bootstrap plus incremental CDC ingestion into a data lake, with unified changelog events, schema management, and reusable DAGs."
+      },
+      {
+        "id": "uber-marmaray-ingestion",
+        "group": "Company Implementations",
+        "groupDescription": "Production data-platform case studies and operational lessons from engineering teams.",
+        "title": "Marmaray: An Open Source Generic Data Ingestion and Dispersal Framework and Library for Apache Hadoop",
+        "url": "https://www.uber.com/us/en/blog/marmaray-hadoop-ingestion-open-source/",
+        "source": "Uber Engineering",
+        "type": "Case study",
+        "why": "Shows pluggable ingestion and dispersal on Spark with work units, checkpoints, schema conversion, error records, metadata updates, and delivery metrics."
+      },
+      {
         "id": "debezium-cdc-features",
         "group": "Ingestion and Change Capture",
         "groupDescription": "Connector, CDC, and batch/stream ingestion references for landing raw data safely.",
@@ -3137,6 +3545,16 @@
         "source": "Debezium",
         "type": "Docs",
         "why": "Explains log-based CDC, snapshots, deletes, old-record state, and metadata needed for correct replayable ingestion."
+      },
+      {
+        "id": "confluent-schema-evolution",
+        "group": "Ingestion and Change Capture",
+        "groupDescription": "Connector, CDC, and batch/stream ingestion references for landing raw data safely.",
+        "title": "Schema Evolution and Compatibility for Schema Registry",
+        "url": "https://docs.confluent.io/platform/7.9/schema-registry/fundamentals/schema-evolution.html",
+        "source": "Confluent Documentation",
+        "type": "Docs",
+        "why": "Defines backward, forward, full, and transitive compatibility checks for versioned event schemas before they break downstream consumers."
       },
       {
         "id": "kafka-connect-docs",
@@ -3177,6 +3595,16 @@
         "source": "dbt",
         "type": "Docs",
         "why": "Practical reference for incremental transforms, unique keys, schema-change handling, and full refresh tradeoffs."
+      },
+      {
+        "id": "lakefs-docs",
+        "group": "Transformation and Orchestration",
+        "groupDescription": "ELT modeling, stream/batch processing, DAGs, backfills, and pipeline execution references.",
+        "title": "Welcome to lakeFS",
+        "url": "https://docs.lakefs.io/",
+        "source": "lakeFS",
+        "type": "Docs",
+        "why": "Shows Git-like branching, commits, atomic merges, and rollback for reproducible lake data changes and safer backfills."
       },
       {
         "id": "beam-guide",
@@ -3240,6 +3668,26 @@
         "why": "Defines a standard lineage event model for jobs, runs, datasets, and extensible facets across pipeline components."
       },
       {
+        "id": "datahub-docs",
+        "group": "Quality, Catalog, and Lineage",
+        "groupDescription": "Validation, monitoring, metadata, and lineage references for operating trusted datasets.",
+        "title": "What is DataHub?",
+        "url": "https://docs.datahub.com/",
+        "source": "DataHub",
+        "type": "Docs",
+        "why": "Reference for a metadata platform that combines discovery, ownership, PII tracking, lineage, profiling, assertions, and data contracts."
+      },
+      {
+        "id": "apache-atlas-governance",
+        "group": "Quality, Catalog, and Lineage",
+        "groupDescription": "Validation, monitoring, metadata, and lineage references for operating trusted datasets.",
+        "title": "Apache Atlas - Data Governance and Metadata framework for Hadoop",
+        "url": "https://atlas.apache.org/",
+        "source": "Apache Atlas",
+        "type": "Docs",
+        "why": "Catalog and governance reference for asset classification, search, lineage, and propagating classifications through derived datasets."
+      },
+      {
         "id": "netflix-metacat",
         "group": "Quality, Catalog, and Lineage",
         "groupDescription": "Validation, monitoring, metadata, and lineage references for operating trusted datasets.",
@@ -3248,6 +3696,26 @@
         "source": "Netflix OSS",
         "type": "Repository",
         "why": "Shows a metadata exploration API for federating warehouse/lake metadata, storing business metadata, and improving discovery."
+      },
+      {
+        "id": "odcs-spec",
+        "group": "Governance and Access Control",
+        "groupDescription": "Contracts and access-control references for protecting raw and modeled analytical data.",
+        "title": "Definition: Open Data Contract Standard (ODCS)",
+        "url": "https://bitol-io.github.io/open-data-contract-standard/v3.0.1/",
+        "source": "Bitol / Linux Foundation",
+        "type": "Docs",
+        "why": "Defines a contract shape for schema, quality rules, ownership, support channels, SLAs, and serving locations across data products."
+      },
+      {
+        "id": "aws-lake-formation-filtering",
+        "group": "Governance and Access Control",
+        "groupDescription": "Contracts and access-control references for protecting raw and modeled analytical data.",
+        "title": "Data Filtering and Cell-Level Security in Lake Formation",
+        "url": "https://docs.aws.amazon.com/lake-formation/latest/dg/data-filtering.html",
+        "source": "AWS Documentation",
+        "type": "Docs",
+        "why": "Concrete reference for enforcing row-level, column-level, and cell-level filtering when raw or modeled warehouse data contains sensitive fields."
       }
     ]
   },

@@ -326,13 +326,18 @@
     },
     {
       "label": "Raw ingest",
-      "value": "~5 TB/day",
-      "note": "Drives object-storage throughput + small-file/compaction pressure in the lake."
+      "value": "~5 TB/day (~210 GB/hr)",
+      "note": "5 TB/day ≈ 210 GB/hr ≈ 60 MB/s average, bursting higher at peak. Spread over ~50 hot tables that's ~4 GB/hr/hot-table average; the largest connectors dominate, so size connector parallelism to them, not to the mean."
     },
     {
       "label": "Stored volume",
       "value": "2-4x raw",
-      "note": "Raw + staging + modeled + snapshots + compaction overhead. 5 TB/day raw -> ~10-20 TB/day landed across layers."
+      "note": "Raw + staging + modeled + snapshots + compaction overhead, so 5 TB/day raw becomes ~10-20 TB/day landed across layers."
+    },
+    {
+      "label": "File/compaction",
+      "value": "target ~128-512 MB files",
+      "note": "Micro-batch landing creates many small files (a CDC table emitting every few minutes can produce 100s of files/day/table). Compact to ~128-512 MB targets so query planners scan fewer files; small-file count, not bytes, is what blows up planning/listing cost."
     },
     {
       "label": "Retention",
@@ -342,17 +347,22 @@
     {
       "label": "Freshness",
       "value": "minutes (CDC) to daily (batch)",
-      "note": "Per-dataset SLA; sizes transform cluster and orchestrator cadence."
+      "note": "Per-dataset SLA; sizes transform cluster and orchestrator cadence. To keep a minutes SLA, each hot table's load+transform+validate+publish cycle must fit inside its interval — so concurrency scales with (tables on tight SLAs) × (cycle time ÷ interval), and a slow table gets its own slot rather than blocking the queue."
     },
     {
       "label": "Query load",
       "value": "~200 queries/min peak",
-      "note": "Plus ~20 long-running dashboard queries — needs warehouse concurrency controls / queue isolation."
+      "note": "~200 short queries/min ≈ 3-4/s; at a few seconds each that's ~10-30 concurrent — fits one bounded interactive queue. The ~20 long dashboards run minutes each, so give them their own isolated warehouse/queue (~20-30 slots) and reserve separate capacity for ad-hoc so neither class starves the other."
     },
     {
       "label": "Backfill",
-      "value": "e.g. 90d x 5 TB/day",
-      "note": "Bounded parallel partitions, admission-controlled below fresh-data priority so SLAs hold."
+      "value": "90d x 5 TB/day = ~450 TB scanned",
+      "note": "A 90-day reprocess re-reads ~450 TB of raw. Cap it at N concurrent partitions or M TB/hr (e.g. ≤8 partitions / ≤10 TB/hr) on a low-priority queue so it finishes in days without preempting fresh-data SLAs; fresh data always wins admission."
+    },
+    {
+      "label": "Metadata",
+      "value": "run/snapshot/quality/lineage records",
+      "note": "~500 tables x runs/day x a few years of run records, output snapshots, quality results, and lineage edges = millions of small rows. Small but high-cardinality — keep it in an indexed operational store, not the columnar warehouse."
     },
     {
       "label": "Load semantics",
@@ -579,9 +589,9 @@
     {
       "method": "GET",
       "path": "/v1/lineage?dataset=fct_orders",
-      "description": "Trace upstream/downstream lineage for a dataset (sources, transform versions, outputs).",
+      "description": "Trace lineage for a dataset at run/snapshot granularity: which run, source offsets, transform version, and input snapshots produced the current committed output, plus upstream/downstream edges.",
       "request": "—",
-      "response": "{ \"upstream\": [ \"stg_orders\", \"raw.orders\" ], \"transformVersion\": \"v42\", \"downstream\": [ \"mart_revenue\" ] }"
+      "response": "{ \"dataset\": \"fct_orders\", \"runId\": \"r_9\", \"outputSnapshot\": \"snap_2026-06-01_v42\", \"transformVersion\": \"v42\", \"sourceOffsets\": { \"raw.orders\": \"lsn:0/3A9F210\" }, \"inputSnapshots\": [ \"stg_orders@snap_2026-06-01\" ], \"upstream\": [ \"stg_orders\", \"raw.orders\" ], \"downstream\": [ \"mart_revenue\" ] }"
     },
     {
       "method": "GET",
@@ -595,7 +605,7 @@
       "path": "/v1/governance/deletion-requests",
       "description": "Request deletion of a subject/key across raw + modeled layers; rejected while a legal hold is in force, otherwise crypto-shreds and records an audit event.",
       "request": "{ \"subjectKey\": \"user:42\", \"reason\": \"gdpr-erasure\", \"scope\": [ \"raw.orders\", \"mart_revenue\" ] }",
-      "response": "{ \"requestId\": \"del_5\", \"state\": \"scheduled\", \"blockedByLegalHold\": false }"
+      "response": "{ \"requestId\": \"del_5\", \"state\": \"scheduled\", \"blockedByLegalHold\": false, \"affectedSnapshots\": [ \"raw.orders@all\", \"mart_revenue@90d\" ], \"rewriteJobId\": \"rw_7\" }"
     },
     {
       "method": "POST",
@@ -1080,7 +1090,7 @@
   "steps": [
     {
       "id": "naive",
-      "title": "1. Naive Baseline: One Script Transforms Then Loads Into the Operational DB",
+      "title": "1. Naive Baseline: One Script Transforms, Then Loads the Operational DB",
       "description": [
         "Start with the simplest thing that works. A nightly cron script reads from the source systems, transforms the rows in memory (joins, type casts, business logic), and loads the result straight into one operational database that analysts query directly. Classic transform-then-load ETL into a single DB.",
         "This is correct for a small shop and exposes two problems the rest of the design exists to solve. First, the transform throws away the raw data — once a transform has a bug or the business logic changes, there is nothing to reprocess from; you can only re-pull whatever the source still has. Second, pointing analysts' heavy scans at the same database the application writes to means analytical queries contend with operational load and don't scale to TBs.",
@@ -1724,8 +1734,8 @@
         "Analysts query huge modeled tables. Two techniques make this fast: partition tables by a natural key (usually date) so queries prune to relevant partitions, and store data columnar so a query reads only the columns it needs.",
         "Partition pruning + columnar scanning means a 'last 7 days, 3 columns' query touches a tiny fraction of the table. Pre-aggregate common rollups (daily summaries) for dashboards. The query/BI layer runs SQL over these modeled, partitioned tables.",
         "Keeping those tables fast over time is an operational job, not a one-time layout choice — and it ties directly to the capacity numbers (5 TB/day landed, ~200 queries/min, ~20 long dashboards). The 5 TB/day ingest produces many small files, so a compaction job rewrites them into right-sized files and expires old snapshots. Table statistics are refreshed so the planner prunes well, clustering/sorting within a partition (e.g. by customer or region) keeps scans tight, and materialized rollups/views are refreshed on a schedule with a clear owner.",
-        "For the ~200 queries/min plus ~20 long-running dashboards, isolate workloads: dashboards and ad-hoc analysts run on separate warehouses/queues so a heavy scan can't starve interactive queries, with per-queue concurrency limits, quotas/budgets, and kill/cancel controls. Cost telemetry attributes bytes-scanned and compute back to pipeline runs, backfills, and query workloads so spend is visible and capped. Concretely this is an async query-job contract (submit, poll, cancel): a job carries a workload class/queue, the caller's principal, an access decision (allow / column-masked / denied), an estimated-vs-scanned byte count, and compute/cost attribution — so isolation, budgets, cancellation, and governance masking are an operable API, not just a layout choice.",
-        "This is the same time-bucketing/columnar idea as analytics/logging systems, applied to the warehouse's modeled tables."
+        "For the ~200 queries/min plus ~20 long-running dashboards, isolate workloads: dashboards and ad-hoc analysts run on separate warehouses/queues so a heavy scan can't starve interactive queries, with per-queue concurrency limits, quotas/budgets, and kill/cancel controls. Cost telemetry attributes bytes-scanned and compute back to pipeline runs, backfills, and query workloads so spend is visible and capped. Concretely this is an async query-job contract (submit, poll, cancel): a job carries a workload class/queue, the caller's principal, an access decision (allow / column-masked / denied), an estimated-vs-scanned byte count, and compute/cost attribution — so isolation, budgets, cancellation, and governance masking become an operable API rather than aspirational prose.",
+        "This is the same time-bucketing and columnar idea that analytics and logging systems use, applied here to the warehouse's modeled tables."
       ],
       "view": {
         "nodes": [
@@ -1947,6 +1957,67 @@
           },
           "highlight": [
             "Warehouse"
+          ]
+        },
+        {
+          "name": "Governed async query job (authorize, admit, attribute)",
+          "note": "Beyond raw pruning, a submitted query is a governed job: governance resolves the caller's effective access (allow / column-masked / deny), the warehouse estimates bytes and admits it to the right workload queue, and on completion the bytes scanned and compute are attributed back to the principal's budget — the control plane behind workload isolation and cost caps.",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Query",
+                "label": "Query / BI Layer"
+              },
+              {
+                "id": "Governance",
+                "label": "Governance"
+              },
+              {
+                "id": "Warehouse",
+                "label": "Warehouse (Columnar)"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Query",
+                "to": "Governance",
+                "arrow": "->>",
+                "label": "authorize principal -> allow | column-masked | deny"
+              },
+              {
+                "type": "alt",
+                "label": "allowed (possibly masked)",
+                "messages": [
+                  {
+                    "from": "Query",
+                    "to": "Warehouse",
+                    "arrow": "->>",
+                    "label": "estimate bytes; admit to workload queue (dashboard | adhoc)"
+                  },
+                  {
+                    "from": "Warehouse",
+                    "to": "Query",
+                    "arrow": "-->>",
+                    "label": "results; attribute bytes scanned + compute to budget"
+                  }
+                ],
+                "else": {
+                  "label": "denied",
+                  "messages": [
+                    {
+                      "from": "Governance",
+                      "to": "Query",
+                      "arrow": "-->>",
+                      "label": "reject before admission; audit the attempt"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Governance",
+            "Query"
           ]
         }
       ]
@@ -3142,18 +3213,19 @@
       "phase": "High-level design",
       "time": "next 10 min",
       "say": [
-        "ELT: land raw immutably, transform in-warehouse.",
-        "Idempotent partitioned loads + transforms.",
-        "Partitioned columnar serving."
+        "ELT into a governed, immutable raw lake; transform in-warehouse.",
+        "Idempotent partitioned loads + transforms with atomic publish: write a temp snapshot, validate, swap, then advance the watermark — queries only ever read committed snapshots.",
+        "Partitioned columnar serving with workload isolation."
       ]
     },
     {
       "phase": "Deep dive",
       "time": "next 15 min",
       "say": [
-        "Schema registry + evolution.",
-        "Backfills from retained raw (idempotent).",
-        "Orchestration DAGs, data quality, lineage."
+        "Run lifecycle and retry/cancel boundaries: cancel is only safe before publish commits; a failed run leaves the last good snapshot visible.",
+        "Schema registry + evolution; backfills from retained raw, admission-controlled below fresh-data priority.",
+        "Async query jobs with queues, budgets, and per-query cost attribution.",
+        "Quality gates (blocking vs advisory) on publish, run/snapshot lineage, and deletion that propagates into raw so erased subjects don't resurrect on backfill."
       ]
     },
     {
@@ -3177,17 +3249,18 @@
     {
       "level": "Senior",
       "expectations": [
-        "Designs ELT + idempotent partitioned loads.",
-        "Schema registry + partitioned columnar serving.",
-        "Orchestration + backfills."
+        "Designs ELT + idempotent partitioned loads with atomic publish (temp snapshot -> validate -> swap -> advance watermark).",
+        "Schema registry + partitioned columnar serving with workload isolation.",
+        "Orchestration + admission-controlled backfills."
       ]
     },
     {
       "level": "Staff",
       "expectations": [
-        "Reasons about reprocessability and idempotency precisely.",
-        "Handles schema evolution and lineage/quality.",
-        "Discusses CDC vs batch, backfill priority, and cost tradeoffs deeply."
+        "Reasons precisely about source offsets vs output watermarks vs committed snapshots, and the run lifecycle (retry/cancel only before publish commits).",
+        "Treats governance as part of the data path: classification/masking, retention/legal-hold, and deletion that propagates into raw so backfills can't resurrect erased subjects.",
+        "Designs the query control plane: async query jobs, isolated queues, budgets, and per-query cost attribution.",
+        "Discusses quality gates (blocking vs advisory), run/snapshot lineage for impact analysis, and CDC vs batch / backfill-priority / cost tradeoffs deeply."
       ]
     }
   ],
@@ -3196,7 +3269,10 @@
     "How do you keep backfills from starving fresh-data pipelines?",
     "When would you go streaming-first (kappa) instead of batch ELT?",
     "How do you guarantee a query never reads a half-written partition?",
-    "How would you enforce data contracts/quality before data reaches analysts?"
+    "How would you enforce data contracts/quality before data reaches analysts?",
+    "How do you cancel a run safely while it's publishing?",
+    "How does a deletion request avoid resurrecting an erased subject during a later backfill?",
+    "How do query queues and budgets keep dashboards, ad-hoc, and backfills from starving each other?"
   ],
   "toProbeFurther": {
     "links": [

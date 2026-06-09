@@ -3,6 +3,53 @@
 Reviewed file: `data/book/cicd-pipeline/interview.json`
 Review date: 2026-06-09
 
+## Update — 2026-06-09 (post-review hardening pass)
+
+This pass implemented the review's P1–P3 recommendations. Summary of what
+changed in `interview.json`:
+
+- **Workflow sequences (P1, issue #1).** Added a final-design "commit to gated
+  production" flow; a deploy "approval → admission → GitOps → rollout" flow
+  (alongside the existing canary ramp); a rollback "gate failure → rollback
+  state machine" flow; the mobile store-state flow now has a title. State-machine
+  transitions are now visible as sequences.
+- **Flaky tests + merge queues (P1, issue #3 / #2).** Promoted from follow-up to
+  first-class content: a `test_results` data-model record (test identity, flake
+  rate, owner, quarantine state, confidence); `GET /tests/{id}` and
+  `POST /tests/{id}/quarantine` APIs; a "Merge queues + flaky tests" deep dive;
+  a "rerun until green" trap; flaky-test and merge-queue failure drills; new
+  `Merge queue` and `Flaky-test quarantine` patterns/concepts.
+- **Fast-feedback option set (P2, issue #2).** Added four options: affected-only +
+  remote cache (default), remote build execution, test selection, brute-force
+  full rebuild. Capacity now has a p95/burst row and clarifies vCPU-slots ≠
+  runners; the cache deep dive notes egress saturation.
+- **Mobile option set + signing (P2/P3, issue #5).** Added three mobile-infra
+  options (self-hosted macOS+Fastlane, managed mobile CI, hybrid), a
+  signing-material deep dive (certs/profiles/store roles/rotation/revocation),
+  and an app-store-rejection failure drill.
+- **Feature flags made explicit (P2, issue #4).** Added an external `FlagService`
+  node + `deployer-flags` link; `required_flags`/`kill_switches` on
+  `mobile_releases`; a "deploy vs. release" concept; a cross-client
+  flag-coordination deep dive; a flag-misconfiguration failure drill; a
+  `Flag-coordinated release` pattern.
+- **Data-model normalization (P3, issue #6).** Split all slash-combined field
+  labels into individual fields across `job_attempts`, `artifacts`, `approvals`,
+  `environment_versions`, `deployment_steps`, `mobile_releases`, `audit_events`,
+  `idempotency_keys`; added `repo` to `runs`; added index/partition hints to the
+  high-cardinality tables.
+- **Minor polish.** Fixed the `/deployments/{id}/pause` "pass action" wording;
+  added a queue-fairness concept to the orchestrate step.
+
+References were re-validated (views/options/flows/satisfies/tech/patterns all
+resolve) and `docs/book/` was rebuilt. The Mermaid sequence/flowchart rendering
+of the new flows still warrants a visual pass in a browser. The rest of this
+document is the original review.
+
+---
+
+Reviewed file: `data/book/cicd-pipeline/interview.json`
+Review date: 2026-06-09
+
 ## Executive Summary
 
 The recent hardening pass materially improved this dataset. The interview is

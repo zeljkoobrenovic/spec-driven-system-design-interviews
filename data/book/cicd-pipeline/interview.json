@@ -141,6 +141,16 @@
           "stateful"
         ],
         "description": "Durable run history, stage status, approvals, and the version->environment ledger."
+      },
+      {
+        "id": "FlagService",
+        "label": "Feature Flag Service",
+        "type": "external",
+        "category": "boundary",
+        "traits": [
+          "stateful"
+        ],
+        "description": "External flag/kill-switch platform (owns flag state, rollout %, targeting). Not part of CI/CD but a hard dependency for safe cross-client and mobile releases under version skew."
       }
     ],
     "links": [
@@ -239,6 +249,12 @@
         "from": "Git",
         "to": "Deployer",
         "label": "GitOps desired state"
+      },
+      {
+        "id": "deployer-flags",
+        "from": "Deployer",
+        "to": "FlagService",
+        "label": "coordinate flag ramp / kill switch"
       }
     ],
     "types": [
@@ -262,7 +278,8 @@
           "K8s",
           "CDN",
           "AppStore",
-          "Metrics"
+          "Metrics",
+          "FlagService"
         ]
       }
     ]
@@ -320,18 +337,23 @@
     },
     {
       "label": "Linux runner pool",
-      "value": "~6 targets x 8 jobs x ~5 min / 2-min queue SLO ≈ 120 warm vCPU-slots, autoscaled",
-      "note": "Keep a warm pool to hide ~30-60s cold-start; burst higher at peak."
+      "value": "~6 targets x 8 jobs x ~5 min / 2-min queue SLO \u2248 120 warm vCPU-slots, autoscaled",
+      "note": "Slots \u2260 runners: 120 vCPU-slots at ~2 vCPU/job \u2248 60 concurrent pods; keep a warm pool to hide ~30-60s cold-start and autoscaler headroom for the burst."
+    },
+    {
+      "label": "p95 / burst load",
+      "value": "p95 ~25 targets x 8 jobs \u2248 200 jobs in one run; peak ~4x commit rate",
+      "note": "A wide shared-lib change at peak can saturate runner slots AND cache egress at once \u2014 size headroom for the p95 fan-out, not the average PR."
     },
     {
       "label": "macOS runner pool (iOS)",
-      "value": "scarce — ~10-20 hosts, the real bottleneck",
+      "value": "scarce \u2014 ~10-20 hosts, the real bottleneck",
       "note": "Xcode needs real macOS HW/VMs; iOS jobs queue here, not on Linux."
     },
     {
       "label": "Build cache",
       "value": "~1-2 TB, target >70% hit rate",
-      "note": "Content-keyed deps/layers/test caches; eviction window ~7-14 days; remote-cache bandwidth matters."
+      "note": "Content-keyed caches for dependencies, container layers, and test results; eviction window ~7-14 days. Watch remote-cache egress: restoring hundreds of targets at once on a wide change can saturate it."
     },
     {
       "label": "Artifact + log retention",
@@ -353,7 +375,7 @@
     {
       "method": "POST",
       "path": "/webhooks/vcs",
-      "description": "VCS push/PR event; computes affected targets and starts a run. Idempotency-Key dedupes retried deliveries so one event makes one run.",
+      "description": "VCS push/PR event; computes affected targets and starts a run. VCS webhooks retry on failure, so an Idempotency-Key dedupes redelivered events \u2014 one push/PR event always yields exactly one run.",
       "request": "{ repo, ref, commit, changedPaths[] }  + Idempotency-Key header",
       "response": "{ runId, pipeline }"
     },
@@ -402,7 +424,7 @@
     {
       "method": "POST",
       "path": "/deployments/{id}/pause",
-      "description": "Pause or resume an in-flight rollout (pass action). Holds the current traffic split.",
+      "description": "Pause or resume an in-flight rollout; takes { action: 'pause'|'resume' }. Holds the current traffic split.",
       "request": "{ action: 'pause'|'resume' }",
       "response": "{ state: 'paused'|'ramping' }"
     },
@@ -440,16 +462,34 @@
       "description": "Halt a staged rollout (or resume/roll-back-on-Play); records the action for forward-fix linkage.",
       "request": "{ action: 'halt'|'resume'|'rollback' }",
       "response": "{ rolloutPct, state }"
+    },
+    {
+      "method": "GET",
+      "path": "/tests/{testId}",
+      "description": "Quality signal for a test: rolling flake rate, owner, quarantine state, and recent attempt history \u2014 visible to owners, not hidden by reruns.",
+      "request": "(testId in path)",
+      "response": "{ flakeRate, owner, quarantineState, confidence }"
+    },
+    {
+      "method": "POST",
+      "path": "/tests/{testId}/quarantine",
+      "description": "Quarantine (or release) a known-flaky test so it is recorded but non-blocking, while staying visible to its owner. Quarantine is bounded and audited, not a silent mute.",
+      "request": "{ action: 'quarantine'|'release', reason }",
+      "response": "{ quarantineState, confidence }"
     }
   ],
   "dataModel": [
     {
       "name": "runs",
-      "note": "One pipeline execution.",
+      "note": "One pipeline execution. Index on (repo, commit_sha) to find a commit's runs and on (status, created_at) for the active-run dashboard.",
       "fields": [
         {
           "name": "run_id",
           "type": "uuid PK"
+        },
+        {
+          "name": "repo",
+          "type": "varchar (indexed with commit_sha)"
         },
         {
           "name": "commit_sha",
@@ -527,7 +567,7 @@
     },
     {
       "name": "job_attempts",
-      "note": "Each (re)try of a job; makes retries first-class.",
+      "note": "Each (re)try of a job; makes retries first-class. Index on (job_id, attempt_no) to list a job's attempts; log_pointer is an object-store URL, not inline bytes.",
       "fields": [
         {
           "name": "attempt_id",
@@ -535,7 +575,7 @@
         },
         {
           "name": "job_id",
-          "type": "uuid FK"
+          "type": "uuid FK (indexed)"
         },
         {
           "name": "attempt_no",
@@ -546,7 +586,15 @@
           "type": "varchar (runner id + lease ttl)"
         },
         {
-          "name": "queued_at / started_at / ended_at",
+          "name": "queued_at",
+          "type": "timestamptz"
+        },
+        {
+          "name": "started_at",
+          "type": "timestamptz"
+        },
+        {
+          "name": "ended_at",
           "type": "timestamptz"
         },
         {
@@ -580,12 +628,20 @@
           "type": "enum(image,web-bundle,ipa,aab)"
         },
         {
-          "name": "signed / attestation_ref",
-          "type": "bool / varchar"
+          "name": "signed",
+          "type": "bool"
         },
         {
-          "name": "sbom_ref / scan_status",
-          "type": "varchar / enum(pending,pass,fail)"
+          "name": "attestation_ref",
+          "type": "varchar (provenance pointer)"
+        },
+        {
+          "name": "sbom_ref",
+          "type": "varchar (SBOM pointer)"
+        },
+        {
+          "name": "scan_status",
+          "type": "enum(pending,pass,fail)"
         }
       ]
     },
@@ -602,16 +658,24 @@
           "type": "uuid FK"
         },
         {
-          "name": "actor / policy",
+          "name": "actor",
           "type": "varchar"
+        },
+        {
+          "name": "policy",
+          "type": "varchar (gate policy id)"
         },
         {
           "name": "decision",
           "type": "enum(approved,rejected)"
         },
         {
-          "name": "override_reason / expires_at",
-          "type": "text / timestamptz"
+          "name": "override_reason",
+          "type": "text"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamptz"
         }
       ]
     },
@@ -624,7 +688,11 @@
           "type": "varchar PK"
         },
         {
-          "name": "live_version / prev_good_version",
+          "name": "live_version",
+          "type": "varchar FK"
+        },
+        {
+          "name": "prev_good_version",
           "type": "varchar FK"
         },
         {
@@ -632,8 +700,12 @@
           "type": "varchar"
         },
         {
-          "name": "strategy / traffic_split",
-          "type": "varchar / jsonb"
+          "name": "strategy",
+          "type": "varchar"
+        },
+        {
+          "name": "traffic_split",
+          "type": "jsonb"
         }
       ]
     },
@@ -646,7 +718,11 @@
           "type": "uuid PK"
         },
         {
-          "name": "version / env",
+          "name": "version",
+          "type": "varchar FK"
+        },
+        {
+          "name": "env",
           "type": "varchar FK"
         },
         {
@@ -665,49 +741,107 @@
     },
     {
       "name": "mobile_releases",
-      "note": "Async, stateful store release record.",
+      "note": "Async, stateful store release record. Index on (platform, track, review_status) for the release dashboard.",
       "fields": [
         {
           "name": "release_id",
           "type": "uuid PK"
         },
         {
-          "name": "platform / artifact_version",
-          "type": "enum(ios,android) / varchar FK"
+          "name": "platform",
+          "type": "enum(ios,android)"
+        },
+        {
+          "name": "artifact_version",
+          "type": "varchar FK"
         },
         {
           "name": "track",
           "type": "enum(internal,testflight,closed,open,production)"
         },
         {
-          "name": "store_submission_id / review_status",
-          "type": "varchar / enum(pending,in_review,approved,rejected)"
+          "name": "store_submission_id",
+          "type": "varchar"
         },
         {
-          "name": "rollout_pct / crash_gate_status",
-          "type": "int / enum(ok,breached)"
+          "name": "review_status",
+          "type": "enum(pending,in_review,approved,rejected)"
         },
         {
-          "name": "min_backend_version / kill_switches",
-          "type": "varchar / text[]"
+          "name": "rollout_pct",
+          "type": "int"
+        },
+        {
+          "name": "crash_gate_status",
+          "type": "enum(ok,breached)"
+        },
+        {
+          "name": "min_backend_version",
+          "type": "varchar"
+        },
+        {
+          "name": "required_flags",
+          "type": "text[] (flag keys this release depends on)"
+        },
+        {
+          "name": "kill_switches",
+          "type": "text[] (flag keys that disable risky paths)"
         }
       ]
     },
     {
       "name": "audit_events",
-      "note": "Who did what, when — append-only.",
+      "note": "Who did what, when \u2014 append-only. Index on (target_ref, at) so an artifact/env/release's history is a range scan.",
       "fields": [
         {
           "name": "event_id",
           "type": "uuid PK"
         },
         {
-          "name": "actor / action / target_ref",
+          "name": "actor",
           "type": "varchar"
+        },
+        {
+          "name": "action",
+          "type": "varchar"
+        },
+        {
+          "name": "target_ref",
+          "type": "varchar (indexed with at)"
         },
         {
           "name": "at",
           "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "test_results",
+      "note": "Per-test quality signal across runs \u2014 backs flaky-test governance and quarantine.",
+      "fields": [
+        {
+          "name": "test_id",
+          "type": "varchar PK (stable test identity: suite::name)"
+        },
+        {
+          "name": "owner",
+          "type": "varchar (team/codeowner)"
+        },
+        {
+          "name": "flake_rate",
+          "type": "float (rolling pass-after-rerun ratio)"
+        },
+        {
+          "name": "quarantine_state",
+          "type": "enum(active,quarantined,muted)"
+        },
+        {
+          "name": "last_pass_at",
+          "type": "timestamptz"
+        },
+        {
+          "name": "confidence",
+          "type": "enum(blocking,non_blocking)"
         }
       ]
     },
@@ -720,8 +854,12 @@
           "type": "varchar PK"
         },
         {
-          "name": "scope / result_ref",
-          "type": "varchar"
+          "name": "scope",
+          "type": "varchar (operation type)"
+        },
+        {
+          "name": "result_ref",
+          "type": "varchar (id of the created resource)"
         },
         {
           "name": "created_at",
@@ -774,7 +912,7 @@
     },
     {
       "name": "Idempotent control plane",
-      "what": "Key mutating operations (webhook, run start, deploy, rollback, store submission) so retries are dedup'd instead of duplicated.",
+      "what": "Give every mutating operation (webhook intake, run start, deploy, rollback, store submission) an idempotency key, so retries are deduplicated instead of creating duplicate work.",
       "whenToUse": "Any at-least-once event source (VCS webhooks, retried API calls).",
       "steps": [
         "orchestrate"
@@ -805,6 +943,31 @@
       "steps": [
         "rollback"
       ]
+    },
+    {
+      "name": "Merge queue",
+      "what": "Serialize merges to main through a queue that re-tests each PR against the current head (speculatively, in batches) so a green PR can't break main when it lands.",
+      "whenToUse": "High-concurrency repos where PRs go stale between CI-pass and merge.",
+      "steps": [
+        "fast-feedback"
+      ]
+    },
+    {
+      "name": "Flaky-test quarantine",
+      "what": "Track each test's flake rate and owner; bound reruns, quarantine known flakes as non-blocking-but-visible, and never let an unaudited rerun turn red into green.",
+      "whenToUse": "Any large test suite where non-determinism erodes trust in the pipeline.",
+      "steps": [
+        "fast-feedback"
+      ]
+    },
+    {
+      "name": "Flag-coordinated release",
+      "what": "Decouple deploy from release: ship dark behind a flag, then ramp/kill the feature via an external flag service so server, web, and mobile can be activated together under version skew.",
+      "whenToUse": "Cross-client features and mobile, where there is no traffic shift for installed apps.",
+      "steps": [
+        "deploy",
+        "mobile"
+      ]
     }
   ],
   "steps": [
@@ -813,8 +976,8 @@
       "title": "1. Naive: One Script on a Build Box (the baseline)",
       "description": [
         "Start with the simplest thing that works: a single shell script on one always-on build server that, on every commit, builds everything, runs the whole test suite, and copies outputs to prod.",
-        "It's correct for a tiny app, and it exposes every problem we'll fix: it rebuilds all 40 services even for a one-line web change (slow), it's a single serial machine (no parallelism, a queue forms), there's no macOS host so iOS can't build, secrets sit in the script, and 'deploy' is a copy with no canary or rollback.",
-        "Put a number on it: 40 services × ~8 min each serially is ~5 hours per commit — at 500 commits/day (peak ~4×) the queue blows past the workday almost immediately. Parallelism, affected-only builds, and caching all exist to kill that number."
+        "It's correct for a tiny app, and it exposes every problem we'll fix: it rebuilds all 40 services even for a one-line web change (slow); it's a single serial machine with no parallelism, so a queue forms; there's no macOS host, so iOS can't build; secrets sit in the script; and 'deploy' is a copy with no canary or rollback.",
+        "Put a number on it: 40 services \u00d7 ~8 min each serially is ~5 hours per commit \u2014 at 500 commits/day (peak ~4\u00d7) the queue blows past the workday almost immediately. Parallelism, affected-only builds, and caching all exist to kill that number."
       ],
       "view": {
         "nodes": [
@@ -855,8 +1018,8 @@
       "title": "2. Model the Pipeline as a DAG on Ephemeral Runners",
       "description": [
         "Replace the script with an orchestrator that turns each run into a DAG of jobs (lint, build, unit, integration, package) and dispatches them to a pool of ephemeral, single-use runners.",
-        "Ephemeral runners give hermetic, reproducible builds (clean state every time) and let independent jobs run in parallel. The orchestrator persists run → stage → job → attempt state with runner leases, a retry policy, queue/start/end times, and log pointers, so a crashed run resumes the unfinished jobs or fails cleanly, a flaky job reruns as a new attempt, and a lost runner's lease expires and reschedules.",
-        "Heterogeneous targets need heterogeneous runners: Linux containers for backend/web, dedicated macOS hosts for iOS (Xcode), and Android runs on Linux."
+        "Ephemeral runners give hermetic, reproducible builds (clean state every time) and let independent jobs run in parallel. The orchestrator persists run \u2192 stage \u2192 job \u2192 attempt state with runner leases, a retry policy, queue/start/end times, and log pointers, so a crashed run resumes the unfinished jobs or fails cleanly, a flaky job reruns as a new attempt, and a lost runner's lease expires and reschedules.",
+        "Heterogeneous targets need heterogeneous runners: Linux containers for backend and web, dedicated macOS hosts for iOS (Xcode), and Linux again for Android."
       ],
       "view": {
         "nodes": [
@@ -884,7 +1047,7 @@
           "description": "A controller (Tekton/Argo-style) compiles each run into a DAG and schedules every job as an ephemeral pod, scaling runners with the cluster.",
           "pros": [
             "Hermetic by construction: one fresh pod per job.",
-            "Elastic — autoscale runners with cluster capacity.",
+            "Elastic \u2014 autoscale runners with cluster capacity.",
             "DAG dependencies and retries are first-class."
           ],
           "cons": [
@@ -939,7 +1102,7 @@
             "highlight": [
               "Orchestrator"
             ],
-            "caption": "A central controller drives a pool of persistent agents — simple but harder to keep hermetic and to scale."
+            "caption": "A central controller drives a pool of persistent agents \u2014 simple but harder to keep hermetic and to scale."
           }
         },
         {
@@ -950,7 +1113,7 @@
             "Ephemeral, hermetic runners out of the box."
           ],
           "cons": [
-            "Constrained build environments — macOS/iOS support is limited and costly.",
+            "Constrained build environments \u2014 macOS/iOS support is limited and costly.",
             "Less control over caching, network, and custom hardware.",
             "Per-minute cost scales with a large monorepo."
           ],
@@ -994,6 +1157,12 @@
           "definition": "Isolation that prevents untrusted PR code (e.g. from a fork) from accessing secrets or writing shared caches.",
           "whyItMatters": "A malicious PR could otherwise exfiltrate signing keys or poison the cache for everyone.",
           "example": "Fork PRs run on a restricted pool with no secrets and read-only cache."
+        },
+        {
+          "term": "Queue fairness / priority",
+          "definition": "Scheduling that shares scarce runner capacity across job classes (PR, main, release, mobile) instead of FIFO.",
+          "whyItMatters": "A burst of PR jobs shouldn't starve a release deploy or scarce macOS iOS jobs; priorities and per-class quotas keep the critical path moving.",
+          "example": "Release/main jobs preempt PR jobs for the macOS pool; each class gets a guaranteed minimum slot quota."
         }
       ],
       "whyNow": [
@@ -1061,7 +1230,7 @@
       "id": "fast-feedback",
       "title": "3. Fast Feedback: Affected-Only Builds + Caching",
       "description": [
-        "A clean runner every time is reproducible but slow: it re-downloads dependencies and recompiles unchanged code. Two levers cut PR latency to the target.",
+        "A clean runner every time is reproducible but slow: each one re-downloads dependencies and recompiles unchanged code. Two levers cut PR latency to the target.",
         "First, affected-only builds: compute the dependency graph and run jobs only for targets the diff touches \u2014 a web-only change shouldn't build 40 backend services or the mobile apps.",
         "Second, a shared build cache keyed by content (lockfile hash, source hash): restore dependency caches, compiler/test caches, and container layers so unchanged work is skipped while staying hermetic."
       ],
@@ -1082,8 +1251,122 @@
         ]
       },
       "decisionPrompt": "How do you key the cache so it's reused safely but never returns stale outputs?",
+      "options": [
+        {
+          "name": "Affected-only builds + remote cache (default)",
+          "description": "Compute the affected-target graph from the diff and run only those jobs, restoring a shared content-keyed cache (deps, compile, test) so unchanged work is skipped.",
+          "pros": [
+            "Biggest win per unit of effort on a monorepo; bounds work to the change.",
+            "Hermetic and correct if the cache key is the full input hash.",
+            "Cache is shared across runners, so cold runners still skip work."
+          ],
+          "cons": [
+            "Needs an accurate dependency graph; a missed edge ships an untested target.",
+            "Cache egress can saturate on a wide p95 change (200+ jobs restoring at once)."
+          ],
+          "view": {
+            "nodes": [
+              "Trigger",
+              "Orchestrator",
+              "RunnerPool",
+              "Cache"
+            ],
+            "links": [
+              "trigger-orch",
+              "orch-runner",
+              "runner-cache"
+            ],
+            "highlight": [
+              "Cache"
+            ],
+            "caption": "Run only affected targets and restore a shared content-keyed cache so unchanged work is skipped."
+          }
+        },
+        {
+          "name": "Remote build execution (RBE)",
+          "description": "Distribute individual compile/test actions across a large remote farm with a shared action cache (Bazel-style), so a single big target fans out across many machines.",
+          "pros": [
+            "Scales a single huge affected graph far past one runner's cores.",
+            "Action-level caching reuses results across PRs and people."
+          ],
+          "cons": [
+            "Requires hermetic, action-granular builds (a big migration to Bazel/Buck).",
+            "Network/coordination overhead; only pays off at large scale."
+          ],
+          "view": {
+            "nodes": [
+              "Orchestrator",
+              "RunnerPool",
+              "Cache"
+            ],
+            "links": [
+              "orch-runner",
+              "runner-cache"
+            ],
+            "highlight": [
+              "RunnerPool",
+              "Cache"
+            ],
+            "caption": "Fan individual build/test actions across a remote farm backed by a shared action cache."
+          }
+        },
+        {
+          "name": "Test selection / predictive testing",
+          "description": "Run only the tests a change is predicted to affect (coverage map or ML model) instead of the full suite for affected targets.",
+          "pros": [
+            "Cuts test time further when even affected targets have huge suites.",
+            "Complements affected-only builds rather than replacing them."
+          ],
+          "cons": [
+            "Selection model can miss a real regression (false negative) \u2014 needs a periodic full run as a safety net.",
+            "Coverage data must stay fresh or selection drifts."
+          ],
+          "view": {
+            "nodes": [
+              "Orchestrator",
+              "RunnerPool",
+              "Cache"
+            ],
+            "links": [
+              "orch-runner",
+              "runner-cache"
+            ],
+            "highlight": [
+              "RunnerPool"
+            ],
+            "caption": "Select only the tests predicted to be affected; back it with a periodic full run."
+          }
+        },
+        {
+          "name": "Full rebuild with massive parallelism",
+          "description": "Skip affected-graph and selection logic; rebuild and test everything on every change, just with a very large runner pool.",
+          "pros": [
+            "Dead simple and always correct \u2014 no graph to get wrong.",
+            "No risk of skipping a target that should have been tested."
+          ],
+          "cons": [
+            "Enormously wasteful at 40 services; cost scales with commit rate.",
+            "Even fully parallel, the slowest target sets PR latency."
+          ],
+          "view": {
+            "nodes": [
+              "Orchestrator",
+              "RunnerPool"
+            ],
+            "links": [
+              "orch-runner"
+            ],
+            "highlight": [
+              "RunnerPool"
+            ],
+            "caption": "Rebuild and test everything every time, leaning only on a large runner pool \u2014 simple but wasteful."
+          }
+        }
+      ],
       "patterns": [
-        "Affected-only builds"
+        "Affected-only builds",
+        "Merge queue",
+        "Flaky-test quarantine"
       ],
       "concepts": [
         {
@@ -1091,6 +1374,18 @@
           "definition": "The set of build targets reachable from changed files through the dependency graph.",
           "whyItMatters": "Bounds work to the change, the single biggest monorepo speedup.",
           "example": "Touching a shared auth lib rebuilds its dependents; touching web CSS does not."
+        },
+        {
+          "term": "Merge queue",
+          "definition": "A queue that serializes merges to main and re-tests each PR against the current head (often speculatively, in batches) before it lands.",
+          "whyItMatters": "A PR that was green hours ago can break main when it merges onto a moved head; the queue keeps main green as concurrency rises.",
+          "example": "Five PRs queue; CI tests each against the projected head, batching to amortize cost, and only merges those that pass."
+        },
+        {
+          "term": "Flaky-test quarantine",
+          "definition": "Marking a known non-deterministic test so it still runs and is recorded, but no longer blocks merges, while keeping its flake rate and owner visible so the team fixes it rather than ignoring it.",
+          "whyItMatters": "Unbounded 'rerun until green' makes the pipeline lie; quarantine isolates flakes without hiding them.",
+          "example": "A test with a 30% rolling flake rate is quarantined, its owner notified, and reruns are bounded and logged."
         }
       ],
       "whyNow": [
@@ -1103,7 +1398,18 @@
             "Key = hash of all declared inputs: source files, lockfiles, toolchain version, build flags, and platform \u2014 not branch or time.",
             "Namespace the cache and make untrusted-PR builds read-only: a fork's job may read trusted entries but must not write, or it can poison main's cache.",
             "Always have a correctness fallback: a cache miss rebuilds from source; a cache hit must be byte-identical to a fresh build (hermetic) or the key is wrong.",
-            "Observe hit rate per target; a sudden drop signals a key that's too specific (no reuse) or a non-hermetic input leaking in."
+            "Observe hit rate per target; a sudden drop signals a key that's too specific (no reuse) or a non-hermetic input leaking in.",
+            "Watch cache egress, not just hit rate: a p95 shared-lib change restoring 200+ targets at once can saturate cache bandwidth and runner slots even when the average PR looks tiny."
+          ]
+        },
+        {
+          "title": "Merge queues + flaky tests (keeping main green as concurrency grows)",
+          "points": [
+            "Stale-green problem: a PR that passed CI hours ago can break main when it lands, because main has advanced since the PR was tested and the PR was never re-tested against the newer tip. A merge queue re-tests each PR against the projected head before it lands.",
+            "Speculative/batched execution: test PRs in batches against the projected head to amortize CI cost; if a batch fails, bisect to find the culprit and requeue the innocents.",
+            "Flaky tests poison this: one flaky test in a batch can fail the whole batch, starve the queue, and hide which PR actually broke. Bound reruns, attribute failures per test, and quarantine known flakes so they don't gate the queue.",
+            "Record every attempt (job_attempts) \u2014 never let an unaudited 'rerun until green' silently convert a real red into a green. Track per-test flake_rate and owner in test_results; quarantine is bounded, visible, and audited, not a permanent mute.",
+            "Keep a confidence signal: blocking tests gate merges; quarantined/non_blocking ones are reported to owners but don't block, with a periodic full run to catch regressions hidden by selection."
           ]
         }
       ],
@@ -1117,11 +1423,28 @@
           "trap": "Letting untrusted fork PRs write to the shared cache.",
           "why": "A malicious PR can seed a poisoned entry that later trusted builds restore.",
           "instead": "Read-only cache for untrusted PRs; only trusted (post-merge) jobs write."
+        },
+        {
+          "trap": "Rerunning a failed job until it goes green and merging.",
+          "why": "It converts a real regression into a false pass and trains everyone to ignore red \u2014 the pipeline stops being trustworthy.",
+          "instead": "Bound reruns, record every attempt, attribute failures per test, and quarantine known flakes (visible to owners) instead of masking them."
+        }
+      ],
+      "failureDrills": [
+        {
+          "scenario": "A flaky integration suite intermittently fails, either blocking every PR or, when reruns mask it, letting a real regression through.",
+          "expectedBehavior": "The flake is detected from its rolling flake_rate, quarantined as non-blocking-but-visible, and its owner notified; bounded reruns and recorded attempts mean a genuine failure still surfaces.",
+          "mitigation": "Track per-test flake_rate/owner, bound reruns, quarantine known flakes, and keep a periodic full run so quarantined tests can't hide regressions forever."
+        },
+        {
+          "scenario": "A flaky test inside a merge-queue batch fails the whole batch.",
+          "expectedBehavior": "The queue bisects to find the real culprit and requeues the innocent PRs instead of rejecting all of them or stalling.",
+          "mitigation": "Attribute failures per test, exclude quarantined flakes from gating the queue, and batch with bisection so one flake can't starve the queue."
         }
       ],
       "followUps": [
-        "Add a merge queue / speculative pre-merge testing so main stays green as concurrency grows.",
-        "Remote build execution + test selection for when the affected graph itself gets huge."
+        "When does remote build execution (action-level distribution) pay for the migration off plain affected-only builds?",
+        "How do you tune the merge-queue batch size against flake rate so the queue neither stalls nor lets regressions through?"
       ],
       "recap": {
         "before": "Every job rebuilt from scratch.",
@@ -1209,7 +1532,7 @@
       "failureDrills": [
         {
           "scenario": "Attestation is missing, or the signing key was rotated mid-release so the digest no longer verifies.",
-          "expectedBehavior": "Admission fails closed — the deploy is blocked, not silently allowed; the run is flagged for re-sign/re-attest.",
+          "expectedBehavior": "Admission fails closed \u2014 the deploy is blocked, not silently allowed; the run is flagged for re-sign/re-attest.",
           "mitigation": "Verify signature + provenance at admission, version signing keys, and overlap old/new keys during rotation."
         }
       ],
@@ -1224,9 +1547,9 @@
       "title": "5. Progressive Delivery for Services + Web (canary / blue-green, GitOps)",
       "description": [
         "Promotion is a separate concern from build. A deployment controller takes an artifact version and rolls it into an environment using a progressive strategy instead of replacing everything at once.",
-        "Canary: route a small slice of traffic to the new version, watch metrics, then ramp. Blue-green: stand up the new version alongside the old and flip the router once healthy. The web bundle ships as immutable, versioned assets to the CDN and is activated by flipping a single active-version pointer (e.g. index.html / a manifest), with old asset versions kept and cache-busting on the bundle hash so cached clients stay consistent.",
+        "For services, two strategies: canary routes a small slice of traffic to the new version, watches metrics, then ramps; blue-green stands up the new version alongside the old and flips the router once healthy. The web bundle is different: ship immutable, versioned assets to the CDN and activate a release by flipping a single active-version pointer (e.g. index.html / a manifest), keeping old asset versions and cache-busting on the bundle hash so already-cached clients stay consistent.",
         "Web releases must stay compatible with the backend: a bundle that calls an API not yet live for all users will break. Gate the active-pointer flip on the API being deployed first, or feature-flag the new client path.",
-        "Desired state is declared in Git (GitOps): the controller reconciles the cluster to match, so every change is reviewed, audited, and revertible by reverting a commit. Approvals are a durable, gated workflow — recorded with actor, policy, and expiry — before promotion into staging and prod."
+        "Desired state is declared in Git (GitOps): the controller reconciles the cluster to match, so every change is reviewed, audited, and revertible by reverting a commit. Approvals are a durable, gated workflow \u2014 recorded with actor, policy, and expiry \u2014 before promotion into staging and prod."
       ],
       "view": {
         "nodes": [
@@ -1254,15 +1577,15 @@
       "options": [
         {
           "name": "Canary (default)",
-          "description": "Route a small % of live traffic to the new version, compare its golden signals to stable, then ramp 5% → 25% → 100% or abort.",
+          "description": "Route a small % of live traffic to the new version, compare its golden signals to stable, then ramp 5% \u2192 25% \u2192 100% or abort.",
           "pros": [
-            "Smallest blast radius — a bad version hurts a fraction of users.",
+            "Smallest blast radius \u2014 a bad version hurts a fraction of users.",
             "Real production traffic exercises the new version.",
             "Natural place to attach automated gates."
           ],
           "cons": [
             "Needs enough traffic for signals to be significant.",
-            "Both versions run at once — must be forward/backward compatible (schema, APIs)."
+            "Both versions run at once \u2014 must be forward/backward compatible (schema, APIs)."
           ],
           "view": {
             "nodes": [
@@ -1296,7 +1619,7 @@
           ],
           "cons": [
             "2x capacity during the overlap.",
-            "All-or-nothing — no gradual blast-radius bounding, so the first bad request hits everyone."
+            "All-or-nothing \u2014 no gradual blast-radius bounding, so the first bad request hits everyone."
           ],
           "view": {
             "nodes": [
@@ -1324,11 +1647,11 @@
           "description": "Replace instances a few at a time in place until the whole fleet runs the new version.",
           "pros": [
             "No extra capacity needed.",
-            "Built into Kubernetes Deployments — simplest to operate."
+            "Built into Kubernetes Deployments \u2014 simplest to operate."
           ],
           "cons": [
             "Mixed-version window with no traffic control or fast abort.",
-            "Rollback means rolling forward again — slower than a traffic flip."
+            "Rollback means rolling forward again \u2014 slower than a traffic flip."
           ],
           "view": {
             "nodes": [
@@ -1348,7 +1671,7 @@
               "Deployer",
               "K8s"
             ],
-            "caption": "Rolling update swaps instances in batches — no extra capacity, but a mixed-version window and slow abort."
+            "caption": "Rolling update swaps instances in batches \u2014 no extra capacity, but a mixed-version window and slow abort."
           }
         }
       ],
@@ -1365,6 +1688,16 @@
             "Trade-off: GitOps adds a reconcile loop and a second repo to manage, and emergency changes still need a fast path; imperative is simpler for one-off or break-glass actions.",
             "Common shape: GitOps for steady-state desired version + an imperative pause/abort/rollback path for the live rollout state machine."
           ]
+        },
+        {
+          "title": "Coordinating one feature across server + web + mobile (flags)",
+          "points": [
+            "Order matters: deploy the backend that is compatible with both old and new clients first, so nothing breaks before the feature is even on.",
+            "Web flips its active-version pointer once the backend is live; the new bundle's path stays behind the flag until ramp.",
+            "Mobile can't flip \u2014 the binary ships through store review and staged rollout, so the feature must stay flag-gated for clients that already updated.",
+            "Once all surfaces carry the code, ramp the flag centrally (1% \u2192 100%); a single kill switch disables the feature everywhere without any redeploy.",
+            "The flag service is external to CI/CD but a hard dependency: it owns flag ownership, rollout %, kill-switch state, and audit history, and the release records reference required_flags + min_backend_version."
+          ]
         }
       ],
       "concepts": [
@@ -1373,6 +1706,12 @@
           "definition": "Send a small % of traffic to the new version, compare health, then ramp or abort.",
           "whyItMatters": "Bounds blast radius \u2014 a bad version hurts 1% of users, not everyone.",
           "example": "5% -> 25% -> 100% with metric checks between steps."
+        },
+        {
+          "term": "Deploy vs. release (feature flags)",
+          "definition": "Deploying ships code to servers; releasing exposes a feature to users. A feature flag separates the two so code can land dark and be turned on independently.",
+          "whyItMatters": "It is the only 'rollback' for code already on user devices and the way to coordinate one feature across server, web, and mobile under version skew.",
+          "example": "Ship the new flow behind a flag, deploy the compatible backend, then ramp the flag \u2014 or hit the kill switch \u2014 across all clients."
         }
       ],
       "whyNow": [
@@ -1380,6 +1719,93 @@
       ],
       "flows": [
         {
+          "title": "Approval \u2192 admission \u2192 GitOps \u2192 rollout",
+          "sequence": {
+            "participants": [
+              {
+                "id": "Orchestrator"
+              },
+              {
+                "id": "Deployer",
+                "label": "Deploy Controller"
+              },
+              {
+                "id": "PipelineDB",
+                "label": "State Store"
+              },
+              {
+                "id": "Git",
+                "label": "GitOps repo"
+              },
+              {
+                "id": "K8s",
+                "label": "Cluster"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Orchestrator",
+                "to": "Deployer",
+                "arrow": "->>",
+                "label": "POST /deployments v123 -> prod"
+              },
+              {
+                "from": "Deployer",
+                "to": "Deployer",
+                "arrow": "->>",
+                "label": "admission: signature + provenance + scan + policy"
+              },
+              {
+                "type": "alt",
+                "label": "policy requires approval",
+                "messages": [
+                  {
+                    "from": "Deployer",
+                    "to": "PipelineDB",
+                    "arrow": "->>",
+                    "label": "record state=pending_approval"
+                  },
+                  {
+                    "from": "Orchestrator",
+                    "to": "Deployer",
+                    "arrow": "->>",
+                    "label": "POST /approve (actor, policy)"
+                  }
+                ]
+              },
+              {
+                "from": "Deployer",
+                "to": "Git",
+                "arrow": "->>",
+                "label": "commit desired rev (GitOps)"
+              },
+              {
+                "from": "Git",
+                "to": "Deployer",
+                "arrow": "-->>",
+                "label": "reconcile desired state"
+              },
+              {
+                "from": "Deployer",
+                "to": "K8s",
+                "arrow": "->>",
+                "label": "start canary ramp"
+              },
+              {
+                "from": "Deployer",
+                "to": "PipelineDB",
+                "arrow": "->>",
+                "label": "state=ramping"
+              }
+            ]
+          },
+          "highlight": [
+            "Deployer",
+            "PipelineDB"
+          ]
+        },
+        {
+          "title": "Canary ramp with gate",
           "sequence": {
             "participants": [
               {
@@ -1460,7 +1886,7 @@
         "Make the canary self-driving. Wire the deployment controller to observability: every rollout step compares the canary's golden signals (error rate, latency, saturation) and the service's SLO error budget against the stable version.",
         "If a gate fails, the controller automatically aborts the ramp and rolls back to the previous known-good version \u2014 instantly for services/web because the old version is still running and you just shift traffic back. Deploy markers correlate the regression with the exact version.",
         "This closes the loop: bad releases are detected and reverted without a human in the critical path, satisfying the 'no bad version reaches everyone' requirement.",
-        "Rollout is a state machine, not a single shift: pending_approval → ramping → (paused) → live, or → aborted → rollback_in_progress → rolled_back, with manual override and a post-rollback verification step. A gate needs explicit inputs — which signal, what window, what threshold, and a minimum sample size — so 'metrics healthy' can't hide a noisy or under-sampled canary."
+        "Rollout is a state machine, not a single shift: pending_approval \u2192 ramping \u2192 (paused) \u2192 live, or \u2192 aborted \u2192 rollback_in_progress \u2192 rolled_back, with manual override and a post-rollback verification step. A gate needs explicit inputs \u2014 which signal, what window, what threshold, and a minimum sample size \u2014 so 'metrics healthy' can't hide a noisy or under-sampled canary."
       ],
       "view": {
         "nodes": [
@@ -1493,7 +1919,7 @@
           "term": "Expand / contract migration",
           "definition": "Roll out a schema change in compatible phases: add the new field (expand), deploy code that writes both, backfill, then remove the old field later (contract).",
           "whyItMatters": "Keeps old and new app versions both working during a canary, so a traffic-shift rollback stays safe.",
-          "example": "Add nullable column → dual-write → backfill → switch reads → drop old column in a later release."
+          "example": "Add nullable column \u2192 dual-write \u2192 backfill \u2192 switch reads \u2192 drop old column in a later release."
         }
       ],
       "whyNow": [
@@ -1503,7 +1929,7 @@
         {
           "title": "Migrations inside a rollout (expand/contract)",
           "points": [
-            "Never couple a destructive schema change to the same release that depends on it — a canary rollback can't undo a dropped column.",
+            "Never couple a destructive schema change to the same release that depends on it \u2014 a canary rollback can't undo a dropped column.",
             "Expand: deploy a backward-compatible schema (add nullable columns/tables) first, independent of app code.",
             "Migrate: deploy the app that dual-writes, backfill data in the background, then switch reads to the new shape.",
             "Contract: only after the old version is fully gone and verified, remove old fields in a later release.",
@@ -1516,7 +1942,80 @@
             "Signals: error rate, latency (p95/p99), saturation, plus business guardrails (conversion, revenue) and synthetic checks.",
             "For mobile: crash-free sessions and ANR rate feed the same gate model.",
             "Each gate names a window and threshold (e.g. 5xx > 3x stable over 2 min) AND a minimum sample size, so low-traffic canaries don't pass or fail on noise.",
-            "Slow signals (weekly retention, billing) can't gate a minutes-long canary — guard those with flags and post-release monitoring instead."
+            "Slow signals (weekly retention, billing) can't gate a minutes-long canary \u2014 guard those with flags and post-release monitoring instead."
+          ]
+        }
+      ],
+      "flows": [
+        {
+          "title": "Gate failure \u2192 rollback state machine",
+          "sequence": {
+            "participants": [
+              {
+                "id": "K8s",
+                "label": "Cluster"
+              },
+              {
+                "id": "Metrics",
+                "label": "Gates"
+              },
+              {
+                "id": "Deployer",
+                "label": "Deploy Controller"
+              },
+              {
+                "id": "PipelineDB",
+                "label": "State Store"
+              }
+            ],
+            "messages": [
+              {
+                "from": "K8s",
+                "to": "Metrics",
+                "arrow": "->>",
+                "label": "canary telemetry"
+              },
+              {
+                "from": "Metrics",
+                "to": "Deployer",
+                "arrow": "->>",
+                "label": "gate FAIL (5xx 3x, sample met)"
+              },
+              {
+                "from": "Deployer",
+                "to": "Deployer",
+                "arrow": "->>",
+                "label": "pause -> abort ramp"
+              },
+              {
+                "from": "Deployer",
+                "to": "PipelineDB",
+                "arrow": "->>",
+                "label": "state=rollback_in_progress"
+              },
+              {
+                "from": "Deployer",
+                "to": "K8s",
+                "arrow": "->>",
+                "label": "shift 100% to prev_good (kept warm)"
+              },
+              {
+                "from": "Deployer",
+                "to": "Metrics",
+                "arrow": "->>",
+                "label": "post-rollback verification"
+              },
+              {
+                "from": "Deployer",
+                "to": "PipelineDB",
+                "arrow": "->>",
+                "label": "state=rolled_back + audit event"
+              }
+            ]
+          },
+          "highlight": [
+            "Deployer",
+            "Metrics"
           ]
         }
       ],
@@ -1527,14 +2026,14 @@
           "mitigation": "Keep old version warm during canary so rollback is a traffic shift, not a redeploy."
         },
         {
-          "scenario": "Canary metric looks bad but it's noise — the canary gets too little traffic for the signal to be significant.",
+          "scenario": "Canary metric looks bad but it's noise \u2014 the canary gets too little traffic for the signal to be significant.",
           "expectedBehavior": "The gate withholds a verdict until the minimum sample size is met instead of flapping abort/ramp.",
           "mitigation": "Require a minimum request count per gate; widen the window or raise the canary % for low-traffic services."
         },
         {
           "scenario": "Canary ships a destructive migration (drops a column the stable version still reads).",
           "expectedBehavior": "Stable starts erroring; a traffic-shift rollback does NOT fix it because the schema is already gone.",
-          "mitigation": "Use expand/contract — never drop in the same release; the canary only ever runs against a compatible schema."
+          "mitigation": "Use expand/contract \u2014 never drop in the same release; the canary only ever runs against a compatible schema."
         },
         {
           "scenario": "A new web bundle calls a backend API not yet available to all users.",
@@ -1566,8 +2065,8 @@
       "description": [
         "Mobile breaks the server model: you can't shift traffic, users update on their own schedule, and Apple/Google gate releases with review. The pipeline reflects this different cadence.",
         "CI signs the binaries (iOS .ipa on a macOS runner, Android .aab) and the deployer uploads to App Store Connect and Google Play. Internal/TestFlight and Play internal tracks get the build first for QA, then it's submitted for review.",
-        "Release safely with staged rollout \u2014 Play's percentage rollout and phased App Store release expose the build to a growing fraction of users. There is no instant rollback: you can halt the rollout and ship a forward-fix or, on Play, roll back to a prior version for users who haven't updated. Feature flags + a server-driven kill switch are the real 'rollback' for code already on devices.",
-        "The store workflow is asynchronous and stateful, so the pipeline tracks it rather than controlling it: a release moves through internal/TestFlight or Play internal \u2192 closed/open \u2192 production tracks, and a review status (pending \u2192 in_review \u2192 approved/rejected) the pipeline learns via store callbacks or polling. Crash-free sessions and adoption metrics feed a crash gate that can halt the staged rollout, just like SLO gates do for services.",
+        "Release safely with staged rollout \u2014 Play's percentage rollout and phased App Store release expose the build to a growing fraction of users. There is no instant rollback (you can't force-downgrade users): you can halt the rollout and ship a forward-fix or, on Play, roll back to a prior version for users who haven't updated yet. Feature flags plus a server-driven kill switch are the real 'rollback' for binaries already installed on devices.",
+        "The store workflow is asynchronous and stateful, so the pipeline tracks it rather than controlling it. A release advances through tracks (internal/TestFlight or Play internal \u2192 closed/open \u2192 production) and a review status (pending \u2192 in_review \u2192 approved/rejected) that the pipeline learns about via store callbacks or polling. Crash-free sessions and adoption metrics feed a crash gate that can halt the staged rollout, just like SLO gates do for services.",
         "Version skew is a first-class concern: because users update on their own schedule, the backend must support old clients for weeks. Each release records a min_backend_version and the kill switches it depends on, and a compatibility policy defines how long old clients are supported."
       ],
       "view": {
@@ -1591,6 +2090,100 @@
         ]
       },
       "decisionPrompt": "Why can't mobile use the same instant traffic-shift rollback as the services?",
+      "options": [
+        {
+          "name": "Self-hosted macOS runners + Fastlane (default)",
+          "description": "Run your own macOS hosts/VMs for iOS builds and drive signing, upload, and store submission with Fastlane (and Gradle Play Publisher for Android).",
+          "pros": [
+            "Full control over Xcode versions, signing material, and caching.",
+            "No per-minute premium; predictable cost at steady volume.",
+            "Same secrets/vault story as the rest of the pipeline."
+          ],
+          "cons": [
+            "You operate scarce, expensive macOS hardware/VMs (Apple licensing limits virtualization).",
+            "Certificate/profile and Xcode upkeep is real ops toil."
+          ],
+          "view": {
+            "nodes": [
+              "RunnerPool",
+              "Signing",
+              "Deployer",
+              "AppStore"
+            ],
+            "links": [
+              "runner-signing",
+              "orch-deployer",
+              "deployer-store"
+            ],
+            "highlight": [
+              "RunnerPool",
+              "Signing"
+            ],
+            "caption": "Own macOS runners build/sign iOS; Fastlane drives upload and store submission."
+          }
+        },
+        {
+          "name": "Managed mobile CI (Bitrise / Codemagic / EAS)",
+          "description": "Rent macOS build capacity and store-submission automation from a managed mobile-CI provider.",
+          "pros": [
+            "No macOS fleet to operate; Xcode images maintained for you.",
+            "Built-in signing, store upload, and device farms."
+          ],
+          "cons": [
+            "Higher per-minute cost; macOS minutes are the priciest.",
+            "Less control over caching/network and custom toolchains; signing material lives with a third party."
+          ],
+          "view": {
+            "nodes": [
+              "RunnerPool",
+              "Signing",
+              "Deployer",
+              "AppStore"
+            ],
+            "links": [
+              "runner-signing",
+              "orch-deployer",
+              "deployer-store"
+            ],
+            "highlight": [
+              "Deployer"
+            ],
+            "caption": "A managed mobile-CI provider owns the macOS fleet and store automation."
+          }
+        },
+        {
+          "name": "Hybrid: Linux for Android, scarce macOS for iOS",
+          "description": "Build/test Android on the cheap Linux pool and reserve the scarce macOS pool strictly for iOS signing/builds, queued with priority.",
+          "pros": [
+            "Keeps the macOS bottleneck for only the jobs that truly need it.",
+            "Android shares the main Linux runner economics and caching."
+          ],
+          "cons": [
+            "Two toolchains and two queues to reason about.",
+            "iOS still gated by macOS capacity; needs queue priority for releases."
+          ],
+          "view": {
+            "nodes": [
+              "RunnerPool",
+              "Signing",
+              "Deployer",
+              "AppStore"
+            ],
+            "links": [
+              "runner-signing",
+              "orch-deployer",
+              "deployer-store"
+            ],
+            "highlight": [
+              "RunnerPool"
+            ],
+            "caption": "Android builds on Linux; the scarce macOS pool is reserved for iOS signing/builds."
+          }
+        }
+      ],
+      "patterns": [
+        "Flag-coordinated release"
+      ],
       "concepts": [
         {
           "term": "Staged rollout",
@@ -1600,7 +2193,7 @@
         },
         {
           "term": "Release tracks & review state",
-          "definition": "Stores expose tracks (TestFlight/internal → closed/open → production) and a review status the pipeline must poll or receive as a callback, not control directly.",
+          "definition": "Stores expose tracks (TestFlight/internal \u2192 closed/open \u2192 production) and a review status the pipeline must poll or receive as a callback, not control directly.",
           "whyItMatters": "The platform tracks an async, externally-owned state machine instead of pretending it can deploy like Kubernetes.",
           "example": "A mobile_releases row holds track, store_submission_id, review_status, and rollout_pct."
         },
@@ -1614,8 +2207,21 @@
       "whyNow": [
         "Mobile is the final piece: same artifact/quality gates, fundamentally different release mechanics."
       ],
+      "deepDives": [
+        {
+          "title": "Signing material lifecycle (certs, profiles, store roles)",
+          "points": [
+            "iOS needs an Apple distribution certificate + provisioning profile; Android needs the upload key and (with Play App Signing) Google holds the app-signing key. All live in the vault, never in source or logs.",
+            "Certificates and profiles expire \u2014 an expired cert silently breaks release builds. Track expiry, alert ahead, and rotate before the deadline.",
+            "Plan key rotation: overlap old/new signing material during the rotation window so in-flight releases still verify; Play App Signing makes upload-key rotation safer than self-managed keys.",
+            "App-store role permissions are part of the trust boundary: only the release service identity (not individual engineers) should hold submit/release rights, with API keys scoped and short-lived.",
+            "Have an emergency revocation path: if signing material leaks, revoke + reissue and know which releases must be re-signed and re-submitted."
+          ]
+        }
+      ],
       "flows": [
         {
+          "title": "Store submission \u2192 review \u2192 staged rollout",
           "sequence": {
             "participants": [
               {
@@ -1718,6 +2324,16 @@
           "scenario": "A backend change must support mobile clients that won't update for weeks.",
           "expectedBehavior": "Old clients keep working; the new behavior is gated by flag and a min_backend_version, not forced on everyone.",
           "mitigation": "Additive/compatible API changes, version negotiation, and a deprecation window tied to adoption metrics."
+        },
+        {
+          "scenario": "The store rejects the build \u2014 privacy/metadata form failure or a policy violation, not a crash or backend issue.",
+          "expectedBehavior": "The release record moves to review_status=rejected and never reaches production; the pipeline surfaces the store's reason instead of retrying blindly.",
+          "mitigation": "Validate metadata/privacy declarations pre-submission, keep a forward-fix path, and treat rejection as a first-class terminal state with owner notification."
+        },
+        {
+          "scenario": "A flag that an active mobile release depends on is deleted or misconfigured while old clients are still in the wild.",
+          "expectedBehavior": "Clients fall back to a safe default rather than crashing; the kill switch can't itself become an outage.",
+          "mitigation": "Flags default-safe when absent, are change-controlled and audited, and required_flags on the release record document the dependency so a flag can't be removed while clients still need it."
         }
       ],
       "recap": {
@@ -1729,7 +2345,7 @@
   ],
   "finalDesign": {
     "title": "Final Design \u2014 CI/CD Pipeline",
-    "description": "A commit triggers an orchestrated DAG run on ephemeral runners that build only affected targets with shared, content-keyed caching, producing immutable signed artifacts (images, web bundle, mobile binaries) — each with an SBOM, scan result, and provenance attestation — in a registry. The Pipeline State Store holds run/stage/job state, approvals, environment_versions (the source of truth for what is live), and an audit log. A deployment controller promotes a verified artifact only after a deploy-time admission check (signature + provenance + scan + policy) and a durable approval, using canary/blue-green/rolling for services and a versioned CDN pointer for web, driven by GitOps with an imperative pause/abort/rollback path. Observability gates auto-rollback degraded canaries via the rollout state machine. Mobile takes a parallel, asynchronous path: signed binaries go to store tracks for review and staged rollout, with crash gates and feature-flag kill switches; feature flags (external to the CI/CD platform) are required for safe cross-client and mobile releases under version skew.",
+    "description": "A commit triggers an orchestrated DAG run on ephemeral runners that build only affected targets with shared, content-keyed caching, producing immutable signed artifacts (images, web bundle, mobile binaries) \u2014 each with an SBOM, scan result, and provenance attestation \u2014 in a registry. The Pipeline State Store holds run/stage/job state, approvals, environment_versions (the source of truth for what is live), and an audit log. A deployment controller promotes a verified artifact only after a deploy-time admission check (signature + provenance + scan + policy) and a durable approval, using canary/blue-green/rolling for services and a versioned CDN pointer for web, driven by GitOps with an imperative pause/abort/rollback path. Observability gates auto-rollback degraded canaries via the rollout state machine. Mobile takes a parallel, asynchronous path: signed binaries go to store tracks for review and staged rollout, with crash gates and feature-flag kill switches; feature flags (external to the CI/CD platform) are required for safe cross-client and mobile releases under version skew.",
     "view": {
       "nodes": [
         "Dev",
@@ -1763,9 +2379,106 @@
         "deployer-store",
         "k8s-metrics",
         "metrics-deployer",
-        "git-deployer"
+        "git-deployer",
+        "deployer-flags"
       ]
-    }
+    },
+    "flows": [
+      {
+        "title": "Commit to gated production",
+        "sequence": {
+          "participants": [
+            {
+              "id": "Git"
+            },
+            {
+              "id": "Orchestrator",
+              "label": "Orchestrator"
+            },
+            {
+              "id": "RunnerPool",
+              "label": "Runners"
+            },
+            {
+              "id": "Registry"
+            },
+            {
+              "id": "Deployer",
+              "label": "Deploy Controller"
+            },
+            {
+              "id": "Metrics",
+              "label": "Gates"
+            }
+          ],
+          "messages": [
+            {
+              "from": "Git",
+              "to": "Orchestrator",
+              "arrow": "->>",
+              "label": "webhook (idempotent) -> schedule DAG"
+            },
+            {
+              "from": "Orchestrator",
+              "to": "RunnerPool",
+              "arrow": "->>",
+              "label": "build/test affected targets"
+            },
+            {
+              "from": "RunnerPool",
+              "to": "Registry",
+              "arrow": "->>",
+              "label": "push signed artifact + SBOM + provenance"
+            },
+            {
+              "from": "Orchestrator",
+              "to": "Deployer",
+              "arrow": "->>",
+              "label": "promote version (approval)"
+            },
+            {
+              "from": "Deployer",
+              "to": "Registry",
+              "arrow": "->>",
+              "label": "deploy-time admission: signature + provenance + scan + policy"
+            },
+            {
+              "from": "Deployer",
+              "to": "Metrics",
+              "arrow": "->>",
+              "label": "canary ramp under SLO gate"
+            },
+            {
+              "type": "alt",
+              "label": "gate pass",
+              "messages": [
+                {
+                  "from": "Deployer",
+                  "to": "Metrics",
+                  "arrow": "->>",
+                  "label": "ramp to 100%, state=live"
+                }
+              ],
+              "else": {
+                "label": "gate fail",
+                "messages": [
+                  {
+                    "from": "Deployer",
+                    "to": "Metrics",
+                    "arrow": "->>",
+                    "label": "auto-rollback to prev_good"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "highlight": [
+          "Orchestrator",
+          "Deployer"
+        ]
+      }
+    ]
   },
   "technologyChoices": [
     {
@@ -1927,7 +2640,7 @@
       },
       "tradeoff": [
         "Flags are external to the CI/CD platform but a hard dependency for safe mobile and cross-client releases; build vs buy trades control for a managed targeting/SDK story.",
-        "The real 'rollback' for code already on user devices — there is no traffic shift for an installed app."
+        "The real 'rollback' for code already on user devices \u2014 there is no traffic shift for an installed app."
       ]
     },
     {

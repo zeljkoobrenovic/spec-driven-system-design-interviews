@@ -5,429 +5,364 @@ Review date: 2026-06-09
 
 ## Executive Summary
 
-This is a clear, focused distributed-systems interview. The walkthrough teaches
-the right spine: start with a single lock row, add consensus-backed state, add
-leases for liveness, add fencing tokens for real protected-resource safety,
-then discuss leader election, partitions, and scaling.
+This dataset has moved from a strong conceptual case to a production-credible
+distributed-systems walkthrough. The recent hardening pass addressed the largest
+prior gaps: capacity is now design-driving, retries use `requestId`, ownership
+uses `leaseId`, expiry is explicitly committed through consensus, fencing has a
+resource-side `max_seen_token` contract, and the data model now includes dedup,
+shard membership, expiration indexing, and resource fencing state.
 
-The main gap is that the dataset is still more conceptual than production
-contract. The hard ideas are named correctly, but the capacity model, API,
-data model, lease-expiry semantics, fencing integration, and operational
-surface are too thin for a strong senior/staff answer. The review should not
-push the case toward feature sprawl; it should make the existing correctness
-claims precise enough to defend.
+The remaining work is mostly about making the polished contract visible in the
+teaching surface. The API descriptions are strong, but only acquire has an API
+flow. The text mentions wait mode, shard movement, reconfiguration, and
+minority-side renewal failure, but those scenarios would benefit from one or two
+small diagrams or flows. The design is now sound; the next pass should improve
+how clearly candidates can rehearse the operational edge cases.
 
 | Axis | Rating | Notes |
 | --- | ---: | --- |
-| System design soundness | 4/5 | Correct CP, lease, fencing, and partition principles; needs sharper lease/time and source-of-truth mechanics. |
-| Production realism | 3.4/5 | Strong conceptual coverage, but API/model/ops/contracts are underspecified. |
-| Pedagogical flow | 4.2/5 | Excellent staged progression; options and final scaling step need more explicit trade-offs. |
-| Dataset/rendering fit | 4.5/5 | JSON and structured diagram references are clean; option labels/tradeoffs are sparse. |
-| Overall | 4/5 | A good book case that needs a precision pass before it feels production-grade. |
+| System design soundness | 4.6/5 | Correct CP/quorum, lease, fencing, expiry-ordering, retry, and sharding mechanics. |
+| Production realism | 4.3/5 | Much stronger API/model/ops contract; remaining gaps are watch/waiter behavior, shard migration details, and auth/tenant policy depth. |
+| Pedagogical flow | 4.6/5 | Excellent staged progression from naive row to consensus, leases, fencing, partitions, and scaling. |
+| Dataset/rendering fit | 4.4/5 | Structured views validate cleanly; API Flows page has placeholders for endpoints without sequences. |
+| Overall | 4.5/5 | A strong book case with a few remaining polish opportunities. |
 
 ## What Works Well
 
-- The central teaching choice is right: it does not pretend a lease alone makes
-  a distributed lock safe. It names fencing tokens as the real fix for the
-  paused-holder problem.
-- The baseline step is useful. The single-row design motivates both liveness
-  failure and split-brain/failover risk without wasting time.
-- The progression is coherent: consensus before leases, leases before fencing,
-  fencing before leader election, and partitions before scaling.
-- The final design integrates every major component introduced in the steps:
-  API, consensus leader/followers, replicated log, derived lock state, sweeper,
-  and protected resource.
-- The probe links are appropriate: Chubby, ZooKeeper, Raft, Redis locks,
-  Spanner, and SRE monitoring are all relevant references for this case.
-- Renderer-facing structure is mostly clean. The dataset uses structured
-  `view` and `sequence` objects rather than raw Mermaid for architecture and
-  flows.
+- The core teaching spine is excellent: naive lock row -> consensus-backed
+  state -> leases -> fencing tokens -> leader election -> partitions -> scaling.
+- The previous capacity gap is fixed. The dataset now converts active leases,
+  TTL, renewal interval, acquire/release QPS, and per-group throughput into an
+  approximate consensus-group count.
+- The API contract now includes the critical safety fields: `requestId`,
+  `leaseId`, wait/fail-fast mode, server-side TTL clamping, linearizable reads,
+  and retryable failover errors.
+- Expiry is now modeled correctly as a consensus-ordered operation, not a local
+  sweeper mutation. The renew-vs-expire race is explained clearly.
+- Fencing is no longer just a token in the lock response. The protected resource
+  must persist `max_seen_token` and reject stale tokens.
+- The data model now supports the promised behavior: lock state, replicated log,
+  request dedup, shard/group membership, expiration index, and external resource
+  fencing state.
+- Options now have useful titles and tradeoffs, especially for consensus vs
+  single-store/Redlock and CP vs AP partition handling.
+- Renderer-facing structure is healthy: the dataset uses structured `view` and
+  `sequence` objects, and the main node/link references resolve.
 
 ## Highest-Impact Issues
 
-### 1. Capacity is a concept list, not a design-driving model
+### 1. API flows lag behind the now-strong API contract
 
-The capacity section lists "many" keys, "seconds" TTL, a 3/5 consensus group,
-and CP semantics. Those are useful reminders, but they do not let a candidate
-size the service or defend design decisions.
+The API descriptions are much better than before, but only
+`POST /v1/locks/{key}/acquire` has a structured sequence. Renew, release, and
+read currently render as "No flow diagram defined for this endpoint" in the API
+Flows wrap-up.
 
-Why it matters: lock services are often dominated by renewal write load, hot
-keys, quorum round trips, and per-shard consensus throughput. Without concrete
-assumptions, Step 7 cannot explain when a single consensus group breaks, how
-many shards are needed, or what p99 latency target is realistic.
-
-Concrete fix:
-
-- Add assumed active locks, lock keys, acquire QPS, renew QPS, release QPS, and
-  read/status QPS.
-- Convert TTL and renewal interval into write load. For example: 1M active
-  locks renewing every 5 seconds means 200K renew writes/sec before replication.
-- Add a per-group throughput budget and derive number of consensus groups.
-- Add p50/p99 targets for acquire and renew, plus an availability target for
-  majority-side operation.
-- Estimate state size: current lock table, log retention before compaction,
-  snapshots, dedup/idempotency records, and expiration index.
-- Explicitly call out hot-key behavior: a single key cannot be horizontally
-  scaled for writes without weakening semantics.
-
-### 2. The API contract lacks the fields that make retries and ownership safe
-
-The API has acquire, renew, and release. That is the right minimal surface, but
-the requests only carry `clientId`, `ttlSec`, and sometimes `fencingToken`.
-They do not define retry idempotency, holder/session identity, wait semantics,
-error codes, TTL bounds, or stale-release behavior.
-
-Why it matters: clients will retry acquire/renew/release across timeouts and
-leader failover. If the API does not define operation IDs and ownership
-preconditions, a retry can create ambiguous grants, release someone else's
-lock, or hide whether a client still owns a lease.
+Why it matters: the most interesting operational behavior is in renew and
+release, not just acquire. A candidate should see how renew commits through the
+leader, how a timed-out renew becomes uncertain, and how stale release is a
+preconditioned no-op.
 
 Concrete fix:
 
-- Add an `Idempotency-Key` or `requestId` to acquire and release/renew writes,
-  scoped by tenant/client.
-- Return a durable `lockId` or `leaseId` in addition to `fencingToken`; renew
-  and release should require it.
-- Define fail-fast vs wait behavior: `waitMs`, `deadline`, or `mode:
-  "fail_fast" | "wait"`.
-- Define stale outcomes: `NOT_HOLDER`, `LEASE_EXPIRED`, `STALE_TOKEN`,
-  `QUORUM_UNAVAILABLE`, and retryable leader-redirect errors.
-- Put TTL policy in the contract: minimum/maximum TTL, server-side clamping,
-  and whether clients may request a TTL or only choose from policy.
-- Add authn/authz/tenant fields or a note that `clientId` is authenticated
-  identity, not a caller-supplied string.
+- Add a renew API flow showing `requestId`, `leaseId`, leader/quorum commit, and
+  the timeout/uncertain-ownership branch.
+- Add a release flow showing the precondition on `leaseId` and the stale-release
+  no-op after expiry/regrant.
+- Add a read flow or explicitly omit API flow cards for endpoints with no
+  sequence; placeholders make the wrap-up look incomplete.
+- In the acquire flow, include the replicated log participant. The current flow
+  jumps from leader/quorum to `LockState`; adding `Log` would reinforce that
+  lock state is derived from committed log entries.
 
-### 3. Lease expiry is shown as a direct state mutation, but it must be committed
+### 2. Waiting/watch semantics are introduced but not fully designed
 
-The diagrams and text show a `Sweeper` expiring stale leases against
-`LockState`. The text also says renew goes through consensus, but expiry is not
-shown as an operation proposed to the consensus log.
+Acquire supports `mode: "wait"` and `waitMs`, and the requirements say clients
+can block or fail fast. The dataset does not yet explain how waiting is
+implemented: polling, long-poll, server-side waiter queues, watches, or a
+notification stream.
 
-Why it matters: in a linearizable lock service, expiry changes ownership state.
-It cannot be an arbitrary local mutation by a background process. If multiple
-replicas independently expire leases based on local clocks, the design can
-reintroduce divergence. Expiry must be decided by the leader or proposed as a
-log entry and applied deterministically.
+Why it matters: distributed lock services are often coordination services, not
+just conditional-write APIs. Waiters, watches, and leader-election clients can
+create herd effects, stuck listeners, and subtle ordering expectations.
 
 Concrete fix:
 
-- Make the sweeper a leader-side task or a stateless worker that proposes
-  `expire(key, expectedLeaseId, observedExpiry)` through the leader.
-- Add a `sweeper-leader` or `sweeper-log` link instead of implying
-  `Sweeper -> LockState` direct mutation.
-- State exactly what time source drives expiry: leader monotonic time,
-  consensus-applied tick entries, or another bounded-clock model.
-- Explain the renew-vs-expire race: renew wins only if committed before the
-  expiry operation under the chosen ordering rule.
-- Add a small failure flow for "renew timeout near expiry" so candidates can
-  discuss uncertainty honestly.
+- State whether `waitMs` is a bounded long-poll, polling wrapper, or real
+  server-side wait queue.
+- If using wait queues, describe the ordering guarantee: best-effort FIFO,
+  priority, or no fairness guarantee.
+- Add backpressure for waiters separately from write QPS.
+- Mention watch/session behavior for leader-election users: how clients learn
+  they lost leadership and how followers learn a leader lock became free.
+- Scope fairness explicitly. It is acceptable to say the service provides
+  safety and bounded waiting, not strict fair locking.
 
-### 4. Fencing is correct conceptually but not yet a complete integration contract
+### 3. Shard movement and membership reconfiguration need one concrete path
 
-Step 4 correctly says the protected resource must reject stale tokens. The
-dataset stops before defining what the resource stores, which operations carry
-the token, and what happens when the resource cannot enforce fencing.
+Step 7 and the data model now mention `shard_map / group_membership`, controlled
+reconfiguration, and safe range movement. That is the right content, but it is
+still abstract compared with the clarity of the lease and fencing sections.
 
-Why it matters: the lock service alone cannot protect an external resource
-after a holder pause. The real contract is between the lock service, client,
-and protected resource. If the resource does not persist the highest accepted
-token per lock/resource, fencing is only a number in the response.
+Why it matters: key-space sharding is the scalability answer, and unsafe range
+movement can create exactly the duplicate-owner problem the lock service exists
+to prevent.
 
 Concrete fix:
 
-- Add a protected-resource contract: every guarded write carries
-  `(lockKey, fencingToken, holderId)` and the resource atomically checks
-  `token >= max_seen_token`.
-- Add a small data-model note for the resource-side `max_seen_token` or state
-  version, even if it is outside the lock service's storage.
-- Make the sequence use distinct old/new holders. The current flow reuses
-  `Client` for both, which weakens the paused-holder teaching moment.
-- State that locks without fencing are only advisory for resources that cannot
-  check tokens.
-- Mention token scope: per lock key, per resource, or global; per-key tokens
-  are usually enough and cheaper.
+- Add a short flow for moving a key range: mark source draining, transfer
+  snapshot/log tail, install destination owner, update shard map with version,
+  and stop serving the source.
+- Explain how API routers handle stale shard-map versions: redirect, refresh,
+  or reject with retryable error.
+- Clarify whether membership changes use joint consensus, one-node-at-a-time
+  replacement, or another safe reconfiguration rule.
+- Consider adding a small `ShardMap` node in the final diagram, or at least
+  mention in the caption that routing uses versioned shard metadata.
 
-### 5. The data model is too small for the behavior promised by the walkthrough
+### 4. The environment assumptions behind the capacity numbers should be named
 
-The model has `lock` and `replicated_log`, which covers the happy path but not
-retry safety, sessions, sharding, expiration lookup, applied indexes, or
-operational recovery.
+The capacity section is now useful and concrete. The remaining weakness is that
+the per-group throughput and latency figures depend heavily on deployment
+topology, storage durability, and whether the consensus group is single-region
+or cross-region.
 
-Why it matters: the final design claims durable, highly available,
-linearizable lock state with leases, fencing, leader failover, and sharding.
-The data model should show the minimum records that make those behaviors
-auditable and recoverable.
+Why it matters: 10-20K committed ops/sec and p99 20-30ms can be plausible in a
+well-tuned single-region setup, but not as a universal promise. A senior answer
+should make the assumptions explicit.
 
 Concrete fix:
 
-- Extend `lock` with `tenant`, `lease_id`, `holder_session_id`,
-  `last_renewed_at`, `expires_at`, `fencing_token`, `version`, `log_index`,
-  and status.
-- Extend `replicated_log.op` with operation ID, expected holder/lease, TTL,
-  token assigned, term, result, and request identity.
-- Add an idempotency/dedup table keyed by client/request ID and retained long
-  enough for safe retries.
-- Add shard or consensus-group metadata: key-range/ring ownership, leader,
-  members, term, health, and reconfiguration status.
-- Add an expiration index/timer wheel concept so the sweeper does not scan all
-  locks.
+- State "single-region / one availability-zone set" or "regional quorum" if
+  those latency numbers assume local quorum round trips.
+- Add a note that cross-region consensus trades much higher p99 latency for
+  regional-failure tolerance.
+- Say whether writes require fsync per op, group commit, or durable batching.
+- Treat the group count as an illustrative sizing pass, then add headroom for
+  tail latency, noisy neighbors, and shard imbalance.
 
 ## System Design Soundness
 
-The core design is sound. A CP consensus group is the right answer when the
-primary guarantee is "never grant two holders." The dataset also correctly
-separates liveness from safety: leases prevent permanent deadlock, while
-fencing protects the resource from paused or partitioned old holders.
+The design is fundamentally sound. A CP consensus group is the correct core for
+a correctness-critical lock service, and the dataset now avoids the common
+mistake of treating lease expiry as a local timer event. State changes,
+including expiry, are committed log operations. That makes ownership
+linearizable and gives a crisp answer for renew-vs-expire races.
 
-The consistency explanation should become more exact. "Quorum-relative expiry"
-is directionally right, but the dataset should say how expiry is ordered with
-renewals. A candidate should be able to explain whether expiry is a committed
-log operation, whether the leader uses monotonic time, and how a renewal that
-arrives near the deadline is accepted or rejected.
+The lease section is especially strong after the update. It covers renewal
+cadence, renewal load, false expiry, timeout uncertainty, and the instruction
+that a holder must stop acting when it cannot confirm ownership.
 
-The architecture should also clarify the source-of-truth boundary. `LockState`
-is derived from the replicated log, but several views show direct API or
-sweeper access to it. Reads may be served from applied state, but writes and
-expiry transitions should be proposed through the leader/log path.
+The fencing section is also strong. It correctly says the protected resource
+must participate by storing the highest accepted token. One useful extension
+would be to note that fencing only orders epochs; if guarded writes are retried
+or non-idempotent, the resource may still need operation IDs, CAS conditions, or
+idempotency at its own boundary.
 
-The fencing section is the strongest conceptual part. It should be preserved,
-then made more concrete by defining the resource-side token check and storing
-distinct old/new-holder examples.
+The scaling story is sound across keys. It correctly says a hot single lock
+cannot be horizontally scaled without weakening semantics. The shard-map and
+group-membership model are present; the remaining opportunity is to make range
+movement and stale-router behavior concrete.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: A Lock Row in a Single Database
 
-Good baseline. It motivates the next steps without caricaturing the single-row
-design. The trap is concrete and worth keeping.
-
-Improvement: add one sentence on where this design is acceptable: a single
-process, a tiny internal tool, or non-critical advisory locking. That makes
-the rejection feel scoped rather than absolute.
+This is a good baseline. It shows why an atomic row can work in the happy path,
+then scopes the rejection to correctness-critical, fleet-wide locks. The added
+"this is acceptable for tiny/advisory cases" paragraph prevents the lesson from
+sounding absolute.
 
 ### Step 2: Consensus-Backed Lock State
 
-This is the right first real mechanism. The step clearly teaches leader,
-quorum, log, and applied lock state. The option contrasting a single atomic
-store and independent SET NX stores is useful.
+This step is now strong. It explicitly says acquire, renew, release, and expire
+are all log entries, and it separates authoritative linearizable reads from
+stale inspection reads.
 
-Improvements:
+The option set is much better after adding titles and tradeoffs. The Redlock
+alternative is fairly framed as a timing-dependent design that is unsafe for
+critical locks without fencing.
 
-- Give the options labels and tradeoff text. Currently the option records have
-  descriptions but no titles/labels/tradeoffs, so the choice is less teachable
-  in the UI.
-- Make acquire, release, renew, and expire all log operations in the text.
-- Add a note about read behavior: linearizable reads through leader/read-index
-  vs stale follower reads for non-authoritative inspection.
+Improvement: align the acquire API sequence with the text by adding the
+replicated log participant before applying to lock state.
 
 ### Step 3: Leases with TTL (No Permanent Deadlock)
 
-The step correctly introduces bounded ownership and renewal. The TTL trade-off
-is also framed well: short TTL recovers faster but increases false expiry and
-renewal load.
+This is one of the strongest steps. It now connects TTL choice to renew load,
+latency, false expiry, and dead-holder recovery. The logged-expiry explanation
+is precise, and the renew-timeout flow teaches the right operational posture:
+ownership is uncertain, so stop acting until confirmed.
 
-Improvements:
-
-- Show expiry as a consensus-ordered transition, not a direct sweeper write.
-- Discuss renewal cadence in relation to TTL and p99 latency.
-- Add the operational load implication: renewals can dominate writes.
-- Define what a client must do after a renewal timeout. It may not know whether
-  the renewal committed; it should stop acting unless it can confirm ownership.
+Improvement: make the server-side TTL policy visible near the step, not only in
+the API description. Min/max TTL and clamping are important because clients
+should not be allowed to request pathological TTLs.
 
 ### Step 4: Fencing Tokens (The Fundamental Gap)
 
-This is the most important step, and it is mostly correct. It teaches that the
-protected resource must reject stale tokens, not just that the lock service
-hands out tokens.
+This is the central insight and it lands well. The sequence now uses distinct
+old and new holders, and the text defines the protected resource's
+`max_seen_token` state.
 
-Improvements:
-
-- Use separate participants for old holder and new holder in the sequence.
-- Add the protected resource's `max_seen_token` check to the model or text.
-- State that fencing requires cooperation from the guarded system; otherwise
-  the lock is advisory.
-- Clarify token scope and monotonicity per key/resource.
+Improvement: add one sentence that fencing is not duplicate suppression. It
+rejects stale epochs; idempotent resource writes still need operation-level
+deduplication or preconditions when side effects are retried.
 
 ### Step 5: Leader Election as a Lock
 
-This is a good application of the primitive. The token-as-epoch connection is
-the right teaching point.
+The step cleanly separates the service's internal Raft leader from a
+client-facing application leader elected by a lock key. That distinction is
+important and worth preserving.
 
-Improvement: separate internal consensus leader election from client-facing
-leader election more explicitly. A reader should not confuse the Raft leader
-for the lock holder of `scheduler-leader`. Add a line that the service's own
-leader is chosen by consensus membership, while clients use lock records as an
-application-level election primitive.
+Improvement: describe how leader-election clients observe leadership loss.
+Polling, long-poll, watches, or session expiry all have different operational
+tradeoffs.
 
 ### Step 6: Failure, Partitions, and the Worst Cases
 
-The CP partition behavior is correct: only a majority side grants or renews.
-The step also names leader failure, committed state, and clock skew.
+The text now covers leader failure, idempotent retry across failover,
+minority-side unavailability, clock skew, and safe membership change. This is a
+substantial improvement over the previous review target.
 
-Improvements:
-
-- Add a minority-side renewal flow: holder cannot reach quorum, renewal fails,
-  and it must stop acting even if its local TTL has not obviously elapsed.
-- State the behavior for in-flight acquire/renew requests during leader
-  failover: retry with idempotency key, redirect to leader, or return retryable
-  error.
-- Add a note on membership changes, because 3/5-node groups eventually need
-  safe reconfiguration.
+Improvement: add a small flow for a holder stranded on the minority side:
+renew cannot reach quorum, client stops acting, majority expires/regrants, and
+fencing rejects any late work. That is one of the most interview-worthy failure
+stories.
 
 ### Step 7: Scaling and Operating the Lock Service
 
-This is directionally right: shard by key across independent consensus groups,
-snapshot/compact logs, and watch long-held locks.
+The step now has real sizing math and a realistic operations checklist. The hot
+key caveat is stated correctly: sharding scales across keys, not within one
+contended key.
 
-Improvements:
-
-- Add concrete capacity math before this step or inside it.
-- Discuss shard-routing metadata and safe movement of key ranges.
-- Call out hot-key limits: one contended lock is serialized by design.
-- Add backpressure, per-client quotas, and admission controls for renewal
-  storms.
-- Add specific metrics: acquire/renew p99, quorum commit latency, failed
-  renewals, expired leases, stale-token rejects, leader changes, compaction lag,
-  per-shard hot keys, and clock-skew warnings.
+Improvements: name the deployment assumptions behind the per-group throughput,
+and add a concrete range-migration/reconfiguration path.
 
 ## Final Design Review
 
-The final design description is concise and accurate at the conceptual level.
-It includes the consensus group, committed log, applied state, leases, sweeper,
-fencing tokens, protected resource, client-facing leader election, partitions,
-and sharding.
+The final design now integrates the steps coherently. It includes consensus
+leader/followers, committed log, applied lock state, leases, logged expiry,
+request-id dedup, fencing, protected resource checks, partition behavior,
+sharding, compaction, quotas, and CP posture.
 
-The final diagram should be tightened around write paths. `api-lockstate` is
-fine for a read or applied-state lookup, but it should not imply that the API
-can mutate lock state outside consensus. Likewise, `sweeper-lockstate` should
-be relabeled or rerouted so expiry is a proposed/committed operation.
-
-The final design should also include the minimal production control plane:
-shard map, group membership, snapshots/compaction, client authentication, and
-idempotency/dedup records. These do not need to dominate the diagram, but they
-should appear in text or data model so the design is operable.
+The diagram remains intentionally compact. That is fine, but the caption and
+view could be slightly richer: a `ShardMap`/routing metadata node would connect
+Step 7 to the final architecture, and a `RequestDedup` or "idempotency cache"
+node would make retry safety visible. These can stay out of the core diagram if
+the text remains explicit, but adding one or two nodes would reduce the gap
+between the data model and architecture picture.
 
 ## Concept Introduction and Learning Flow
 
-The concept order is strong:
+The concept order is excellent:
 
 - atomic single-store lock
 - quorum-backed linearizable state
 - leases and renewal
+- consensus-ordered expiry
 - fencing tokens
 - lock-based leader election
 - CP partition behavior
-- sharding and operations
+- key-space sharding and operations
 
-The biggest learning-flow improvement is to turn implicit contracts into
-explicit ones as they appear. When leases arrive, define renewal uncertainty
-and expiry ordering. When fencing arrives, define the resource-side check.
-When sharding arrives, define shard ownership and hot-key limits.
+The dataset introduces the hard concepts just in time. It avoids front-loading
+Raft detail before the user sees why single-row locking fails, and it waits to
+introduce fencing until leases have created the paused-holder gap.
 
-The option tabs need more teaching metadata. The consensus, lease, and
-availability steps include meaningful alternatives, but the options lack
-titles, labels, and tradeoff fields. Adding them would improve the decision
-tree and make the alternatives scan better in the explorer.
+The next teaching improvement is scenario coverage. The text now contains the
+right ideas, but more of them should appear as flows: renew timeout, minority
+partition, stale release, and shard movement.
 
 ## Step-to-Final-Design Coherence
 
-Most steps land cleanly in the final design:
+Each step maps cleanly into the final design:
 
-- Step 1 motivates why single-store locking is not enough.
-- Step 2 contributes leader, followers, log, and linearizable state.
-- Step 3 contributes leases and sweeper.
-- Step 4 contributes fencing token and protected resource.
-- Step 5 contributes the leader-election use case.
-- Step 6 contributes majority-only progress under partition.
-- Step 7 contributes sharding, log compaction, and operational monitoring.
+- Step 1 motivates why single-store locking is insufficient.
+- Step 2 contributes the leader, followers, log, and applied lock state.
+- Step 3 contributes TTL leases, renewal, sweeper, and logged expiry.
+- Step 4 contributes fencing tokens and the protected resource contract.
+- Step 5 contributes lock-as-leader and token-as-epoch.
+- Step 6 contributes majority-only progress, retry behavior, and membership
+  change concerns.
+- Step 7 contributes key-space sharding, compaction, quotas, and monitoring.
 
-The weaker connections are the production state records. Idempotency, shard
-metadata, expiration indexing, and resource-side fencing state are needed by
-the story but are not represented in the final model. Add them lightly rather
-than expanding the diagram too much.
+The only weak mapping is visual rather than conceptual: shard metadata, request
+dedup, and expiration indexing are in the data model and text but not obvious
+in the final design diagram.
 
 ## Realism Compared With Production Systems
 
-Compared with Chubby/ZooKeeper-style systems, the dataset teaches the core
-correctness principles well. It avoids the common bad answer of using a cache
-or Redis key and calling it done.
+Compared with Chubby/ZooKeeper-style coordination systems, this is now a strong
+teaching case. It correctly treats locking as a linearizable coordination
+problem, not a cache-key trick, and it handles the real failure modes: crashed
+holders, paused holders, leader failover, partitions, and hot keys.
 
-Remaining realism gaps:
+Remaining realism gaps are bounded:
 
-- No session model or watch/waiter model for blocking acquire.
-- No idempotency or request replay handling across leader failover.
-- No clear ownership contract for `clientId`, `leaseId`, and stale renew/release.
-- No explicit expiry ordering through the consensus log.
-- No resource-side fencing storage model.
-- No shard-map, reconfiguration, or hot-key operational story.
-- No authn/authz, tenant isolation, TTL caps, or abuse controls.
-- Observability is mentioned only briefly.
+- Watch/waiter/session behavior is not fully specified.
+- Shard migration and stale shard-map handling are described but not stepped
+  through.
+- API authz/tenant policy is present as authenticated `clientId` and tenant in
+  the model, but not developed into permissions or audit behavior.
+- Resource-side idempotency for retried guarded writes is not discussed.
+- Cross-region vs single-region assumptions are not named for the latency and
+  throughput numbers.
 
-The case does not need to become a full ZooKeeper clone. It does need enough of
-these contracts to show that the candidate understands where the hard edges are.
+These are not foundational flaws. They are the next layer of production detail.
 
 ## Dataset and Renderer-Facing Observations
 
 - `interview.json` parses successfully.
-- Top-level keys include expected book fields: `patterns`, `interviewScript`,
-  `levelVariants`, `followUps`, `satisfies`, and `toProbeFurther`.
+- Top-level keys include the expected book fields: `patterns`,
+  `interviewScript`, `levelVariants`, `followUps`, `satisfies`, and
+  `toProbeFurther`.
 - Main step `view.nodes` and `view.links` references resolve.
-- Option view string links resolve; option-local nodes such as `StoreA`,
-  `StoreB`, and `StoreC` are inline nodes, not missing high-level nodes.
 - Final design `view.nodes`, `view.links`, and `view.groups` references
   resolve.
 - `satisfies[*].steps[*]` references resolve to real step IDs.
 - Dataset-level `patterns[*].steps` references resolve to real step IDs.
-- API sequence participants resolve to high-level node IDs.
+- Option titles and tradeoffs are now present where they matter.
+- API endpoint sequences are optional per the renderer, but missing sequences
+  render placeholders in the API Flows wrap-up. This dataset currently has an
+  acquire sequence only.
 - There are no generated AI visuals or explainer comic wired for this dataset.
-  That is acceptable for this review.
-- Option records are sparse: several have no `title`, `label`, or `tradeoff`.
-  This is not a schema error, but it weakens the UI and decision-tree teaching
-  value.
+  That is acceptable for the review; it is not required for correctness.
 
 ## Recommended Edits, Prioritized
 
-### P1: Add design-driving capacity math
+### P1: Add missing API flows
 
-Add active locks, key count, acquire/renew/release QPS, TTL/renewal-derived
-write load, consensus-group throughput, shard count, latency targets, and
-state/log storage estimates.
+Add structured sequences for renew, release, and linearizable read, and include
+the replicated log in the acquire sequence. This is the biggest visible polish
+gap because the API contract itself is now strong.
 
-### P1: Harden the API and ownership contract
+### P1: Define wait/watch/session behavior
 
-Add idempotency keys, lease/session IDs, wait/fail-fast semantics, stale error
-codes, TTL bounds, authenticated identity, and retry behavior.
+Clarify how bounded wait works, whether the service has server-side waiters or
+watches, what fairness it does or does not guarantee, and how leader-election
+clients observe leadership loss.
 
-### P1: Make expiry a consensus-ordered operation
+### P2: Make shard movement concrete
 
-Reroute or relabel sweeper behavior so expiry is proposed through the leader
-and applied from the committed log. Define the renew-vs-expire race.
+Add a small flow or step note for safe range migration, stale shard-map
+versions, router refresh/redirect behavior, and membership reconfiguration.
 
-### P1: Complete the fencing integration contract
+### P2: Name deployment assumptions behind capacity
 
-Define the protected resource's token check, resource-side highest-token state,
-token scope, and the advisory-lock caveat when a resource cannot fence.
+State whether the sizing assumes single-region quorum, local durable storage,
+batching/group commit, or cross-region replication. Keep the current numbers as
+illustrative estimates, not universal promises.
 
-### P2: Expand the data model to support retries, sharding, and operations
+### P2: Add resource-side retry/idempotency caveat
 
-Add lease/session identity, request dedup, shard/group metadata, applied log
-index, expiration index, snapshots, and richer log op fields.
+Fencing prevents stale holders; it does not by itself make non-idempotent
+resource writes safe to retry. Add a short note about operation IDs or resource
+CAS/idempotency for guarded side effects.
 
-### P2: Add operational controls and metrics
+### P3: Enrich Design vs. Requirements summaries
 
-Cover backpressure, renewal storms, per-client quotas, shard health,
-leader-change rate, expired leases, stale-token rejects, commit latency, and
-compaction lag.
-
-### P2: Improve option metadata
-
-Add `title`, `label`, and `tradeoff` fields to the consensus, lease, and
-availability options so the alternatives are more useful in the explorer.
-
-### P3: Add one or two failure flows
-
-Good candidates: renewal timeout near expiry, minority partition renewal
-failure, and retry after leader failover with an idempotency key.
+The `satisfies` entries are correct but terse. Update them to mention logged
+expiry, request-id retry safety, resource `max_seen_token`, and key-space
+sharding so the wrap-up reflects the stronger body content.
 
 ## What Not To Change
 
@@ -435,15 +370,16 @@ failure, and retry after leader failover with an idempotency key.
   election.
 - Keep consensus/CP as the chosen design; do not weaken the guarantee to make
   availability easier.
-- Keep the single-row baseline and the independent-store alternative as
-  rejected options.
+- Keep the single-row baseline and independent-store/Redlock alternatives as
+  rejected options for correctness-critical locks.
 - Keep fencing tokens as the central insight.
-- Keep the final design compact; add missing contracts mostly through API,
-  data model, captions, and short flows.
+- Keep the final diagram compact unless added nodes materially improve the
+  teaching path.
 
 ## Bottom Line
 
-This is a strong conceptual interview for distributed locks. The next pass
-should make the contract operational: concrete load assumptions, safe retry
-semantics, consensus-ordered expiry, resource-enforced fencing, and enough
-state model detail to prove the design survives real failures.
+The recent updates fixed the major correctness and production-contract gaps.
+This is now a strong distributed lock service interview. The next pass should
+mostly improve the visible walkthrough: API flows for renew/release/read,
+explicit wait/watch semantics, a concrete shard-migration story, and a few
+deployment-assumption caveats around capacity.

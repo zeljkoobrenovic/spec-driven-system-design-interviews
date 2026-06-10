@@ -81,7 +81,26 @@ publishable once it has an `index.json` manifest.
 changing anything in `_templates/` or `data/`, re-run `build.py` and commit the
 regenerated `docs/`.
 
+**Generated AI images are downscaled in the build.** The full-resolution
+originals under `data/<group>/<id>/assets/generated/` are ~1500–3000px tall, but
+the explorer only ever shows them in a `.diagram-image` box capped at
+`max-height: 560px`. Shipping the originals pushes `docs/` past GitHub Pages'
+size limit, so `build.py` downscales the **docs/ copies** of generated AI
+images to `GENERATED_IMAGE_MAX_HEIGHT` (1120px = 2× the display height, for
+retina sharpness), preserving aspect ratio and format. This applies only to the
+`ai-visuals/` and `design-vs-requirements/` subdirs (`RESIZABLE_GENERATED_DIRS`)
+— **comics are left at full size** (long vertical strips read full-size, not in
+the 560px box). The originals in `data/` are never modified. Resizing uses
+**Pillow** (cross-platform; pinned in `requirements.txt` — `pip install -r
+requirements.txt`), so `build.py` imports `PIL` at the top and won't run without
+it. To change the cap (or what gets resized), edit the constants near the top of
+`build.py`.
+
 ## Building
+
+The build needs Pillow (for image downscaling — see "Build output" above).
+Install once: `pip install -r requirements.txt` (a `venv/` is checked into this
+repo; use `venv/bin/python build.py` if `python3` on PATH lacks Pillow).
 
 ```bash
 python3 build.py            # rebuild every publishable group into docs/

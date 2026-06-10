@@ -5,337 +5,285 @@ Review date: 2026-06-10
 
 ## Executive Summary
 
-This is a strong classic-system-design walkthrough. The step order is coherent:
-local state, durable storage, stateless scale-out, hot-read caching, ID
-generation, sharding, CDN/analytics, and multi-region replication. The case does
-well at teaching read-heavy trade-offs, 301 vs. 302 redirect semantics, cache
-invalidation, sharding by `short_code`, and active-passive vs. active-active
-multi-region choices.
+This review reflects the current dataset after the recent URL-shortener updates.
+Several earlier high-impact findings have been addressed: create idempotency and
+URL normalization are now in the API, the data model includes idempotency,
+abuse, redirect-policy, and click-rollup fields, click-event capacity is sized,
+analytics traps cover duplicate/replayed events, the multi-region sequence
+participant IDs are unique, and the incorrect node types have been fixed.
 
-It is close to publish-ready as a book case, but the dataset itself still has a
-few important gaps. The biggest design gaps are production abuse controls,
-create idempotency and URL normalization, analytics capacity, and a more
-explicit final multi-region write model. There are also two concrete
-renderer-facing issues in the multi-region sequence diagrams and node metadata.
+The case is now a strong book-quality walkthrough. The remaining work is mostly
+about making newly introduced production contracts visible everywhere they
+matter: the active-active write model needs matching data fields and diagram
+components, the safety gate needs API/operational semantics, and analytics/cache
+degradation behavior should be explicit enough for an interview candidate to
+defend under follow-up questions.
 
 Overall assessment:
 
 | Dimension | Rating | Notes |
 |---|---:|---|
-| System design soundness | 4.1 / 5 | The main architecture is credible; abuse, idempotency, analytics sizing, and multi-region write semantics need tightening. |
-| Production realism | 3.6 / 5 | Good cache/CDN/sharding coverage, but safety, takedown, queue-loss, replay, and operational workflows are thin. |
-| Pedagogical flow | 4.5 / 5 | Clear problem-by-problem buildup with useful option trade-offs and strong 301/302 teaching. |
-| Final design coherence | 4.0 / 5 | Final design includes the introduced components, but collapses regional details and does not choose a crisp write model. |
-| Dataset/rendering fit | 3.9 / 5 | JSON parses and option views validate; multi-region sequence IDs and a node type need repair. |
+| System design soundness | 4.4 / 5 | The core architecture is credible and now covers idempotency, abuse state, analytics sizing, and a clearer regional write model. |
+| Production realism | 4.1 / 5 | Much stronger than before; remaining gaps are safety workflow semantics, queue/backpressure behavior, cache stampede handling, and owner-index consistency. |
+| Pedagogical flow | 4.6 / 5 | Excellent step progression with concrete trade-offs; a few advanced contracts need to be staged more visibly. |
+| Final design coherence | 4.3 / 5 | The final prose chooses active-active generated-code writes plus global alias ownership, but the final diagram/data model do not fully carry that choice. |
+| Dataset/rendering fit | 4.8 / 5 | JSON and structured views validate cleanly; no duplicate sequence participants or unresolved step references were found. |
 
-Recommendation: keep the overall step sequence. Fix the publication and
-generated-doc sync issues first, then add targeted realism around create
-safety, analytics, and operations rather than restructuring the case.
+Recommendation: keep the step sequence and recent fixes. Make a targeted pass
+over final-design artifacts, safety semantics, and operational failure modes
+rather than restructuring the interview.
 
 ## What Works Well
 
-- The capacity section gives the right first-order shape: about 1k creates/sec,
-  100k redirects/sec, 100:1 read/write ratio, 7-character base62 codes, and a
-  bounded cache working set rather than pretending the cache holds everything.
-- The API covers the important user-facing operations: create, redirect,
-  metadata fetch, and soft delete.
-- The data model includes the core `urls` table, owner listing support,
-  append-only click events, and users.
-- The step sequence introduces one scaling pressure at a time and connects each
-  new component to a visible bottleneck.
-- The cache step has useful traps for long-tail cache pollution and stale
-  deleted/expired links.
-- The CDN/analytics step correctly teaches why 302 is the safer default when
-  expiry, deletion, and analytics matter, while 301 is an explicit lower-cost,
-  lower-observability mode.
-- The sharding step teaches the right shard key: hash `short_code`, not
-  `user_id`, because redirects start with the code.
-- The multi-region step frames active-passive and active-active as real
-  alternatives instead of treating active-active as automatically better.
-- `satisfies` is mostly aligned with the steps and gives a readable
-  requirement-to-design trace.
+- The capacity section now includes click-event throughput and storage impact:
+  about 100k events/sec, about 8.6B/day, raw retention of 7-30 days, and
+  rollups for long-term dashboards.
+- `POST /api/v1/shorten` now covers auth, URL normalization/validation, an
+  `Idempotency-Key`, and useful error codes for unsafe URLs, reserved aliases,
+  and quota exhaustion.
+- The data model is substantially more production-ready: `idempotency_keys`,
+  `redirect_policy`, URL hash, abuse fields, blocked reasons, created IP hash,
+  and click rollups are all present.
+- The step order remains strong: client/server, durable storage, stateless
+  scale-out, cache, ID generation, sharding, edge/analytics, and multi-region.
+- The cache, database, and analytics steps now have realistic traps instead of
+  only happy-path descriptions.
+- The final design now states a concrete default: active-active writes for
+  generated codes and single-owner/global reservation for custom aliases.
+- The renderer-facing issues called out in the previous review appear resolved:
+  sequence participant IDs are unique, `AppA` is typed as `service`, and
+  `Clock` is no longer rendered as a database.
 
 ## Highest-Impact Issues
 
-### 1. Multi-region sequence diagrams reuse participant IDs for different actors
+### 1. The active-active final design needs matching data-model and diagram support
 
-The step `multi-region` has two flow diagrams with duplicate participant IDs:
+The final prose says generated codes are active-active, custom aliases are
+globally reserved or home-region routed, and early misses during replication lag
+fall back to the link's home region. That is the right direction, but the
+structured artifacts do not fully model it.
 
-- `Create in home region` declares `DB` for both "Region A DB Shard" and
-  "Region B DB Shard".
-- `Regional failover redirect` declares `B` for both "Region B App" and
-  "Region B DB Shard".
+Current gaps:
 
-Mermaid participants are keyed by ID, so these diagrams can collapse distinct
-actors or turn app-to-DB interactions into self-messages. This weakens the most
-advanced step in the case.
+- `urls` does not store `home_region`, `region_id`, `code_source`, or an
+  equivalent owner-region marker.
+- There is no `alias_reservations` table or final-design node for the
+  strongly-consistent custom-alias namespace.
+- The create API response does not include `homeRegion`, even though the
+  multi-region create flow returns it.
+- The final diagram is still a collapsed global stack, so the reader cannot see
+  regional ownership, alias reservation, or early-miss home-region fallback.
 
-Concrete fix:
+Concrete fix: add the missing fields/table, add an `Alias Reservation` or
+`Home Region Router` component to the final view, and align the create API
+response with the multi-region flow. If the final diagram stays collapsed, add a
+short final-design deep-dive note that names these contracts explicitly.
 
-- Use unique IDs such as `DBA` and `DBB`, or `AppB` and `DBB`, in the sequence
-  participants and messages.
-- Keep aliases only for display labels, not for making two different
-  participants share the same canonical ID.
-- Rerun a browser/serve check for the multi-region sequence diagrams after the
-  change.
+### 2. Abuse controls exist, but the user-visible safety contract is under-specified
 
-### 2. Abuse prevention is treated as a follow-up, but it is core to URL shorteners
+The data model now has `status`, `abuse_status`, `last_scanned_at`,
+`blocked_reason`, and `created_ip_hash`, and step 7 includes a takedown flow.
+That is a major improvement. The remaining gap is that the product/API behavior
+for unsafe links is still not crisp.
 
-The follow-up list asks how to prevent phishing and malware URLs, and how to
-rate limit at the edge. That is useful, but for a production URL shortener these
-are not optional polish items. Without them, the create path can become an abuse
-factory and the redirect path can damage users before operators can intervene.
+Current gaps:
 
-Concrete fix:
+- `GET /{code}` still says unknown/expired/deleted links return 404, but does
+  not define behavior for `blocked` or `under_review`.
+- The takedown flow uses `POST /admin/block`, but that API is not listed in the
+  API section.
+- Cache/CDN purge retry is named in the final prose, but there is no durable
+  purge job, outbox, or acknowledgement model in the data model.
+- Abuse is still not promoted into the requirements list, even though the design
+  now contains safety mechanisms.
 
-- Add a short abuse/safety slice to either step 2 or step 7: URL validation,
-  per-IP/per-user create quotas, domain reputation checks, malware/phishing scan
-  state, and blocklist enforcement on redirect.
-- Add data fields such as `abuse_status`, `review_status`, `last_scanned_at`,
-  `blocked_reason`, and `created_ip_hash` or an equivalent abuse table.
-- Add an admin/takedown flow that invalidates cache/CDN entries and changes
-  redirect behavior to a warning page or 404/410.
-- Keep the deeper anti-abuse system as a follow-up, but make the base design
-  acknowledge the safety gate.
+Concrete fix: add a safety requirement, define redirect responses for blocked
+and under-review links (for example warning page, 410, or 451 depending on
+policy), add an admin/scanner API or describe it as internal, and model purge
+retry state if takedown propagation is part of the design.
 
-### 3. Create semantics need idempotency, canonicalization, and alias ownership
+### 3. Redirect policy is modeled, but clients cannot set it
 
-The design handles short-code collisions, but it does not clearly handle client
-retry semantics. A mobile client or load balancer retrying `POST /api/v1/shorten`
-can create multiple short links for the same user intent unless the API exposes
-an idempotency key or deterministic request token.
+The dataset correctly teaches the 302 vs. 301 trade-off, and `urls` now has a
+`redirect_policy` field. However, `POST /api/v1/shorten` accepts only
+`longUrl`, optional `alias`, and optional `ttlSeconds`. A candidate reading the
+API cannot tell how a permanent 301 link is requested, which constraints apply,
+or whether 301 is only an operator-side policy.
 
-The API also accepts `longUrl`, `alias`, and `ttlSeconds` without discussing URL
-normalization, reserved aliases, ownership of vanity aliases, or validation of
-dangerous schemes.
+Concrete fix: add a request field such as `redirectPolicy?: "temporary" |
+"permanent"` or `permanent?: boolean`. State that permanent links cannot have a
+short TTL, are poor fits for editable vanity links, and make analytics
+approximate because browsers may never return to the edge/origin.
 
-Concrete fix:
+### 4. Analytics and cache degradation behavior should be explicit
 
-- Add `Idempotency-Key` or `requestId` to the create API and store the resolved
-  result for a bounded window.
-- Normalize and validate the target URL before generating a code. Be explicit
-  about allowed schemes, max length, punycode/Unicode handling, and canonical
-  host normalization.
-- For custom aliases, document reserved words, per-user ownership, release
-  policy after deletion/expiry, and whether aliases are globally unique or
-  scoped by domain/tenant.
-- Add a trap: "only relying on UNIQUE(short_code) solves collisions, not client
-  retries."
+The analytics capacity and duplicate-event traps are good. The remaining
+production question is what the redirect path does when the click queue,
+analytics consumer, or rollup store is degraded. The step currently says
+analytics can drop during queue outages, but does not choose a behavior.
 
-### 4. Analytics volume is under-modeled relative to the stated traffic
+Concrete fix: add a small operational note or trap that says redirects never
+block on analytics; edge/origin either buffer briefly, drop/sampling-mark events
+under pressure, or write to a durable local/outbox stream. Also add cache
+stampede mitigation to step 4: request coalescing/singleflight, jittered TTLs,
+or stale-while-revalidate for extremely hot codes.
 
-The capacity section estimates mapping storage, cache hot set, and redirect
-bandwidth. It does not size click-event ingestion or retention, even though the
-architecture adds a click queue and analytics store. At 100k redirects/sec, the
-raw click event stream can dominate storage, queue throughput, and processing
-cost if retained at full fidelity.
+### 5. Secondary consistency details need one more pass
 
-Concrete fix:
+Two secondary indexes are now important enough to define more tightly:
 
-- Add a capacity row for click events/sec and daily event volume.
-- State a retention policy: raw events for a short window, rolled-up aggregates
-  for long-term dashboards, and sampled or privacy-limited dimensions where
-  needed.
-- Add a data model entry for aggregate counters, for example per-code
-  minute/hour/day rollups, since `GET /api/v1/links/{code}` returns `clickCount`
-  and the prose mentions near-real-time counters.
-- Discuss duplicate click events and replay in the async pipeline, because edge
-  logs and queue consumers are usually at-least-once.
+- `idempotency_keys` is keyed by `idempotency_key`, but the note says the key is
+  per user/request. In practice this should be `(user_id, idempotency_key)` plus
+  a request hash so a repeated key with a different body returns an idempotency
+  conflict.
+- `owner_links` supports dashboards, but the write path does not say whether it
+  is updated synchronously with the mapping, updated from a change stream, or
+  asynchronously repaired.
 
-### 5. The final design does not choose a crisp multi-region write model
-
-Step 8 teaches active-passive and active-active, but the final design is named a
-"Recommended multi-region redirect design" without saying whether creates are
-active-passive, active-active, or home-region routed. The final diagram uses
-collapsed global nodes (`DB1`, `DB2`, `DB3`, `Rep`) rather than region-specific
-app/cache/shard ownership, so the reader has to infer where writes happen and
-how a brand-new link becomes visible in another region.
-
-There is also a specific wording issue in the active-passive option:
-`appb-replica-lookup-write` labels Region B app traffic to the replica as
-`lookup/write`. In active-passive mode, the standby replica should usually serve
-reads only until promotion; writes should route to the primary or fail until a
-controlled failover.
-
-Concrete fix:
-
-- Make the final recommended write model explicit: for example, "single write
-  primary with regional read replicas and home-region fallback on early misses"
-  or "active-active generated-code writes with globally reserved custom aliases."
-- If active-passive is the recommended default, change Region B replica links to
-  read-only and describe promotion.
-- If active-active is the recommended default, add the global alias reservation
-  service or home-region alias routing to the final design.
-- Consider showing two regional cache/shard groups in the final view rather than
-  one collapsed shard set.
+Concrete fix: tighten the table definitions and add one sentence in steps 2/6
+about the consistency contract for each index.
 
 ## System Design Soundness
 
 ### Requirements and Capacity
 
-The functional and non-functional requirements are a good fit for a classic URL
-shortener. They include optional custom aliases, expiration, analytics, high
-redirect availability, low p99 latency, read-heavy traffic, durable mappings,
-and eventual analytics.
+The requirements and capacity are now strong for the classic URL-shortener
+scope. The click-event row is especially valuable because it prevents the
+analytics pipeline from looking free next to the mapping store.
 
-The capacity math is directionally sound, but incomplete for the components
-introduced later. Mapping storage is estimated; click-event storage, queue
-throughput, analytics rollups, CDN log ingestion, and purge volume are not. The
-bandwidth estimate is plausible for 302 responses, but should mention that bot
-traffic and abuse scans can distort both redirect QPS and analytics volume.
+The main missing requirement is safety/abuse. Since the design now includes
+abuse state, scanner/admin flows, and redirect blocking, safety should be a
+first-class functional or non-functional requirement instead of only a follow-up
+question.
 
 ### API
 
-The API is practical and teachable. It includes create, redirect, metadata
-fetch, and delete. The redirect endpoint correctly defaults to 302 and names 301
-as a permanent, less-trackable mode.
+The public API is much more credible after adding auth, idempotency, URL
+validation, quota errors, and alias-reservation errors. The remaining API gaps
+are concentrated around policies introduced elsewhere:
 
-Missing production details:
-
-- Create idempotency for retried POSTs.
-- Authentication/ownership semantics on create, not only on metadata/delete.
-- URL normalization and validation.
-- Custom alias reservation and reserved-name policy.
-- Explicit response behavior for blocked, expired, deleted, and under-review
-  links. The current text mostly collapses these into 404.
+- Add how clients request 301 vs. 302 behavior.
+- Add blocked/under-review redirect semantics.
+- Add or explicitly mark the admin/scanner block endpoint as internal.
+- Include `homeRegion` or equivalent metadata if early-miss fallback is part of
+  the multi-region contract.
 
 ### Data Model
 
-The `urls`, `owner_links`, `click_events`, and `users` tables are a good
-starting point. `status`, `expires_at`, and `deleted_at` support expiration and
-soft delete.
+The model now supports the promised behavior better than before. `urls`,
+`idempotency_keys`, `click_counters`, `owner_links`, `click_events`, and `users`
+cover the core read/write/analytics paths.
 
-Missing or thin model pieces:
-
-- `redirect_policy` or equivalent to distinguish 301-permanent links from the
-  default 302 mode.
-- Normalized URL hash and create idempotency state.
-- Abuse/review state and takedown metadata.
-- Aggregate click counters and rollups.
-- Alias ownership/reuse policy.
-- Owner index denormalization for status/expiry so management pages do not
-  immediately fan out to many shards.
+The next useful additions are not broad new tables; they are targeted
+contract fields: home-region ownership, alias reservation state, purge retry
+state, scoped idempotency keys, and request hashes for idempotency replay.
 
 ### Architecture
 
 The architecture is credible: stateless app servers, HA load balancing, Redis or
 Memcached cache-aside, dedicated ID generation, shard routing, CDN edge
-redirects, async analytics, replication, and metrics. The major architectural
-gap is not missing infrastructure; it is that a few operational contracts are
-only implied: cache purge reliability, queue replay, duplicate analytics events,
-regional failover, and abuse enforcement.
+redirects, async analytics, replication, and observability. The final design now
+has a defensible multi-region choice. It should make that choice visible in the
+diagram and in table/API contracts so the learner can answer follow-up questions
+without relying on prose alone.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Client and Server
 
-Good first step. It anchors the product behavior and introduces redirect
-semantics before distributed systems. The prototype options are intentionally
-weak, which is fine pedagogically.
+Good opening step. It keeps the first architecture intentionally small while
+anchoring create and redirect behavior. The in-memory and local-store options
+are weak by design, and their limitations are clear.
 
-Suggested improvement: add one sentence that the in-memory version is for
-understanding only, not an acceptable first production answer, because successful
-creates can disappear.
+Suggested improvement: no structural change needed.
 
 ### Step 2: Add a Database
 
-Strong durability transition. SQL vs. managed KV is a useful option pair, and
-the SQL unique constraint explains generated-code and vanity-alias collisions
-well.
+This step is now much stronger. The SQL/KV comparison is useful, and the traps
+for idempotency and URL normalization are exactly the right corrections.
 
-Suggested improvement: add create idempotency and URL normalization here. This
-is the natural place to teach that database uniqueness handles code collisions
-but not duplicate client requests or unsafe URLs.
+Suggested improvement: tie the `idempotency_keys` table to `(user_id,
+idempotency_key, request_hash)` so the trap has a complete implementation
+answer.
 
 ### Step 3: Scale Out with a Load Balancer
 
-Good statelessness and health-check coverage. The DNS round-robin alternative is
-useful because its cons teach why a real LB matters.
+The statelessness and health-check story is good. Adding create-side quota and
+safety-gate concepts improves production realism.
 
-Suggested improvement: add a small operational note for rate limits or request
-admission. URL shorteners need create-side quotas early, before cache/CDN
-optimizations.
+Suggested improvement: show where create-side quotas are enforced in the request
+path, even if it is just a sentence naming edge/LB/app admission control.
 
 ### Step 4: Add a Cache for Hot URLs
 
-This is one of the strongest steps. It correctly ties read-heavy traffic to a
-hot-set cache, includes negative caching, warns about stale deleted/expired
-links, and avoids arbitrary "cache 10 percent of all keys" thinking.
+Still one of the strongest teaching steps. It explains cache-aside, TTLs,
+negative caching, and stale deleted/expired links without overcomplicating the
+first cache pass.
 
-Suggested improvement: add cache-stampede mitigation directly to the main path,
-not only as a failure-mode note: singleflight/request coalescing, jittered TTLs,
-or stale-while-revalidate for very hot keys.
+Suggested improvement: add cache-stampede mitigation for very hot codes:
+singleflight/request coalescing, jittered TTLs, or stale-while-revalidate.
 
 ### Step 5: Dedicated ID Generation Service
 
-Good range-allocation vs. Snowflake contrast. The discussion of wasted IDs,
-clock rollback, machine ID assignment, and generated-code predictability is
-useful.
+The range-allocation vs. Snowflake contrast is clear and useful. The current
+range-allocation cons mention predictable codes, which is the right caveat.
 
-Suggested improvement: connect generated ID strategy to code enumeration and
-abuse. If monotonic IDs are base62-encoded directly, attackers can crawl nearby
-codes; scrambling or randomization should be part of the trade-off.
+Suggested improvement: make the mitigation explicit: scramble encoded IDs,
+reserve random-looking code space, or use non-sequential generated codes when
+enumeration risk matters.
 
 ### Step 6: Shard the Mapping Store
 
-Strong shard-key explanation. The step correctly avoids `user_id` as the mapping
-shard key and introduces owner indexes and virtual buckets.
+Good shard-key explanation. The step correctly chooses `short_code`, not
+`user_id`, because redirects start with the code.
 
-Suggested improvement: make the owner/admin read path more concrete. The data
-model has `owner_links`, but the step should say whether this index is
-synchronously written with the mapping, asynchronously repaired, or allowed to
-lag.
+Suggested improvement: define owner-index consistency. If dashboards can lag,
+say so; if the owner index is written in the same transaction or via an outbox,
+say that instead.
 
 ### Step 7: CDN, Analytics, and Async Pipeline
 
-Strong conceptual step. It has the right 302/301 distinction and places click
-analytics off the redirect critical path.
+This step now teaches the right 302/301 distinction, includes a takedown flow,
+and has good traps for at-least-once analytics and raw-event retention.
 
-Suggested improvement: add at-least-once queue semantics. Edge logs and app
-servers can emit duplicates; stream processors need event IDs, dedup windows, or
-idempotent aggregate updates. Also add backpressure behavior: what happens when
-the analytics queue is down or lagging.
+Suggested improvement: define analytics backpressure behavior. Redirects should
+not fail because click logging is degraded, but the design should say whether it
+buffers, samples, drops with counters, or writes an outbox.
 
 ### Step 8: Multi-Region Redirects and Replication
 
-The option framing is good, but the diagrams and final recommendation need more
-precision. Active-passive should not show standby replica writes, and
-active-active needs a concrete alias uniqueness mechanism.
+This step improved substantially. Active-passive now reads as read-only standby
+until promotion, active-active names region-scoped ID prefixes, and the sequence
+diagrams no longer reuse participant IDs.
 
-Suggested improvement: use unique participant IDs in the sequence diagrams and
-make the chosen default write model explicit before the final design.
+Suggested improvement: connect the active-active choice to concrete data and
+control-plane artifacts: home region, alias reservation, early-miss fallback,
+and promotion/failover behavior.
 
 ## Final Design Review
 
-The final design integrates the main components introduced in the steps:
-GeoDNS/CDN, load balancer, stateless app tier, ID generator, cache, shard router,
-mapping shards, owner index, queue, analytics store, replication, and metrics.
-That is the right component set for the scope.
+The final design now integrates the main components introduced in the steps:
+GeoDNS/CDN, load balancer, stateless app tier, ID generator, cache, shard
+router, mapping shards, owner index, queue, analytics store, replication, and
+metrics.
 
-The weak point is regional specificity. The final design reads like a global
-single diagram with a replication node, not a fully explained multi-region
-operating model. A candidate using this final design should be able to answer:
-
-- Which region owns a create?
-- What happens if a redirect reaches a region before replication catches up?
-- Are custom aliases globally reserved synchronously, home-region routed, or
-  eventually reconciled?
-- During failover, which writes pause and which reads continue?
-- How are CDN purges retried and observed?
-
-Add those answers in final design prose or as one final deep-dive note.
+The biggest improvement is that the final prose chooses a write model instead
+of leaving active-passive vs. active-active ambiguous. The remaining weakness is
+representation: the final view does not show the regional ownership contracts
+that the prose relies on. Add a global alias reservation component, home-region
+metadata/fallback, or region-specific cache/app/shard groups if the final
+diagram is meant to be the candidate's last drawing.
 
 ## Concept Introduction and Learning Flow
 
-The concept staging is strong. It introduces API contracts and HTTP redirects
-first, then durable mapping, unique constraints, horizontal scaling, cache-aside,
+Concept staging is strong. The walkthrough introduces API contracts and HTTP
+redirects first, then durable mapping, uniqueness, horizontal scale, cache-aside,
 TTL, collision avoidance, base62 encoding, sharding, async analytics, edge
-caching, replication lag, and active-active.
+caching, replication lag, and active-active trade-offs.
 
-The main concept gap is security/abuse. A learner can finish the walkthrough
-with a strong scaling story but an incomplete product safety story. Add a small
-set of concepts such as "URL safety scanning", "takedown propagation", and
-"create-side quota" so this does not live only in follow-ups.
+The safety concepts were added in a reasonable place, but they should now be
+connected to requirements and API behavior. That will make abuse prevention feel
+like part of the base design instead of an attached note.
 
 ## Step-to-Final-Design Coherence
 
@@ -343,33 +291,27 @@ Most steps map cleanly into `finalDesign`:
 
 - `add-database` and `sharded-mapping-store` become `Router`, `DB1`, `DB2`,
   and `DB3`.
-- `cache` becomes `Cache` and CDN cache policy.
+- `cache` becomes `Cache` and the CDN/cache policy.
 - `id-generator` becomes `IDGen`.
 - `cdn-and-analytics` becomes `CDN`, `Queue`, and `Analytics`.
 - `multi-region` becomes `Geo` and `Rep`.
 - `load-balancer` becomes `LB` and the stateless `App` tier.
 
-The coherence issue is that the final design does not preserve enough detail
-from step 8. It should carry forward the chosen active-passive or active-active
-decision rather than only the generic concept of replication.
+The coherence issue is that some new step-level contracts do not have final
+design counterparts: alias reservation, home-region fallback, purge retry, and
+analytics rollup/dedup workers.
 
 ## Realism Compared With Production Systems
 
-Production URL shorteners are shaped as much by misuse as by load. The current
-dataset is strong on load but light on misuse. Real systems need controls for
-malware/phishing URLs, spam campaigns, account quotas, link takedowns, redirect
-warning pages, domain allow/deny lists, and appeal/audit workflows.
+The dataset now acknowledges the two hard production realities that many URL
+shortener designs skip: misuse and analytics volume. That is a meaningful
+quality jump.
 
-The analytics path also needs production semantics. A queue-based click pipeline
-should state whether events are at-least-once, how duplicate events are handled,
-what retention is kept in raw form, and what aggregates support owner-facing
-dashboards.
-
-Operations are present but compressed into a `Metrics / Alerts` node. For this
-case, the most useful SLOs and alerts are redirect p99 latency, CDN hit ratio,
-cache hit ratio, cache stampede rate, 404/blocked redirect rate, ID allocation
-failures, shard hotness, replication lag, queue lag, purge failures, and abuse
-scan backlog.
+The next realism improvements are operational rather than architectural:
+define purge retries and auditability for takedowns, state what happens when
+analytics is down, include cache-stampede protection, and add privacy limits for
+click analytics fields such as IP hash, referrer, and user agent. The existing
+retention note is a good start; a short privacy note would make it stronger.
 
 ## Dataset and Renderer-Facing Observations
 
@@ -378,81 +320,73 @@ Validated:
 - `interview.json` parses as JSON.
 - `_scripts/validate_options.py data/book/url-shortener/interview.json` returns
   `OK`.
-- Step option view nodes and link references resolve to
-  `highLevelArchitecture`.
+- Step and final-design option view nodes resolve to `highLevelArchitecture`.
+- Step and final-design option view links resolve to `highLevelArchitecture`.
 - `satisfies[*].steps[*]` values resolve to real step IDs.
+- Step and API sequence diagrams have no duplicate participant IDs.
+- The previous node-type issues for `AppA` and `Clock` are fixed.
 
-Issues:
+Observations:
 
-- `data/book/index.json` includes `url-shortener`; keep the generated
-  `docs/book/data/index.json` copy in sync whenever the manifest changes.
-- The multi-region flows use duplicate participant IDs for different sequence
-  actors, as described above.
-- `highLevelArchitecture.nodes[]` has `AppA` labeled "Region A Apps" with type
-  `database`; it should be `service`.
-- `Clock` is labeled "Clock Sync" with type `database`. If it represents clock
-  synchronization infrastructure, `external`, `service`, or a more explicit
-  "time sync service" label would be clearer than rendering it as a database.
-- The active-passive link `appb-replica-lookup-write` should not say
-  `lookup/write` unless Region B has been promoted or the design is not really
-  active-passive.
-- `technologyChoices` is absent. That is optional, but for a book case this
-  would be a good addition covering mapping store, cache, CDN/edge compute, ID
-  generation, queue/stream, analytics store, observability, and abuse scanning.
+- `technologyChoices` is absent. That is optional, but this book case is now
+  mature enough to benefit from choices for mapping store, cache, CDN/edge
+  compute, ID generation, queue/stream, analytics store, observability, abuse
+  scanning, and global alias reservation.
+- No `docs/` rebuild is needed for this review-only file. If the dataset itself
+  changes later, rebuild `docs/book/`.
 
 ## Recommended Edits, Prioritized
 
-### P1: Make the case reachable and render correctly
+### P1: Carry the active-active write model into the artifacts
 
-- Fix duplicate sequence participant IDs in the multi-region flows.
-- Change `AppA.type` from `database` to `service`.
-- Rename or retype `Clock` so Snowflake clock coordination does not render like
-  an authoritative data store.
-- Keep the source and generated book manifests in sync after edits.
+- Add home-region/region-source fields to `urls`.
+- Add a global alias reservation table or component.
+- Include `homeRegion` or equivalent in the create response if early-miss
+  fallback depends on it.
+- Add alias reservation and home-region fallback to the final design view or a
+  final-design deep dive.
 
-### P1: Add create-path correctness and safety
+### P1: Make safety behavior explicit
 
-- Add idempotency to `POST /api/v1/shorten`.
-- Add URL normalization and validation.
-- Add custom-alias ownership/reservation rules.
-- Add basic anti-abuse controls: quotas, safety scan state, blocklists, and
-  takedown/cache-purge flow.
+- Add a safety/abuse requirement.
+- Define redirect behavior for `blocked` and `under_review`.
+- Add or mark the admin/scanner block endpoint as internal.
+- Model or describe durable CDN/cache purge retries for takedowns.
 
-### P2: Tighten analytics realism
+### P2: Expose redirect policy in the API
 
-- Add click-event capacity math.
-- Add raw-event retention and aggregate-counter storage.
-- State duplicate/replay handling for queue consumers.
-- Define backpressure behavior when analytics ingestion is degraded.
+- Add a create-request field for temporary vs. permanent redirects.
+- Document constraints for 301 links: no short TTL, hard deletion semantics, and
+  approximate analytics.
 
-### P2: Make multi-region writes explicit
+### P2: Tighten operational degradation paths
 
-- Pick the recommended write model in `finalDesign`.
-- If active-passive, make standby writes read-only until promotion.
-- If active-active, add global alias reservation or home-region alias routing.
-- Describe early-miss routing during replication lag.
+- Define analytics queue/backpressure behavior.
+- Add cache-stampede mitigation to the cache step.
+- Scope idempotency keys by user and request hash.
+- State owner-index consistency and repair behavior.
 
-### P3: Add operations and implementation choices
+### P3: Add implementation choices
 
-- Add a metrics/runbook deep dive.
 - Add `technologyChoices` for the major implementation concerns.
-- Add a few traps beyond cache, especially for idempotency, abuse, analytics
-  duplicates, and active-active custom aliases.
+- Include managed-vs-self-hosted trade-offs for Redis/Memcached, SQL/KV,
+  Kafka/Pub/Sub/Kinesis, CDN/edge compute, analytics store, observability, and
+  abuse scanning.
 
 ## What Not To Change
 
-- Keep the current step order. It is a good teaching progression.
-- Keep the SQL vs. managed KV option pair in step 2 and step 6; it teaches the
-  right trade-off at two maturity levels.
+- Keep the current step order. It remains a clean teaching progression.
 - Keep 302 as the default redirect mode and 301 as an explicit permanent-link
   option.
 - Keep sharding by `short_code`; the owner index should stay separate.
 - Keep analytics off the hot redirect path.
+- Keep the active-passive vs. active-active comparison in step 8, even if the
+  final recommendation favors active-active generated-code writes.
 
 ## Bottom Line
 
-This is a strong foundation for a book-quality URL shortener case. The core
-scaling arc works. The remaining work is to repair the multi-region rendering
-issues and add the production contracts that make real URL shorteners hard:
-abuse controls, idempotent creates, analytics replay/retention, and an explicit
-regional write model.
+The URL shortener case is now substantially stronger than the earlier review
+version. It is publishable as a classic scaling walkthrough, with the remaining
+work concentrated in a few high-value production contracts: active-active
+metadata, safety behavior, redirect-policy exposure, and degraded-mode
+operations.

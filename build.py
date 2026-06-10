@@ -19,6 +19,11 @@ the data must sit next to the page as a sibling `data/` directory.
 A group is published only if data/<group>/index.json exists. Groups without
 one (e.g. planning/notes folders) are skipped with a notice.
 
+This build is purely a copy step — it does not touch image sizes. The generated
+AI images in docs/ are large; shrink them for deployment with the separate
+downsize-images.py script (run by hand, not every build), e.g.
+`python3 downsize-images.py docs/<group>/data`.
+
 Usage:
   python3 build.py            # build every publishable group
   python3 build.py examples   # build only the named group(s)
@@ -28,23 +33,10 @@ import shutil
 import sys
 from pathlib import Path
 
-from PIL import Image
-
 ROOT = Path(__file__).resolve().parent
 TEMPLATES = ROOT / "_templates"
 DATA = ROOT / "data"
 DOCS = ROOT / "docs"
-
-# Generated AI images are authored at ~1500-3000px tall but only ever shown in
-# a .diagram-image box capped at max-height: 560px (see _templates/styles.css).
-# Shipping the full-resolution originals bloats docs/ past GitHub Pages' size
-# limit, so the build downscales the *copies* in docs/ to 2x the display height
-# (retina-sharp) while leaving the originals in data/ untouched. Comics are
-# excluded — they're long vertical strips read at full size, not in the 560px
-# box. Resizing uses Pillow (cross-platform) — see requirements.txt.
-GENERATED_IMAGE_MAX_HEIGHT = 1120  # 2x the 560px CSS display height
-RESIZABLE_GENERATED_DIRS = ("ai-visuals", "design-vs-requirements")
-GENERATED_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
 
 # Files the templates must contain for a build to make sense.
 # The overview page (index.html + overview.js) links to the per-interview
@@ -77,60 +69,6 @@ def _ignore_template_docs(dirpath, names):
 def fail(msg):
     print(f"error: {msg}", file=sys.stderr)
     sys.exit(1)
-
-
-def _downscale_image(path, max_height):
-    """Downscale `path` in place to `max_height` if it's taller, preserving
-    aspect ratio and format. Returns True if it resized, False if it was already
-    small enough. Raises on a read/write error so the caller can warn.
-    """
-    with Image.open(path) as im:
-        width, height = im.size
-        if height <= max_height:
-            return False
-        new_width = max(1, round(width * max_height / height))
-        resized = im.resize((new_width, max_height), Image.LANCZOS)
-        # Preserve the original format and don't drop ICC/EXIF; save params
-        # mirror typical generator output (high-quality JPEG, optimized PNG).
-        fmt = im.format
-        save_kwargs = {}
-        if fmt == "JPEG":
-            save_kwargs.update(quality=90, optimize=True)
-            if resized.mode in ("RGBA", "P"):
-                resized = resized.convert("RGB")
-        elif fmt == "PNG":
-            save_kwargs.update(optimize=True)
-        resized.save(path, format=fmt, **save_kwargs)
-    return True
-
-
-def _downscale_generated_images(out_data):
-    """Downscale oversized generated AI images in the docs/ copy in place.
-
-    Walks each dataset's assets/generated/{ai-visuals,design-vs-requirements}/
-    (recursively, incl. the steps/ subdir) and shrinks any image taller than
-    GENERATED_IMAGE_MAX_HEIGHT to that height, preserving aspect ratio and
-    format. Images already at/below the cap are left alone. Comics are not
-    touched. Only the docs/ copies change — the originals under data/ are
-    untouched. Returns (resized_count, skipped_count).
-    """
-    resized = 0
-    skipped = 0
-    for sub in RESIZABLE_GENERATED_DIRS:
-        for gen_dir in out_data.glob(f"*/assets/generated/{sub}"):
-            for img in gen_dir.rglob("*"):
-                if not img.is_file():
-                    continue
-                if img.suffix.lower() not in GENERATED_IMAGE_SUFFIXES:
-                    continue
-                try:
-                    if _downscale_image(img, GENERATED_IMAGE_MAX_HEIGHT):
-                        resized += 1
-                    else:
-                        skipped += 1
-                except (OSError, ValueError) as exc:
-                    print(f"    warn: failed to resize {img} ({exc}) — left as-is")
-    return resized, skipped
 
 
 def discover_groups():
@@ -173,16 +111,8 @@ def build_group(group):
         if entry.is_dir():
             shutil.copytree(entry, out_data / entry.name, ignore=_ignore_non_data)
 
-    # 3. Downscale oversized generated AI images in the docs/ copy only — the
-    #    originals under data/ stay full-resolution. Keeps docs/ within GitHub
-    #    Pages' size budget without losing source images.
-    resized, skipped = _downscale_generated_images(out_data)
-
     dataset_count = sum(1 for e in out_data.iterdir() if e.is_dir())
-    print(
-        f"  built docs/{group}/  ({dataset_count} datasets; "
-        f"{resized} images downscaled, {skipped} already small)"
-    )
+    print(f"  built docs/{group}/  ({dataset_count} datasets)")
 
 
 def main(argv):

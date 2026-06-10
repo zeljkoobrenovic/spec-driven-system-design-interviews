@@ -47,6 +47,12 @@ python3 -m http.server 8000 -d docs    # serve the built output
 #   explorer: http://localhost:8000/examples/interview.html#url-shortener
 ```
 
+The build also **downscales the generated AI images** in its `docs/` copies to
+the size they're actually displayed at (capped at 1120px tall), keeping `docs/`
+within GitHub Pages' size limit. The full-resolution originals stay in `data/`.
+This needs Pillow — `pip install -r requirements.txt` once before building. See
+[`CLAUDE.md`](CLAUDE.md) for details.
+
 The app fetches JSON, so opening a file via `file://` will not work — always
 serve over HTTP. You serve the **built** output under `docs/<group>/`, never
 `_templates/`. After editing anything in `_templates/` or `data/`, re-run

@@ -47,11 +47,18 @@ python3 -m http.server 8000 -d docs    # serve the built output
 #   explorer: http://localhost:8000/examples/interview.html#url-shortener
 ```
 
-The build also **downscales the generated AI images** in its `docs/` copies to
-the size they're actually displayed at (capped at 1120px tall), keeping `docs/`
-within GitHub Pages' size limit. The full-resolution originals stay in `data/`.
-This needs Pillow — `pip install -r requirements.txt` once before building. See
-[`CLAUDE.md`](CLAUDE.md) for details.
+A separate script, **`downsize-images.py`**, downscales the generated AI images
+in `docs/` to the size they're actually displayed at (capped at 1120px tall),
+keeping `docs/` within GitHub Pages' size limit. It is **not** part of `build.py`
+— run it by hand on the built tree when needed (the full-resolution originals
+stay in `data/`):
+
+```bash
+python3 downsize-images.py docs/book/data   # shrink one group's docs/ images
+```
+
+It prefers macOS `sips` (no install) and falls back to Pillow
+(`pip install -r requirements.txt`). See [`CLAUDE.md`](CLAUDE.md) for details.
 
 The app fetches JSON, so opening a file via `file://` will not work — always
 serve over HTTP. You serve the **built** output under `docs/<group>/`, never

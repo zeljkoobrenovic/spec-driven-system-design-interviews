@@ -81,31 +81,47 @@ publishable once it has an `index.json` manifest.
 changing anything in `_templates/` or `data/`, re-run `build.py` and commit the
 regenerated `docs/`.
 
-**Generated AI images are downscaled in the build.** The full-resolution
-originals under `data/<group>/<id>/assets/generated/` are ~1500–3000px tall, but
-the explorer only ever shows them in a `.diagram-image` box capped at
-`max-height: 560px`. Shipping the originals pushes `docs/` past GitHub Pages'
-size limit, so `build.py` downscales the **docs/ copies** of generated AI
-images to `GENERATED_IMAGE_MAX_HEIGHT` (1120px = 2× the display height, for
-retina sharpness), preserving aspect ratio and format. This applies only to the
-`ai-visuals/` and `design-vs-requirements/` subdirs (`RESIZABLE_GENERATED_DIRS`)
-— **comics are left at full size** (long vertical strips read full-size, not in
-the 560px box). The originals in `data/` are never modified. Resizing uses
-**Pillow** (cross-platform; pinned in `requirements.txt` — `pip install -r
-requirements.txt`), so `build.py` imports `PIL` at the top and won't run without
-it. To change the cap (or what gets resized), edit the constants near the top of
-`build.py`.
+**Generated AI images are huge; downscale them as a separate step before
+deploying.** The full-resolution originals under
+`data/<group>/<id>/assets/generated/` are ~1500–3000px tall, but the explorer
+only ever shows them in a `.diagram-image` box capped at `max-height: 560px`.
+Shipping the originals pushes `docs/` past GitHub Pages' size limit. **`build.py`
+does NOT touch image sizes** — it's a pure copy step. A separate script,
+**`downsize-images.py`**, shrinks the generated images in a built `docs/` tree
+in place to `DEFAULT_MAX_HEIGHT` (1120px = 2× the display height, for retina
+sharpness), preserving aspect ratio and format. Run it **by hand on the built
+tree, not on every build** (it's slow and lossy — you don't want to re-shrink
+on every rebuild):
+
+```bash
+python3 build.py                              # 1. copy sources into docs/
+python3 downsize-images.py docs/book/data     # 2. shrink that group's docs/ images
+```
+
+It applies only to the `ai-visuals/` and `design-vs-requirements/` subdirs
+(`RESIZABLE_GENERATED_DIRS`) — **comics are left at full size** (long vertical
+strips read full-size, not in the 560px box). It rewrites only the `docs/`
+copies; the originals in `data/` are never modified (so you can re-run `build.py`
+to restore full-res, then re-downsize). It's idempotent (already-small images
+are skipped), so a second pass is a safe no-op. Flags: `--max-height N`,
+`--backend sips|pillow`, and it accepts multiple dirs. To change the default cap
+or scope, edit the constants near the top of `downsize-images.py`.
+
+`downsize-images.py` prefers macOS **`sips`** (no install, ships with the OS) and
+falls back to **Pillow** (cross-platform; pinned in `requirements.txt` —
+`pip install -r requirements.txt`); if neither is present it prints a notice and
+changes nothing. `build.py` itself has **no third-party dependencies**.
 
 ## Building
-
-The build needs Pillow (for image downscaling — see "Build output" above).
-Install once: `pip install -r requirements.txt` (a `venv/` is checked into this
-repo; use `venv/bin/python build.py` if `python3` on PATH lacks Pillow).
 
 ```bash
 python3 build.py            # rebuild every publishable group into docs/
 python3 build.py examples   # rebuild only the named group(s)
 ```
+
+`build.py` is a pure copy step with no third-party dependencies; it does not
+resize images (that's the separate `downsize-images.py` step described under
+"Build output" above).
 
 The script wipes and regenerates each `docs/<group>/`, so removed or renamed
 datasets don't linger. Groups without an `index.json` are skipped with a

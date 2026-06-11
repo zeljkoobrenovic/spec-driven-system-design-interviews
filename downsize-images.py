@@ -21,11 +21,20 @@ Backends, in order of preference:
 If neither is available the script prints a notice and resizes nothing, so the
 build still produces a working (if larger) site.
 
+It searches each given directory recursively (any depth) for
+`assets/generated/{ai-visuals,design-vs-requirements}/` folders, so you can
+point it at the whole `docs/` root, a single group, or one dataset:
+
 Usage:
-  python3 downsize-images.py <dir> [<dir> ...]   # downscale generated images
-                                                 # under each given directory
-  python3 downsize-images.py --max-height 1120 <dir>
+  python3 downsize-images.py docs/                # every group under docs/
+  python3 downsize-images.py docs/book           # one group
+  python3 downsize-images.py docs/book/data/foo  # one dataset
+  python3 downsize-images.py --max-height 1120 docs/
+  python3 downsize-images.py --backend pillow docs/
   python3 downsize-images.py --help
+
+Run a single pass at a time — running two passes over the same tree
+concurrently makes the backends race on the same files.
 
 Importable too: `from downsize_images import downsize_tree` (the module name
 uses an underscore — import via importlib if you need the hyphenated file).
@@ -199,7 +208,9 @@ def main(argv):
         description="Downscale oversized generated AI images in place "
                     "(sips, with Pillow as a cross-platform fallback).")
     parser.add_argument("dirs", nargs="+", metavar="DIR",
-                        help="one or more `.../data/` trees to process")
+                        help="one or more directories to search recursively for "
+                             "assets/generated/{ai-visuals,design-vs-requirements} "
+                             "folders (e.g. docs/, docs/book, a single dataset)")
     parser.add_argument("--max-height", type=int, default=DEFAULT_MAX_HEIGHT,
                         help=f"height cap in px (default {DEFAULT_MAX_HEIGHT})")
     parser.add_argument("--backend", choices=("sips", "pillow"), default=None,

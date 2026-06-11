@@ -3025,9 +3025,15 @@
         const wrap = document.createElement("div");
         wrap.className = "api-list";
         for (const r of rows) {
-            const card = document.createElement("div");
+            // Each endpoint is a collapsible <details>: the method+path line is
+            // the always-visible <summary>, and the description/request/response
+            // expand on click. Endpoints with no body details stay as a plain
+            // card (no disclosure triangle) so there's nothing empty to expand.
+            const hasBody = !!(r.description || r.request || r.response);
+            const card = document.createElement(hasBody ? "details" : "div");
             card.className = "api-card";
-            const head = document.createElement("div");
+
+            const head = document.createElement(hasBody ? "summary" : "div");
             head.className = "api-head";
             const method = document.createElement("span");
             method.className = `api-method method-${(r.method || "").toLowerCase()}`;
@@ -3131,11 +3137,21 @@
         const wrap = document.createElement("div");
         wrap.className = "schema-list";
         for (const t of tables) {
-            const card = document.createElement("div");
+            // Each table is a collapsible <details>: the table name is the
+            // always-visible <summary>, and the field table expands on click.
+            // Tables with no fields stay a plain card (no disclosure triangle)
+            // so there's nothing empty to expand.
+            const hasBody = !!(t.fields && t.fields.length);
+            const card = document.createElement(hasBody ? "details" : "div");
             card.className = "schema-card";
-            const h = document.createElement("h3");
+            const h = document.createElement(hasBody ? "summary" : "h3");
+            h.className = "schema-head";
             h.textContent = t.name || "table";
             card.appendChild(h);
+
+            // The note (description) lives in the <details> body, after the
+            // <summary> head — it shows when the card is expanded, not inside
+            // the summary line itself.
             const tableNote = t.note || t.notes;
             if (tableNote) {
                 const n = document.createElement("p");
@@ -3143,6 +3159,7 @@
                 n.textContent = tableNote;
                 card.appendChild(n);
             }
+
             const tbl = document.createElement("table");
             tbl.className = "schema-table";
             const thead = document.createElement("thead");

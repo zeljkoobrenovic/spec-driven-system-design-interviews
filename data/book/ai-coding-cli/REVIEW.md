@@ -1,4 +1,4 @@
-# Review: AI Coding Agent CLI (Claude Code / Codex)
+# Review: AI Coding Agent CLI (Claude Code / Codex) - System Design
 
 Reviewed file: `data/book/ai-coding-cli/interview.json`
 Review date: 2026-06-12
@@ -7,9 +7,10 @@ Review date: 2026-06-12
 
 This is a strong, modern system-design walkthrough for a terminal AI coding
 agent. The step sequence is coherent: naive prompt-to-patch, agent loop,
-context engineering, compaction, permissions/sandboxing, inference economics,
-verification, and headless cloud agents. The strongest parts are the harness vs.
-model framing, the safety model, the prefix-cache explanation, and the
+context engineering, compaction, permissions/sandboxing, extensibility,
+inference economics, verification, and headless cloud agents. The strongest
+parts are the harness vs. model framing, the safety model, the
+extensibility/trust-boundary discussion, the prefix-cache explanation, and the
 pedagogical traps/signals around each step.
 
 | Axis | Rating | Notes |
@@ -65,8 +66,8 @@ IDs on usage records.
 
 ### 2. Verification and evals are conceptually strong but not first-class in the architecture
 
-Step 6 correctly says that tests, typecheck, lint, build, git checkpoints, and
-subagents close the truth loop. Step 7 also introduces evals as release
+Step 7 correctly says that tests, typecheck, lint, build, git checkpoints, and
+subagents close the truth loop. Step 8 also introduces evals as release
 infrastructure. In the diagram, however, these are mostly implicit inside
 `Sandbox` and `Telemetry`.
 
@@ -222,7 +223,21 @@ Improvement: make permission rules more concrete in the data model. Include
 path scopes, command pattern semantics, rule source, precedence, expiry, and
 audit records. Approval prompts need these fields to avoid becoming vague UX.
 
-### Step 5: Streaming & the Inference Backend
+### Step 5: Extensibility: Commands, Skills, and MCP Servers
+
+This section is a strong addition to the walkthrough. It explains why slash
+commands, skills, and MCP servers are not just convenience features but a
+context-budget and trust-boundary problem. The progressive-disclosure framing
+is especially good because it links product extensibility back to token cost
+and prefix-cache stability.
+
+Improvement: make extension provenance and policy state more explicit in the
+API/data model. A mature design needs installed-version metadata, pinned
+servers or skills, credential scopes, review status, and revocation behavior.
+The section already teaches those concerns in prose; a small state model would
+make them easier for candidates to operationalize.
+
+### Step 6: Streaming & the Inference Backend
 
 Strong system insight. The step explains why prefix caching matters, why
 append-only transcripts are a harness constraint, and why routing must be
@@ -232,7 +247,7 @@ Improvement: add capacity implications for cache memory, cache eviction, and
 fallback behavior when affinity cannot be preserved. Also specify stream resume
 semantics: event IDs, duplicate deltas, and whether tool calls can be replayed.
 
-### Step 6: Verify & Iterate: Tests, Git, and Subagents
+### Step 7: Verify & Iterate: Tests, Git, and Subagents
 
 The content is strong: verification by external checks, baseline red tests,
 bounded retries, reward hacking, git checkpoints, and worktree isolation are all
@@ -241,7 +256,7 @@ production-realistic.
 Improvement: make verification a flow or a visible architectural path. This
 step is central enough that it should not be inferred from the sandbox node.
 
-### Step 7: Background & Cloud Agents at Scale
+### Step 8: Background & Cloud Agents at Scale
 
 The cloud section is credible and well staged. Queue leases, branch-per-task
 idempotency, short-lived scoped tokens, egress controls, PR review, metering,
@@ -267,8 +282,9 @@ make the final design feel much more production-grade.
 
 Concepts are introduced at the right time. "Completion vs. agent" precedes the
 loop; "context window" precedes context engineering; prompt injection and blast
-radius arrive before cloud autonomy; prefill/decode arrives before prefix
-caching; subagents arrive after context and cost are established.
+radius arrive before cloud autonomy; MCP and progressive disclosure arrive
+before extension trust becomes a production concern; prefill/decode arrives
+before prefix caching; subagents arrive after context and cost are established.
 
 The weakest concept gap is idempotency. It appears in the cloud recap, but it
 should be introduced as a named concept before the cloud step relies on it.
@@ -283,9 +299,10 @@ The steps build cleanly into the final diagram:
 - Step 2 inserts `AgentCore` and `Sandbox`.
 - Step 3 adds `SessionStore` and optional `CodeIndex`.
 - Step 4 adds `Policy` and hardens `Sandbox`.
-- Step 5 adds `Router`, `PromptCache`, and `Usage`.
-- Step 6 adds `Subagents`.
-- Step 7 adds `CloudOrch`, `TaskQueue`, `CloudSandbox`, `GitHost`, and
+- Step 5 adds `SkillsLib` and `MCPServer`.
+- Step 6 adds `Router`, `PromptCache`, and `Usage`.
+- Step 7 adds `Subagents`.
+- Step 8 adds `CloudOrch`, `TaskQueue`, `CloudSandbox`, `GitHost`, and
   operational telemetry.
 
 This is a good spine. The only coherence issue is that verification/evals are
@@ -294,9 +311,9 @@ important in the narrative but do not become a distinct visible node or flow.
 ## Realism Compared With Production Systems
 
 The dataset is realistic about the hard parts most AI-agent designs miss:
-prompt injection, approval fatigue, sandbox egress, append-only prompt caching,
-model tiering, baseline test failures, reward hacking, worktree isolation,
-leases, scoped credentials, and eval harnesses.
+prompt injection, approval fatigue, sandbox egress, extension/tool poisoning,
+append-only prompt caching, model tiering, baseline test failures, reward
+hacking, worktree isolation, leases, scoped credentials, and eval harnesses.
 
 The remaining realism gaps are mostly around operations:
 

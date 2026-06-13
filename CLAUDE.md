@@ -94,18 +94,23 @@ tree, not on every build** (it's slow and lossy — you don't want to re-shrink
 on every rebuild):
 
 ```bash
-python3 build.py                              # 1. copy sources into docs/
-python3 downsize-images.py docs/book/data     # 2. shrink that group's docs/ images
+python3 build.py                  # 1. copy sources into docs/
+python3 downsize-images.py docs/  # 2. shrink generated images across all groups
 ```
 
-It applies only to the `ai-visuals/` and `design-vs-requirements/` subdirs
-(`RESIZABLE_GENERATED_DIRS`) — **comics are left at full size** (long vertical
-strips read full-size, not in the 560px box). It rewrites only the `docs/`
-copies; the originals in `data/` are never modified (so you can re-run `build.py`
-to restore full-res, then re-downsize). It's idempotent (already-small images
-are skipped), so a second pass is a safe no-op. Flags: `--max-height N`,
-`--backend sips|pillow`, and it accepts multiple dirs. To change the default cap
-or scope, edit the constants near the top of `downsize-images.py`.
+It searches each given directory **recursively at any depth** for
+`assets/generated/{ai-visuals,design-vs-requirements}/` folders, so you can point
+it at the whole `docs/` root (every group at once), a single group
+(`docs/book`), or one dataset (`docs/book/data/foo`). **Comics are left at full
+size** (long vertical strips read full-size, not in the 560px box). It rewrites
+only the `docs/` copies; the originals in `data/` are never modified (so you can
+re-run `build.py` to restore full-res, then re-downsize). It's idempotent
+(already-small images are skipped), so a second pass is a safe no-op — but run
+**one pass at a time**: two concurrent passes over the same tree make the
+backends race on the same files (the source of spurious `sips` "exit status 13"
+failures). Flags: `--max-height N`, `--backend sips|pillow`, and it accepts
+multiple dirs. To change the default cap or scope, edit the constants near the
+top of `downsize-images.py`.
 
 `downsize-images.py` prefers macOS **`sips`** (no install, ships with the OS) and
 falls back to **Pillow** (cross-platform; pinned in `requirements.txt` —

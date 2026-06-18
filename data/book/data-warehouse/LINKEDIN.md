@@ -19,10 +19,10 @@ Modern tools can shorten the build, but they do not remove the questions. You mi
 The key is choosing where the platform gives you replay, atomic publish, governance, and operable backfills.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#data-warehouse
+https://system-design-interviews.com/book/interview.html#data-warehouse
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

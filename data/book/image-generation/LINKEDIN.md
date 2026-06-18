@@ -11,10 +11,10 @@ The useful interview lesson: with AI systems, classic distributed-systems basics
 The technology choices make the trade-offs concrete: Triton, KServe, Ray Serve, TorchServe, or custom Diffusers workers for batching control; SageMaker, Vertex AI, Azure ML, Bedrock, Imagen, or Azure OpenAI image models for managed serving; SQS/Pub/Sub/Service Bus for dispatch; S3/GCS/Blob Storage plus CDN for delivery; managed or in-house safety classifiers for policy control.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#image-generation
+https://system-design-interviews.com/book/interview.html#image-generation
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

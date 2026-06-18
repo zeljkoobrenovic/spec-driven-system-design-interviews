@@ -11,10 +11,10 @@ Implementation choices are concrete too. You can compare NGINX/tusd or direct ob
 Practice lives in those trade-offs: where state belongs, what must be idempotent, which paths need strong correctness, and which counters can be eventually consistent.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#youtube-upload
+https://system-design-interviews.com/book/interview.html#youtube-upload
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

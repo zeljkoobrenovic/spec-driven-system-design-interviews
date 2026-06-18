@@ -18,10 +18,10 @@ The interview also connects those fundamentals to modern implementation choices:
 The tools can change. The invariants do not.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#payment-system
+https://system-design-interviews.com/book/interview.html#payment-system
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

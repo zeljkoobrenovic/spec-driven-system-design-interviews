@@ -13,10 +13,10 @@ The technology choices make the trade-offs concrete: ripgrep versus semantic ind
 Managed tools reduce operations. They do not decide permissions, token budgets, cache-aware routing, retries, or human review.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#ai-coding-cli
+https://system-design-interviews.com/book/interview.html#ai-coding-cli
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

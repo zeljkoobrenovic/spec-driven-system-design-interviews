@@ -9,10 +9,10 @@ That matters in interviews because patterns are not decorations. A work queue ch
 The modern choices are just as important. You can self-host PostgreSQL, Kafka, Redis, Elasticsearch, Temporal, Keycloak, or Ceph. You can also reach for DynamoDB, Spanner, Cosmos DB, Pub/Sub, SQS, CloudFront, managed search, workflow services, and managed identity. The useful answer is not "which tool is best"; it is knowing which pattern you need, what the service removes, and which trade-off remains yours.
 
 Try the interactive catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#patterns
+https://system-design-interviews.com/book/interview.html#patterns
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

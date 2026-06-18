@@ -11,10 +11,10 @@ The useful lesson: consistency is not one setting. Catalog descriptions can be s
 Practical choices: PostgreSQL, Aurora, DynamoDB, or Spanner for catalog truth; Elasticsearch, OpenSearch, Solr, Lucene, or Vespa for search; Redis, Valkey, Bigtable, or ScyllaDB for read models; Kafka, Pulsar, Kinesis, Pub/Sub, or Debezium for projections. Managed services help, but the boundary stays: browse is projected, purchase decisions are authoritative.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#product-catalog
+https://system-design-interviews.com/book/interview.html#product-catalog
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

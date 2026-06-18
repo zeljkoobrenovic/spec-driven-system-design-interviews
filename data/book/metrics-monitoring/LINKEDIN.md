@@ -9,10 +9,10 @@ The practical lesson: cardinality control and alert state are not advanced extra
 The technology choices make the trade-offs concrete: Prometheus-compatible TSDBs, Thanos/Mimir/Cortex/M3DB, Kafka/Pulsar/Kinesis/Pub/Sub ingestion buffers, Grafana, managed Prometheus, object storage, caches, and cloud alerting. Managed services can remove shard-ring and compaction operations, but not the need to reason about budgets, query limits, missing data, and paging semantics.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#metrics-monitoring
+https://system-design-interviews.com/book/interview.html#metrics-monitoring
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

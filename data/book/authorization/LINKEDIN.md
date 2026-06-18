@@ -13,10 +13,10 @@ It also covers the part many candidates miss: listing. "Can user:42 view doc:9?"
 Modern implementations can use pieces like SpiceDB, OpenFGA, OPA, Cedar, Verified Permissions, Redis/Valkey, Kafka/Kinesis/Pub/Sub, DynamoDB, Spanner, and PostgreSQL. The point is to understand which responsibility each tool removes, and which correctness semantics still belong to the design.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#authorization
+https://system-design-interviews.com/book/interview.html#authorization
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

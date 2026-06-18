@@ -9,10 +9,10 @@ The useful lesson is that "correctness over availability" changes the architectu
 Modern technology helps, but it does not remove the accounting model. PostgreSQL, Aurora, Spanner, DynamoDB, Temporal, Kafka, S3/Cloud Storage, KMS, and managed observability tools all show up as choices around the core invariant: every posting balances, every derived view can be rebuilt, and every external settlement can be reconciled.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#wallet-ledger
+https://system-design-interviews.com/book/interview.html#wallet-ledger
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

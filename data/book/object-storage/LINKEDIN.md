@@ -15,10 +15,10 @@ Technology choices shape it: FoundationDB/Spanner/CockroachDB/DynamoDB/Cassandra
 Managed services remove machinery. They do not remove visibility commit order, failure-domain placement, repair lag, index consistency, signed data-plane access, GC safety, or cost-vs-latency tiering.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#object-storage
+https://system-design-interviews.com/book/interview.html#object-storage
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

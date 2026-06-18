@@ -9,10 +9,10 @@ It also separates the two worlds that get confused in many booking designs. Brow
 Modern technology choices are visible, but they do not replace the core invariant. You might use Aurora, Spanner, DynamoDB, or PostgreSQL for the truth store; OpenSearch and Redis/Valkey for browse; Kafka/Kinesis/Pub/Sub for freshness; Temporal or Step Functions for confirm/cancel workflows; and managed observability for conflict rate, projector lag, stale cache age, and stuck sagas. The design still lives or dies on "reserve every night or none."
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#hotel-booking
+https://system-design-interviews.com/book/interview.html#hotel-booking
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

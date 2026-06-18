@@ -11,10 +11,10 @@ The central lesson: the order store is the truth, but the live system is mostly 
 Modern choices make the trade-offs concrete: PostgreSQL, Aurora, Spanner, or DynamoDB for order state; Kafka, Redpanda, Kinesis, or Pub/Sub for streams; Redis, PostGIS, OpenSearch, or DynamoDB for geo lookup; Temporal, Step Functions, or Workflows for timers and compensation; and realtime gateways or WebSocket fleets for fanout.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#food-delivery
+https://system-design-interviews.com/book/interview.html#food-delivery
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

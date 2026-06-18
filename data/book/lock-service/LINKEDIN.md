@@ -15,10 +15,10 @@ That makes it a strong interview case because it separates mutual exclusion, fai
 Modern technology choices make build-vs-buy concrete. etcd, Consul, ZooKeeper, Raft/Paxos groups, DynamoDB, Spanner, Redis/Valkey, managed queues, API gateways, KMS, and Kubernetes-style placement can remove pieces of infrastructure. They do not remove the fundamentals: quorum, expiry ordering, retry deduplication, shard migration, hot-key serialization, and resource-side fencing.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#lock-service
+https://system-design-interviews.com/book/interview.html#lock-service
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

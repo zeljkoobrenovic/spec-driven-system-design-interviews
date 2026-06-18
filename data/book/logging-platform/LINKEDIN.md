@@ -15,10 +15,10 @@ Modern choices sharpen the trade-offs: Fluent Bit, OpenTelemetry Collector, Vect
 The useful lesson: logs are mostly written and never read, but when they are needed, something is often already broken.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#logging-platform
+https://system-design-interviews.com/book/interview.html#logging-platform
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

@@ -17,10 +17,10 @@ The technology choices make this concrete. Lucene, OpenSearch, or Solr can give 
 Those tools help, but they do not remove the design work around shard count, top-k limits, cache hit-rate collapse, robots.txt politeness, and query p99.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#search-engine
+https://system-design-interviews.com/book/interview.html#search-engine
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

@@ -15,10 +15,10 @@ Technology choices make trade-offs concrete: PostgreSQL/Vitess/CockroachDB/Found
 Managed services remove plumbing. They do not remove idempotent commits, version conflicts, commit-time ACL checks, dedup privacy, cursor recovery, refcount drift, or GC safety.
 
 Try the walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#file-sync
+https://system-design-interviews.com/book/interview.html#file-sync
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

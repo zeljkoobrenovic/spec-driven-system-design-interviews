@@ -11,10 +11,10 @@ Lesson: "fast cart" and "correct order" are different systems. Cart state can be
 Practical choices: Redis, Valkey, Cassandra, ScyllaDB, or DynamoDB-style stores for carts; PostgreSQL, Aurora, or Spanner-style stores for order truth; Temporal or Step Functions for sagas; Kafka, SQS, Pub/Sub, or Service Bus for outbox delivery. Managed services reduce plumbing, not invariants.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#shopping-cart
+https://system-design-interviews.com/book/interview.html#shopping-cart
 
 Explore the catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

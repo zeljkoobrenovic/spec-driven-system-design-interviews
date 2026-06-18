@@ -13,10 +13,10 @@ The interview connects those fundamentals to current implementation choices: Bed
 The tools reduce operational work. They do not design retrieval boundaries, token budgets, citation checks, reindexing flows, or quality gates.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#rag-llm-chat
+https://system-design-interviews.com/book/interview.html#rag-llm-chat
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

@@ -15,10 +15,10 @@ What makes the case useful is the failure-mode thinking: what if the password da
 Technology choices are options, not endorsements: Keycloak, Cognito, Microsoft Entra ID, Identity Platform, OPA/OpenFGA, Redis/Valkey, KMS/HSM signing, API gateways, WAFs, audit pipelines, and managed databases can remove plumbing, but not the reasoning around token lifetime, tenant isolation, revocation, policy freshness, and abuse controls.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#auth-system
+https://system-design-interviews.com/book/interview.html#auth-system
 
 Project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

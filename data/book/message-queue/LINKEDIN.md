@@ -15,10 +15,10 @@ Modern choices make the trade-offs concrete: Kafka, Redpanda, Pulsar, or Kinesis
 Managed services can remove broker operations. They do not remove the fundamentals: partitioning, offsets, replication, idempotency, backpressure, lag and hot-partition observability, and the scope of ordering.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#message-queue
+https://system-design-interviews.com/book/interview.html#message-queue
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

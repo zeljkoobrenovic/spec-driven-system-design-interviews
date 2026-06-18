@@ -13,10 +13,10 @@ Technology choices make the trade-offs concrete: Open Connect-style appliances o
 Use the products as trade-off prompts, not a checklist.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#netflix
+https://system-design-interviews.com/book/interview.html#netflix
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

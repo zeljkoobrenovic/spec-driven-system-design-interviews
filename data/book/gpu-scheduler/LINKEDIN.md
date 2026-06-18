@@ -11,10 +11,10 @@ The core lesson is that metrics are not the source of truth. GPU utilization hel
 Trade-offs are concrete: Kubernetes with Volcano or Kueue, Slurm, Ray, or managed training platforms for scheduling; PostgreSQL, etcd, or distributed SQL for durable state; indexed free lists for placement; object storage or parallel filesystems for checkpoints; and DCGM-style GPU signals for observability, not authority.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#gpu-scheduler
+https://system-design-interviews.com/book/interview.html#gpu-scheduler
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

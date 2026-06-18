@@ -13,10 +13,10 @@ It is a good interview because every step exposes a trade-off: latency vs. fresh
 Modern implementations can map those choices to Redis or Valkey for timelines, Cassandra, ScyllaDB, DynamoDB, or Bigtable for tweets and graph data, Kafka, SQS, Kinesis, or Pub/Sub for fanout, object storage plus CDN for media, and managed model endpoints for ranking. The fundamentals still decide the architecture.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#twitter-feed
+https://system-design-interviews.com/book/interview.html#twitter-feed
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

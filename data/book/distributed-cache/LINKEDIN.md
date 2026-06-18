@@ -15,10 +15,10 @@ Technology choices make the trade-offs concrete. Memcached is lean for plain key
 Managed services help, but they do not remove the fundamentals: key ownership, eviction, invalidation, TTL jitter, backfill budgets, replica-lag alerts, stale-serve rules, and the response when DB fallback exceeds budget.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#distributed-cache
+https://system-design-interviews.com/book/interview.html#distributed-cache
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

@@ -11,10 +11,10 @@ The core trade-off is blunt: availability of the buy path is negotiable; the no-
 The technology choices make the fundamentals concrete. A managed CDN/WAF or waiting-room product can absorb the first wave. Redis Lua, DynamoDB conditional writes, Spanner, or Cosmos DB can implement decrement-if-positive. SQS, Pub/Sub, Service Bus, Kafka, or RabbitMQ can decouple reservation from order creation. Observability matters here: operators need token issue rate, queue depth, reservation success, payment failures, hold expiry, counter-vs-ledger drift, and kill switches before T0.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#flash-sale
+https://system-design-interviews.com/book/interview.html#flash-sale
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

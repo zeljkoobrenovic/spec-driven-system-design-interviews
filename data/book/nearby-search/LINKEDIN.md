@@ -9,10 +9,10 @@ The useful lesson is that a geo index is only the recall layer. The design still
 Modern implementation choices make the trade-offs concrete: S2 or H3 over a KV store for control, PostGIS or OpenSearch for richer geo queries, DynamoDB, Bigtable, or Cosmos DB-style cell-prefix indexes for scale, Kafka, Kinesis, Pub/Sub, or Debezium for change streams, Redis or Valkey for hot place details, and managed routing APIs or OSRM/Valhalla when ETA is useful. The tools help, but they do not remove the need to defend radius caps, freshness lag, and bounded ranking.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#nearby-search
+https://system-design-interviews.com/book/interview.html#nearby-search
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

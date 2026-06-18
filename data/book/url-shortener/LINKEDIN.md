@@ -13,10 +13,10 @@ This case also connects fundamentals to modern implementation choices. A managed
 That is why this is a useful interview problem: every shortcut has a boundary, and every boundary forces a product decision.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#url-shortener
+https://system-design-interviews.com/book/interview.html#url-shortener
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

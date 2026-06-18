@@ -11,10 +11,10 @@ The technology choices stay practical: PostgreSQL, Aurora, DynamoDB, Spanner, or
 The interview is good practice because it forces the trade-offs interviewers care about: consistency without distributed transactions, idempotency, async fulfillment, partial shipment, refund safety, auditability, and operational repair.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#order-management
+https://system-design-interviews.com/book/interview.html#order-management
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

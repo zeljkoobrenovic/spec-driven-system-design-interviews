@@ -11,10 +11,10 @@ The core lesson is cadence separation. The base graph changes slowly, traffic ch
 Modern choices make the trade-offs concrete: OSRM, Valhalla, GraphHopper, or managed Routes APIs for routing; S3 or Cloud Storage plus CloudFront, Cloud CDN, or Azure CDN for tiles; Kafka, Kinesis, Pub/Sub, Flink, or Dataflow for probes; Redis, Valkey, DynamoDB, Bigtable, or Cassandra-style stores for edge speeds; and workflow/batch systems for route regression, canarying, and rollback.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#maps-routing
+https://system-design-interviews.com/book/interview.html#maps-routing
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

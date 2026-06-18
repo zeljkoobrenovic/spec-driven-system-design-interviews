@@ -13,10 +13,10 @@ Technology choices become concrete: object storage + CDN, KMS/Vault signing, Pos
 The products are prompts, not a checklist. The durable question is: what state is authoritative, what is rebuildable, and what must never depend on avoidable origin work?
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#spotify
+https://system-design-interviews.com/book/interview.html#spotify
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

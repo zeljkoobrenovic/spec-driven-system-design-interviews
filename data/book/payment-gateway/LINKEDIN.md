@@ -19,10 +19,10 @@ The technology choices are framed as trade-offs: managed KMS/HSM for vault key c
 The lesson is demanding: in money systems, correctness beats availability. You can retry a request, replay an event, or reconcile a settlement line, but you cannot casually "eventually fix" a duplicate charge.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#payment-gateway
+https://system-design-interviews.com/book/interview.html#payment-gateway
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

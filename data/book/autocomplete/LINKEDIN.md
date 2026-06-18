@@ -11,10 +11,10 @@ The lesson is not just "use a trie." The lesson is how to separate serving laten
 Modern technology choices make the trade-offs concrete: OpenSearch or Lucene suggesters can accelerate adoption, a custom compressed trie/FST can reduce serving footprint, CloudFront or Cloud CDN can absorb the hot head, Kafka/Kinesis/Pub/Sub can carry query events, and Flink/Dataflow-style aggregation can maintain rolling popularity counts. Those choices still leave cache keys, freshness windows, shard ownership, abuse controls, and rollback.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#autocomplete
+https://system-design-interviews.com/book/interview.html#autocomplete
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

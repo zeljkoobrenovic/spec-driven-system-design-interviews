@@ -11,10 +11,10 @@ It is a useful interview case because every choice has a business trade-off. Blo
 Modern implementations can use managed gateways, Kafka/Kinesis/Pub/Sub-style streams, Flink/Dataflow-style aggregation, Redis or durable KV feature stores, managed model serving, workflow engines, and object-storage retention tiers. The fundamentals still decide how those pieces fit together.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#fraud-detection
+https://system-design-interviews.com/book/interview.html#fraud-detection
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

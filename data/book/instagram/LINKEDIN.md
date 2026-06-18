@@ -9,10 +9,10 @@ From there, the design moves one bottleneck at a time: resumable object-store up
 The technology choices make the trade-offs concrete. You can discuss S3 or Cloud Storage behind a CDN for media, Kafka/SQS/Pub/Sub for processing and fanout, Redis or DynamoDB-style stores for feed lists, and SageMaker/Vertex/KServe-style serving for ranking. The point is not to memorize products. It is to connect each product choice back to the design pressure it relieves and the operational cost it introduces.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#instagram
+https://system-design-interviews.com/book/interview.html#instagram
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

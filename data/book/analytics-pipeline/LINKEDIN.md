@@ -11,10 +11,10 @@ The speed layer gives dashboards fresh clicks, impressions, CTR, and conversion 
 The technology choices make the trade-offs concrete: Kafka, Redpanda, Pulsar, Kinesis, Pub/Sub, and Event Hubs for ingestion; Flink, Spark, Dataflow, and Databricks for stream processing; Redis, Cassandra, DynamoDB, Bigtable, and Cosmos DB for state; S3, Cloud Storage, Blob Storage, HDFS, and Ceph for the raw lake; ClickHouse, BigQuery, Redshift, Synapse, and OpenSearch for rollups.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#analytics-pipeline
+https://system-design-interviews.com/book/interview.html#analytics-pipeline
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

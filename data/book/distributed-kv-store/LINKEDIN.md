@@ -13,10 +13,10 @@ Technology choices make the trade-offs concrete. Cassandra, ScyllaDB, and Riak-s
 Managed services remove a lot of ownership. They do not remove the fundamentals: partitioning, replica placement, quorum math, conflict handling, repair lag, hot-key controls, and foreground-latency metrics.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#distributed-kv-store
+https://system-design-interviews.com/book/interview.html#distributed-kv-store
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

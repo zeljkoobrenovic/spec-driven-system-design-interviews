@@ -11,10 +11,10 @@ It is a good interview because the trade-offs are not cosmetic. You have to expl
 Modern implementation choices make the discussion sharper: managed databases for calendar-sharded event rows and conditional writes, streams or queues for the outbox/projectors, delayed queues or workflow engines for reminders, Redis-like caches for hot views, and gateways/identity services for auth and rate limits. They reduce infrastructure work, but they do not remove the domain semantics.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#calendar
+https://system-design-interviews.com/book/interview.html#calendar
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

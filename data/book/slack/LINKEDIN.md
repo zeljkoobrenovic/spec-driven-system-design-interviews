@@ -15,10 +15,10 @@ Search can index asynchronously. Large channels can be chunked, queued, rate-lim
 The scale signals make the trade-offs concrete: ~10M concurrent sockets, ~50K messages/sec, and ~1-2M pushes/sec when channel fanout is included.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#slack
+https://system-design-interviews.com/book/interview.html#slack
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

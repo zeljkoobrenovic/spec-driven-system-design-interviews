@@ -11,10 +11,10 @@ That is the useful interview lesson: the hard part is not "run cron on more mach
 The case also shows where modern platform choices change the build-vs-buy discussion. EventBridge Scheduler, Cloud Scheduler, Logic Apps, Step Functions, SQS, Pub/Sub, Service Bus, DynamoDB, Spanner, Aurora, Fargate, Lambda, Cloud Run, and Kubernetes can remove pieces of the custom stack. But they do not remove the need to reason about misfire policy, overlap policy, fire-key deduplication, queue visibility, retry limits, and operational recovery.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#job-scheduler
+https://system-design-interviews.com/book/interview.html#job-scheduler
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

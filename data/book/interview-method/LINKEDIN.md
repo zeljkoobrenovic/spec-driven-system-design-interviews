@@ -11,10 +11,10 @@ It also connects classic whiteboard moves to today's implementation options: API
 The goal is not a memorized script. It is to leave artifacts an interviewer can score: scope, estimates, API contract, data model, architecture, defended trade-offs, risk register, ops checklist, and a clear 60-second close.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#interview-method
+https://system-design-interviews.com/book/interview.html#interview-method
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

@@ -11,10 +11,10 @@ The central lesson: a geo index makes lookup fast, but correctness comes from of
 Modern choices make the trade-offs concrete: Kafka, Pulsar, Kinesis, or Pub/Sub for streams; Redis, Cassandra, DynamoDB, or Bigtable for locations and TTL-backed geo cells; Kubernetes, EKS, GKE, or AKS for matching fleets; PostgreSQL, Spanner, DynamoDB, or Cosmos DB for guarded trip and claim state; Flink or Dataflow for surge windows.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#uber
+https://system-design-interviews.com/book/interview.html#uber
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

@@ -15,10 +15,10 @@ Crash gates and feature flags protect mobile releases, where instant rollback is
 The technology choices make the trade-offs concrete: self-hosted Jenkins, Tekton, Argo, GitLab, or GitHub runners versus managed CodeBuild, Cloud Build, or Azure Pipelines; Kubernetes runner pools versus managed workers; Bazel or Gradle caches; Harbor or managed registries; Argo CD/Rollouts, Flux/Flagger, or Spinnaker; and Prometheus/Grafana or cloud observability.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#cicd-pipeline
+https://system-design-interviews.com/book/interview.html#cicd-pipeline
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

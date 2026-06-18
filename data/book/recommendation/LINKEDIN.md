@@ -9,10 +9,10 @@ That sequence matters. Scoring the whole catalog per request fails immediately. 
 It also connects classic architecture choices to modern implementations. You can discuss FAISS/HNSWlib/Milvus/Qdrant versus managed vector search, Feast/Redis/Cassandra versus managed feature stores, Kafka/Pulsar/Redpanda versus cloud streams, and Triton/TensorFlow Serving/MLflow versus managed model endpoints and registries. The point is not to memorize vendors; it is to explain the trade-offs they simplify or push back onto your team.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#recommendation
+https://system-design-interviews.com/book/interview.html#recommendation
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

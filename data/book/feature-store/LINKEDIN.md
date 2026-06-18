@@ -15,10 +15,10 @@ Technology trade-offs: Feast, Hopsworks, or custom registry vs managed feature s
 Managed services reduce control-plane code, but not the need to reason about leakage, skew, versioning, freshness, and governance.
 
 Try the interactive walkthrough:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/interview.html#feature-store
+https://system-design-interviews.com/book/interview.html#feature-store
 
 Explore the project/book catalog:
-https://zeljkoobrenovic.github.io/spec-driven-system-design-interviews/book/index.html
+https://system-design-interviews.com/book/index.html
 
 Free source code:
 https://github.com/zeljkoobrenovic/spec-driven-system-design-interviews

@@ -322,7 +322,7 @@
     "graph LR",
     "  Tasks[~50k tasks/day; peak ~120/min]",
     "  Queue[Admission-controlled queue]",
-    "  Sandbox[~500 concurrent sandboxes + CI minutes]",
+    "  Sandbox[~900 steady-state sandboxes + CI minutes; bursts queue]",
     "  Index[Repo index + inference + trajectory storage]",
     "  Tasks --> Queue",
     "  Queue --> Sandbox",
@@ -357,8 +357,8 @@
     },
     {
       "label": "Concurrent sandboxes",
-      "value": "~120k\u00d7p95-duration / 60 \u2248 ~500 concurrent target",
-      "note": "Little's Law on arrival rate \u00d7 p95 duration; admission control caps this hard, warm pool ~50 hides ~20s microVM boot."
+      "value": "steady-state ~900 (Little's Law: ~35/min daily avg \u00d7 25 min p95); peak ~120/min would imply ~3000",
+      "note": "Provision the warm fleet for steady-state p95 (~900) plus headroom; the admission queue absorbs peak bursts rather than scaling to ~3000. Sizing for daily-average arrival, not peak arrival, is the explicit policy. A warm pool of ~50 hides the ~20s microVM boot."
     },
     {
       "label": "Repo checkout / cache",
@@ -395,9 +395,9 @@
     {
       "method": "POST",
       "path": "/v1/tasks",
-      "description": "Submit a coding task (from an issue, webhook, or cron); the supervisor plans and dispatches it to the fleet.",
-      "request": "{ \"repo\": \"...\", \"issue\": \"...\", \"base\": \"main\" }",
-      "response": "{ \"taskId\": \"...\", \"status\": \"queued\" }",
+      "description": "Submit a coding task (from an issue, webhook, or cron); the supervisor plans and dispatches it to the fleet. The idempotency key collapses replayed webhooks, and baseBranch/baseSha bind the work to a specific commit.",
+      "request": "{ \"tenantId\": \"...\", \"repoId\": \"...\", \"idempotencyKey\": \"...\", \"taskSource\": \"issue|webhook|cron\", \"issue\": \"...\", \"baseBranch\": \"main\", \"baseSha\": \"abc123 (optional)\", \"requestedPaths\": [\"src/auth/**\"], \"riskClass\": \"low|medium|high\", \"priority\": \"normal\", \"callback\": { \"webhookUrl\": \"...\" } }",
+      "response": "{ \"taskId\": \"...\", \"status\": \"queued\", \"idempotencyKey\": \"...\", \"deduped\": false }",
       "sequence": {
         "participants": [
           {
@@ -447,16 +447,23 @@
     {
       "method": "GET",
       "path": "/v1/tasks/{id}",
-      "description": "Poll a task: its status, the draft PR url, and CI check state.",
+      "description": "Poll a task: lifecycle status, lease/retry state, the commit/branch/PR identifiers it produced, and a link to durable gate evidence.",
       "request": "(task id in path)",
-      "response": "{ \"status\": \"running|pr_open|failed\", \"prUrl\": \"...\", \"checks\": \"pending|passing|failing\" }"
+      "response": "{ \"status\": \"queued|leased|running|verifying|pr_open|merged|failed|canceled\", \"attempt\": 2, \"leaseState\": \"held|expired|released\", \"baseSha\": \"abc123\", \"branchName\": \"agent/fix-auth\", \"headSha\": \"def456\", \"prId\": \"...\", \"prUrl\": \"...\", \"checks\": \"pending|passing|failing\", \"terminalReason\": null, \"retryAfter\": null, \"gateEvidenceUrl\": \"/v1/tasks/{id}/gate-decisions\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/{id}/cancel",
+      "description": "Request cancellation; sets cancel_requested_at so the worker stops at its next checkpoint and tears down the sandbox. Idempotent: cancelling a terminal task is a no-op.",
+      "request": "{ \"reason\": \"superseded|duplicate|manual\" }",
+      "response": "{ \"status\": \"canceling|canceled\", \"terminalReason\": \"...\" }"
     },
     {
       "method": "GET",
       "path": "/v1/tasks/{id}/trajectory",
-      "description": "Fetch the agent's trajectory (steps, tool calls, retrievals) for review and audit.",
+      "description": "Fetch the agent's trajectory (steps, tool calls, retrievals) for review and audit. Spans may contain source and secrets, so access is scoped and the payload carries a retention class and redaction status.",
       "request": "(task id in path)",
-      "response": "{ \"spans\": [ { \"kind\": \"AGENT|TOOL|RETRIEVER\", \"...\": \"...\" } ] }"
+      "response": "{ \"retentionClass\": \"standard-90d\", \"redacted\": true, \"spans\": [ { \"kind\": \"AGENT|TOOL|RETRIEVER\", \"...\": \"...\" } ] }"
     }
   ],
   "dataModel": [
@@ -843,7 +850,7 @@
       "title": "1. Naive: One Agent, Direct Commit (the baseline)",
       "description": [
         "Start with one coding agent on a developer's machine: it reads the task, edits files, and commits straight to the branch. This is essentially the single-CLI tool \u2014 fine for one person, one task.",
-        "It doesn't become a platform: it serves one user at a time, runs with that user's full credentials, has no isolation between tasks, pushes unreviewed code, and can't take work from an issue or webhook while nobody is watching.",
+        "It doesn't scale into a platform: it serves one user at a time, runs with that user's full credentials, has no isolation between tasks, pushes unreviewed code, and can't pick up work from an issue or webhook while nobody is watching.",
         "The rest of the interview turns this into a fleet with a review gate."
       ],
       "view": {
@@ -973,6 +980,16 @@
           ]
         }
       ],
+      "deepDives": [
+        {
+          "title": "When the index is stale",
+          "points": [
+            "index_jobs tracks re-index lag per repo; the freshness SLO is a bound on how far behind the index may be the latest pushed commit.",
+            "If lag exceeds the SLO, the agent should fall back to direct VCS reads for the files it touches, or delay PR creation until the relevant paths are re-indexed.",
+            "Retrieval records the commit_sha it was served from; if the base advanced past that, the agent refreshes the affected chunks before opening the PR so it never edits against stale structure."
+          ]
+        }
+      ],
       "options": [
         {
           "name": "Hybrid: Tree-sitter chunks + code graph (recommended)",
@@ -1036,7 +1053,7 @@
       "description": [
         "Turn one agent into many. A supervisor plans each task and fans it out to parallel coding agents, each in its own ephemeral sandbox with a scoped, brokered credential and its own branch \u2014 so tasks can't interfere and a compromise is contained.",
         "Admission control caps concurrent sandboxes; a durable run log lets a long task resume exactly-once. This is the shared runtime/durability from Foundations applied to coding work.",
-        "Make it operable under retries and parallelism: each task holds a renewable lease (so a dead worker's task is re-leased, not orphaned), carries an attempt number and idempotency key (so a replayed webhook doesn't double-spend a sandbox), and captures its branch name and base SHA up front. Path-level work-intents stop two agents racing on the same files; if the base moved, the agent rebases optimistically before opening the PR, and the conflict policy decides retry vs. cancel."
+        "Make it operable under retries and parallelism. Each task holds a renewable lease, so a dead worker's task is re-leased rather than orphaned. It carries an attempt number and idempotency key, so a replayed webhook doesn't double-spend a sandbox. And it captures its branch name and base SHA up front, so resume and rebase are deterministic. Path-level work-intents stop two agents racing on the same files; if the base moved, the agent rebases optimistically before opening the PR, and the conflict policy decides retry vs. cancel."
       ],
       "view": {
         "nodes": [
@@ -1139,6 +1156,12 @@
                 "label": "replay events to last_event_seq"
               },
               {
+                "from": "CodingAgent",
+                "to": "DurableLog",
+                "arrow": "->>",
+                "label": "claim work_intent(path_glob, base_sha) — else wait/dedupe"
+              },
+              {
                 "type": "alt",
                 "label": "fresh task / no prior side effects",
                 "messages": [
@@ -1199,7 +1222,7 @@
       "description": [
         "This is the crux of the vertical. The agent's autonomy ceiling is opening a draft PR / requesting review \u2014 never a direct push to a protected branch. That first gate is cheap to reverse.",
         "Merge and deploy are a distinct second gate, because reverting code is not the same as reversing effects: a merge can trigger deployments, schema migrations, or irreversible data jobs. Protect it with branch protection, required CI checks, code owners, migration policy, and progressive delivery with rollback. Auto-merge is allowed only for low-risk changes under those rollout controls.",
-        "Both gates must leave durable evidence, not just flip a status. A gate_decisions record captures who approved (reviewer / code-owner / auto-merge bot), the policy version in force, the required-checks set, the risk class, and a link to the downstream deploy gate's proof. The platform owns the review gate; the actual deploy gate lives in the CI/CD platform — this design stores the link/evidence that proves it passed rather than re-implementing it."
+        "Both gates must leave durable evidence, not just flip a status. A gate_decisions record captures who approved (reviewer / code-owner / auto-merge bot), the policy version in force, the required-checks set, the risk class, and a link to the downstream deploy gate's proof. The platform owns the review gate; the actual deploy gate lives in the CI/CD platform. This design stores the evidence that proves the deploy gate passed rather than re-implementing it."
       ],
       "view": {
         "nodes": [
@@ -1268,6 +1291,10 @@
               {
                 "id": "Dev",
                 "label": "Reviewer"
+              },
+              {
+                "id": "DurableLog",
+                "label": "gate_decisions"
               }
             ],
             "messages": [
@@ -1287,7 +1314,7 @@
                 "from": "CI",
                 "to": "VCS",
                 "arrow": "-->>",
-                "label": "status"
+                "label": "status (bound to head_sha)"
               },
               {
                 "from": "VCS",
@@ -1301,14 +1328,32 @@
                 "messages": [
                   {
                     "from": "Dev",
+                    "to": "DurableLog",
+                    "arrow": "->>",
+                    "label": "write gate_decision(actor, role, head_sha, policy_version, required_checks, risk_class)"
+                  },
+                  {
+                    "from": "Dev",
                     "to": "VCS",
                     "arrow": "->>",
                     "label": "merge under branch protection (gate 2)"
+                  },
+                  {
+                    "from": "VCS",
+                    "to": "DurableLog",
+                    "arrow": "->>",
+                    "label": "link deploy_evidence_url from CI/CD platform"
                   }
                 ],
                 "else": {
                   "label": "low-risk auto-merge",
                   "messages": [
+                    {
+                      "from": "VCS",
+                      "to": "DurableLog",
+                      "arrow": "->>",
+                      "label": "gate_decision(role=auto_merge_bot, risk_class=low)"
+                    },
                     {
                       "from": "VCS",
                       "to": "VCS",
@@ -1322,7 +1367,8 @@
           },
           "highlight": [
             "VCS",
-            "Dev"
+            "Dev",
+            "DurableLog"
           ]
         }
       ],
@@ -1341,7 +1387,7 @@
     },
     {
       "id": "verify",
-      "title": "5. Verify Before Proposing: Tests, Lint, CI in-Sandbox",
+      "title": "5. Verify Before Proposing: Tests, Lint, CI In-Sandbox",
       "description": [
         "A draft PR is only worth a human's time if the change actually works. Verification-first means the agent runs tests, lint, and build inside its sandbox and iterates until they pass before opening the PR.",
         "The same required checks run again as CI on the PR \u2014 the in-sandbox loop is the agent's fast feedback; CI is the gate's source of truth."
@@ -1377,7 +1423,7 @@
         {
           "title": "Make the verification result evidence, not a sandbox loop",
           "points": [
-            "Emit test_start / test_result run_events with the test command, exit code, retry count, and changed-files set so a reviewer sees what was actually run.",
+            "Emit test_start / test_result run_events whose payload carries the test command, exit code, retry count, and changed-files set, so a reviewer sees what was actually run — the verification result lives in run_events.payload, not a separate table.",
             "Attach a log artifact (link, not inline) so failures are inspectable after the sandbox is torn down.",
             "Record the final head_sha the green run was produced from, so the PR's evidence binds to a specific commit.",
             "PR CI re-runs the same required checks as the source of truth; in-sandbox green is necessary but not sufficient for the gate."
@@ -1449,7 +1495,7 @@
       "title": "6. Untrusted Repo Text: Prompt-Injection Defense",
       "description": [
         "The agent's inputs are attacker-reachable: issue bodies, PR descriptions, code comments, dependency READMEs, and CI logs can all carry injected instructions. This is the live threat for coding fleets.",
-        "Apply the Foundations defenses here: treat all repo text as untrusted, partition it from tool authority (Plan-then-Execute / Dual-LLM), allowlist tools and parameters, and keep the trifecta apart \u2014 an agent with repo write access and an open network is exactly the lethal combination, so constrain egress per task."
+        "Apply the Foundations defenses here: treat all repo text as untrusted, partition it from tool authority (Plan-then-Execute / Dual-LLM), and allowlist tools and parameters. Above all, keep the lethal trifecta apart \u2014 an agent that reads untrusted text, holds repo write access, and has an open network is the dangerous combination \u2014 so constrain egress per task."
       ],
       "view": {
         "nodes": [
@@ -1482,17 +1528,100 @@
           "definition": "Any human- or tool-authored text the agent ingests (issues, PRs, comments, logs) that an attacker can write.",
           "whyItMatters": "It is the indirect-injection surface unique to coding agents; the agent can't tell instructions from data.",
           "example": "A poisoned dependency README tells the agent to exfiltrate the CI token."
+        },
+        {
+          "term": "the lethal trifecta",
+          "definition": "Three capabilities that are dangerous only when combined in one agent: (1) access to untrusted data, (2) authority over powerful tools (repo/CI write), and (3) a path to exfiltrate (open network egress).",
+          "whyItMatters": "Injection becomes a real exploit only when all three are present; removing any one leg — sandboxing data, scoping tool authority, or constraining egress — defangs the attack even if the prompt still gets through.",
+          "example": "A poisoned issue can instruct the agent, but with egress denied it can't post the stolen token anywhere."
         }
       ],
       "whyNow": [
         "Once agents have repo/CI write access and read untrusted text, injection is the dominant risk and must be bounded."
       ],
+      "flows": [
+        {
+          "sequence": {
+            "participants": [
+              {
+                "id": "CodingAgent",
+                "label": "Coding Agent"
+              },
+              {
+                "id": "Guardrail",
+                "label": "Guardrail / Policy"
+              },
+              {
+                "id": "Identity",
+                "label": "Token Broker"
+              },
+              {
+                "id": "Sandbox",
+                "label": "Sandbox / Egress"
+              }
+            ],
+            "messages": [
+              {
+                "from": "CodingAgent",
+                "to": "Guardrail",
+                "arrow": "->>",
+                "label": "retrieved repo text (issue/PR/comment/log)"
+              },
+              {
+                "from": "Guardrail",
+                "to": "CodingAgent",
+                "arrow": "-->>",
+                "label": "mark/partition as untrusted data (not instructions)"
+              },
+              {
+                "from": "CodingAgent",
+                "to": "Guardrail",
+                "arrow": "->>",
+                "label": "request tool call (e.g. push branch, fetch URL)"
+              },
+              {
+                "type": "alt",
+                "label": "call within task scope + allowlist",
+                "messages": [
+                  {
+                    "from": "Guardrail",
+                    "to": "Identity",
+                    "arrow": "->>",
+                    "label": "approve; mint token scoped to this repo only"
+                  },
+                  {
+                    "from": "Identity",
+                    "to": "Sandbox",
+                    "arrow": "->>",
+                    "label": "execute under scoped creds + egress allowlist"
+                  }
+                ],
+                "else": {
+                  "label": "out of scope / egress to unknown host",
+                  "messages": [
+                    {
+                      "from": "Guardrail",
+                      "to": "Sandbox",
+                      "arrow": "-->>",
+                      "label": "deny; no token, egress blocked, log event"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Guardrail",
+            "Identity"
+          ]
+        }
+      ],
       "deepDives": [
         {
           "title": "Bounding the blast radius",
           "points": [
-            "Scope each task's token to the one repo it works; no org-wide credentials.",
-            "Constrain egress so a fooled agent can't exfiltrate (remove a trifecta leg).",
+            "Scope each task's token to the one repo it works; no org-wide credentials (limits tool authority, the trifecta's second leg).",
+            "Constrain egress so a fooled agent can't exfiltrate \u2014 denying the exfiltration path removes the trifecta's third leg even if injection succeeds.",
             "MCP/tool supply chain is part of the surface \u2014 pin and review tool definitions."
           ]
         }
@@ -1514,7 +1643,7 @@
       "id": "async-obs",
       "title": "7. Async at Scale: Triggers, Observability & Fleet Quality",
       "description": [
-        "Make the fleet operable. Tasks arrive asynchronously from webhooks and cron, queue through admission control, and run unattended; humans engage only at the review gate. Duplicate or replayed triggers are collapsed by the idempotency key; tasks that exhaust retries land in a dead-letter queue for inspection; per-tenant quotas keep one tenant's burst from starving the fleet.",
+        "Make the fleet operable. Tasks arrive asynchronously from webhooks and cron, queue through admission control, and run unattended; humans engage only at the review gate. Three controls keep that bearable at scale: the idempotency key collapses duplicate or replayed triggers, tasks that exhaust retries land in a dead-letter queue for inspection, and per-tenant quotas keep one tenant's burst from starving the fleet.",
         "Every agent emits OTel trajectories so a reviewer can see what it did, and the platform rolls up token/cost and fleet-quality signals against SLOs (queue depth, p95 task duration, index lag). Treat merge rate as a useful but vendor-reported signal, not a benchmark \u2014 pair it with trajectory eval to catch agents that pass CI but take a bad path. Trajectories and retrieved context can contain source and secrets, so they carry a retention class and redaction, and access to trajectory spans is itself scoped."
       ],
       "view": {
@@ -1547,6 +1676,25 @@
       ],
       "whyNow": [
         "Async triggers and observability are what let the fleet run unattended and improve over time."
+      ],
+      "concepts": [
+        {
+          "term": "activity vs. outcome vs. safety metrics",
+          "definition": "Activity metrics count what the fleet did (PRs opened, tasks run); outcome metrics measure whether the work was good (merged with little rework); safety metrics catch harm (regressions, escaped incidents).",
+          "whyItMatters": "A fleet can look busy and even merge a lot while reviewers heavily rewrite or revert its PRs; only outcome and safety metrics show real developer throughput.",
+          "example": "High merge rate but high reviewer edit distance means the agents are generating rework, not saving time."
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Measure outcomes, not just merge rate",
+          "points": [
+            "Outcome quality: reviewer edit distance (lines changed after the agent), comments per PR, time-to-review, and stale-PR rate — high values mean the agent is creating work, not saving it.",
+            "Safety: revert/regression rate, escaped-incident links back to the originating task, and CI rerun/flakiness rate attributable to the change.",
+            "Efficiency & fairness: duplicate-task rate, conflict-cancellation rate (from work_intents), cost per merged PR (tokens + sandbox + CI minutes), and per-tenant fairness so one tenant doesn't consume the fleet.",
+            "Keep merge rate and LLM-as-judge trajectory eval as secondary signals: merge rate is vendor-reported and gameable, and model judgment is only a cheap proxy for the externally grounded metrics above."
+          ]
+        }
       ],
       "flows": [
         {

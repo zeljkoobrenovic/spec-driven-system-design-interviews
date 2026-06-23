@@ -192,7 +192,7 @@ The remaining realism gaps are operational:
 - All `patterns[*].steps[*]` references resolve to real step IDs.
 - Sequence participant/message references resolve to canonical node IDs or declared participants.
 - Node types now follow the project convention; `Matter` is `external`, not `client`.
-- `toProbeFurther` is populated. `technologyChoices`, AI visuals, and comic assets are absent, which is valid for this dataset.
+- `toProbeFurther` and `technologyChoices` are populated. AI visuals and comic assets are absent, which is valid for this dataset.
 
 ## Recommended Edits, Prioritized
 

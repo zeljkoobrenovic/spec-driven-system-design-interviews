@@ -5,245 +5,206 @@ Review date: 2026-06-23
 
 ## Executive Summary
 
-This is a strong foundations case for the Agentic Platforms series. It has a clear thesis, a useful eight-step teaching arc, and several unusually good agent-specific concerns: sandboxing, delegated identity, durable side effects, prompt-injection blast-radius reduction, token economics, trajectory eval, and the workflow-vs-agent selection rule.
+The recent changes substantially improved this dataset. The earlier gaps around audit evidence, control-plane APIs, idempotent side effects, memory governance, quantitative capacity, guarded tool execution, eval promotion, `Subagent` introduction, and diagram endpoint mismatches have largely been addressed. The interview now reads as a credible foundation case for an enterprise agent platform, not just a collection of agent components.
 
 | Axis | Rating | Notes |
 | --- | --- | --- |
-| System design soundness | 4/5 | Strong pillars, but audit evidence, policy/config APIs, and exactly-once contracts need more concrete modeling. |
-| Production realism | 3.5/5 | Good threat and cost framing; missing operational details around tool registry, approvals, memory governance, eval rollout, and queue fairness. |
-| Pedagogical flow | 4.5/5 | The "one failure at a time" progression works well and the recap/new-risk fields are effective. |
-| Step-to-final coherence | 4/5 | Most final components are introduced, but `Subagent` appears mainly in the final design and a few diagrams reference links through omitted nodes. |
-| Dataset/rendering fit | 3.5/5 | JSON parses and IDs mostly resolve; two step views contain links whose endpoints are not in the view nodes, and one authoring note remains in reader-facing text. |
+| System design soundness | 4.5/5 | The core substrate is coherent and agent-specific. The main remaining gap is durable control-plane state for agent/tool/policy/eval configuration. |
+| Production realism | 4/5 | Stronger on idempotency, evidence, memory, eval, and cost. Approval workflow, registry state, overload behavior, and retention semantics could be more operational. |
+| Pedagogical flow | 4.5/5 | The "one failure at a time" progression remains excellent, and the new deep dives add concrete artifacts at the right steps. |
+| Step-to-final coherence | 4.5/5 | `Subagent`, audit evidence, and guarded tool paths now connect to the final design. A little more wording would clarify the early direct MCP edge versus the final guarded path. |
+| Dataset/rendering fit | 4.5/5 | JSON parses; node/link/step references resolve; previous view endpoint mismatches are fixed. Browser/Mermaid visual rendering was not exercised in this review. |
 
 ## What Works Well
 
-- The dataset has a clear center of gravity: "assume the model is compromisable" and "pick the least-autonomous path that solves the task." Those themes show up in requirements, steps, traps, final design, and level expectations.
-- The step sequence is pedagogically strong. The naive loop exposes a failure, each next step fixes one failure, and each recap names the next risk.
-- The security step is substantially better than a generic "add guardrails" answer. It names the lethal trifecta, data-flow partitioning, MCP supply chain risk, tool poisoning, and markdown auto-fetch exfiltration.
-- The capacity step correctly frames agent cost as compounding token growth, not a fixed request multiplier.
-- The final design integrates most of the platform: runtime, identity, guardrails, memory, durable log, queue, inference, eval, traces, and observability.
+- The dataset has a clear thesis: choose the least-autonomous path that solves the task, and assume the model layer is compromisable.
+- The recent additions made the design much more concrete: control-plane endpoints, `action_evidence`, idempotency keys, delegated token shape, memory provenance/trust/TTL, a worked capacity path, and promotion gates.
+- Step sequencing is strong. Each step exposes a production failure, fixes that failure, and hands the next risk to the following step.
+- Security is still the strongest pillar. The interview teaches prompt injection as an architectural/data-flow problem, not a prompt-writing problem.
+- The final design now matches the journey better: `Subagent` is introduced before final design, high-risk tools route through guardrails, and audit evidence is explicitly named.
 
 ## Highest-Impact Issues
 
-### 1. Auditability is required but not actually closed
+### 1. Control-plane APIs exist, but their durable state is not modeled
 
-The non-functional requirements include: "Auditable: every dangerous action is attributable and logged as an evidence record." That requirement is absent from `satisfies.nonFunctional`, and the data model does not define an evidence/audit record beyond a generic `events.payload`.
+The API now includes representative control-plane endpoints for agents, tools, policies, eval runs, and promotion. That fixes the earlier session-only API concern. The data model, however, still has only `sessions`, `events`, `action_evidence`, and `memories`.
 
-Why it matters: in an agent platform, auditability is not just a trace viewer. Dangerous tool calls need actor, delegated subject, agent principal, approval decision, policy version, tool name, parameters or redacted parameters, downstream resource, idempotency key, result, and retention class. Without that, the design cannot prove who authorized an irreversible action.
+Why it matters: the platform promise is that teams can deploy agents without rebuilding runtime, identity, guardrails, eval, or observability. That promise depends on durable configuration: agent versions, tool manifests, policy versions, eval suites/runs, promotion decisions, tenant quotas, and budget bindings.
 
-Concrete fix: add an explicit non-functional satisfaction item for auditability, likely tied to `identity`, `durable`, `security`, `eval-obs`, and `control-flow`. Extend the data model with an `action_evidence` or `audit_records` entity, or make the `events` schema specific enough to carry evidence records.
+Concrete fix: add a compact control-plane data model slice. It does not need to be exhaustive, but should include entities such as `agents`, `agent_versions`, `tool_manifests`, `policy_versions`, `eval_runs`, and `tenant_budget_rules`. Tie those entities to `/v1/agents`, `/v1/tools`, `/v1/policies/{id}`, `/v1/evals/runs`, and `/v1/agents/{id}/promote`.
 
-### 2. The platform API is too session-only for a shared platform
+### 2. Approval and evidence need a clearer state-machine contract
 
-The requirements say teams can deploy agents without rebuilding runtime, identity, guardrails, eval, or observability. The API only exposes:
+The design now has `action_evidence`, approval fields, and a guarded tool path. The remaining weakness is that the approval API and flow do not show how a human decision is bound to a specific pending action.
 
-- `POST /v1/sessions`
-- `POST /v1/sessions/{id}/approve`
-- `GET /v1/sessions/{id}/trace`
+Why it matters: high-risk actions need race-safe, replay-safe approval. A production system should prove that the approver saw the action, risk class, policy version, redacted parameters, downstream resource, and consequence before the durable run resumed.
 
-That is enough to run a session, but not enough to operate the shared platform. There is no contract for registering agents, publishing tool manifests, binding policies, setting tenant quotas and token budgets, configuring memory scope/retention, registering eval suites, or promoting a version after eval.
+Concrete fix: enrich `POST /v1/sessions/{id}/approve` with an `actionId` or `evidenceId`, expected `policyVersion`, decision idempotency key, and optional expiration. Add a short sequence flow: guardrail creates pending evidence -> human approves/rejects -> evidence is finalized -> durable run resumes or compensates.
 
-Concrete fix: add a small "control plane API" slice. It does not need to be exhaustive, but should include representative endpoints such as `POST /v1/agents`, `POST /v1/tools`, `PUT /v1/policies/{id}`, `POST /v1/evals/runs`, and `POST /v1/agents/{id}/promote`, or explicitly state that this case scopes them out.
+### 3. The durable-log/evidence relationship should be explicit
 
-### 3. Exactly-once side effects are named but under-specified
+The data model defines a separate `action_evidence` entity, while the final design says the durable log "doubles as the immutable audit/evidence store." That is plausible, but the relationship is underspecified.
 
-Step 3 correctly warns that checkpoints alone are not durable execution. However, the concrete data model has only `events.seq`, `events.kind`, `payload`, and `committed`. The API also lacks idempotency keys. This is thin for a design that claims exactly-once side effects.
+Why it matters: audit evidence and execution replay have different access patterns and retention rules. One may be the append-only source of truth and the other a projection, but readers should not have to infer it.
 
-Why it matters: "exactly once" across external tools is usually achieved as "at least once plus idempotency/deduplication and a durable intent/result protocol." The current wording could lead candidates to overclaim exactly-once behavior across systems the platform does not control.
+Concrete fix: state one model directly: for example, `events` is the append-only execution stream and `action_evidence` is an immutable evidence record written in the same transaction or projected from evidence events, with its own retention class and query path.
 
-Concrete fix: add fields such as `idempotency_key`, `external_operation_id`, `tool_call_id`, `intent_recorded_at`, `committed_at`, and `result_hash`. In the flow, show the tool call carrying the idempotency key and resume reading the durable result before retrying.
+### 4. Admission control is credible but still light on overload behavior
 
-### 4. Tool-call enforcement is ambiguous because final design still has a direct control-plane-to-tool link
+The capacity section now includes a good worked sizing path and weighted fair scheduling. The next production detail is what happens when demand exceeds the budgeted envelope.
 
-The high-level links include both `cp-tool` (`ControlPlane` -> `ToolMCP`) and `guard-tool` (`Guardrail` -> `ToolMCP`). The security step says the guardrail gates tool calls, but the final design includes both links without clarifying when the direct path is allowed.
+Why it matters: agent traffic is bursty, long-running, and sometimes background work. Queue fairness alone does not define cancellation, deadline expiry, priority inversion, dead-lettering, backpressure to callers, or tenant-level throttling.
 
-Why it matters: the core security lesson is architectural separation. If readers see a direct orchestrator-to-tool edge beside a guarded edge, they may infer a bypass path.
-
-Concrete fix: either remove `cp-tool` from guarded/final views, route all high-risk calls through `Guardrail`, or relabel the direct link as "approved low-risk/read-only tool call" and explain that egress/high-risk tools must use the guarded path.
-
-### 5. Capacity is conceptually good but not quantitative enough for system design
-
-The capacity section names compounding tokens, prefix cache, terminating budgets, and queue-level admission, but it does not give a sample traffic profile, token formula with variables, latency/SLO target, model capacity assumption, or cost envelope.
-
-Why it matters: candidates need at least one worked sizing path to justify the queue, continuous batching, model routing, and hard budgets. Without numbers, the capacity step reads more like principles than system design.
-
-Concrete fix: add one concrete scenario, for example tenants, sessions/day, p95 steps/session, average input/output tokens per step, prefix cache hit rate, max concurrent runs, and budget termination threshold. Then show how that drives inference concurrency and queue admission.
+Concrete fix: add one compact overload policy: interactive sessions get first-step SLO priority, background runs can be delayed or checkpointed, expired queued work returns a retryable status, repeated tool failures go to a dead-letter path, and tenant budget exhaustion produces deterministic termination rather than best-effort throttling.
 
 ## System Design Soundness
 
-The requirements are coherent and agent-specific. They avoid the common mistake of treating an agent as just chat plus tools. The architecture covers the right major pillars: gateway, orchestrator, sandbox, inference, tools, guardrails, identity, vault, memory, durable log, queue, eval, trace stream, and observability.
+The requirements are coherent and specific to agent platforms. The architecture covers the right shared substrate: gateway, orchestrator, sub-agents, sandbox, inference, tools, guardrails, identity, vault, memory, durable log, queue, eval, trace stream, and observability.
 
-The weakest area is the contract layer around those pillars. The platform promises multi-team deployment, policy, eval gates, delegated identity, memory, and auditability, but the API/data model mostly cover session execution. A stronger design would show how teams onboard an agent and its tools, how policies and budgets are versioned, how eval gates block promotion, and how a dangerous action produces an immutable evidence record.
+The biggest improvement is that the dataset no longer overclaims "exactly once" as magic. Step 3 now teaches the correct contract: at-least-once execution plus idempotency keys, deduplication, durable intent/result records, and resume logic. One small wording issue remains: the Step 3 recap says "Runs resume exactly-once," while the body correctly says "exactly-once effect." Aligning that recap would prevent candidates from repeating an overclaim.
 
-Durable execution is directionally correct but should avoid implying magic exactly-once semantics. The interview should teach that external side effects require durable intents, idempotency keys, deduplication, committed result records, and sometimes human compensation workflows.
+Auditability is now materially stronger. `action_evidence` includes actor, agent principal, approval decision, policy version, tool, redacted parameters, downstream resource, idempotency key, result, and retention class. The missing piece is not the fields; it is the state transition that binds approval to evidence and then resumes the run.
 
-Security is one of the strongest parts. The lethal-trifecta framing, partitioning, classifier limits, MCP supply-chain risk, and "model is compromisable" assumption are all appropriate. Tightening the diagram so tool calls visibly pass through the guard/policy path would make the lesson cleaner.
+Security remains strong. The final design now clearly says there is no direct orchestrator-to-tool bypass for egress or high-risk actions, and the final view omits the direct `cp-tool` link. Early steps still use `cp-tool` to introduce MCP before guardrails exist, which is acceptable, but a short note would help readers understand that this is intentionally pre-security or low-risk/read-only, not the final enforcement path.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: A Single Hosted Agent Loop
 
-This is a good baseline. It names the demo failure modes clearly: ambient privilege, prompt secrets, crash loss, runaway tokens, no identity, no eval, and no trace.
-
-Improvement: the view includes `app-gw` and `gw-cp` links but omits `Gateway` from `view.nodes`. Add `Gateway` to the view nodes or use links that only touch the listed nodes. As authored, the diagram references link endpoints outside the view.
+This remains a strong baseline. It exposes the exact failures that the rest of the interview fixes: full privilege, prompt secrets, crash loss, runaway tokens, missing identity, missing eval, and missing trace. The previous diagram endpoint issue is fixed by including `Gateway`.
 
 ### Step 2: Runtime Isolation & Credential Brokering
 
-The option comparison between Firecracker microVMs and gVisor/containers is useful and realistic. The "agent never sees secrets" message is strong.
+The Firecracker versus gVisor/container option comparison is useful and realistic. The new sandbox lifecycle deep dive adds the missing operational detail: signed snapshots, default-deny egress, short-lived brokered credentials, cleanup, and warm-pool reset.
 
-Improvement: clarify lifecycle and network policy: sandbox image provenance, egress allowlist, secret mount/injection lifetime, cleanup, and warm-pool trade-offs. This can be one deep-dive card, not a new major step.
+Minor improvement: connect this more explicitly to tenant isolation, not just compromised-code isolation. The architecture has the ingredients, but "multi-tenant isolation" appears mostly as quota/fairness later.
 
 ### Step 3: Durable Sessions, Context & Memory
 
-This is a strong step because it separates durable execution from memory and explicitly warns that checkpoints are not enough. The flow is a good teaching device.
+This step is much stronger after the idempotency and memory-governance additions. The flow now shows intent, `idempotency_key`, downstream execution, committed result, and resume behavior.
 
-Improvement: add idempotency and result-record details. The current flow says "replay, skip committed" but does not show how a tool call is recognized as already submitted or already completed.
-
-Memory also needs governance. The follow-up asks about memory poisoning, but the main design should mention memory provenance, trust tier, TTL/retention, user deletion, and whether retrieved memory can drive tool authority.
+Improvement: change the recap from "Runs resume exactly-once" to "Runs resume with exactly-once-effect semantics" or similar. The detailed explanation is correct; the recap should match it.
 
 ### Step 4: Tool / Protocol Boundary & Identity Delegation
 
-The delegation-not-impersonation lesson is excellent. It gives candidates the right answer for downstream authority: agent principal plus user delegation, audience binding, revocation, and attribution.
+The delegated token shape is a good concrete artifact: `sub=agent`, `act=user`, `aud=tool`, scope, tenant, policy version, and expiry. It connects identity to audit evidence and avoids the common "reuse the user's token" mistake.
 
-Improvement: add a minimal token/audit shape. For example: `sub=agent`, `act=user`, `aud=tool`, `scope=...`, `tenant=...`, `policy_version=...`, `expires_at=...`. This would connect identity to the missing evidence-record requirement.
+Improvement: when the control-plane data model is added, make `policy_version` a durable object referenced by tokens and evidence records.
 
 ### Step 5: Security Guardrails & Data-Flow Partitioning
 
-This is the strongest individual step. It correctly treats prompt injection as an architectural problem, not a prompt wording problem.
+This is still the best individual step. It distinguishes statistical classifiers from deterministic enforcement and names the MCP supply-chain/tool-poisoning risk, data-flow partitioning, lethal-trifecta mitigation, and markdown auto-fetch exfiltration.
 
-Required cleanup: the deep dive contains a reader-facing authoring note: "VERIFY the exact CVE before publishing." Replace it with a verified reference or remove the CVE wording and keep the general markdown auto-fetch example.
-
-Improvement: distinguish statistical guardrails from deterministic enforcement. The step already says classifiers are one layer; the diagram and final design should reinforce that high-risk tools are gated by deterministic policy, allowlists, taint/capability checks, and approval interrupts.
+Improvement: if the CVE-specific example is kept, add a project-consistent external reference or keep the example generic. The authoring note is gone, which was the important cleanup.
 
 ### Step 6: Capacity, Inference Economics & Admission Control
 
-The economics message is right: terminate runaways in-line, use prefix caching, route models by cost/quality, and queue bursty work.
+The worked sizing path is a major upgrade. It gives candidates a concrete traffic profile, token calculation, concurrency estimate, prefix-cache leverage, hard budget, and queue fairness policy.
 
-Improvement: make this a worked capacity example. Show a sample token equation and one admission policy such as per-tenant weighted fair queueing with hard per-run and per-tenant budgets. That would make the step feel less abstract.
+Improvement: add one overload/backpressure rule so admission control has behavior under saturation, not just a scheduling strategy.
 
 ### Step 7: Evaluation & Observability
 
-This step is well scoped. It distinguishes final-answer eval from trajectory eval and mentions deterministic checks, LLM judges, humans, bias controls, tail sampling, high-cost traces, and silent failures.
+The rollout/promotion contract closes the previous loop: promotion is gated, production failures feed golden sets, and observability can demote a bad version. This is now a useful production teaching step rather than a generic "add observability" step.
 
-Improvement: add the rollout contract. What blocks deployment? Which eval suite is required? How are production failures promoted into golden sets? What metric trips rollback or human review? A small data model or API addition would close the loop.
+Improvement: model `eval_runs`, `eval_suites`, or `promotion_decisions` in the data model so the `/v1/evals/runs` and `/v1/agents/{id}/promote` APIs have persistent backing.
 
 ### Step 8: Control-Flow Synthesis
 
-The synthesis lands the central lesson: workflow first when the path is known, autonomous loop only when the search space justifies it, hybrid gate in between.
+This lands the central lesson well: deterministic workflow first, autonomous loop only for genuinely open search, hybrid gate in between. The new orchestrator-workers deep dive introduces `Subagent` before final design and explains bounded context, least privilege, durability, attribution, and observability for fan-out legs.
 
-Improvement: the final design includes `Subagent`, and the description mentions fan-out to sub-agents, but no step view introduces `Subagent`. Add `Subagent` to this step or add a small deep dive for orchestrator-workers/scatter-gather so the final node does not appear suddenly.
-
-Also, this view includes `user-app` and `gw-cp` links while omitting `AgentApp` and `Gateway` from `view.nodes`. Add those nodes or choose links whose endpoints are present.
+Improvement: add one sentence that every path still routes dangerous side effects through the guardrail/evidence path. The flow already shows it; the text can make it impossible to miss.
 
 ## Final Design Review
 
-The final design is credible as a reference architecture. It correctly shows the shared substrate rather than one vertical agent. Most nodes are justified by earlier steps.
+The final design is now coherent as a reference architecture. It integrates the platform substrate, states the no-bypass rule for high-risk tools, includes sub-agents, and ties the durable log to evidence and trajectory traces.
 
-The final design should make enforcement paths less ambiguous. If guardrails gate tools, show that path as the normal path. If direct tool calls exist, label them as read-only/low-risk or pre-approved. The final design should also include an audit/evidence store or make the durable log explicitly serve that role with evidence-specific fields.
-
-The `Subagent` node is plausible, but it needs clearer introduction before the final design. It is currently supported mostly by the final description and the brief workflow-pattern mention in Step 8.
+The remaining final-design issue is precision rather than missing components. Clarify whether `action_evidence` is a table, log stream, projection, or append-only record family inside the durable log. Also consider adding control-plane state nodes or at least data-model entities for agent/tool/policy/eval configuration, because those are now visible in the API.
 
 ## Concept Introduction and Learning Flow
 
-Concept staging is strong. The concepts appear just before they are needed: ReAct in the baseline, microVM isolation before real tools, exactly-once side effects before identity, delegation before prompt-injection risk, hard token budgets before eval, and trajectory eval before synthesis.
+Concept staging is strong and improved by the new concrete artifacts:
 
-The main pedagogical improvement is to make a few abstract concepts tangible with compact artifacts:
+- Step 3 introduces the idempotent side-effect protocol before identity and security depend on it.
+- Step 4 introduces the delegated token shape before audit evidence and policy versioning matter.
+- Step 5 introduces deterministic policy enforcement before capacity makes the platform broad.
+- Step 6 makes token economics quantitative instead of hand-wavy.
+- Step 7 turns eval into a deploy gate and production feedback loop.
+- Step 8 synthesizes workflow, hybrid gate, autonomous loop, and sub-agents.
 
-- A delegated token/evidence-record shape in Step 4.
-- An idempotent tool-call protocol in Step 3.
-- A worked token/cost/concurrency calculation in Step 6.
-- An eval-gate/promotion contract in Step 7.
-
-These would give candidates concrete things to draw and defend.
+The learning flow would become even tighter if the remaining control-plane entities were added. That would let candidates see how an agent version, policy version, tool manifest, eval run, and promotion decision travel through the platform.
 
 ## Step-to-Final-Design Coherence
 
-The step sequence maps well to final components:
+The sequence now maps well to final components:
 
+- `naive` introduces the loop, inference, and tools.
 - `runtime` introduces `Sandbox`, `Identity`, and `Vault`.
 - `durable` introduces `DurableLog`, `MemoryStore`, and `MemoryIndex`.
 - `identity` introduces the MCP/tool boundary and delegated authority.
-- `security` introduces `Guardrail`.
-- `capacity` introduces `TaskQueue` and `Inference` economics.
+- `security` introduces `Guardrail` and the policy-gated tool path.
+- `capacity` introduces `TaskQueue` and inference economics.
 - `eval-obs` introduces `EvalHarness`, `TraceStream`, and `Observability`.
-- `control-flow` explains the workflow/hybrid/loop selection rule.
+- `control-flow` introduces `Subagent`, human gates, and the path-selection rule.
 
-The coherence gaps are:
-
-- `Subagent` is in the final design without a full step-level introduction.
-- Auditability is a top-level requirement but has no explicit final node or data entity.
-- The final design includes both guarded and direct tool-call edges without a policy explanation.
+The only coherence caveat is the `cp-tool` direct link. It is useful in early steps, but the final design intentionally omits it. Add wording that direct MCP calls are the pre-guard baseline or only allowed for explicitly low-risk/read-only cases after policy classification.
 
 ## Realism Compared With Production Systems
 
-The dataset is realistic in its threat model and better than most agent-platform sketches on cost and security. It correctly assumes hostile tool output and model compromise, and it does not pretend that prompt instructions solve injection.
+The dataset is now realistic for a foundations interview. It covers the hard parts many agent-platform designs skip: prompt-injection blast radius, delegated identity, idempotent side effects, memory poisoning, token amplification, trajectory eval, eval gates, and sub-agent fan-out.
 
-Production realism would improve by adding:
+Production realism would improve most from:
 
-- Policy/config versioning for agents, tools, guardrails, budgets, and eval gates.
-- Tool registry and tool-manifest supply-chain controls.
-- Memory governance: provenance, TTL, tenant/user deletion, trust score, and poisoning controls.
-- Queue fairness: per-tenant quotas, priority classes, starvation avoidance, and budget-aware scheduling.
-- Approval/audit workflow: approver identity, reason, risk classification, evidence bundle, and immutable retention.
-- Incident/rollback path for eval and observability findings.
+- Control-plane persistence for agents, versions, tool manifests, policy versions, quotas, budgets, eval suites, eval runs, and promotions.
+- A race-safe approval/evidence state machine.
+- Explicit overload/backpressure behavior for queue saturation and tenant budget exhaustion.
+- A clear retention model for traces, memories, durable events, and action evidence.
+- A stated relationship between durable execution logs and queryable audit evidence.
 
 ## Dataset and Renderer-Facing Observations
 
 - JSON parsing succeeds.
-- Step IDs referenced by `patterns[].steps` and `satisfies[*].steps` resolve to real steps.
 - Step view node IDs and link IDs resolve to canonical high-level architecture IDs.
-- Canonical node types are valid.
-- The following step views reference links whose endpoints are not included in the view nodes:
-  - Step `naive`: `app-gw` needs `Gateway`; `gw-cp` also needs `Gateway`.
-  - Step `control-flow`: `user-app` needs `AgentApp`; `gw-cp` needs `Gateway`.
-- The security deep dive includes an authoring note: "VERIFY the exact CVE before publishing." This should not ship in reader-facing content.
-- `satisfies.nonFunctional` has five entries for six non-functional requirements; the missing one is auditability/evidence records.
+- Selected links have both endpoints present in their view nodes, including the previously problematic `naive` and `control-flow` views.
+- `finalDesign.view.links` endpoints are present in `finalDesign.view.nodes`.
+- `patterns[].steps` and `satisfies[*].steps` references resolve to real step IDs.
+- The prior reader-facing authoring note has been removed.
+- No source-vs-generated docs change is needed for this `REVIEW.md` update.
 
 ## Recommended Edits, Prioritized
 
-### P1: Close auditability
+### P1: Add control-plane data-model entities
 
-Add a non-functional satisfaction item for auditability and make the data model carry evidence records for dangerous actions. Tie it to identity, durable log, guardrail policy, approval, and trace.
+Model `agents`, `agent_versions`, `tool_manifests`, `policy_versions`, `eval_runs`, and tenant budget/quota rules. Tie them to the new control-plane API endpoints.
 
-### P1: Remove ambiguity in tool-call enforcement
+### P1: Add an approval/evidence state-machine flow
 
-Make guarded tool calls the default in the final design, or explicitly label the direct control-plane-to-tool path as low-risk/pre-approved. Avoid implying that high-risk tools can bypass policy.
+Show guardrail-created pending evidence, human decision binding, immutable evidence finalization, and durable run resume/cancel/compensation.
 
-### P1: Clean reader-facing authoring text
+### P2: Clarify durable log versus action evidence
 
-Replace the "VERIFY the exact CVE before publishing" note in the security deep dive with a verified citation or non-CVE-specific language.
+State whether evidence is part of the event log, a separate append-only table, or an immutable projection from evidence events.
 
-### P2: Add platform control-plane APIs
+### P2: Define overload behavior
 
-Add representative APIs for agent registration, tool registration, policy/budget binding, eval run/gate, and version promotion. This supports the "shared platform for teams" requirement.
+Add queue saturation behavior: priority classes, deadline expiry, retryable rejection, background checkpointing, dead-letter handling, and tenant budget exhaustion.
 
-### P2: Strengthen durable side-effect modeling
+### P3: Align exactly-once wording
 
-Add idempotency keys, external operation IDs, committed result records, and retry/dedup semantics to the data model and sequence flow.
+Change recap-level wording from "resume exactly-once" to "resume with exactly-once-effect semantics" so the summary matches the correct detailed explanation.
 
-### P2: Make capacity quantitative
+### P3: Clarify the early `cp-tool` edge
 
-Add a worked sizing example with sessions, steps/session, tokens/step, prefix-cache hit rate, concurrency, queue policy, and budget thresholds.
-
-### P2: Introduce `Subagent` before final design
-
-Add `Subagent` to Step 8 or add a deep dive for orchestrator-workers/scatter-gather.
-
-### P3: Fix two diagram view endpoint mismatches
-
-Update `view.nodes` or `view.links` in `naive` and `control-flow` so every selected link has both endpoints present.
-
-### P3: Add memory governance notes
-
-Add a short memory deep dive or fields for provenance, trust, TTL, deletion, and poisoning controls.
+Explain that direct control-plane-to-tool calls are the pre-security baseline or low-risk/read-only path, while egress/high-risk calls must route through guardrails and evidence.
 
 ## What Not To Change
 
-- Keep the "one failure at a time" sequence. It is the strongest teaching feature of the dataset.
-- Keep the assumption that the model layer is compromisable. It makes the security design more credible.
-- Keep the workflow/hybrid/loop synthesis as the final step. It gives the platform a reusable decision rule for the rest of the Agentic Platforms series.
-- Keep the existing pattern list; it is well aligned with the step sequence.
+- Keep the one-failure-at-a-time sequence. It is the strongest teaching feature.
+- Keep the compromisable-model assumption. It makes the security design credible.
+- Keep the workflow/hybrid/loop selection rule as the final synthesis.
+- Keep the concrete deep dives added by the recent changes; they turn abstract platform concerns into defendable interview artifacts.
+- Keep `Subagent` in Step 8 rather than introducing it only in final design.
 
 ## Bottom Line
 
-This is a strong, publishable foundations interview after a few targeted fixes. The biggest improvements are not broad rewrites; they are closing the audit/evidence requirement, making platform operations visible in the API/data model, tightening exactly-once semantics, cleaning one authoring note, and fixing two diagram endpoint mismatches.
+This is now a strong foundations interview. The prior blocking issues are mostly resolved; the remaining work is narrower and operational: persist the control plane, make approval/evidence state transitions explicit, define overload behavior, and tighten a few phrases so candidates do not overclaim exactly-once or infer a guarded-tool bypass.

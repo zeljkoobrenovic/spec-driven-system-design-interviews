@@ -20,8 +20,15 @@ are marked resolved; remaining P2/P3 items fixed — step sketches now carry an
 exact `step.patterns[]` mapping table (frozen §4 names), the "~50×" token-
 amplifier claim is tagged + backlogged, a compliance/legal source-anchor table
 was added, and the catalog-sequencing heading was disambiguated ("after dataset
-1, before dataset 2"). No `interview.json` datasets written yet. Build order is
-in §7.
+1, before dataset 2"). Build order is in §7.
+>
+> **Implementation status:** **Phase 1 (§5–§7) and Phase 2 (§8) are DELIVERED** —
+> 7 datasets shipped in the `agentic-platforms` category (Foundations +
+> Developer, Marketing, Sales, HR, Finance, Legal) plus the 17 frozen agentic
+> patterns in `data/book/patterns` with `usedBy[]` backlinks; all verifier-clean
+> and built into `docs/book/`. **Phase 3 (§8b) is proposed, not built** — four
+> verticals that each teach a *new* gate (Healthcare, Support, Public Benefits,
+> Research).
 
 ## 1. Decisions taken
 
@@ -444,9 +451,13 @@ generation scripts, then `downsize-images.py`).
   `satisfies[].steps[]` resolve) as a secondary pass.
 - Commit the regenerated `docs/book/`. Optional `data/book/<id>/icon.png`.
 
-## 8. Phase 2 (deferred)
+## 8. Phase 2 — three enterprise-function verticals (DELIVERED)
 
-Add the remaining verticals once phase 1 validates the skeleton:
+The remaining enterprise functions, built once phase 1 validated the skeleton.
+All three follow the §6 A–G skeleton, reuse the frozen §4 patterns, and extend
+the irreversibility gradient *between* Developer and Finance — the damage behind
+each gate is reputation/compliance or a legally-consequential decision, not
+money or a filing.
 - **`agentic-marketing-platform`** — gate: brand-claim/negative-claim review +
   C2PA provenance; corpus: brand kit/DAM; bandit optimization loop. Cite Jasper,
   HubSpot Breeze, Agentforce Marketing, Adobe GenStudio.
@@ -457,6 +468,101 @@ Add the remaining verticals once phase 1 validates the skeleton:
   (four-fifths) monitoring; corpus: policy KB (effective-dated, jurisdiction);
   PII-scoped retrieval. Cite Workday Illuminate, ServiceNow HRSD/Moveworks,
   Eightfold, Paradox. Compliance: NYC LL144, EU AI Act high-risk (date in flux).
+
+## 8b. Phase 3 — four verticals that teach a *new* gate (proposed)
+
+> Selection rule for any further vertical: it earns a slot only if its **gate
+> type or dominant constraint is not already taught** by the existing seven
+> (Developer = two-stage / revert≠reverse; Marketing = optimization-inside-a-gate
+> + provenance; Sales = deliverability + global suppression; HR =
+> adverse-impact fairness; Finance = maker-checker + idempotency + correctness
+> over availability; Legal = citation verification + hallucination-as-first-class).
+> A domain that only re-skins one of those is better as a level-variant or a
+> deep dive, not a new dataset.
+
+Phase 3 picks **one flagship per domain family**, each adding a genuinely new
+axis. Together they extend the series from the enterprise-function set to the
+full gradient: *revertible → reputation → decision/fairness → money → filing →
+**physical harm***, plus the **real-time** and **contestability** axes the
+function set never reaches.
+
+- **`agentic-healthcare-platform`** — Clinical decision support. **New on the
+  gradient: the irreversible action is harm to a person**, strictly above Legal.
+  - *Gate:* clinician sign-off; **abstain-don't-guess** as the safe default
+    (the platform declines rather than answers when confidence/grounding is low).
+  - *Corpus:* clinical guidelines + the patient record; **PHI-scoped retrieval**.
+  - *Distinctive:* a **safety case** and fail-safe defaults; HIPAA/PHI scoping;
+    SaMD/FDA regulatory framing; grounding-or-abstain rather than hallucinate.
+  - *Cite (VERIFY BEFORE PUBLISHING):* clinical-LLM offerings and SaMD guidance;
+    treat any accuracy figure as a dated claim, like the Legal hallucination note.
+  - *Reuses from Foundations:* grounding, eval (calibration/abstention),
+    security/confidentiality.
+
+- **`agentic-support-platform`** — Customer support / CX agent. **New axis:
+  real-time, in-conversation, transactional.** Everything in phases 1–2 gates
+  *before* an async action; this gates *inside* a live loop.
+  - *Gate:* the agent takes transactional actions (refund, cancel, reschedule)
+    **mid-conversation, on the customer's behalf**, with in-conversation
+    escalation/handoff to a human at the boundary.
+  - *Corpus:* product/policy KB + the customer's account/order record (scoped).
+  - *Distinctive:* a **real-time turn-taking latency budget**; transactional
+    side effects with rollback; the gate moves into the live loop; deflect-vs-
+    escalate routing. Natural home for **agentic-commerce / checkout** as an
+    option, where the *ACP (Agentic Commerce Protocol)* deliberately scoped out
+    of Foundations §5 becomes the subject (delegated payment authority + cart
+    idempotency).
+  - *Cite (VERIFY BEFORE PUBLISHING):* support-agent and CX offerings.
+  - *Reuses from Foundations:* identity/delegation (act-on-behalf-of), durable
+    execution (transactional rollback), guardrails.
+
+- **`agentic-public-benefits-platform`** — Government benefits / eligibility.
+  **New gate dimension: contestability / due process.** The audit record must be
+  legible to the affected person and a reviewer, not just to a compliance team.
+  - *Gate:* a caseworker decision affecting a citizen's rights, with an
+    **appeal path** and **explainability-for-appeal** built in.
+  - *Corpus:* statute/eligibility rules (effective-dated, jurisdiction-tagged) +
+    the applicant record.
+  - *Distinctive:* contestability (the decision can be challenged and reviewed),
+    audit-for-appeal (a record the applicant can understand), bias-at-population-
+    scale monitoring, and a deterministic eligibility engine the LLM can't
+    override. (Content moderation / trust & safety is the close sibling —
+    population-scale takedown decisions with appeal queues and reviewer
+    calibration — and is the better second pick in this family if a second is
+    wanted; keep it as a candidate, not a commitment.)
+  - *Cite (VERIFY BEFORE PUBLISHING):* gov-tech / eligibility-automation
+    references; note due-process and algorithmic-accountability constraints.
+  - *Reuses from Foundations:* identity/PII scoping, eval/fairness,
+    observability/audit.
+
+- **`agentic-research-platform`** — Scientific research agent. **New gate: a
+  physical-experiment boundary** plus reproducibility.
+  - *Gate:* the agent proposes experiments; a human authorizes anything that
+    **consumes reagents, drives a lab robot, or has biosafety implications**.
+  - *Corpus:* primary scientific literature + experimental data, with
+    **provenance for every claim** (traceable hypotheses/findings).
+  - *Distinctive:* reproducibility as a first-class property; gating **physical
+    lab automation** (the wet-lab boundary is what separates it from Legal's
+    research grounding); a deterministic protocol/safety check before execution.
+  - *Cite (VERIFY BEFORE PUBLISHING):* lab-automation and research-agent work;
+    biosafety/dual-use framing.
+  - *Reuses from Foundations:* retrieval/grounding, durable execution, eval.
+
+**Build order (when phase 3 is greenlit):** Healthcare first (clearest gradient
+extension and the strongest single addition), then Support (the real-time axis),
+then Public Benefits (contestability), then Research (physical-experiment
+boundary). Same per-dataset checklist as §7; backfill catalog `usedBy[]` after
+each. If all four land, consider the **capstone synthesis interview**
+("Choosing the Right Agent Gate") — a Pattern-Catalog-style comparison of every
+gate across the series — as the navigational spine; it gets materially more
+valuable at 10+ verticals.
+
+**Explicitly deferred / fold-in, not standalone** (they re-skin an existing
+gate): personal/consumer assistant (≈ Support); autonomous-vehicle & drone fleet
+ops (≈ an industrial-robotics option); data-science/analytics agent (≈ Finance
+pipeline + eval); education/grading (≈ a Public-Benefits contestability option).
+Industrial / robotics / physical-ops is a strong *fifth* candidate (operator-
+authorized actuation with a hardware kill-switch + real-time safety envelope) —
+hold it as the lead of a possible phase 4 rather than crowding phase 3.
 
 ## 9. Sourcing: caveats and the source backlog
 

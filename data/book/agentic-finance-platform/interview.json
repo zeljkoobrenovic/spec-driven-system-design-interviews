@@ -110,12 +110,32 @@
         "description": "Pending journal entries the agent has proposed, awaiting checker approval (never posted yet)."
       },
       {
+        "id": "PaymentOutbox",
+        "label": "Payment Outbox / Executor",
+        "type": "worker",
+        "category": "async",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Records each approved payment as a payment_instruction and submits it idempotently to the rail; never posts the GL itself."
+      },
+      {
         "id": "PaymentRail",
         "label": "Payment Rail",
         "type": "external",
         "category": "boundary",
         "traits": [],
-        "description": "ACH / wire / RTP rails that move money once a payment is approved."
+        "description": "ACH / wire / RTP rails (or a processor) that move money once a payment is submitted; settlement is asynchronous."
+      },
+      {
+        "id": "PaymentEvents",
+        "label": "Payment Events / Reconciler",
+        "type": "service",
+        "category": "async",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Stores every provider callback keyed by (provider, event id), dedupes, applies monotonic status transitions, and reconciles unknown outcomes by querying the provider."
       },
       {
         "id": "Guardrail",
@@ -273,6 +293,39 @@
         "label": "release approved payment"
       },
       {
+        "id": "id-outbox",
+        "from": "Identity",
+        "to": "PaymentOutbox",
+        "label": "authorize payment (idempotency key)"
+      },
+      {
+        "id": "outbox-rail",
+        "from": "PaymentOutbox",
+        "to": "PaymentRail",
+        "label": "idempotent submit"
+      },
+      {
+        "id": "rail-events",
+        "from": "PaymentRail",
+        "to": "PaymentEvents",
+        "label": "settled/failed/returned callback"
+      },
+      {
+        "id": "events-outbox",
+        "from": "PaymentEvents",
+        "to": "PaymentOutbox",
+        "label": "deduped status transition / reconcile",
+        "render": {
+          "arrow": "-.-"
+        }
+      },
+      {
+        "id": "outbox-log",
+        "from": "PaymentOutbox",
+        "to": "DecisionLog",
+        "label": "append payment + callback event ids"
+      },
+      {
         "id": "pipe-log",
         "from": "Pipeline",
         "to": "DecisionLog",
@@ -327,6 +380,15 @@
           "Checker",
           "Identity",
           "Ledger"
+        ]
+      },
+      {
+        "id": "payment-exec",
+        "label": "Payment Execution & Reconciliation",
+        "nodes": [
+          "PaymentOutbox",
+          "PaymentRail",
+          "PaymentEvents"
         ]
       },
       {
@@ -396,9 +458,14 @@
       "note": "Bounded retries; persistent extraction failure becomes an exception, not an infinite loop or a guess."
     },
     {
-      "label": "Approval throughput",
-      "value": "checker SLA by risk tier (e.g. low: hours, high/fraud: same-day dual approval)",
-      "note": "Approval queue depth and aging are first-class metrics; backpressure holds work rather than auto-posting to clear backlog."
+      "label": "Approval workload",
+      "value": "~45k/day: ~80% clean (batch-approvable), ~20% exceptions (~9k single-item reviews/day)",
+      "note": "Clean, well-matched items are batch-approved (one checker decision over a reviewed batch, each item still getting its own audit record); exceptions need single-item review. At ~60 single-item reviews/checker/hour, ~9k exceptions ≈ ~150 checker-hours/day ≈ ~20 reviewers, with the ~10x month-end burst absorbed by the queue and temporary reviewer capacity, not by relaxing the gate."
+    },
+    {
+      "label": "Approval SLA & backlog",
+      "value": "checker SLA by risk tier (low: hours, high/fraud: same-day dual approval)",
+      "note": "Approval queue depth and aging are first-class metrics; when backlog crosses a threshold the system widens reviewer capacity or escalates, and backpressure holds work — it never auto-posts to clear backlog (that would silently reintroduce auto-authorization)."
     },
     {
       "label": "Audit storage",
@@ -483,16 +550,16 @@
     {
       "method": "POST",
       "path": "/v1/proposals/{id}/approve",
-      "description": "A human checker (distinct from the maker) approves; the broker then drives an idempotent GL post and, for payments, an outbox submission reconciled asynchronously.",
+      "description": "A human checker (distinct from the maker) approves; the broker accepts the approval and enqueues the side effects — the GL post and any payment outbox submission run asynchronously, so approval does not synchronously return 'posted'. Poll GET /v1/proposals/{id}/record for terminal status.",
       "request": "{ \"decision\": \"approve|reject\", \"idempotencyKey\": \"...\" }",
-      "response": "{ \"status\": \"approved|posting|posted|rejected\", \"journalId\": \"...\", \"paymentInstructionId\": \"...|null\" }"
+      "response": "{ \"status\": \"approved|rejected\", \"postStatus\": \"queued|posting|posted\", \"paymentStatus\": \"none|queued|submitted|settled\", \"journalId\": \"...|null\", \"paymentInstructionId\": \"...|null\" }"
     },
     {
       "method": "POST",
       "path": "/v1/payments/callbacks",
-      "description": "Idempotent rail webhook: reconciles a payment_instruction's status (settled/failed/returned); duplicate callback event IDs are deduped.",
-      "request": "{ \"providerRef\": \"...\", \"callbackEventId\": \"...\", \"status\": \"settled|failed|returned\" }",
-      "response": "{ \"instructionId\": \"...\", \"status\": \"settled|failed|returned\" }"
+      "description": "Idempotent rail webhook: each event is stored in payment_events keyed by (provider, callbackEventId); duplicates are dropped and a monotonic status_seq ignores stale/out-of-order events before the instruction's status advances.",
+      "request": "{ \"provider\": \"...\", \"providerRef\": \"...\", \"callbackEventId\": \"...\", \"status\": \"settled|failed|returned\" }",
+      "response": "{ \"instructionId\": \"...\", \"status\": \"settled|failed|returned\", \"applied\": true }"
     },
     {
       "method": "GET",
@@ -536,12 +603,76 @@
           "type": "uuid FK null (reversal/correction)"
         },
         {
+          "name": "entity_id",
+          "type": "varchar (legal entity — multi-entity posting)"
+        },
+        {
+          "name": "currency",
+          "type": "char(3) (txn currency; FX rate version recorded in evidence)"
+        },
+        {
           "name": "period_id",
-          "type": "varchar (accounting period)"
+          "type": "varchar FK -> accounting_periods"
+        },
+        {
+          "name": "coa_version",
+          "type": "varchar (chart-of-accounts version validated against)"
+        },
+        {
+          "name": "control_policy_version",
+          "type": "varchar (threshold/SoD policy version in effect)"
         },
         {
           "name": "idempotency_key",
           "type": "varchar unique"
+        }
+      ]
+    },
+    {
+      "name": "accounting_periods",
+      "note": "Master data for period-close: a proposal can only post into an open period.",
+      "fields": [
+        {
+          "name": "period_id",
+          "type": "varchar PK"
+        },
+        {
+          "name": "entity_id",
+          "type": "varchar"
+        },
+        {
+          "name": "status",
+          "type": "enum(open,closing,locked)"
+        },
+        {
+          "name": "locked_at",
+          "type": "timestamptz null"
+        }
+      ]
+    },
+    {
+      "name": "vendor_master",
+      "note": "Versioned vendor master data; bank-account changes require out-of-band approval before payments resume.",
+      "fields": [
+        {
+          "name": "vendor_id",
+          "type": "varchar PK"
+        },
+        {
+          "name": "version",
+          "type": "int (incremented on any controlled change)"
+        },
+        {
+          "name": "bank_account",
+          "type": "varchar (encrypted)"
+        },
+        {
+          "name": "bank_change_status",
+          "type": "enum(active,frozen_pending_confirmation)"
+        },
+        {
+          "name": "tax_id",
+          "type": "varchar null"
         }
       ]
     },
@@ -596,12 +727,62 @@
           "type": "enum(initiated,submitted,pending,settled,failed,returned,reversed,unknown)"
         },
         {
+          "name": "provider",
+          "type": "varchar (processor / bank rail)"
+        },
+        {
           "name": "provider_ref",
           "type": "varchar null (rail reference id)"
         },
         {
-          "name": "last_callback_event_id",
-          "type": "varchar null (dedupe webhooks)"
+          "name": "status_seq",
+          "type": "int (monotonic; rejects stale/out-of-order callbacks)"
+        }
+      ]
+    },
+    {
+      "name": "payment_events",
+      "note": "Every provider callback, deduped by (provider, callback_event_id); status only advances monotonically.",
+      "fields": [
+        {
+          "name": "event_pk",
+          "type": "uuid PK"
+        },
+        {
+          "name": "provider",
+          "type": "varchar"
+        },
+        {
+          "name": "callback_event_id",
+          "type": "varchar (unique with provider — dedupe key)"
+        },
+        {
+          "name": "instruction_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "provider_ref",
+          "type": "varchar"
+        },
+        {
+          "name": "raw_status",
+          "type": "varchar (provider's raw status)"
+        },
+        {
+          "name": "normalized_transition",
+          "type": "enum(submitted,pending,settled,failed,returned)"
+        },
+        {
+          "name": "applied",
+          "type": "bool (false if duplicate or stale-and-ignored)"
+        },
+        {
+          "name": "decision_event_id",
+          "type": "uuid FK (decision_record)"
+        },
+        {
+          "name": "received_at",
+          "type": "timestamptz"
         }
       ]
     },
@@ -623,7 +804,7 @@
         },
         {
           "name": "payload",
-          "type": "jsonb (source+model+prompt+policy versions, records + versions, provider/callback ids, summaries)"
+          "type": "jsonb (source+model+prompt+policy versions, coa/entity/period/vendor master-data versions, records, provider/callback ids, summaries)"
         },
         {
           "name": "prev_hash",
@@ -707,7 +888,7 @@
       "id": "naive",
       "title": "1. Naive: An Agent That Posts to the Ledger (the baseline)",
       "description": [
-        "Start with the obvious thing: an autonomous agent reads an invoice, decides the entry, and writes it straight to the general ledger — and pays it.",
+        "Start with the obvious thing: an autonomous agent reads an invoice, decides the entry, writes it straight to the general ledger — and pays it.",
         "In finance this is the dangerous version, not the convenient one. The action is irreversible (money moved, the books changed), there is no second pair of eyes, no idempotency (a retry double-pays), and no audit artifact beyond the agent's say-so. Regulators and a CFO who is personally liable will not accept 'the model decided'.",
         "The rest of the interview turns this into a propose-only, maker-checker, deterministic pipeline."
       ],
@@ -735,7 +916,7 @@
         "Workflow vs agent (deterministic pipeline vs probabilistic loop)"
       ],
       "whyNow": [
-        "The naive direct-post makes the irreversibility and audit requirements concrete."
+        "Starting from the naive direct-post makes the irreversibility and audit requirements concrete before we design the controls that address them."
       ],
       "recap": {
         "before": "Nothing.",
@@ -755,7 +936,7 @@
       "title": "2. The Ledger Is Ground Truth: Propose, Don't Mutate",
       "description": [
         "The grounding corpus for this vertical is the books themselves: the double-entry general ledger, sub-ledgers, and bank feeds. The ledger is ground truth, and only an approved, controlled, idempotent post may change it.",
-        "So the agent's output is a proposed journal written to a separate proposals store — not a direct GL mutation. A valid proposal must satisfy invariants the proposals store enforces before it can even reach a checker: balanced debits and credits, accounts that exist in the chart of accounts, a consistent currency/entity, an open accounting period, attached source evidence, and a status that only advances through its lifecycle (extracted → matched → awaiting_approval → approved → posted, with corrections as new reversal proposals). This single inversion (propose, don't mutate) is what makes everything else auditable."
+        "So the agent's output is a proposed journal written to a separate proposals store — not a direct GL mutation. Before a proposal can even reach a checker, the proposals store enforces a set of invariants: balanced debits and credits, accounts that exist in the chart of accounts, a consistent currency/entity, an open accounting period, attached source evidence, and a status that only advances through its lifecycle (extracted → matched → awaiting_approval → approved → posted, with corrections as new reversal proposals). This single inversion — propose, don't mutate — is what makes everything else auditable."
       ],
       "view": {
         "nodes": [
@@ -787,6 +968,17 @@
       "whyNow": [
         "Establishing propose-only grounding is the foundation the gate and audit record build on."
       ],
+      "deepDives": [
+        {
+          "title": "Where accounting validity & master data live",
+          "points": [
+            "Validity rules are not in the agent: the proposals store and a deterministic policy/master-data layer enforce balanced debits/credits, chart-of-accounts membership, entity/currency consistency, tax/VAT codes, and open-period checks before a proposal can reach a checker.",
+            "Master data is versioned: chart-of-accounts (coa_version), control/threshold policy (control_policy_version), accounting periods, and vendor master (incl. bank-account version) each carry a version, so 'what rules were in force' is reproducible.",
+            "Multi-entity / multi-currency: each proposal records entity_id and currency; cross-entity or FX entries record the rate version used as evidence.",
+            "Those versions flow into the decision record, so an auditor can later see the exact chart-of-accounts, period state, and policy version a journal was validated against."
+          ]
+        }
+      ],
       "recap": {
         "before": "The agent could write the GL.",
         "after": "The agent proposes journals against ground truth; the GL is controlled.",
@@ -797,8 +989,8 @@
       "id": "pipeline",
       "title": "3. A Deterministic Pipeline, Not a Loop",
       "description": [
-        "Source documents are adversarial and messy — emails, PDFs, EDI, bank feeds, vendor updates — so intake is the first deterministic stage, not an afterthought. The finance API authenticates the sender and maps it to a known vendor/account, assigns an ingress idempotency key to detect duplicate documents, normalizes each format into a single DocumentEnvelope, runs schema/OCR-quality validation, and quarantines the document for malware and prompt-injection screening before the extract node ever sees untrusted content. Malformed documents route to a resubmission workflow rather than into extraction. Admitted envelopes queue (TaskQueue) so month-end bursts level instead of overrunning the pipeline.",
-        "Because the path is known and correctness/audit dominate, the control plane is then a deterministic pipeline — intake → extract → match → propose — with LLM calls confined to bounded nodes, rather than an autonomous ReAct loop fenced by a late gate (the §2 selection rule).",
+        "Source documents are adversarial and messy — emails, PDFs, EDI, bank feeds, vendor updates — so intake is the first deterministic stage, not an afterthought. Before the extract node ever sees untrusted content, the finance API authenticates the sender and maps it to a known vendor/account, assigns an ingress idempotency key to detect duplicate documents, normalizes each format into a single DocumentEnvelope, runs schema/OCR-quality validation, and quarantines the document for malware and prompt-injection screening. Malformed documents route to a resubmission workflow rather than into extraction. Admitted envelopes queue (TaskQueue) so month-end bursts level instead of overrunning the pipeline.",
+        "Because the path is known and correctness/audit dominate, the control plane is then a deterministic pipeline — intake → extract → match → propose — with LLM calls confined to bounded nodes, rather than an autonomous ReAct loop fenced by a late gate. (This is the workflow-vs-agent selection rule: pick a fixed pipeline when the steps are known and auditability matters more than flexibility.)",
         "The model extracts and codes inside one node; a deterministic match engine does the three-way / PO match and threshold checks; the pipeline writes the proposal. The data contract between nodes is explicit: DocumentEnvelope → ExtractedFields → MatchResult → ProposedJournal. Each node's behavior is testable and its output is logged."
       ],
       "view": {
@@ -976,6 +1168,17 @@
       "whyNow": [
         "The gate is what makes propose-only autonomy safe for irreversible money movement."
       ],
+      "deepDives": [
+        {
+          "title": "Making the checker queue scale (~45k items/day)",
+          "points": [
+            "Removing auto-authorization makes the approval queue the dominant constraint, so the operating model has to be designed, not assumed: ~80% of items are clean (matched, known vendor, under tier limit) and ~20% are exceptions needing single-item review.",
+            "Batch approval for clean items: a checker approves a reviewed batch in one decision, but each item still gets its own immutable audit record (the batch evidence and per-item record are both stored) — this keeps SoD intact while cutting per-item human cost.",
+            "Single-item review for exceptions (~9k/day): at ~60 reviews/checker/hour that is ~150 checker-hours/day (~20 reviewers); high-risk and fraud items require dual senior approval.",
+            "Queue aging and SLA are first-class: when backlog crosses a threshold the system adds reviewer capacity or escalates — it never auto-posts to drain the queue, because that would silently reintroduce auto-authorization."
+          ]
+        }
+      ],
       "flows": [
         {
           "sequence": {
@@ -1067,26 +1270,35 @@
       "title": "5. Exactly-Once: Idempotent Posting & Payment",
       "description": [
         "Approval authorizes an irreversible action, so the post and the payment must each be exactly-once — but they are two different side effects with different failure modes, not one. Treat them separately: the GL journal post is a transactional, idempotent write inside the finance platform / ERP integration; the payment is an idempotent submission to an asynchronous rail plus status reconciliation.",
-        "The journal post carries an idempotency key; the GL dedupes on it, so a retry after a timeout or crash never double-posts and returns the same journalId. The payment is written to a payment outbox (payment_instructions) and submitted with its own key. Rails are asynchronous — pending, settled, failed, returned — so 'exactly-once payment' is an externally observable effect achieved through idempotent submission plus reconciliation of provider callbacks (deduped by callback event id), not a distributed-systems guarantee by assertion. An unknown outcome (timeout, missing callback) is reconciled by querying the provider, never by blindly resubmitting.",
+        "The journal post carries an idempotency key; the GL dedupes on it, so a retry after a timeout or crash never double-posts and returns the same journalId. The payment is written to a payment outbox (payment_instructions) and submitted with its own key. Rails are asynchronous — pending, settled, failed, returned — so 'exactly-once payment' is an externally observable effect, achieved through idempotent submission plus reconciliation of provider callbacks (deduped by callback event id), not a distributed-systems guarantee you can simply assert. An unknown outcome (timeout, missing callback) is reconciled by querying the provider, never by blindly resubmitting.",
         "This is the Foundations durable-execution discipline applied where it matters most: the side effect is money, so 'resume' must skip already-committed actions and must distinguish 'submitted' from 'settled'."
       ],
       "view": {
         "nodes": [
           "Identity",
           "Ledger",
+          "PaymentOutbox",
           "PaymentRail",
+          "PaymentEvents",
           "DecisionLog"
         ],
         "links": [
           "id-ledger",
-          "ledger-rail",
-          "ledger-log"
+          "id-outbox",
+          "outbox-rail",
+          "rail-events",
+          "events-outbox",
+          "ledger-log",
+          "outbox-log"
         ],
         "highlight": [
-          "Ledger",
-          "PaymentRail"
+          "PaymentOutbox",
+          "PaymentEvents"
         ],
-        "caption": "Approved posts and payments carry an idempotency key; the GL and rail dedupe so a retry never double-applies."
+        "groups": [
+          "payment-exec"
+        ],
+        "caption": "GL post is one idempotent write; payment is an idempotent outbox submission whose async outcome is reconciled from deduped provider callbacks — not a direct ledger-to-rail call."
       },
       "decisionPrompt": "The post succeeds but the response is lost and the pipeline retries — what prevents a double posting?",
       "patterns": [
@@ -1116,6 +1328,7 @@
             "Proposal: extracted -> matched | exception -> awaiting_approval -> approved -> posting -> posted (or rejected); a correction is a new reversed/reversal proposal, never an edit.",
             "Journal post and payment release are separate controlled side effects driven off an outbox/event log, not a single synchronous approve response that returns 'posted'.",
             "Payment: initiated -> submitted -> pending -> settled | failed | returned; an unknown outcome is reconciled by querying the provider before any retry.",
+            "Callbacks: every provider event is stored in payment_events keyed by (provider, callback_event_id); duplicates are dropped and a monotonic status_seq rejects stale/out-of-order events, so a single last_callback_event_id is not relied on.",
             "Accounting period: a proposal records its period_id; if the period locked between creation and posting, it re-validates and routes as a next-period entry or a controlled reopen rather than posting into a closed period."
           ]
         }
@@ -1133,8 +1346,16 @@
                 "label": "GL"
               },
               {
+                "id": "PaymentOutbox",
+                "label": "Payment Outbox"
+              },
+              {
                 "id": "PaymentRail",
-                "label": "Payment Rail"
+                "label": "Rail"
+              },
+              {
+                "id": "PaymentEvents",
+                "label": "Reconciler"
               }
             ],
             "messages": [
@@ -1159,10 +1380,45 @@
                   "label": "first time",
                   "messages": [
                     {
-                      "from": "Ledger",
+                      "from": "Identity",
+                      "to": "PaymentOutbox",
+                      "arrow": "->>",
+                      "label": "record instruction (key=K)"
+                    },
+                    {
+                      "from": "PaymentOutbox",
                       "to": "PaymentRail",
                       "arrow": "->>",
-                      "label": "release payment (key=K)"
+                      "label": "idempotent submit (status=submitted)"
+                    }
+                  ]
+                }
+              },
+              {
+                "from": "PaymentRail",
+                "to": "PaymentEvents",
+                "arrow": "-->>",
+                "label": "callback (eventId, settled|failed|returned)"
+              },
+              {
+                "type": "alt",
+                "label": "duplicate or stale eventId",
+                "messages": [
+                  {
+                    "from": "PaymentEvents",
+                    "to": "PaymentEvents",
+                    "arrow": "-->>",
+                    "label": "ignore (already applied / out of order)"
+                  }
+                ],
+                "else": {
+                  "label": "new monotonic transition",
+                  "messages": [
+                    {
+                      "from": "PaymentEvents",
+                      "to": "PaymentOutbox",
+                      "arrow": "->>",
+                      "label": "advance status; on timeout query provider, never blind-resubmit"
                     }
                   ]
                 }
@@ -1170,7 +1426,8 @@
             ]
           },
           "highlight": [
-            "Ledger"
+            "PaymentOutbox",
+            "PaymentEvents"
           ]
         }
       ],
@@ -1185,7 +1442,7 @@
       "title": "6. The Audit Artifact: An Immutable Decision Record",
       "description": [
         "Finance must be a glass box. For every action the platform writes an immutable decision record — not a chain-of-thought dump. It captures the auditable evidence and decision: retrieved records and their source versions, tool calls, deterministic calculations, policy/control checks, maker and checker approvals, model-output summaries, exception reasons, and immutable event IDs.",
-        "Raw prompts and model reasoning are kept behind stricter retention, redaction, and access controls: hidden reasoning is not a stable audit log and can leak secrets or carry prompt-injection artifacts. This record is what continuous SOX/ICFR controls and external auditors rely on."
+        "Raw prompts and model reasoning are kept separately, behind stricter retention, redaction, and access controls: hidden reasoning is not a stable audit log and can leak secrets or carry prompt-injection artifacts. The decision record — not the reasoning — is what continuous SOX/ICFR controls and external auditors rely on."
       ],
       "view": {
         "nodes": [
@@ -1251,7 +1508,7 @@
       "id": "exceptions",
       "title": "7. Thresholds, Exceptions, Fraud & Evaluation",
       "description": [
-        "Make autonomy safe and measurable. The invariant from Step 2/4 still holds: no ledger mutation or payment happens without a checker who is not the maker. So thresholds do not decide what to *auto-post* — they decide how an item is routed for approval. Low-risk, well-matched items (clean three-way match, known vendor, under a tier limit) are auto-recommended and routed to a fast single-checker queue; higher-risk items escalate to senior approval or dual checkers; and on any ambiguity the platform halts and escalates rather than guessing. 'Auto' means auto-routed and auto-recommended, never auto-authorized.",
+        "Make autonomy safe and measurable. The invariant from Steps 2 and 4 still holds: no ledger mutation or payment happens without a checker who is not the maker. So thresholds do not decide what to *auto-post* — they decide how an item is routed for approval. Low-risk, well-matched items (clean three-way match, known vendor, under a tier limit) are auto-recommended and routed to a fast single-checker queue; higher-risk items escalate to senior approval or dual checkers; and on any ambiguity the platform halts and escalates rather than guessing. 'Auto' means auto-routed and auto-recommended, never auto-authorized.",
         "Controls include fraud checks such as vendor bank-account-change detection (a business-email-compromise vector), which forces a positive out-of-band confirmation and an evidence requirement before that vendor's payments can be approved. And the pipeline is evaluated against ground-truth bookings: track extraction/coding accuracy and exception rates, and use trajectory eval so a high straight-through-approval rate never hides systematic miscoding."
       ],
       "view": {
@@ -1300,6 +1557,15 @@
             "Vendor bank-account-change: freeze that vendor's payments, require out-of-band confirmation evidence, and route to dual senior approval before any release.",
             "Period closed after a proposal was created: the proposal is re-validated against the now-locked period and routed as a next-period entry or a controlled reopen."
           ]
+        },
+        {
+          "title": "Operating dashboards that prove it is safe at scale",
+          "points": [
+            "Approval health: queue depth and aging by risk tier, approval SLA attainment, batch vs single-item ratio, and dual-approval coverage for high-risk/fraud items.",
+            "Quality: extraction/coding accuracy and exception rate against ground-truth bookings, plus miscoding rate so a high straight-through-approval rate can't hide systematic errors.",
+            "Controls & fraud: false-positive and false-negative rates on fraud checks, frozen-vendor count, and out-of-band-confirmation turnaround.",
+            "Payments: provider reconciliation lag, unknown-outcome count, and returned/failed rates — the signals that catch a payment reported as moved when it wasn't."
+          ]
         }
       ],
       "recap": {
@@ -1311,7 +1577,7 @@
   ],
   "finalDesign": {
     "title": "Final Design — Agentic Finance Platform",
-    "description": "Source documents enter through the finance API, which authenticates the sender, dedupes by ingress key, normalizes formats to a DocumentEnvelope, and quarantines for injection/malware before they queue into a deterministic pipeline. The pipeline extracts and codes each transaction in a bounded LLM node, runs a deterministic three-way/PO match and threshold check, runs SOX/ICFR controls and fraud checks (e.g. vendor bank-change), and writes a proposed journal to a separate proposals store — never the GL. A human checker distinct from the maker approves (risk tiers in Step 7 only decide routing, never bypass the checker); the identity broker enforces segregation of duties and only then authorizes a scoped, idempotent post to the general ledger. The 'Ledger → Payment Rail' edge is shorthand for a controlled payment-execution path: an approved payment is written to a payment outbox and submitted idempotently to the rail, then reconciled from deduped provider callbacks (initiated → submitted → settled/failed/returned). Every step appends to an immutable, hash-chained decision record (source/model/prompt/policy versions, evidence, calculations, controls, approvals, provider references, event IDs) on WORM storage, with raw model traces kept separately under stricter controls. Identity/delegation, guardrails, and durable execution are the shared substrate from Agentic Platform Foundations; the priority, unlike the Developer vertical, is correctness and auditability over availability.",
+    "description": "Source documents enter through the finance API, which authenticates the sender, dedupes by ingress key, normalizes formats to a DocumentEnvelope, and quarantines for injection/malware before they queue into a deterministic pipeline. The pipeline extracts and codes each transaction in a bounded LLM node, runs a deterministic three-way/PO match and threshold check, runs SOX/ICFR controls and fraud checks (e.g. vendor bank-change), and writes a proposed journal to a separate proposals store — never the GL. A human checker distinct from the maker approves (risk tiers in Step 7 only decide routing, never bypass the checker); the identity broker enforces segregation of duties and only then authorizes a scoped, idempotent post to the general ledger. Payment execution is a first-class path distinct from the GL post: the broker authorizes a payment outbox (payment_instructions), which submits idempotently to the rail; a reconciler stores every provider callback keyed by (provider, event id), dedupes duplicates, applies monotonic status transitions (initiated → submitted → settled/failed/returned), and resolves unknown outcomes by querying the provider rather than blind-resubmitting. Every step appends to an immutable, hash-chained decision record (source/model/prompt/policy versions, evidence, calculations, controls, approvals, provider references, event IDs) on WORM storage, with raw model traces kept separately under stricter controls. Identity/delegation, guardrails, and durable execution are the shared substrate from Agentic Platform Foundations; the priority, unlike the Developer vertical, is correctness and auditability over availability.",
     "view": {
       "nodes": [
         "Maker",
@@ -1325,7 +1591,9 @@
         "Ledger",
         "SubLedgers",
         "Proposals",
+        "PaymentOutbox",
         "PaymentRail",
+        "PaymentEvents",
         "Guardrail",
         "Identity",
         "DecisionLog",
@@ -1347,10 +1615,14 @@
         "proposals-checker",
         "checker-id",
         "id-ledger",
-        "ledger-rail",
+        "id-outbox",
+        "outbox-rail",
+        "rail-events",
+        "events-outbox",
         "pipe-log",
         "checker-log",
         "ledger-log",
+        "outbox-log",
         "pipe-obs",
         "guard-fraud",
         "guard-checker"
@@ -1358,6 +1630,7 @@
       "groups": [
         "pipeline",
         "maker-checker",
+        "payment-exec",
         "controls"
       ]
     }
@@ -1638,7 +1911,7 @@
         ]
       },
       "tradeoff": [
-        "The extract node needs a capable model with strong structured extraction; for the latest and most capable models, default to Claude (Opus/Sonnet) via the provider's API or a managed gateway.",
+        "The extract node needs a capable model with strong structured extraction, reached through a managed frontier-model provider or the shared model gateway from Foundations rather than a hard-coded vendor.",
         "Self-hosting keeps sensitive financial documents in-VPC but shifts capacity and quality work in-house; this is the shared inference tier from Foundations."
       ]
     },
@@ -1839,7 +2112,7 @@
       "phase": "Operate",
       "time": "last 5 min",
       "say": [
-        "Auto-execute vs escalate thresholds, fraud (vendor bank-change), and eval against ground-truth bookings."
+        "Auto-route/auto-recommend vs escalate thresholds (never auto-authorize), fraud (vendor bank-change), and eval against ground-truth bookings."
       ]
     }
   ],
@@ -1907,11 +2180,12 @@
         "id": "maker-checker-control",
         "group": "Controls, Audit & Compliance",
         "groupDescription": "Why financial systems need segregation of duties, immutable evidence, and human accountability for postings.",
-        "title": "Segregation of duties (maker-checker) as a fraud control",
-        "url": "https://en.wikipedia.org/wiki/Separation_of_duties",
-        "source": "Wikipedia",
-        "type": "Overview",
-        "why": "Background on why the party that initiates a transaction must be distinct from the party that approves it — the crux control of this design."
+        "title": "Separation of Duties control (AC-5), NIST SP 800-53 Rev. 5",
+        "url": "https://csrc.nist.gov/projects/cprt/catalog#/cprt/framework/version/SP_800_53_5_1_1/home?element=AC-5",
+        "source": "NIST",
+        "type": "Standard",
+        "year": "2020",
+        "why": "An authoritative control definition: the party that initiates a transaction must be distinct from the party that approves it, and the system must enforce it — the crux control of this design."
       },
       {
         "id": "stripe-idempotency",

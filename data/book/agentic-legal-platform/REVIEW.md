@@ -5,262 +5,230 @@ Review date: 2026-06-23
 
 ## Executive Summary
 
-This is a strong case-study outline with the right central insight: legal AI is not just "RAG plus drafting"; the hard gate is citation correctness, attorney approval, provenance, and confidentiality. The teaching arc is clear and the final design mostly integrates the components introduced in the steps.
+This review reflects the current post-revision dataset. The interview is now a strong and production-aware legal-agent case study. The earlier gaps around capacity, workflow-aware APIs, citation-verification evidence, review state, confidentiality placement, probe links, and step diagram omissions have mostly been addressed.
 
-The main weakness is that the dataset is still closer to a crisp conceptual walkthrough than a production system design. The capacity model, API, data model, and operational failure modes need more concrete machinery for real legal workflows: batch diligence, contract redlining, citation-verification evidence, provider rate limits, review state transitions, source versioning, and ethical-wall enforcement.
+The core teaching move is excellent: legal AI is not "RAG plus drafting"; it is a deterministic, attorney-gated work-product pipeline where every citation is checked for existence, currency, and relevance before a licensed attorney finalizes anything. The remaining improvements are narrower and mostly about internal consistency and operational depth: align the job/review state machine across API and data model, add the domain entities implied by the workflow fields, and make provider/retention/eval controls concrete enough for a staff-level design.
 
 | Axis | Rating | Notes |
 | --- | --- | --- |
-| System design soundness | 4/5 | Strong control-plane framing, but verifier semantics, workflow state, and source lifecycle are under-modeled. |
-| Production realism | 3/5 | Mentions the right risks, but lacks retries, provider limits, ingestion/versioning, DLQs, and legal-review operations. |
-| Pedagogical flow | 4/5 | Baseline -> grounding -> pipeline -> gate -> attorney -> trust -> eval is effective. |
-| Dataset/rendering fit | 3/5 | JSON and references parse cleanly, but some step view links will not render because their endpoints are omitted. |
-| Overall | 4/5 | Good interview case; needs concrete production details before it feels staff-level. |
+| System design soundness | 4/5 | Strong architecture and domain model; a few referenced entities and state transitions are still implicit. |
+| Production realism | 4/5 | Much stronger on capacity, provider limits, correction loops, and audit evidence; still needs sharper operational policies. |
+| Pedagogical flow | 4/5 | Clear baseline -> grounding -> pipeline -> cite gate -> attorney gate -> trust -> workflows arc. |
+| Dataset/rendering fit | 5/5 | JSON parses cleanly; node/link/step references resolve; prior diagram omissions are fixed. |
+| Overall | 4/5 | A strong interview dataset, close to flagship quality after a consistency pass. |
 
 ## What Works Well
 
-- The domain crux is well chosen: a real-but-overruled citation is treated as a first-class failure, not just a generic hallucination.
-- The deterministic retrieve -> draft -> verify -> review pipeline is the right default for legal work products.
-- The attorney-in-the-loop step is framed as mandatory professional responsibility, not optional UX.
-- Provenance is tied to source spans and versions, which is the right basis for audit-defensible legal output.
-- The final design includes the core components introduced earlier: `Pipeline`, `DraftAgent`, `AuthIndex`, `CiteVerifier`, `DraftStore`, `Provenance`, `Guardrail`, `Identity`, `AuditLog`, `TaskQueue`, and `Observability`.
-- The dataset uses structured views and sequence flows rather than raw Mermaid for architecture steps, which fits the renderer conventions.
+- The revised capacity section now converts legal workflows into concrete work units: matters/day, cites/memo, diligence batch size, token scale, provider calls, queueing, and concurrency caps.
+- The API is now asynchronous, workflow-aware, and idempotent. `matterId`, `task`, `jurisdiction`, `sourceCorpus`, `playbookId`, `outputSchemaId`, `reviewAssignee`, and `idempotencyKey` are the right fields.
+- Citation verification is no longer a black box. Step 4 now names proposition spans, source spans, KeyCite status, relevance score, verifier version, decision state, correction loop, audit evidence, and provider limits.
+- Confidentiality now appears early in Step 2 as a retrieval constraint, not only as later hardening. That is the right legal-platform posture.
+- The attorney review step now describes assignment, annotation, request changes, rejection, approval, high-risk second review, license/jurisdiction validation, and audited cite override.
+- Workflow-specific outputs are present: redlines, diligence findings, source spans, confidence, and attorney ground-truth eval.
+- `toProbeFurther` is now populated with relevant legal hallucination, professional responsibility, confidentiality, citator, and RAG evaluation links.
 
 ## Highest-Impact Issues
 
-### 1. Citation verification is named correctly but not specified enough
+### 1. The lifecycle state machine is split across API prose and data model
 
-Step 4 correctly makes existence, currency, and relevance the gate. The missing production detail is how the system represents verification evidence and decisions.
+The API says a draft moves through `queued -> drafting -> verifying -> (correcting ->) awaiting_review`, and Step 4 describes repeated verification attempts and correction loops. The `drafts.status` field only lists `awaiting_review, changes_requested, finalized, returned, rejected`.
 
-Why it matters: existence and currency can be checked against legal-authority metadata, but relevance is a semantic claim about whether a cited authority supports a specific proposition. That needs thresholds, evidence, escalation paths, and reviewable artifacts. Without those, the most important component in the design is still a black box.
-
-Concrete fix:
-
-- Add fields to `citations` or a new `citation_verifications` table: `proposition_text`, `proposition_span`, `source_span`, `jurisdiction`, `authority_type`, `keycite_status`, `verified_at`, `verifier_version`, `relevance_score`, `decision`, `blocking_reason`.
-- Distinguish machine-pass, machine-flagged, and attorney-overridden states.
-- Add a failure path in the architecture: flagged cite -> correction loop -> reverify, with audit entries for each attempt.
-- Add a deep dive explaining that relevance is not purely deterministic and may require model-assisted scoring plus attorney escalation.
-
-### 2. The three promised legal workflows are too compressed
-
-The requirements promise contract review with redlines, due-diligence tabular extraction, and research memos. Step 7 lists them, but the API and data model mostly model one generic `draft`.
-
-Why it matters: these workflows produce different outputs and need different state:
-
-- Contract review needs playbook/rule IDs, clause spans, risk severity, redline diffs, and rationale.
-- Due diligence needs batch jobs, extraction schemas, per-document status, table cells, confidence, and source spans.
-- Research memos need jurisdiction, question presented, authority hierarchy, citation verification, and memo sections.
+Why it matters: this is now the main consistency gap. The architecture depends on retryable asynchronous jobs, correction loops, review returns, and finalization, but the persisted state model does not fully represent the pre-review job lifecycle.
 
 Concrete fix:
 
-- Add workflow-specific request fields to `/v1/drafts`: `jurisdiction`, `playbookId`, `outputSchemaId`, `sourceCorpus`, `reviewAssignee`, and `idempotencyKey`.
-- Add workflow tables or child entities for redlines, diligence findings/cells, and memo propositions.
-- Split Step 7 into sub-steps or deep dives for contract review and diligence at scale so the case does not end with a generic "run workflows" statement.
+- Split job state and review state, or expand the draft status enum.
+- Add states such as `queued`, `drafting`, `verifying`, `correcting`, `verification_failed`, `awaiting_review`, `changes_requested`, `approved`, `finalized`, `rejected`.
+- Make the "request changes" path explicit: attorney event -> correction loop -> reverify -> awaiting review.
+- Add terminal failure behavior for repeated cite failures or provider outage, likely `human_exception` or `verification_blocked`.
 
-### 3. Capacity and operations are qualitative only
+### 2. Several referenced workflow entities are implied but not modeled
 
-The capacity section says "every cite", "draft-only", and "thousands of docs", but it does not convert those into work units.
+The revised API and deep dives reference `playbookId`, `outputSchemaId`, redline `rule_id`, diligence `batch_id`, extraction schemas, and per-document batch status. The data model includes `redlines` and `diligence_findings`, but it does not define playbooks/rules, diligence batches, extraction schemas, per-document batch attempts, or source corpora as first-class entities.
 
-Why it matters: system design interviews need sizing to justify queues, parallelism, provider throttling, and cost controls. Legal platforms are especially sensitive to expensive retrieval, long documents, and third-party legal-database limits.
-
-Concrete fix:
-
-- Add estimates for matters/day, documents/matter, pages/document, tokens/page, citations/draft, verification calls/citation, and peak batch concurrency.
-- Add latency targets separately for interactive memo drafting and offline diligence review.
-- Add provider constraints: legal-source API rate limits, inference budget, retry policy, timeout budget, circuit breakers, and backpressure.
-- Add queue behavior: per-matter concurrency caps, DLQ, checkpointing, resumable batch extraction, and idempotent retry.
-
-### 4. Confidentiality and ethical walls arrive late in the teaching flow
-
-Step 6 is good, but confidentiality affects ingestion and retrieval from Step 2 onward. The current flow introduces DMS access and authoritative grounding before it has fully introduced matter ACLs, ethical walls, provider retention policy, and untrusted-document handling.
-
-Why it matters: in a legal platform, data isolation is not a later hardening layer. It changes which documents can be retrieved, which providers can be called, which traces can be stored, and who can approve.
+Why it matters: the interview now promises real contract review and diligence workflows. Without these entities, the schema still cannot fully support the user-facing API or the operational claims around resumability and partial completion.
 
 Concrete fix:
 
-- Pull a short "tenant/matter access boundary" into Step 2 or Step 3.
-- Show `Guardrail` or an access-policy service on the early grounding path, not only in the later trust step.
-- Add explicit storage-retention and trace-redaction behavior for prompts, retrieved snippets, model outputs, and audit records.
-- Model ethical-wall enforcement as a policy check on every retrieval and approval action.
+- Add `playbooks` and `playbook_rules` tables referenced by contract-review redlines.
+- Add `diligence_batches`, `diligence_documents`, and `extraction_schemas` for per-document status, checkpointing, poison-document DLQ, and partial completion.
+- Add `source_corpora` or `corpus_versions` for Westlaw/Practical Law/statute snapshots, freshness, and version pinning.
+- Connect these entities to `review_events` and `audit_events` so returned/edited outputs preserve their lineage.
 
-### 5. Some authored diagram links will not render
+### 3. Provider operations are mentioned but not yet operationalized
 
-The JSON references all valid links, but the renderer only emits a link when both endpoints are included in the current `view.nodes`. These step views include links whose endpoints are absent:
+The dataset now correctly names KeyCite/Westlaw rate limits, caching, batching, timeouts, retries, circuit breakers, and source-version drift. That is a major improvement, but it remains mostly prose.
 
-- Step `confidentiality`: `pipe-guard`, `pipe-prov`, and `pipe-log` all start at `Pipeline`, but `Pipeline` is not in `view.nodes`.
-- Step `workflows-eval`: `draftstore-attorney` starts at `DraftStore`, but `DraftStore` is not in `view.nodes`.
-
-Why it matters: the diagrams will silently omit those links. Step 6 will mostly show `Guardrail -> DMS` while losing the provenance and audit links the caption describes.
+Why it matters: legal-source providers and inference providers are external bottlenecks with commercial, latency, freshness, and outage behavior. This is where a staff-level answer should show concrete controls.
 
 Concrete fix:
 
-- Add `Pipeline` to Step 6 `view.nodes`, or replace those links with links whose endpoints are visible.
-- Add `DraftStore` to Step 7 `view.nodes`, or remove `draftstore-attorney` from that step view.
+- Add a short deep dive or data-model row for provider call attempts: provider, operation, request hash, source version, timeout, retry count, response status, cached result, and cost.
+- Define stale-cache behavior for citation currency: when cached KeyCite status is acceptable, when it must be refreshed, and what happens during provider outage.
+- State explicit retry limits and DLQ behavior for verification and diligence extraction.
+- Include spend controls beyond "global token budget": per-matter budget, per-client quota, and priority between interactive memos and offline batches.
+
+### 4. Evaluation needs release-gate semantics
+
+The dataset correctly identifies citation-error rate, unsupported-finding rate, trajectory eval, and attorney ground truth. It stops short of explaining how those metrics gate rollout or regression.
+
+Why it matters: legal AI evaluation is not just observability. If a new verifier, retriever, or model increases off-point citations, the platform must block or stage rollout.
+
+Concrete fix:
+
+- Add thresholds or policy examples: max citation-error rate, max unsupported-finding rate, and required attorney-adjudicated sample size.
+- Distinguish offline eval sets, shadow eval on production drafts, and production monitoring.
+- Track results by task type (`contract_review`, `diligence`, `memo`) because failure modes differ.
+- Add a rollback or holdout story for model/verifier/corpus changes.
 
 ## System Design Soundness
 
-Requirements are well scoped around legal work product risk. The functional set is coherent, and the non-functional set correctly prioritizes hallucination, provenance, confidentiality, authoritative grounding, and deterministic control flow.
+The requirements are now coherent and specific. Functional requirements cover contract redlines, diligence extraction, cited memos, citation verification, and attorney approval. Non-functional requirements correctly prioritize hallucination, traceability, confidentiality, authoritative grounding, and deterministic control flow.
 
-Capacity needs real numbers. The current values are labels, not a sizing model. The design introduces a `TaskQueue`, but the reader cannot infer why it is sized the way it is, what gets queued, how batches are partitioned, or where the provider bottlenecks sit.
+The capacity model is now credible. It gives interactive memo volume, citation-verification volume, diligence batch scale, token scale, provider calls, queue behavior, and per-matter/global throttles. The remaining sizing gap is that the caps are directional rather than numerical; that is acceptable for this dataset, but a staff-level interview could ask the candidate to choose specific queue and provider budgets.
 
-The API is directionally right but too narrow. `/v1/drafts` needs to be asynchronous and workflow-aware. It should expose a job lifecycle, idempotency key, matter/tenant scope, jurisdiction, source-corpus selection, playbook or output schema, and review assignment. `/v1/drafts/{id}/approve` needs richer state transitions: approve, request changes, reject, finalize, file externally, and attorney override of a flagged cite if policy allows.
+The API shape is strong. `/v1/drafts` is async and idempotent, `/v1/drafts/{id}` exposes lifecycle and batch progress, `/v1/drafts/{id}/review` captures review decisions, and `/v1/drafts/{id}/provenance` exposes support evidence. The main fix is to align these lifecycle states with the data model.
 
-The data model captures drafts, citations, and provenance, but it is missing the entities that make the system credible: matters, documents, document versions, ingestion jobs, source corpora, playbooks, redline suggestions, diligence extraction rows/cells, review events, verification attempts, and immutable audit records. The `citations` table needs more detail than booleans because the verifier is the core design component.
+The data model is much better than the original review described. Matters, documents, drafts, citations, citation verification attempts, redlines, diligence findings, review events, provenance, and audit events are all present. The missing pieces are the parent entities those rows reference: playbook rules, diligence batches, extraction schemas, source corpora, and provider-call attempts.
 
-The architecture has the right components, but the correction loop is not visible enough. A citation gate that flags bad authority should route back to drafting or a human exception queue before producing a review packet. Provider outages, legal-database freshness, and source-version pinning should also be explicit.
+The architecture has the right components and link structure: `Gateway`, `Pipeline`, `DraftAgent`, `AuthIndex`, `DMS`, `CiteVerifier`, `DraftStore`, `Provenance`, `Guardrail`, `Identity`, `AuditLog`, `TaskQueue`, and `Observability`. The correction loop from verifier to draft agent is explicit, and the final design integrates the steps.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive Agent
 
-Strong baseline. It makes the malpractice-grade failure concrete and creates a reason for the rest of the design. The trap is useful and domain-specific.
+Strong baseline. It makes the legal failure concrete: fluent output, fake or overruled citations, no provenance, no attorney review, and confidentiality risk. The trap is domain-specific and useful.
 
-Improvement: call out confidentiality and privilege even more directly here as a co-equal failure with hallucinated citations, because it affects provider and storage choices immediately.
+Improvement: no major issue. This step does exactly what it needs to do.
 
 ### Step 2: Ground in Authoritative Law
 
-Good introduction of Westlaw/Practical Law/KeyCite and DMS grounding. This is the right point to distinguish authoritative law, matter documents, and open web sources.
+This step is materially improved. It now introduces tenant, matter, jurisdiction, document version, ethical walls, guardrail/access-policy checks, untrusted matter documents, and source versioning before retrieval becomes trusted.
 
-Improvement: add source-ingestion/versioning and access-policy detail. Retrieval should be constrained by tenant, matter, jurisdiction, document version, and ethical wall. The current view includes `Guardrail -> DMS`, but the prose should make the access boundary more operational.
+Improvement: consider briefly separating "authoritative legal corpus" from "client matter corpus" as two source lifecycle tracks. Westlaw/KeyCite freshness and DMS document versioning fail differently.
 
 ### Step 3: Deterministic Pipeline
 
-The recommended deterministic pipeline option is well chosen. The contrast with an autonomous research loop teaches the right trade-off.
+The recommended deterministic pipeline option is still the right trade-off. The contrast with an autonomous research loop teaches why the verifier must be a mandatory stage.
 
-Improvement: make the job model explicit. The pipeline should show asynchronous job creation, per-matter queueing, checkpointing, and idempotent retries. The current `pipe-draftstore` link can also be read as writing a draft before verification; clarify whether this is an internal draft artifact or a review-ready draft.
+Improvement: clarify the `DraftStore` write. In the step diagram, `Pipeline -> DraftStore` appears before the citation-verification step has been introduced. The API sequence writes the pending draft after verification. Either wording is defensible if the store holds internal draft artifacts, but the dataset should say whether `DraftStore` contains unverified intermediate drafts, verified drafts awaiting review, or both with different statuses.
 
 ### Step 4: Citation Gate
 
-This is the strongest step and the right centerpiece. The existence/currency/relevance framing is memorable and defensible.
+This is now the strongest step. The existence/currency/relevance framing is memorable, the correction loop is explicit, and the deep dives cover relevance scoring, evidence rows, provider limits, outages, and source-version pinning.
 
-Improvement: deepen relevance checking and failure handling. Show the correction loop, verifier evidence, disputed/uncertain states, and legal-source provider constraints. The sequence flow should include audit logging of verification results because the final architecture has `verify-log`.
+Improvement: add one sentence on how attorney override interacts with machine-flagged citations. The data model has `attorney_overridden`; Step 5 mentions policy-permitted overrides. Step 4 can cross-reference that an override never means "machine passed"; it means a licensed attorney accepted the risk with evidence attached.
 
 ### Step 5: Attorney-in-the-Loop
 
-The gate is framed correctly: verification does not replace attorney responsibility. Binding finalization to a licensed attorney principal is a strong detail.
+The step correctly treats review as a workflow, not a button. It includes assignment, annotation, request changes, approval, rejection, second review, license/jurisdiction source, and audit events.
 
-Improvement: add review workflow state. A real platform needs request-changes, annotate, assign reviewer, delegation/supervision, second review for high-risk work, and a durable approval event. "Licensed attorney" also implies a license/jurisdiction verification source or firm-admin attestation.
+Improvement: align the review event actions with API response statuses and draft statuses. Today the prose is richer than the `drafts.status` enum.
 
 ### Step 6: Confidentiality and Provenance
 
-The concepts are right and the deep dive is useful. Treating matter documents as untrusted input is important.
+This step is concise and right. It correctly says confidentiality and provenance sit under everything, and the diagram now includes `Pipeline`, so the intended links render.
 
-Improvement: move some of this earlier and fix the diagram view. The step references `pipe-guard`, `pipe-prov`, and `pipe-log`, but `Pipeline` is not visible, so those links will not render. Add `Pipeline` or author local links that match the visible nodes.
+Improvement: add operational retention detail if space allows: prompt traces, retrieved snippets, model outputs, eval traces, audit records, and raw matter documents likely have different retention/redaction policies.
 
 ### Step 7: Workflows at Scale and Evaluation
 
-The step correctly names the production workflows and quality metrics. Evaluating against attorney ground truth and citation-error rate is the right direction.
+The step is much stronger than before. The deep dives distinguish contract review, diligence extraction, and evaluation against attorney ground truth. Diligence now includes checkpointing, per-document errors, DLQ, low-confidence human adjudication, and concurrency caps.
 
-Improvement: it is too compressed for a final step. Contract review, diligence extraction, and memos deserve distinct output models or at least a structured deep dive. Also add `DraftStore` to the view if the `draftstore-attorney` link is meant to appear.
+Improvement: this step now references several entities that should exist in the data model: batches, extraction schemas, document-level batch status, and playbook rules.
 
 ## Final Design Review
 
-The final design integrates the major components and has a clear narrative. It successfully explains why the platform is deterministic and why the irreversible action is attorney-finalized work product.
+The final design integrates the major components and now reads like a credible production architecture. It covers deterministic control flow, access-scoped retrieval, version-pinned authoritative law, correction loops, reviewable verification evidence, provenance, attorney review, identity binding, confidentiality, immutable audit, evaluation, provider limits, retries, and circuit breakers.
 
-Missing details:
+Remaining gaps:
 
-- A visible correction loop from `CiteVerifier` back to `DraftAgent` or an exception queue.
-- Source lifecycle for authoritative law: update cadence, version pinning, and legal-source freshness.
-- Matter-document ingestion and indexing lifecycle.
-- Review-state transitions and attorney override/return handling.
-- Provider outage and rate-limit behavior for legal databases and inference.
-- Retention/redaction policy for prompts, traces, retrieved snippets, drafts, and audit logs.
+- The final design says work queues and correction loops exist, but the persisted lifecycle states are not fully modeled.
+- Workflow-specific parent entities are missing even though the API and deep dives refer to them.
+- Provider-call operations are named but not modeled as observable, auditable attempts.
+- Evaluation is described as monitoring; it should also be a release gate for retriever, verifier, model, and corpus changes.
 
 ## Concept Introduction and Learning Flow
 
-The order is mostly effective. The case starts with a dangerous baseline, adds authoritative grounding, then builds a deterministic pipeline and gates it with citation verification and attorney review.
+The flow is now strong. Confidentiality appears in Step 2, the deterministic pipeline is motivated before the citation gate, and the attorney gate lands after machine verification. The sequence helps a candidate build the answer incrementally.
 
-The main sequencing issue is confidentiality. It is introduced as Step 6, but it constrains every earlier step. A short access-boundary concept should appear in Step 2 before retrieval from DMS or matter corpora is allowed.
+The only sequencing ambiguity is the `DraftStore` write in Step 3 before Step 4 verification. A small clarification would avoid suggesting that an unverified draft is ready for attorney review.
 
-The final workflow/eval step could teach more if it were split into smaller sub-steps or deep dives. Right now it acts as a summary of three product lines rather than a design decision.
+The patterns are well chosen: deterministic workflow vs agent loop, bounded autonomy, human-in-the-loop gate, memory/grounding, prompt-injection defense, delegation, and queue-based load leveling.
 
 ## Step-to-Final-Design Coherence
 
-Most step components appear in `finalDesign`, which is good. The progression is coherent:
+The step progression maps cleanly to final design:
 
-- Step 1 introduces `DraftAgent` and `Inference`.
+- Step 1 introduces `DraftAgent`, `Inference`, and `DraftStore`.
 - Step 2 adds `AuthIndex`, `DMS`, and `Guardrail`.
-- Step 3 adds `Pipeline`, `TaskQueue`, and `DraftStore`.
-- Step 4 adds `CiteVerifier`.
-- Step 5 adds `Attorney`, `Identity`, and `AuditLog`.
-- Step 6 adds `Provenance`.
-- Step 7 adds `Observability`.
+- Step 3 adds `Pipeline` and `TaskQueue`.
+- Step 4 adds `CiteVerifier`, correction loop, and verification audit evidence.
+- Step 5 adds `Attorney`, `Identity`, and review/audit semantics.
+- Step 6 adds `Provenance` and confidentiality posture.
+- Step 7 adds `Observability` and workflow scale.
 
-Gaps:
-
-- Step 6 and Step 7 diagrams omit some intended links because endpoints are missing from `view.nodes`.
-- `Matter` and `Gateway` appear only in final design, not in the step sequence. That is acceptable, but a small API-ingress step or intro note would make the final diagram feel less abrupt.
-- The final design says flagged citations return for correction, but no link models that loop.
+`Matter` and `Gateway` appear only in the final design, but that is acceptable because the API section introduces the ingress shape. If desired, a tiny note in Step 2 or Step 3 could make the API ingress less abrupt.
 
 ## Realism Compared With Production Systems
 
-The review, approval, provenance, and hallucination themes are realistic. The remaining realism gaps are mostly operational:
+The current dataset is realistic on the central domain risks: overruled citations, off-point authorities, attorney supervision, access-scoped retrieval, source spans, version pinning, and no auto-filing.
 
-- Legal-source providers have rate limits, latency, freshness windows, commercial constraints, and outage modes.
-- Long matter documents require chunking, OCR/format handling, versioning, deduplication, and source-span stability.
-- Diligence batches need resumability, partial completion, per-document errors, and human adjudication for low-confidence findings.
-- Citation relevance has false positives and false negatives; it should produce reviewable evidence rather than a bare boolean.
-- Attorney review is a workflow with assignment, annotations, returns, approvals, and durable signatures.
-- Audit logs need immutability, retention, access controls, and trace redaction.
-- Confidentiality needs provider routing and policy enforcement, not just a ZDR/no-train statement.
+The remaining realism gaps are operational:
+
+- Citation currency cache freshness and provider outage policy need more explicit behavior.
+- Diligence batch state should include document-level attempts, poison documents, retries, and partial completion entities.
+- Retention/redaction should differ for prompts, retrieved snippets, model outputs, eval traces, audit events, and finalized work product.
+- Legal hold, client export/deletion, and immutable audit retention can conflict; the platform should name the policy boundary.
+- Evaluation should gate release, not only report metrics.
 
 ## Dataset and Renderer-Facing Observations
 
 - `interview.json` parses as valid JSON.
 - All `view.nodes` references resolve to `highLevelArchitecture.nodes`.
 - All `view.links` references resolve to `highLevelArchitecture.links`.
+- All visible step/final-design links include both endpoints in the current view; the earlier `confidentiality` and `workflows-eval` rendering issue is fixed.
 - All `satisfies[*].steps[*]` references resolve to real step IDs.
 - All `patterns[*].steps[*]` references resolve to real step IDs.
-- Sequence participant and message IDs resolve to canonical architecture node IDs.
-- Renderer issue: some step links will be filtered out because the step does not include both link endpoints in `view.nodes` (`confidentiality` and `workflows-eval`).
-- Node-type issue: `Matter` has type `client` but is labeled "Matter Documents". Per repo convention, `client` should represent software outside the backend boundary. Consider renaming it to a client app/portal or changing the node type to a data/source-like type such as `external` or `object-storage`.
-- Optional enrichment fields such as `technologyChoices`, `toProbeFurther`, AI visuals, and comics are absent. That is fine for validity, but `toProbeFurther` would help this domain because legal-source verification, privilege, and attorney supervision are nuanced.
+- Sequence participant/message references resolve to canonical node IDs or declared participants.
+- Node types now follow the project convention; `Matter` is `external`, not `client`.
+- `toProbeFurther` is populated. `technologyChoices`, AI visuals, and comic assets are absent, which is valid for this dataset.
 
 ## Recommended Edits, Prioritized
 
-### P1: Fix diagram rendering omissions
+### P1: Align job, verification, and review states
 
-Add missing endpoints to the affected step views:
+Make API lifecycle, `drafts.status`, `review_events.action`, correction-loop behavior, and terminal failure states agree.
 
-- Step `confidentiality`: add `Pipeline` to `view.nodes`, or remove/replace `pipe-guard`, `pipe-prov`, and `pipe-log`.
-- Step `workflows-eval`: add `DraftStore` to `view.nodes`, or remove/replace `draftstore-attorney`.
+### P1: Add the workflow parent entities now referenced by API and deep dives
 
-### P1: Specify citation-verification evidence and state
+Add playbooks/playbook rules, diligence batches, extraction schemas, document-level batch status, source corpora/corpus versions, and provider-call attempts.
 
-Expand the citation model and Step 4 to include proposition span, source span, authority status, jurisdiction, relevance score, verifier version, decision state, blocking reason, and correction loop.
+### P2: Clarify `DraftStore` semantics
 
-### P1: Add a real capacity model
+State whether it stores unverified internal drafts, verified drafts awaiting review, finalized work product, or all of them with separate statuses.
 
-Convert qualitative capacity into numbers: matters/day, docs/matter, pages/doc, citations/draft, extraction cells/batch, verification calls/citation, peak concurrency, latency targets, and provider limits.
+### P2: Operationalize provider limits and cache freshness
 
-### P2: Make APIs workflow-aware and idempotent
+Add retry limits, cache TTL/freshness rules for legal authority checks, outage behavior, per-matter spend budget, and DLQ criteria.
 
-Add request fields for task-specific inputs and lifecycle control: `idempotencyKey`, `jurisdiction`, `playbookId`, `outputSchemaId`, `sourceCorpus`, `reviewAssignee`, and asynchronous job/status endpoints.
+### P2: Turn eval metrics into release gates
 
-### P2: Expand the data model
+Define how citation-error and unsupported-finding rates block or stage model, retriever, verifier, prompt, and corpus-version changes.
 
-Add matters, documents/document versions, ingestion jobs, source corpora, playbooks, review events, redlines, diligence findings/cells, verification attempts, and audit events.
+### P3: Add retention and legal-hold nuance
 
-### P2: Move access-control constraints earlier
-
-Introduce tenant/matter ACLs, ethical walls, provider retention policy, and prompt/document untrusted-input handling in Step 2 or Step 3.
-
-### P3: Add operational deep dives
-
-Add deep dives for legal-source provider outages/rate limits, batch retry/DLQ, source-version pinning, prompt trace retention, and eval sampling against attorney ground truth.
-
-### P3: Add probe links or further reading
-
-This domain would benefit from curated links on legal citation verification, professional responsibility around AI assistance, privilege/confidentiality, and RAG evaluation for legal research.
+Differentiate retention/redaction for traces, snippets, drafts, eval samples, immutable audit events, and finalized work product.
 
 ## What Not To Change
 
 - Keep the citation-verification gate as the central design move.
 - Keep the deterministic pipeline recommendation over an autonomous research loop.
-- Keep attorney approval as mandatory and identity-bound.
-- Keep provenance tied to source spans and versions.
-- Keep the naive baseline because it teaches the domain risk quickly.
+- Keep attorney approval mandatory and identity-bound.
+- Keep confidentiality in the grounding step, not only the later trust step.
+- Keep workflow-specific deep dives for contract review, diligence, and evaluation.
+- Keep the curated probe links; they make this domain-specific and defensible.
 
 ## Bottom Line
 
-This is a strong legal-agent case study with a clear pedagogical spine. The next improvement pass should make the core gate and production workflow concrete: richer citation-verification evidence, workflow-specific APIs/data, real capacity numbers, operational failure handling, and a small diagram fix so the rendered visuals match the authored intent.
+The recent changes moved this dataset from a strong conceptual walkthrough to a credible production-oriented interview. The next pass should be a consistency pass, not a redesign: align lifecycle states, model the workflow entities already implied by the API, and make provider/eval/retention operations concrete.

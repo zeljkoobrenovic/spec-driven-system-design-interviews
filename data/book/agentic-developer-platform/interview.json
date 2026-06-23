@@ -320,11 +320,13 @@
   ],
   "capacityDiagram": [
     "graph LR",
-    "  Tasks[Many async tasks]",
-    "  Sandboxes[Ephemeral sandbox per task]",
-    "  Cap[Admission-controlled fleet]",
-    "  Tasks --> Sandboxes",
-    "  Sandboxes --> Cap"
+    "  Tasks[~50k tasks/day; peak ~120/min]",
+    "  Queue[Admission-controlled queue]",
+    "  Sandbox[~500 concurrent sandboxes + CI minutes]",
+    "  Index[Repo index + inference + trajectory storage]",
+    "  Tasks --> Queue",
+    "  Queue --> Sandbox",
+    "  Queue --> Index"
   ],
   "requirements": {
     "functional": [
@@ -344,19 +346,49 @@
   },
   "capacity": [
     {
-      "label": "Parallel agents",
-      "value": "fleet-scale",
-      "note": "Many tasks run at once; each needs an isolated sandbox \u2014 admission control caps concurrency."
+      "label": "Task volume",
+      "value": "~50k tasks/day, peak ~120 submissions/min",
+      "note": "Bursty: issue/webhook/cron storms cluster around business hours and CI events; the queue levels it."
     },
     {
-      "label": "Sandbox lifetime",
-      "value": "ephemeral, per task",
-      "note": "Created on task start, destroyed on PR open or timeout; warm pools hide boot latency."
+      "label": "Task duration",
+      "value": "avg ~6 min, p95 ~25 min",
+      "note": "Long-tail tasks dominate sandbox occupancy; p95 \u00d7 arrival rate sizes concurrency, not the average."
     },
     {
-      "label": "Trigger latency",
-      "value": "async",
-      "note": "Tasks are queued, not interactive; throughput and merge rate matter more than per-step latency."
+      "label": "Concurrent sandboxes",
+      "value": "~120k\u00d7p95-duration / 60 \u2248 ~500 concurrent target",
+      "note": "Little's Law on arrival rate \u00d7 p95 duration; admission control caps this hard, warm pool ~50 hides ~20s microVM boot."
+    },
+    {
+      "label": "Repo checkout / cache",
+      "value": "~1\u20135 GB working copy per task",
+      "note": "Shallow/partial clone + shared git cache and CoW snapshots keep checkout off the critical path."
+    },
+    {
+      "label": "Code index storage",
+      "value": "~1\u20132 GB per MLOC; ~5k incremental re-index events/day",
+      "note": "Push webhooks drive incremental re-index; index_jobs lag is the freshness SLO."
+    },
+    {
+      "label": "CI runner minutes",
+      "value": "~2 PR runs/task \u00d7 ~8 min \u2248 ~13k runner-min/day",
+      "note": "In-sandbox verify is the agent's fast loop; PR CI is the gate's source of truth and the costlier budget."
+    },
+    {
+      "label": "Token spend",
+      "value": "~200k\u2013500k tokens/task; millions/day fleet-wide",
+      "note": "Shared inference tier from Foundations; per-tenant token budgets feed admission control and cost roll-ups."
+    },
+    {
+      "label": "Trajectory / event storage",
+      "value": "~5\u201320 MB/task; retained ~90 days",
+      "note": "OTel spans + run_events; may contain source/secrets, so redaction and a retention class apply."
+    },
+    {
+      "label": "Per-tenant limits",
+      "value": "concurrency + token + queue-depth quota",
+      "note": "Fairness under bursty multi-tenant load; one tenant's storm can't starve the fleet."
     }
   ],
   "api": [
@@ -430,26 +462,74 @@
   "dataModel": [
     {
       "name": "tasks",
-      "note": "One coding task worked by one agent.",
+      "note": "One coding task worked by one agent, with the state needed for exactly-once resume, retries, and conflict handling.",
       "fields": [
         {
           "name": "task_id",
           "type": "uuid PK"
         },
         {
-          "name": "repo",
-          "type": "varchar"
+          "name": "tenant_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "repo_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "idempotency_key",
+          "type": "varchar unique"
         },
         {
           "name": "base_branch",
           "type": "varchar"
         },
         {
-          "name": "status",
-          "type": "enum(queued,running,pr_open,merged,failed)"
+          "name": "base_sha",
+          "type": "varchar null"
         },
         {
-          "name": "pr_url",
+          "name": "branch_name",
+          "type": "varchar null"
+        },
+        {
+          "name": "head_sha",
+          "type": "varchar null"
+        },
+        {
+          "name": "pr_id",
+          "type": "varchar null"
+        },
+        {
+          "name": "status",
+          "type": "enum(queued,leased,running,verifying,pr_open,merged,failed,canceled)"
+        },
+        {
+          "name": "attempt",
+          "type": "int default 0"
+        },
+        {
+          "name": "lease_owner",
+          "type": "varchar null"
+        },
+        {
+          "name": "lease_expires_at",
+          "type": "timestamptz null"
+        },
+        {
+          "name": "last_event_seq",
+          "type": "bigint default 0"
+        },
+        {
+          "name": "retry_policy",
+          "type": "jsonb"
+        },
+        {
+          "name": "cancel_requested_at",
+          "type": "timestamptz null"
+        },
+        {
+          "name": "terminal_reason",
           "type": "varchar null"
         },
         {
@@ -460,7 +540,7 @@
     },
     {
       "name": "run_events",
-      "note": "Durable run log for exactly-once resume.",
+      "note": "Append-only durable run log; replaying events up to last_event_seq resumes a task exactly-once.",
       "fields": [
         {
           "name": "event_id",
@@ -472,29 +552,113 @@
         },
         {
           "name": "seq",
-          "type": "int"
+          "type": "bigint"
         },
         {
           "name": "kind",
-          "type": "enum(plan,edit,test,push,pr_open)"
+          "type": "enum(checkout,retrieve,plan,tool_call,patch,test_start,test_result,push_branch,pr_opened,ci_status,review_event,lease_renewed,canceled)"
         },
         {
           "name": "payload",
           "type": "jsonb"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "work_intents",
+      "note": "Path/repo-level locks that stop two parallel agents from racing on the same files; supports duplicate-task detection and conflict policy.",
+      "fields": [
+        {
+          "name": "intent_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "repo_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "path_glob",
+          "type": "varchar"
+        },
+        {
+          "name": "task_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "base_sha",
+          "type": "varchar"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "gate_decisions",
+      "note": "Durable evidence that the two gates were satisfied: reviewer/code-owner approval, required checks, and downstream deploy proof.",
+      "fields": [
+        {
+          "name": "decision_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "task_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "actor",
+          "type": "varchar"
+        },
+        {
+          "name": "role",
+          "type": "enum(reviewer,code_owner,auto_merge_bot)"
+        },
+        {
+          "name": "decision",
+          "type": "enum(approved,changes_requested,merged,blocked)"
+        },
+        {
+          "name": "policy_version",
+          "type": "varchar"
+        },
+        {
+          "name": "required_checks",
+          "type": "jsonb"
+        },
+        {
+          "name": "risk_class",
+          "type": "enum(low,medium,high)"
+        },
+        {
+          "name": "deploy_evidence_url",
+          "type": "varchar null"
+        },
+        {
+          "name": "decided_at",
+          "type": "timestamptz"
         }
       ]
     },
     {
       "name": "repo_index",
-      "note": "Hybrid retrieval index over a codebase.",
+      "note": "Hybrid retrieval index over a codebase, tied to a commit and authorization scope so retrieval is fresh and tenant-safe.",
       "fields": [
         {
           "name": "chunk_id",
           "type": "uuid PK"
         },
         {
-          "name": "repo",
-          "type": "varchar"
+          "name": "repo_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "tenant_id",
+          "type": "uuid FK"
         },
         {
           "name": "path",
@@ -505,12 +669,78 @@
           "type": "varchar null"
         },
         {
+          "name": "commit_sha",
+          "type": "varchar"
+        },
+        {
+          "name": "chunk_hash",
+          "type": "varchar"
+        },
+        {
+          "name": "language",
+          "type": "varchar"
+        },
+        {
+          "name": "parser_version",
+          "type": "varchar"
+        },
+        {
+          "name": "visibility_scope",
+          "type": "enum(public,internal,private)"
+        },
+        {
           "name": "embedding",
           "type": "vector"
         },
         {
           "name": "graph_edges",
           "type": "jsonb (deps/refs)"
+        },
+        {
+          "name": "indexed_at",
+          "type": "timestamptz"
+        },
+        {
+          "name": "deleted_at",
+          "type": "timestamptz null"
+        }
+      ]
+    },
+    {
+      "name": "index_jobs",
+      "note": "Webhook-triggered (re)indexing state per repo: tracks lag, retry, and backfill so retrieval freshness is observable.",
+      "fields": [
+        {
+          "name": "index_job_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "repo_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "commit_sha",
+          "type": "varchar"
+        },
+        {
+          "name": "trigger",
+          "type": "enum(push,backfill,manual)"
+        },
+        {
+          "name": "status",
+          "type": "enum(pending,running,done,failed)"
+        },
+        {
+          "name": "attempt",
+          "type": "int default 0"
+        },
+        {
+          "name": "started_at",
+          "type": "timestamptz null"
+        },
+        {
+          "name": "finished_at",
+          "type": "timestamptz null"
         }
       ]
     }
@@ -583,6 +813,22 @@
       ]
     },
     {
+      "name": "Lease + idempotency (exactly-once resume)",
+      "what": "Time-bound renewable leases plus a dedup key so a dead worker's task is re-leased and a replayed trigger is a no-op.",
+      "whenToUse": "Long-running async tasks with external side effects (branch push, PR create).",
+      "steps": [
+        "fleet"
+      ]
+    },
+    {
+      "name": "Work-intent locks + optimistic rebase (conflict handling)",
+      "what": "Path-level claims plus rebase-before-PR so parallel agents don't produce incompatible draft PRs on the same files.",
+      "whenToUse": "Many agents editing the same repo in parallel.",
+      "steps": [
+        "fleet"
+      ]
+    },
+    {
       "name": "LLM-as-judge / trajectory evaluation",
       "what": "Evaluate the path taken and track fleet quality signals like merge rate.",
       "whenToUse": "Measuring and improving the fleet.",
@@ -618,9 +864,7 @@
         "caption": "One agent edits and commits directly \u2014 the single-CLI baseline, before it becomes a platform."
       },
       "decisionPrompt": "What breaks when the company wants hundreds of these running unattended across many repos?",
-      "patterns": [
-        "Orchestrator-workers / scatter-gather subagents"
-      ],
+      "patterns": [],
       "whyNow": [
         "The single-agent baseline makes the fleet and gate requirements concrete."
       ],
@@ -669,10 +913,65 @@
           "definition": "Retrieval that follows dependency/reference edges between symbols, not just text similarity.",
           "whyItMatters": "Edits ripple across call sites; a dependency-aware view finds what a vector match misses.",
           "example": "Changing a function signature retrieves all its callers via graph edges."
+        },
+        {
+          "term": "index freshness + commit binding",
+          "definition": "Each chunk records the commit_sha and parser_version it was built from, and an index_job tracks re-index lag per push.",
+          "whyItMatters": "A stale or cross-tenant index makes the agent edit against the wrong code or leak private repo context; binding retrieval to a commit makes 'which version did I edit?' answerable.",
+          "example": "The agent records that it retrieved against commit abc123; if the base advanced, it knows to refresh before opening the PR."
         }
       ],
       "whyNow": [
         "Grounding is the corpus that makes this vertical a vertical; everything later assumes the agent can navigate code."
+      ],
+      "flows": [
+        {
+          "sequence": {
+            "participants": [
+              {
+                "id": "VCS",
+                "label": "Source Control"
+              },
+              {
+                "id": "RepoIndex",
+                "label": "Repo Index"
+              },
+              {
+                "id": "CodingAgent",
+                "label": "Coding Agent"
+              }
+            ],
+            "messages": [
+              {
+                "from": "VCS",
+                "to": "RepoIndex",
+                "arrow": "->>",
+                "label": "push webhook (repo, commit_sha)"
+              },
+              {
+                "from": "RepoIndex",
+                "to": "RepoIndex",
+                "arrow": "->>",
+                "label": "index_job: re-chunk + update graph, tombstone deleted"
+              },
+              {
+                "from": "CodingAgent",
+                "to": "RepoIndex",
+                "arrow": "->>",
+                "label": "retrieve (tenant + visibility scoped)"
+              },
+              {
+                "from": "RepoIndex",
+                "to": "CodingAgent",
+                "arrow": "-->>",
+                "label": "chunks bound to commit_sha"
+              }
+            ]
+          },
+          "highlight": [
+            "RepoIndex"
+          ]
+        }
       ],
       "options": [
         {
@@ -717,7 +1016,7 @@
               "VCS"
             ],
             "links": [
-              "sandbox-vcs"
+              "agent-vcs"
             ],
             "highlight": [
               "CodingAgent"
@@ -736,7 +1035,8 @@
       "title": "3. Run a Fleet: Supervisor + Ephemeral Sandboxes",
       "description": [
         "Turn one agent into many. A supervisor plans each task and fans it out to parallel coding agents, each in its own ephemeral sandbox with a scoped, brokered credential and its own branch \u2014 so tasks can't interfere and a compromise is contained.",
-        "Admission control caps concurrent sandboxes; a durable run log lets a long task resume exactly-once. This is the shared runtime/durability from Foundations applied to coding work."
+        "Admission control caps concurrent sandboxes; a durable run log lets a long task resume exactly-once. This is the shared runtime/durability from Foundations applied to coding work.",
+        "Make it operable under retries and parallelism: each task holds a renewable lease (so a dead worker's task is re-leased, not orphaned), carries an attempt number and idempotency key (so a replayed webhook doesn't double-spend a sandbox), and captures its branch name and base SHA up front. Path-level work-intents stop two agents racing on the same files; if the base moved, the agent rebases optimistically before opening the PR, and the conflict policy decides retry vs. cancel."
       ],
       "view": {
         "nodes": [
@@ -771,14 +1071,113 @@
         "Least privilege / sandboxing (microVM isolation)",
         "Credential brokering (agent never sees secrets)",
         "Durable execution / checkpointing (resume after crash)",
-        "Queue-based load leveling; admission control"
+        "Queue-based load leveling; admission control",
+        "Lease + idempotency (exactly-once resume)",
+        "Work-intent locks + optimistic rebase (conflict handling)"
       ],
       "whyNow": [
         "Parallelism is the whole point of a platform; isolation and admission control make it safe and bounded."
       ],
+      "concepts": [
+        {
+          "term": "lease + idempotency key",
+          "definition": "A task holds a time-bound, renewable lease and a dedup key; a worker must renew to keep it, and the key collapses replayed submissions.",
+          "whyItMatters": "It is what turns 'resumable' from a slogan into exactly-once: a dead worker's task is re-leased and a replayed webhook is a no-op.",
+          "example": "A worker crashes after pushing a branch; the lease expires, another worker re-leases, replays run_events to last_event_seq, and finds the branch already pushed instead of pushing twice."
+        },
+        {
+          "term": "work-intent lock",
+          "definition": "A repo/path-level claim a task takes on the files it intends to edit, with the base SHA it started from.",
+          "whyItMatters": "Without it two parallel agents touch the same hotspot files and produce incompatible draft PRs that waste reviewer time.",
+          "example": "Two issues both want to edit auth.py; the second task either waits, picks a different slice, or is flagged a duplicate."
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Surviving retries and parallel edits",
+          "points": [
+            "Lease + renew: a task is leased to one worker; renew heartbeats keep it, lease expiry re-queues it for another attempt.",
+            "Idempotency + dedup: the request_id/idempotency_key collapses replayed triggers; resume replays run_events up to last_event_seq instead of redoing side effects.",
+            "Capture branch_name + base_sha at start so resume and rebase are deterministic, and the PR records exactly which base it targeted.",
+            "Work-intent locks + optimistic rebase: claim the file slice, rebase if the base moved, and on hard conflict apply the retry-vs-cancel policy rather than rebasing forever.",
+            "Per-tenant quotas and queue fairness so one tenant's burst can't starve the fleet."
+          ]
+        }
+      ],
+      "flows": [
+        {
+          "sequence": {
+            "participants": [
+              {
+                "id": "TaskQueue",
+                "label": "Task Queue"
+              },
+              {
+                "id": "CodingAgent",
+                "label": "Coding Agent"
+              },
+              {
+                "id": "DurableLog",
+                "label": "Run Log"
+              },
+              {
+                "id": "Sandbox",
+                "label": "Sandbox"
+              }
+            ],
+            "messages": [
+              {
+                "from": "CodingAgent",
+                "to": "TaskQueue",
+                "arrow": "->>",
+                "label": "lease task (attempt n, base_sha)"
+              },
+              {
+                "from": "CodingAgent",
+                "to": "DurableLog",
+                "arrow": "->>",
+                "label": "replay events to last_event_seq"
+              },
+              {
+                "type": "alt",
+                "label": "fresh task / no prior side effects",
+                "messages": [
+                  {
+                    "from": "CodingAgent",
+                    "to": "Sandbox",
+                    "arrow": "->>",
+                    "label": "checkout + run; renew lease"
+                  }
+                ],
+                "else": {
+                  "label": "resume after crash",
+                  "messages": [
+                    {
+                      "from": "CodingAgent",
+                      "to": "Sandbox",
+                      "arrow": "->>",
+                      "label": "skip already-pushed branch; continue"
+                    }
+                  ]
+                }
+              },
+              {
+                "from": "CodingAgent",
+                "to": "DurableLog",
+                "arrow": "->>",
+                "label": "append step (seq++)"
+              }
+            ]
+          },
+          "highlight": [
+            "CodingAgent",
+            "DurableLog"
+          ]
+        }
+      ],
       "recap": {
         "before": "One agent, one task, shared credentials.",
-        "after": "Many isolated agents work tasks in parallel, resumably, under a concurrency cap.",
+        "after": "Many isolated agents work tasks in parallel, resumably under leases and a concurrency cap, with work-intent locks against conflicting edits.",
         "newRisk": "All these agents are now pushing code \u2014 how does any of it reach the main branch safely?"
       },
       "traps": [
@@ -786,6 +1185,11 @@
           "trap": "Sharing one long-lived sandbox or one token across the fleet.",
           "why": "One poisoned task then contaminates others and inherits broad access.",
           "instead": "Ephemeral sandbox + scoped credential per task."
+        },
+        {
+          "trap": "Treating 'resumable' as just retrying the task from the top.",
+          "why": "Re-running side effects double-pushes branches, double-opens PRs, or double-spends sandboxes.",
+          "instead": "Lease + idempotency key + replay run_events to last_event_seq so resume skips completed side effects."
         }
       ]
     },
@@ -794,7 +1198,8 @@
       "title": "4. The Gate: Draft PR, Then a Distinct Merge/Deploy Gate",
       "description": [
         "This is the crux of the vertical. The agent's autonomy ceiling is opening a draft PR / requesting review \u2014 never a direct push to a protected branch. That first gate is cheap to reverse.",
-        "Merge and deploy are a distinct second gate, because reverting code is not the same as reversing effects: a merge can trigger deployments, schema migrations, or irreversible data jobs. Protect it with branch protection, required CI checks, code owners, migration policy, and progressive delivery with rollback. Auto-merge is allowed only for low-risk changes under those rollout controls."
+        "Merge and deploy are a distinct second gate, because reverting code is not the same as reversing effects: a merge can trigger deployments, schema migrations, or irreversible data jobs. Protect it with branch protection, required CI checks, code owners, migration policy, and progressive delivery with rollback. Auto-merge is allowed only for low-risk changes under those rollout controls.",
+        "Both gates must leave durable evidence, not just flip a status. A gate_decisions record captures who approved (reviewer / code-owner / auto-merge bot), the policy version in force, the required-checks set, the risk class, and a link to the downstream deploy gate's proof. The platform owns the review gate; the actual deploy gate lives in the CI/CD platform — this design stores the link/evidence that proves it passed rather than re-implementing it."
       ],
       "view": {
         "nodes": [
@@ -833,6 +1238,17 @@
       ],
       "whyNow": [
         "The gate is what makes a fleet of autonomous agents safe to point at production repos."
+      ],
+      "deepDives": [
+        {
+          "title": "Make the gate durable, not just a status flip",
+          "points": [
+            "Record a gate_decision per gate: actor, role (reviewer / code-owner / auto-merge bot), decision, policy_version, required_checks set, and risk_class.",
+            "Bind the decision to the exact head_sha so an approval can't silently carry to a force-pushed change.",
+            "Store the downstream deploy gate's evidence URL — this platform owns the review gate and only links to the CI/CD platform's deploy proof, it doesn't re-implement deploy.",
+            "Auto-merge is itself an actor with a decision row, gated to low risk_class under rollout controls, so even bot merges are auditable."
+          ]
+        }
       ],
       "flows": [
         {
@@ -956,6 +1372,17 @@
       ],
       "whyNow": [
         "Verification is what makes draft PRs reviewable instead of noise; it precedes any quality measurement."
+      ],
+      "deepDives": [
+        {
+          "title": "Make the verification result evidence, not a sandbox loop",
+          "points": [
+            "Emit test_start / test_result run_events with the test command, exit code, retry count, and changed-files set so a reviewer sees what was actually run.",
+            "Attach a log artifact (link, not inline) so failures are inspectable after the sandbox is torn down.",
+            "Record the final head_sha the green run was produced from, so the PR's evidence binds to a specific commit.",
+            "PR CI re-runs the same required checks as the source of truth; in-sandbox green is necessary but not sufficient for the gate."
+          ]
+        }
       ],
       "flows": [
         {
@@ -1087,15 +1514,17 @@
       "id": "async-obs",
       "title": "7. Async at Scale: Triggers, Observability & Fleet Quality",
       "description": [
-        "Make the fleet operable. Tasks arrive asynchronously from webhooks and cron, queue through admission control, and run unattended; humans engage only at the review gate.",
-        "Every agent emits OTel trajectories so a reviewer can see what it did, and the platform rolls up token/cost and fleet-quality signals. Treat merge rate as a useful but vendor-reported signal, not a benchmark \u2014 pair it with trajectory eval to catch agents that pass CI but take a bad path."
+        "Make the fleet operable. Tasks arrive asynchronously from webhooks and cron, queue through admission control, and run unattended; humans engage only at the review gate. Duplicate or replayed triggers are collapsed by the idempotency key; tasks that exhaust retries land in a dead-letter queue for inspection; per-tenant quotas keep one tenant's burst from starving the fleet.",
+        "Every agent emits OTel trajectories so a reviewer can see what it did, and the platform rolls up token/cost and fleet-quality signals against SLOs (queue depth, p95 task duration, index lag). Treat merge rate as a useful but vendor-reported signal, not a benchmark \u2014 pair it with trajectory eval to catch agents that pass CI but take a bad path. Trajectories and retrieved context can contain source and secrets, so they carry a retention class and redaction, and access to trajectory spans is itself scoped."
       ],
       "view": {
         "nodes": [
+          "Dev",
           "Trigger",
           "Gateway",
           "Supervisor",
           "TaskQueue",
+          "CodingAgent",
           "Observability"
         ],
         "links": [
@@ -1103,6 +1532,7 @@
           "trigger-gw",
           "gw-sup",
           "sup-queue",
+          "queue-agent",
           "agent-obs"
         ],
         "highlight": [
@@ -1118,6 +1548,76 @@
       "whyNow": [
         "Async triggers and observability are what let the fleet run unattended and improve over time."
       ],
+      "flows": [
+        {
+          "sequence": {
+            "participants": [
+              {
+                "id": "Trigger",
+                "label": "Webhook / Cron"
+              },
+              {
+                "id": "Gateway",
+                "label": "Platform API"
+              },
+              {
+                "id": "TaskQueue",
+                "label": "Task Queue"
+              },
+              {
+                "id": "CodingAgent",
+                "label": "Coding Agent"
+              },
+              {
+                "id": "Observability",
+                "label": "Observability"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Trigger",
+                "to": "Gateway",
+                "arrow": "->>",
+                "label": "event (idempotency key, tenant)"
+              },
+              {
+                "from": "Gateway",
+                "to": "TaskQueue",
+                "arrow": "->>",
+                "label": "enqueue if quota allows (else 429)"
+              },
+              {
+                "from": "TaskQueue",
+                "to": "CodingAgent",
+                "arrow": "->>",
+                "label": "admit when sandbox capacity"
+              },
+              {
+                "from": "CodingAgent",
+                "to": "Observability",
+                "arrow": "->>",
+                "label": "emit trajectory + token/cost (retention class)"
+              },
+              {
+                "type": "alt",
+                "label": "retries exhausted",
+                "messages": [
+                  {
+                    "from": "TaskQueue",
+                    "to": "Observability",
+                    "arrow": "->>",
+                    "label": "dead-letter for inspection"
+                  }
+                ]
+              }
+            ]
+          },
+          "highlight": [
+            "TaskQueue",
+            "Observability"
+          ]
+        }
+      ],
       "recap": {
         "before": "Agents ran but were unobservable and hard to trust at scale.",
         "after": "Tasks are triggered async, admission-controlled, and fully traced; quality is measured.",
@@ -1127,7 +1627,7 @@
   ],
   "finalDesign": {
     "title": "Final Design \u2014 Agentic Developer Platform",
-    "description": "Issues, webhooks, and cron submit tasks through the platform API; the fleet supervisor plans each one and fans it out, admission-controlled, to parallel coding agents. Each agent runs in an ephemeral sandbox with a scoped, brokered repo/CI credential, retrieves repo context from a hybrid index, edits and verifies in-sandbox (tests/lint), and opens a draft PR \u2014 never a direct push. A guardrail treats all repo text as untrusted and partitions it from tool authority. Humans review the draft PR (gate 1) and own merge/deploy behind branch protection, CI, code owners, and rollout controls (gate 2). A durable run log gives exactly-once resume; OTel trajectories feed observability and quality measurement. Runtime, durability, identity, and observability are the shared substrate from Agentic Platform Foundations.",
+    "description": "Issues, webhooks, and cron submit tasks through the platform API; the fleet supervisor plans each one and fans it out, admission-controlled, to parallel coding agents. Each task runs as a leased, idempotent state machine (queued \u2192 leased \u2192 running \u2192 verifying \u2192 pr_open \u2192 merged/failed/canceled) so it resumes exactly-once after a crash and a replayed trigger is a no-op; work-intent locks and optimistic rebase keep parallel agents from colliding on the same files. Each agent runs in an ephemeral sandbox with a scoped, brokered repo/CI credential, retrieves repo context from a hybrid index bound to a commit SHA (kept fresh by webhook-driven index jobs and scoped by tenant/visibility), edits and verifies in-sandbox (tests/lint), and opens a draft PR \u2014 never a direct push. A guardrail treats all repo text as untrusted and partitions it from tool authority. Humans review the draft PR (gate 1) and own merge/deploy behind branch protection, CI, code owners, and rollout controls (gate 2); each gate writes a durable gate_decision (actor, policy version, required checks, risk class, deploy-evidence link) so the two-gate invariant has real state, not just a status flag. A durable run log gives exactly-once resume; OTel trajectories feed observability and quality measurement under a retention class. Runtime, durability, identity, and observability are the shared substrate from Agentic Platform Foundations.",
     "view": {
       "nodes": [
         "Dev",
@@ -1237,9 +1737,17 @@
       },
       {
         "requirement": "Async and resumable",
-        "how": "Durable run log with exactly-once resume.",
+        "how": "Leases + idempotency key + durable run log give exactly-once resume.",
         "steps": [
           "fleet"
+        ]
+      },
+      {
+        "requirement": "Multi-repo, multi-tenant fairness",
+        "how": "Per-tenant concurrency/token/queue quotas and admission control under bursty load.",
+        "steps": [
+          "fleet",
+          "async-obs"
         ]
       }
     ]
@@ -1308,8 +1816,9 @@
   ],
   "followUps": [
     "How do you keep the repo index fresh and cheap across a large monorepo?",
-    "How do you stop two parallel agents from producing conflicting PRs on the same files?",
+    "Beyond work-intent locks, how do you resolve a true semantic conflict between two parallel agents' PRs?",
     "When is auto-merge actually safe, and what rollout controls must back it?",
+    "Trajectories and retrieved context can contain source and secrets — what redaction, retention class, and access scoping do you apply?",
     "How does this gate differ from the finance and legal verticals' gates later in the series?"
   ]
 }

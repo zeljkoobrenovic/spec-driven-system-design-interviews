@@ -23,12 +23,16 @@ was added, and the catalog-sequencing heading was disambiguated ("after dataset
 1, before dataset 2"). Build order is in §7.
 >
 > **Implementation status:** **Phase 1 (§5–§7) and Phase 2 (§8) are DELIVERED** —
-> 7 datasets shipped in the `agentic-platforms` category (Foundations +
-> Developer, Marketing, Sales, HR, Finance, Legal) plus the 17 frozen agentic
-> patterns in `data/book/patterns` with `usedBy[]` backlinks; all verifier-clean
-> and built into `docs/book/`. **Phase 3 (§8b) is proposed, not built** — four
-> verticals that each teach a *new* gate (Healthcare, Support, Public Benefits,
-> Research).
+> **Phases 1–3 are all DELIVERED: 11 datasets** in the `agentic-platforms`
+> category (Foundations + Developer, Marketing, Sales, HR, Finance, Legal,
+> Healthcare, Support, Public Benefits, Research) plus the 17 frozen agentic
+> patterns in `data/book/patterns` with `usedBy[]` backlinks across every
+> vertical; all verifier-clean and built into `docs/book/`. The series spans the
+> full irreversibility gradient (revertible → reputation → decision/fairness →
+> money → filing → physical harm) plus the **real-time** (Support),
+> **contestability** (Public Benefits), and **physical-experiment** (Research)
+> axes. Remaining ideas live in §8b (capstone "Choosing the Right Agent Gate")
+> and a possible phase 4 (industrial/robotics).
 
 ## 1. Decisions taken
 
@@ -469,7 +473,7 @@ money or a filing.
   PII-scoped retrieval. Cite Workday Illuminate, ServiceNow HRSD/Moveworks,
   Eightfold, Paradox. Compliance: NYC LL144, EU AI Act high-risk (date in flux).
 
-## 8b. Phase 3 — four verticals that teach a *new* gate (proposed)
+## 8b. Phase 3 — four verticals that teach a *new* gate (DELIVERED)
 
 > Selection rule for any further vertical: it earns a slot only if its **gate
 > type or dominant constraint is not already taught** by the existing seven

@@ -131,6 +131,36 @@
         "description": "Pending screening recommendations awaiting a human hiring decision."
       },
       {
+        "id": "WorkflowEngine",
+        "label": "Workflow Engine",
+        "type": "orchestrator",
+        "category": "compute",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Durable engine running onboarding/offboarding as idempotent HRIS tasks with retry, timeout, and reconciliation."
+      },
+      {
+        "id": "WorkflowQueue",
+        "label": "HRIS Task Queue",
+        "type": "queue",
+        "category": "async",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Levels bursty screening and throttled HRIS writes; idempotent, keyed tasks survive partial failure and duplicate callbacks."
+      },
+      {
+        "id": "WorkflowStore",
+        "label": "Workflow State",
+        "type": "database",
+        "category": "state",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Workflow runs, per-task state, and reconciliation events — the durable record of long-running provisioning."
+      },
+      {
         "id": "Guardrail",
         "label": "Policy & Privacy",
         "type": "service",
@@ -322,6 +352,54 @@
         "from": "Employee",
         "to": "Identity",
         "label": "authenticate scope"
+      },
+      {
+        "id": "orch-wfe",
+        "from": "Orchestrator",
+        "to": "WorkflowEngine",
+        "label": "start onboarding/offboarding"
+      },
+      {
+        "id": "wfe-queue",
+        "from": "WorkflowEngine",
+        "to": "WorkflowQueue",
+        "label": "enqueue idempotent HRIS task"
+      },
+      {
+        "id": "queue-hris",
+        "from": "WorkflowQueue",
+        "to": "HRIS",
+        "label": "throttled write (keyed)"
+      },
+      {
+        "id": "hris-wfe",
+        "from": "HRIS",
+        "to": "WorkflowEngine",
+        "label": "callback / reconcile"
+      },
+      {
+        "id": "wfe-store",
+        "from": "WorkflowEngine",
+        "to": "WorkflowStore",
+        "label": "persist run + task state"
+      },
+      {
+        "id": "wfe-log",
+        "from": "WorkflowEngine",
+        "to": "AuditLog",
+        "label": "append provisioning event"
+      },
+      {
+        "id": "wfe-obs",
+        "from": "WorkflowEngine",
+        "to": "Observability",
+        "label": "emit workflow metrics"
+      },
+      {
+        "id": "orch-hris",
+        "from": "Orchestrator",
+        "to": "HRIS",
+        "label": "synchronous write (baseline)"
       }
     ],
     "types": [
@@ -352,6 +430,16 @@
           "Guardrail",
           "AuditLog"
         ]
+      },
+      {
+        "id": "workflow",
+        "label": "Durable HRIS Workflow",
+        "nodes": [
+          "WorkflowEngine",
+          "WorkflowQueue",
+          "WorkflowStore",
+          "HRIS"
+        ]
       }
     ]
   },
@@ -369,11 +457,19 @@
   ],
   "capacityDiagram": [
     "graph LR",
-    "  Fair[Skills only, no proxies]",
-    "  Scope[PII scoped to requester]",
-    "  Human[Humans decide hiring]",
-    "  Fair --> Scope",
-    "  Scope --> Human"
+    "  Burst[Screening burst ~25k/day]",
+    "  Queue[Work queue]",
+    "  Score[LLM scoring ~1 call/candidate]",
+    "  Review[Reviewers ~30/day ~24h SLA]",
+    "  Help[Helpdesk ~150 QPS open-enroll]",
+    "  Cache[Policy cache + index ~50k chunks]",
+    "  WF[Onboarding ~500 wf/day]",
+    "  Throttle[HRIS writes ~2-10/sec/tenant]",
+    "  Nightly[Nightly adverse-impact batch]",
+    "  Burst --> Queue --> Score --> Review",
+    "  Help --> Cache",
+    "  WF --> Throttle",
+    "  Review --> Nightly"
   ],
   "requirements": {
     "functional": [
@@ -426,15 +522,20 @@
       "label": "Adverse-impact batch",
       "value": "nightly aggregation; min cohort ~30–50 before a four-fifths flag is trusted",
       "note": "Selection rates are computed on a rolling window; small cohorts are reported with a low-confidence caveat rather than a hard flag."
+    },
+    {
+      "label": "Latency / SLA targets",
+      "value": "policy answer p95 ~2–3s; review-queue age <24h; HRIS op completion minutes–hours; adverse-impact freshness ~24h",
+      "note": "The human review queue, not the LLM, is the binding SLA: a recommendation must reach a decision within ~24h, and the queue is sized to reviewer throughput. HRIS operations are eventually consistent (the workflow may sit in 'reconciling'); adverse-impact metrics are at most a day stale."
     }
   ],
   "api": [
     {
       "method": "POST",
       "path": "/v1/screenings",
-      "description": "Screen a candidate on skills; returns a recommendation for human review \u2014 never a decision.",
-      "request": "{ \"candidateId\": \"...\", \"jobId\": \"...\" }",
-      "response": "{ \"screeningId\": \"...\", \"status\": \"awaiting_human_decision\" }",
+      "description": "Screen a candidate on skills; returns a recommendation for human review \u2014 never a decision. Idempotent on idempotencyKey so a retried submit does not create a duplicate screening; the tenant is derived from the auth token, not the body.",
+      "request": "{ \"candidateId\": \"...\", \"jobId\": \"...\", \"idempotencyKey\": \"...\" }",
+      "response": "{ \"screeningId\": \"...\", \"recommendation\": \"advance|reject\", \"reviewState\": \"awaiting_assignment\", \"status\": \"awaiting_human_decision\" }",
       "sequence": {
         "participants": [
           {
@@ -484,9 +585,9 @@
     {
       "method": "POST",
       "path": "/v1/screenings/{id}/decide",
-      "description": "A human recruiter records the hiring decision; the agent never decides an adverse outcome.",
-      "request": "{ \"decision\": \"advance|reject\", \"rationale\": \"...\" }",
-      "response": "{ \"status\": \"recorded\" }"
+      "description": "A human recruiter records the hiring decision; the agent never decides an adverse outcome. The deciding principal is taken from the auth token (not the body), the call is idempotent on decisionIdempotencyKey, and the response returns the audit correlation id so the decision is traceable end-to-end.",
+      "request": "{ \"decision\": \"advance|reject|override\", \"rationale\": \"...\", \"recused\": false, \"decisionIdempotencyKey\": \"...\" }",
+      "response": "{ \"status\": \"recorded\", \"decidedBy\": \"<auth-principal>\", \"auditCorrelationId\": \"...\", \"noticeSentAt\": \"...|null\", \"appealStatus\": \"none\" }"
     },
     {
       "method": "GET",
@@ -534,24 +635,67 @@
     {
       "method": "GET",
       "path": "/v1/reviews",
-      "description": "List the pending hiring-review queue for a recruiter: recommendations awaiting a human decision, with feature evidence and any adverse-impact flag.",
-      "request": "(job/assignee/status in query)",
-      "response": "{ \"items\": [ { \"screeningId\": \"...\", \"recommendation\": \"advance|reject\", \"flagged\": false, \"slaDueAt\": \"...\" } ] }"
+      "description": "List the pending hiring-review queue for a recruiter: recommendations awaiting a human decision, with feature evidence and any adverse-impact flag, plus assignment and SLA state.",
+      "request": "(job/assignee/reviewState/priority in query)",
+      "response": "{ \"items\": [ { \"screeningId\": \"...\", \"recommendation\": \"advance|reject\", \"flagged\": false, \"priority\": \"normal|high\", \"reviewState\": \"assigned\", \"assignedTo\": \"...\", \"slaDueAt\": \"...\", \"escalationReason\": \"...|null\", \"secondReview\": false } ] }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/reviews/{id}/escalate",
+      "description": "Escalate a stuck or conflicted review (SLA breach, reviewer recusal, adverse-impact flag) to a second reviewer or supervisor; the screening moves to the escalated state with a reason.",
+      "request": "{ \"reason\": \"sla_breach|recusal|flag\", \"assignTo\": \"...|null\" }",
+      "response": "{ \"screeningId\": \"...\", \"reviewState\": \"escalated\", \"assignedTo\": \"...\", \"escalationReason\": \"...\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/policy-cases",
+      "description": "Open an HR case when a policy answer abstains or the question crosses identity scope (e.g. requires manager-only data): the LLM answer escalates to a human owner instead of guessing. Created from a policy-answer escalation rather than returned inline.",
+      "request": "{ \"questionRef\": \"...\", \"reason\": \"low_confidence|scope_refusal|no_policy\" }",
+      "response": "{ \"caseId\": \"...\", \"state\": \"open\", \"assignedTo\": \"hr_human|null\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/workflows/{id}/cancel",
+      "description": "Cancel or compensate a running onboarding/offboarding workflow; reversible tasks are compensated (rolled back) and irreversible ones are flagged for manual attention.",
+      "request": "{ \"reason\": \"...\" }",
+      "response": "{ \"workflowId\": \"...\", \"state\": \"cancelled|needs_attention\", \"compensated\": [ \"taskId\" ], \"manual\": [ \"taskId\" ] }"
     }
   ],
   "dataModel": [
     {
       "name": "screenings",
-      "note": "A candidate screening recommendation awaiting a human decision.",
+      "note": "A candidate screening recommendation and its review-queue state, awaiting a human decision.",
       "fields": [
         { "name": "screening_id", "type": "uuid PK" },
         { "name": "tenant_id", "type": "varchar" },
+        { "name": "idempotency_key", "type": "varchar unique (dedup re-submits)" },
         { "name": "candidate_id", "type": "varchar" },
         { "name": "job_id", "type": "varchar FK job_rubrics" },
         { "name": "rubric_version", "type": "varchar" },
         { "name": "recommendation", "type": "enum(advance,reject)" },
+        { "name": "flagged", "type": "bool (adverse-impact / borderline)" },
+        { "name": "priority", "type": "enum(normal,high)" },
+        { "name": "review_state", "type": "enum(awaiting_assignment,assigned,decided,escalated,appealed)" },
+        { "name": "assigned_to", "type": "varchar null (reviewer principal)" },
+        { "name": "sla_due_at", "type": "timestamptz null" },
+        { "name": "escalation_reason", "type": "varchar null (sla_breach, recusal, flag)" },
+        { "name": "second_review", "type": "bool (requires a second reviewer)" },
         { "name": "status", "type": "enum(awaiting_human_decision,advanced,rejected)" },
         { "name": "created_at", "type": "timestamptz" }
+      ]
+    },
+    {
+      "name": "review_assignments",
+      "note": "Assignment and queue lifecycle of a screening to a reviewer, with SLA and escalation history.",
+      "fields": [
+        { "name": "assignment_id", "type": "uuid PK" },
+        { "name": "screening_id", "type": "uuid FK screenings" },
+        { "name": "tenant_id", "type": "varchar" },
+        { "name": "assigned_to", "type": "varchar (reviewer principal)" },
+        { "name": "state", "type": "enum(open,decided,reassigned,escalated)" },
+        { "name": "assigned_at", "type": "timestamptz" },
+        { "name": "sla_due_at", "type": "timestamptz" },
+        { "name": "escalation_reason", "type": "varchar null" }
       ]
     },
     {
@@ -579,26 +723,33 @@
     },
     {
       "name": "review_decisions",
-      "note": "Human hiring decision events on a screening recommendation.",
+      "note": "Human hiring decision events on a screening recommendation — idempotent, bound to a human principal, with candidate-notice and appeal artifacts.",
       "fields": [
         { "name": "decision_id", "type": "uuid PK" },
         { "name": "screening_id", "type": "uuid FK screenings" },
+        { "name": "idempotency_key", "type": "varchar unique (one decision per key)" },
         { "name": "decision", "type": "enum(advance,reject,override)" },
-        { "name": "decided_by", "type": "varchar (human principal)" },
+        { "name": "decided_by", "type": "varchar (human principal, auth-derived not body)" },
         { "name": "rationale", "type": "text" },
         { "name": "recused", "type": "bool (conflict-of-interest)" },
+        { "name": "notice_sent_at", "type": "timestamptz null (AEDT candidate notice)" },
+        { "name": "appeal_status", "type": "enum(none,requested,in_review,upheld,reversed)" },
         { "name": "decided_at", "type": "timestamptz" },
         { "name": "audit_correlation_id", "type": "uuid" }
       ]
     },
     {
       "name": "protected_attribute_audit_data",
-      "note": "Protected-attribute data kept ONLY for fairness auditing, never exposed to scoring features.",
+      "note": "Protected-attribute data kept ONLY for fairness auditing, never exposed to scoring features. Lives in a separate, access-controlled store with its own retention.",
       "fields": [
         { "name": "subject_id", "type": "varchar PK" },
+        { "name": "tenant_id", "type": "varchar" },
         { "name": "job_id", "type": "varchar" },
+        { "name": "residency_region", "type": "varchar" },
         { "name": "attributes", "type": "jsonb (separate store, access-controlled)" },
-        { "name": "consent_basis", "type": "varchar" }
+        { "name": "source", "type": "varchar (self-declared, EEO form, inferred)" },
+        { "name": "legal_basis", "type": "varchar (consent / regulatory)" },
+        { "name": "retention_expires_at", "type": "timestamptz null" }
       ]
     },
     {
@@ -622,7 +773,11 @@
       "fields": [
         { "name": "policy_id", "type": "varchar" },
         { "name": "version", "type": "varchar PK(policy_id,version)" },
+        { "name": "tenant_id", "type": "varchar" },
         { "name": "jurisdiction", "type": "varchar (e.g. US-CA, EU-DE)" },
+        { "name": "residency_region", "type": "varchar (where the doc may be stored/served)" },
+        { "name": "locale", "type": "varchar (e.g. en-US, de-DE)" },
+        { "name": "source", "type": "varchar (provenance: legal team, vendor, statute)" },
         { "name": "effective_from", "type": "timestamptz" },
         { "name": "effective_to", "type": "timestamptz null (supersession)" },
         { "name": "status", "type": "enum(draft,approved,active,superseded)" },
@@ -631,27 +786,82 @@
     },
     {
       "name": "policy_chunks",
-      "note": "Retrievable chunks with embeddings; carry citation + version metadata for grounding.",
+      "note": "Retrievable chunks with embeddings; carry tenant/residency + citation + version metadata for grounding and filtering.",
       "fields": [
         { "name": "chunk_id", "type": "uuid PK" },
         { "name": "policy_id", "type": "varchar FK policy_documents" },
         { "name": "version", "type": "varchar" },
+        { "name": "tenant_id", "type": "varchar" },
         { "name": "jurisdiction", "type": "varchar" },
+        { "name": "residency_region", "type": "varchar" },
+        { "name": "locale", "type": "varchar" },
         { "name": "embedding", "type": "vector" },
         { "name": "text", "type": "text" }
       ]
     },
     {
+      "name": "workflow_runs",
+      "note": "Parent record for a durable onboarding/offboarding workflow — the long-running unit of work.",
+      "fields": [
+        { "name": "workflow_id", "type": "uuid PK" },
+        { "name": "tenant_id", "type": "varchar" },
+        { "name": "idempotency_key", "type": "varchar unique (dedup duplicate starts)" },
+        { "name": "type", "type": "enum(onboarding,offboarding)" },
+        { "name": "subject_id", "type": "varchar (employee/candidate)" },
+        { "name": "actor_id", "type": "varchar (who started it)" },
+        { "name": "residency_region", "type": "varchar" },
+        { "name": "state", "type": "enum(pending,running,completed,needs_attention,cancelled)" },
+        { "name": "started_at", "type": "timestamptz" },
+        { "name": "updated_at", "type": "timestamptz" }
+      ]
+    },
+    {
+      "name": "workflow_tasks",
+      "note": "Per-task state inside a workflow run — one row per HRIS operation, with attempt history.",
+      "fields": [
+        { "name": "task_id", "type": "uuid PK" },
+        { "name": "workflow_id", "type": "uuid FK workflow_runs" },
+        { "name": "action", "type": "varchar (provision_email, revoke_access, ...)" },
+        { "name": "reversible", "type": "bool (compensation possible?)" },
+        { "name": "state", "type": "enum(queued,sent,confirmed,failed,reconciling,compensated)" },
+        { "name": "attempts", "type": "int" },
+        { "name": "depends_on", "type": "uuid null (task ordering)" },
+        { "name": "updated_at", "type": "timestamptz" }
+      ]
+    },
+    {
       "name": "hris_operations",
-      "note": "Idempotent onboarding/offboarding actions against the HRIS/ATS, with reconciliation.",
+      "note": "Idempotent onboarding/offboarding actions against the HRIS/ATS, with reconciliation and full provider response/error history.",
       "fields": [
         { "name": "operation_id", "type": "uuid PK" },
-        { "name": "workflow_id", "type": "uuid" },
+        { "name": "workflow_id", "type": "uuid FK workflow_runs" },
+        { "name": "task_id", "type": "uuid FK workflow_tasks" },
+        { "name": "tenant_id", "type": "varchar" },
+        { "name": "subject_id", "type": "varchar" },
+        { "name": "actor_id", "type": "varchar (human or service principal)" },
+        { "name": "residency_region", "type": "varchar" },
         { "name": "idempotency_key", "type": "varchar unique" },
         { "name": "action", "type": "varchar (provision_email, revoke_access, ...)" },
         { "name": "reversible", "type": "bool" },
+        { "name": "attempt_count", "type": "int" },
         { "name": "state", "type": "enum(queued,sent,confirmed,failed,reconciling)" },
-        { "name": "provider_ref", "type": "varchar null (callback/reconcile)" }
+        { "name": "provider_ref", "type": "varchar null (callback/reconcile)" },
+        { "name": "provider_response", "type": "jsonb null" },
+        { "name": "error", "type": "text null" }
+      ]
+    },
+    {
+      "name": "workflow_reconciliation_events",
+      "note": "Provider callbacks, timeouts, and manual-HRIS-edit detections reconciled against expected task state.",
+      "fields": [
+        { "name": "event_id", "type": "uuid PK" },
+        { "name": "workflow_id", "type": "uuid FK workflow_runs" },
+        { "name": "task_id", "type": "uuid null FK workflow_tasks" },
+        { "name": "kind", "type": "enum(callback,timeout,duplicate,manual_edit,exception)" },
+        { "name": "expected_state", "type": "varchar" },
+        { "name": "observed_state", "type": "varchar" },
+        { "name": "resolution", "type": "enum(matched,retried,compensated,escalated)" },
+        { "name": "occurred_at", "type": "timestamptz" }
       ]
     },
     {
@@ -667,12 +877,16 @@
     },
     {
       "name": "audit_runs",
-      "note": "Dated compliance evidence packets (e.g. LL144 annual bias audit, EU AI Act records).",
+      "note": "Dated compliance evidence packets (e.g. LL144 annual bias audit, EU AI Act records) with generated artifact location and publication approval.",
       "fields": [
         { "name": "audit_run_id", "type": "uuid PK" },
+        { "name": "tenant_id", "type": "varchar" },
         { "name": "regime", "type": "enum(ll144,eu_ai_act,internal)" },
+        { "name": "jurisdiction_scope", "type": "varchar (e.g. US-NY, EU)" },
         { "name": "period", "type": "daterange" },
         { "name": "metrics_snapshot", "type": "jsonb" },
+        { "name": "artifact_uri", "type": "varchar null (WORM/object-lock evidence packet)" },
+        { "name": "approved_by", "type": "varchar null (reviewer/publisher)" },
         { "name": "published_at", "type": "timestamptz null" },
         { "name": "legal_hold", "type": "bool" }
       ]
@@ -750,11 +964,19 @@
       ]
     },
     {
-      "name": "Queue-based load leveling; admission control",
-      "what": "Level screening and helpdesk load.",
-      "whenToUse": "Bursty recruiting or open-enrollment load.",
+      "name": "Durable workflow with idempotency + reconciliation",
+      "what": "Long-running onboarding/offboarding runs as a state machine of idempotent HRIS tasks that survive throttling, timeouts, duplicate callbacks, and manual HRIS edits.",
+      "whenToUse": "Multi-step, partially-failing, rate-limited writes to an external system of record.",
       "steps": [
-        "naive"
+        "service-eval"
+      ]
+    },
+    {
+      "name": "Queue-based load leveling; admission control",
+      "what": "Level bursty screening and throttled HRIS-write load behind a durable task queue.",
+      "whenToUse": "Bursty recruiting, open-enrollment helpdesk, or rate-limited HRIS provisioning.",
+      "steps": [
+        "service-eval"
       ]
     }
   ],
@@ -766,6 +988,7 @@
         "Start with the demo: an agent reads resumes, scores candidates, and auto-rejects the low scores \u2014 and answers any employee's question against whatever data it can reach.",
         "In HR this is legally hazardous. Auto-rejection is an automated adverse decision; the model may lean on proxies for protected traits, creating disparate impact with no audit; there's no fairness monitoring; and unscoped retrieval can expose one employee's PII to another.",
         "The rest of the interview adds grounding, PII scoping, a human-decision gate, and adverse-impact monitoring.",
+        "It also leaves capacity implicit for now: screening is bursty (a posting wave can 5x daily applications) and HRIS provisioning is rate-limited, so this synchronous baseline must later move behind a durable task queue (Step 5) rather than fanning out calls inline.",
         "Keep one distinction sharp for later: a *recommendation* is the agent's scored output; a *decision* is a human committing to an outcome. And a *meaningful* human review (sees feature evidence, records a rationale, can override) is not the same as a rubber-stamp approval click."
       ],
       "view": {
@@ -896,6 +1119,42 @@
       "whyNow": [
         "Correct grounding is the basis for trustworthy answers and defensible screening."
       ],
+      "flows": [
+        {
+          "sequence": {
+            "participants": [
+              { "id": "Identity", "label": "Identity" },
+              { "id": "PIIScope", "label": "Scoped Retrieval" },
+              { "id": "PolicyKB", "label": "Policy KB" },
+              { "id": "Inference", "label": "Inference" },
+              { "id": "DecisionGate", "label": "HR Case" },
+              { "id": "AuditLog", "label": "Audit" }
+            ],
+            "messages": [
+              { "from": "Identity", "to": "PIIScope", "arrow": "->>", "label": "scope: tenant + jurisdiction + effective date" },
+              { "from": "PIIScope", "to": "PolicyKB", "arrow": "->>", "label": "metadata-filtered retrieval (in-force version)" },
+              { "from": "PolicyKB", "to": "Inference", "arrow": "->>", "label": "chunks + citation metadata" },
+              {
+                "type": "alt",
+                "label": "grounded answer found",
+                "messages": [
+                  { "from": "Inference", "to": "AuditLog", "arrow": "->>", "label": "answer + citations (version, jurisdiction)" }
+                ],
+                "else": {
+                  "label": "low confidence / no in-force policy",
+                  "messages": [
+                    { "from": "Inference", "to": "DecisionGate", "arrow": "->>", "label": "abstain -> open HR case (escalate)" }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "PolicyKB",
+            "PIIScope"
+          ]
+        }
+      ],
       "recap": {
         "before": "Answers came from model memory or a single doc.",
         "after": "Answers are grounded in the right policy version and jurisdiction.",
@@ -999,6 +1258,42 @@
       "whyNow": [
         "Privacy scoping must be enforced before any sensitive answer or action."
       ],
+      "flows": [
+        {
+          "sequence": {
+            "participants": [
+              { "id": "Employee", "label": "Requester" },
+              { "id": "Identity", "label": "Identity / PDP" },
+              { "id": "PIIScope", "label": "Scoped Retrieval" },
+              { "id": "HRIS", "label": "HRIS" },
+              { "id": "AuditLog", "label": "Audit" }
+            ],
+            "messages": [
+              { "from": "Employee", "to": "Identity", "arrow": "->>", "label": "authenticate (role: employee/recruiter/...)" },
+              { "from": "Identity", "to": "PIIScope", "arrow": "->>", "label": "scoped, delegated token (act claim, row filter)" },
+              {
+                "type": "alt",
+                "label": "request within scope",
+                "messages": [
+                  { "from": "PIIScope", "to": "HRIS", "arrow": "->>", "label": "fetch only the requester's record" },
+                  { "from": "HRIS", "to": "PIIScope", "arrow": "-->>", "label": "scoped record" }
+                ],
+                "else": {
+                  "label": "crosses identity scope",
+                  "messages": [
+                    { "from": "PIIScope", "to": "Employee", "arrow": "-->>", "label": "refuse (token can't widen scope)" },
+                    { "from": "PIIScope", "to": "AuditLog", "arrow": "->>", "label": "log denied cross-scope attempt" }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Identity",
+            "PIIScope"
+          ]
+        }
+      ],
       "recap": {
         "before": "Retrieval could reach any record.",
         "after": "Each query is scoped to the requester's own data.",
@@ -1017,7 +1312,7 @@
       "title": "4. The Gate: Humans Decide, Adverse-Impact Monitored",
       "description": [
         "This is the crux. The agent scores candidates on job-related skills only and produces a recommendation; a human decides every adverse outcome \u2014 agents recommend, humans decide, and nothing auto-rejects. Identity binds the decision to a human principal.",
-        "Operationally the gate is a queue, not a callback: a pending recommendation carries the versioned job rubric, the feature evidence that supported it, and an SLA. Reviewers are assigned, may recuse on conflict of interest, must record a rationale, and may override. The override and the rationale are themselves audited.",
+        "Operationally the gate is a queue, not a callback: a pending recommendation carries the versioned job rubric, the feature evidence that supported it, an assignment, and an SLA. A reviewer must record a rationale, may override the recommendation, and may recuse on a conflict of interest. A breached SLA, a recusal, or an adverse-impact flag escalates the item to a second reviewer; an adverse decision emits the AEDT candidate notice and can be appealed. The decision is recorded idempotently against the deciding human principal, and the override, rationale, notice, and appeal are themselves audited.",
         "In parallel, an adverse-impact monitor instruments selection rates by group and computes the four-fifths rule, flagging disparate impact for the bias audit. The protected-attribute data used for that audit lives in a separate, access-controlled store and is never a feature the scoring agent can see. Selection rates are computed over a rolling cohort window; small cohorts are reported with a low-confidence caveat rather than a hard flag. Prohibited signals and proxies are excluded from the feature allowlist the agent may use."
       ],
       "view": {
@@ -1175,32 +1470,41 @@
       "id": "service-eval",
       "title": "5. Service Delivery, Compliance & Evaluation",
       "description": [
-        "Round out the platform. The helpdesk deflects routine questions (grounded, PII-scoped) and escalates the rest; onboarding/offboarding orchestrates HRIS actions. Compliance is first-class and source-backed: NYC LL144 requires an annual bias audit, public posting of results, and candidate notice for AEDTs (enforced since July 5, 2023); the EU AI Act (Reg. 2024/1689) treats Annex III hiring uses as high-risk with staged Article 113 dates. Produce dated evidence packets (audit runs), not just generic logs. Every recommendation, decision, policy answer, and provisioning action is audited.",
+        "Round out the platform. The helpdesk deflects routine questions (grounded, PII-scoped) and escalates the rest; onboarding/offboarding orchestrates HRIS actions as a durable, idempotent workflow rather than a synchronous chain of calls.",
+        "Compliance is first-class and source-backed: NYC LL144 requires an annual bias audit, public posting of results, and candidate notice for AEDTs (enforced since July 5, 2023); the EU AI Act (Reg. 2024/1689) treats Annex III hiring uses as high-risk with staged Article 113 dates. Produce dated evidence packets (audit runs), not just generic logs. Every recommendation, decision, policy answer, and provisioning action is audited.",
         "Evaluate both quality (deflection and answer accuracy) and fairness (selection-rate dashboards), so an efficient helpdesk never hides a wrong policy answer or a biased screen."
       ],
       "view": {
         "nodes": [
           "Orchestrator",
-          "Identity",
+          "WorkflowEngine",
+          "WorkflowQueue",
+          "WorkflowStore",
           "HRIS",
           "FairnessMonitor",
           "AuditLog",
           "Observability"
         ],
         "links": [
-          "orch-log",
-          "id-hris",
+          "orch-wfe",
+          "wfe-queue",
+          "queue-hris",
+          "hris-wfe",
+          "wfe-store",
+          "wfe-log",
           "fair-obs",
           "orch-obs"
         ],
         "highlight": [
+          "WorkflowEngine",
           "AuditLog",
           "Observability"
         ],
         "groups": [
+          "workflow",
           "privacy"
         ],
-        "caption": "Helpdesk and onboarding run under compliance (LL144, EU AI Act); quality and fairness are evaluated and audited."
+        "caption": "Onboarding/offboarding runs as a durable workflow of idempotent HRIS tasks with reconciliation; helpdesk and compliance (LL144, EU AI Act) are evaluated and audited."
       },
       "decisionPrompt": "Which compliance obligations attach to automated hiring tools, and how do you evidence them?",
       "options": [
@@ -1216,9 +1520,9 @@
             "Eventual consistency: the workflow can be in 'reconciling' for a while."
           ],
           "view": {
-            "nodes": ["Orchestrator", "Identity", "HRIS", "AuditLog"],
-            "links": ["id-hris", "orch-log"],
-            "highlight": ["HRIS", "AuditLog"]
+            "nodes": ["WorkflowEngine", "WorkflowQueue", "WorkflowStore", "HRIS", "AuditLog"],
+            "links": ["wfe-queue", "queue-hris", "hris-wfe", "wfe-store", "wfe-log"],
+            "highlight": ["WorkflowEngine", "WorkflowQueue"]
           }
         },
         {
@@ -1231,14 +1535,16 @@
             "No clean recovery when a write times out after it actually succeeded."
           ],
           "view": {
-            "nodes": ["Orchestrator", "Identity", "HRIS"],
-            "links": ["id-hris"],
+            "nodes": ["Orchestrator", "HRIS"],
+            "links": ["orch-hris"],
             "highlight": ["HRIS"]
           }
         }
       ],
       "patterns": [
-        "LLM-as-judge / trajectory evaluation"
+        "Durable workflow with idempotency + reconciliation",
+        "LLM-as-judge / trajectory evaluation",
+        "Queue-based load leveling; admission control"
       ],
       "concepts": [
         {
@@ -1250,6 +1556,45 @@
       ],
       "whyNow": [
         "Compliance and evaluation are what let the platform operate lawfully at scale."
+      ],
+      "flows": [
+        {
+          "sequence": {
+            "participants": [
+              { "id": "WorkflowEngine", "label": "Workflow Engine" },
+              { "id": "WorkflowQueue", "label": "Task Queue" },
+              { "id": "HRIS", "label": "HRIS / ATS" },
+              { "id": "WorkflowStore", "label": "Workflow State" },
+              { "id": "AuditLog", "label": "Audit" }
+            ],
+            "messages": [
+              { "from": "WorkflowEngine", "to": "WorkflowStore", "arrow": "->>", "label": "start run (idempotency key)" },
+              { "from": "WorkflowEngine", "to": "WorkflowQueue", "arrow": "->>", "label": "enqueue keyed HRIS task" },
+              { "from": "WorkflowQueue", "to": "HRIS", "arrow": "->>", "label": "throttled write (provision/revoke)" },
+              {
+                "type": "alt",
+                "label": "callback confirms",
+                "messages": [
+                  { "from": "HRIS", "to": "WorkflowEngine", "arrow": "-->>", "label": "provider callback (provider_ref)" },
+                  { "from": "WorkflowEngine", "to": "WorkflowStore", "arrow": "->>", "label": "task confirmed" }
+                ],
+                "else": {
+                  "label": "timeout / duplicate / manual edit",
+                  "messages": [
+                    { "from": "WorkflowEngine", "to": "HRIS", "arrow": "->>", "label": "reconcile: read actual state" },
+                    { "from": "WorkflowEngine", "to": "WorkflowStore", "arrow": "->>", "label": "match / retry / compensate or needs_attention" }
+                  ]
+                }
+              },
+              { "from": "WorkflowEngine", "to": "AuditLog", "arrow": "->>", "label": "append provisioning event" }
+            ]
+          },
+          "highlight": [
+            "WorkflowEngine",
+            "WorkflowQueue",
+            "HRIS"
+          ]
+        }
       ],
       "deepDives": [
         {
@@ -1264,7 +1609,7 @@
       "recap": {
         "before": "Service and compliance were ad hoc.",
         "after": "Helpdesk and onboarding run under compliance; quality and fairness are evaluated.",
-        "newRisk": "This completes phase 2 \u2014 Marketing, Sales, and HR extend the gradient between Developer and Finance."
+        "newRisk": "None new \u2014 the platform is now complete: grounded answers, scoped PII, a human gate, monitored fairness, and durable provisioning, all audited."
       },
       "traps": [
         {
@@ -1298,6 +1643,9 @@
         "DecisionGate",
         "PIIScope",
         "ReviewStore",
+        "WorkflowEngine",
+        "WorkflowQueue",
+        "WorkflowStore",
         "Guardrail",
         "Identity",
         "AuditLog",
@@ -1318,6 +1666,12 @@
         "recruiter-id",
         "id-hris",
         "orch-review",
+        "orch-wfe",
+        "wfe-queue",
+        "queue-hris",
+        "hris-wfe",
+        "wfe-store",
+        "wfe-log",
         "fair-obs",
         "orch-guard",
         "orch-log",
@@ -1327,7 +1681,8 @@
       "groups": [
         "screening",
         "hiring-gate",
-        "privacy"
+        "privacy",
+        "workflow"
       ]
     }
   },
@@ -1335,35 +1690,35 @@
     "functional": [
       {
         "requirement": "Screen on job-related skills",
-        "how": "Skills-only scoring producing a recommendation.",
+        "how": "Skills-only scoring against a versioned job rubric, producing a recommendation with feature evidence — never a decision.",
         "steps": [
           "hiring-gate"
         ]
       },
       {
         "requirement": "Answer policy questions correctly",
-        "how": "Grounded in effective-dated, jurisdiction-tagged policy.",
+        "how": "Grounded in effective-dated, jurisdiction-tagged policy with citations; abstains to an HR case when no in-force policy is found.",
         "steps": [
           "grounding"
         ]
       },
       {
         "requirement": "Orchestrate onboarding",
-        "how": "HRIS actions via scoped identity.",
+        "how": "A durable workflow of idempotent HRIS operations with reconciliation, not synchronous fan-out, run under scoped identity.",
         "steps": [
           "service-eval"
         ]
       },
       {
         "requirement": "Humans decide adverse outcomes",
-        "how": "Recommendations route to a human decision.",
+        "how": "Recommendations sit in an assigned, SLA-tracked review queue; a human principal records an idempotent decision with rationale and recusal.",
         "steps": [
           "hiring-gate"
         ]
       },
       {
         "requirement": "Monitor adverse impact",
-        "how": "Selection rates and the four-fifths rule.",
+        "how": "Nightly selection-rate aggregation and the four-fifths rule, with low-confidence flags for small cohorts and protected attributes kept apart from scoring.",
         "steps": [
           "hiring-gate"
         ]
@@ -1372,29 +1727,30 @@
     "nonFunctional": [
       {
         "requirement": "Fairness",
-        "how": "Prohibited signals excluded; selection rates monitored.",
+        "how": "Prohibited signals excluded from the feature allowlist; selection rates monitored with the four-fifths rule and low-confidence small-cohort flags.",
         "steps": [
           "hiring-gate"
         ]
       },
       {
         "requirement": "PII privacy",
-        "how": "Identity-scoped retrieval to the requester's own record.",
+        "how": "Identity-scoped, token/PDP-enforced retrieval to the requester's own record, with cross-scope requests refused and logged; residency carried on the records.",
         "steps": [
           "privacy"
         ]
       },
       {
         "requirement": "Compliance",
-        "how": "NYC LL144 and EU AI Act obligations with audit evidence.",
+        "how": "NYC LL144 and EU AI Act obligations evidenced as dated audit runs with artifact storage, publication approval, retention, and legal hold.",
         "steps": [
           "service-eval"
         ]
       },
       {
         "requirement": "Auditable",
-        "how": "Recommendations, decisions, answers, provisioning recorded.",
+        "how": "Append-only audit of recommendations, human decisions, policy answers with citations, and HRIS provisioning, correlated end-to-end.",
         "steps": [
+          "hiring-gate",
           "service-eval"
         ]
       }

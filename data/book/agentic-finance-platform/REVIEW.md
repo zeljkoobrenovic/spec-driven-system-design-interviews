@@ -5,237 +5,207 @@ Review date: 2026-06-23
 
 ## Executive Summary
 
-This is a strong, focused book-case draft. The central framing is right for finance: agents propose, the ledger remains ground truth, maker-checker gates irreversible actions, idempotency wraps posting/payment, and the audit artifact is a decision record rather than raw model reasoning. The walkthrough also fits the broader agentic-platform series by reusing identity, guardrails, and durable execution while changing the priority order toward correctness and auditability.
+This review is updated after the recent improvement pass to `interview.json`. The dataset is now materially stronger than the prior review described: intake is explicit, capacity is numeric, payment ambiguity is acknowledged, the decision record has concrete evidence fields, `technologyChoices` and `toProbeFurther` are present, and the previous local-view Mermaid endpoint omissions are fixed.
 
-The main issue is that several details that make a finance system credible in production are still compressed into slogans. The dataset needs sharper treatment of document intake, proposal lifecycle/state transitions, payment-rail ambiguity, accounting-period controls, capacity math, and the exact meaning of "auto-execute" in a system whose requirements say proposals must never post or pay autonomously. There is also a concrete renderer-facing issue: several step views reference links whose endpoints are not in the local `view.nodes`, which can create implicit Mermaid nodes.
+The architecture thesis is strong: agents propose, the ledger remains ground truth, maker-checker gates every irreversible action, idempotency wraps posting/payment, and the audit artifact is a decision record rather than raw model reasoning. The remaining gaps are narrower and mostly about consistency at scale: the strict human-checker invariant needs workload math for the stated 1M invoices/month, the payment outbox/reconciliation design should be visible as a first-class architecture element instead of mostly prose, and one stale "auto-execute" phrase in the interview script reintroduces the old ambiguity.
 
 | Axis | Score | Notes |
 | --- | --- | --- |
-| System design soundness | 4/5 | Correct core control boundaries, but missing state machine/payment boundary/accounting controls. |
-| Production realism | 3/5 | Good finance instincts; needs intake, reconciliation, period close, retention, callbacks, and ops detail. |
-| Pedagogical flow | 4/5 | Clear progression from dangerous baseline to controlled design; Step 7 muddies the earlier autonomy boundary. |
-| Dataset/rendering fit | 3/5 | JSON and global references are valid; local view/link endpoint coherence needs cleanup. |
-| Book-case completeness | 3/5 | Missing `technologyChoices` and `toProbeFurther`, unlike adjacent book datasets. |
+| System design soundness | 4/5 | Strong invariants and side-effect boundaries; approval-scale and accounting-master-data details need tightening. |
+| Production realism | 4/5 | Much improved capacity, intake, audit, and payment lifecycle; callback/event ordering and human SLA math remain thin. |
+| Pedagogical flow | 4/5 | Clear step progression with just-in-time concepts; Step 5 should teach the outbox/reconciliation visually. |
+| Dataset/rendering fit | 4/5 | JSON and references validate; local view endpoint issue is resolved; one stale script phrase remains. |
+| Book-case completeness | 4/5 | Technology choices and probe links now exist; source quality and time-sensitive model wording need polish. |
+
+## Material Changes Since Prior Review
+
+- Real capacity planning was added: document volume, month-end burst, bank-feed volume, LLM retry limits, checker SLA, audit storage, and failure posture.
+- Step 3 now designs intake and evidence normalization instead of starting after documents are already trustworthy.
+- Step 4 and Step 7 now state that thresholds route approvals but never replace a checker for ledger mutation or money movement.
+- Step 5 now separates GL posting from payment submission and reconciliation in prose, data model, and deep dive.
+- The data model now includes proposal lifecycle states, `payment_instructions`, policy/evidence versions, provider references, callback IDs, and hash-chain audit evidence.
+- `technologyChoices`, richer `toProbeFurther`, and source tech icons were added.
+- Local step diagrams no longer reference links whose endpoints are absent from the step's `view.nodes`.
 
 ## What Works Well
 
-- The design has the right invariant: the general ledger is ground truth, and the agent writes proposed journals rather than mutating the GL.
-- Maker-checker is placed in the authorization path through the identity broker, not left as a UI convention or policy document.
-- The decision record vs raw reasoning distinction is excellent and important for audit, privacy, and prompt-injection safety.
-- The interview flow exposes one major finance control at a time: direct posting is unsafe, proposals are safer, deterministic workflow bounds the agent, approval gates the irreversible action, idempotency protects retries, and audit evidence explains outcomes.
-- The `requirements`, `satisfies`, `patterns`, `interviewScript`, `levelVariants`, and `followUps` sections are coherent and use the book-specific schema well.
+- The core invariant is exactly right for finance: the agent writes proposed journals, never the ledger.
+- Maker-checker is enforced through the identity broker, not left as a UI or policy convention.
+- The intake stage now treats PDFs, email, EDI, bank feeds, and vendor updates as untrusted evidence before extraction.
+- Step 5 now tells the right story: idempotent GL post is different from payment settlement, and rails require reconciliation.
+- The decision record is concrete and audit-grade: versions, evidence, calculations, controls, approvals, provider references, event IDs, WORM storage, and raw-trace separation.
+- The new follow-up drills are realistic and useful: duplicate invoice, lost approval response, vendor bank-account change, period lock, provider timeout, and one-year audit reproduction.
 
 ## Highest-Impact Issues
 
-### 1. Step 7 conflicts with the stated autonomy boundary
+### 1. Human-checker throughput is not reconciled with the capacity target
 
-The requirements say:
+The case now says the platform handles roughly 1M invoices/month, about 45k/business-day, with a 10x month-end burst. It also says every ledger mutation or payment needs a human checker who is distinct from the maker. Those two claims can coexist, but the dataset does not yet show the operating model that makes them plausible.
 
-- "Propose journal entries and payments - never post or pay autonomously."
-- "Route proposals through maker-checker approval before any ledger mutation or money movement."
+Why it matters: after removing auto-authorization, the approval queue becomes the dominant capacity constraint. A finance interviewer will ask whether the design is actually scalable if every low-risk proposal waits for human approval. The current capacity section names checker SLA by risk tier, but not approval volume, batch size, staffing, queue aging, or what happens when the checker queue misses SLA.
 
-Step 4 says a checker can be "a human, or for low-risk items a deterministic threshold." Step 7 then says low-risk, well-matched items may "auto-execute under control." That can be a valid design, but the dataset currently leaves two incompatible readings:
+Concrete fix: add approval workload math. For example, estimate clean vs exception volume, approvals/checker/hour, batch approval size, dual-approval fraction, and backlog thresholds. If batch approval is allowed, model the batch evidence and per-item audit record. If the intended answer is policy-as-checker for low-risk items, then update the requirements and evidence model deliberately; do not imply it through wording.
 
-- If auto-execute means no independent checker, it violates the interview's stated invariant.
-- If auto-execute means a deterministic policy service acts as a separate checker, the API/data model/decision record must say that explicitly and record policy version, threshold inputs, control results, and checker type.
+### 2. Payment outbox and reconciliation are still underrepresented in diagrams and API shape
 
-Concrete fix: choose one stance. The simpler and safer fix is to keep the case strictly propose-only plus human checker for every ledger mutation/payment, then frame Step 7 as "auto-route/auto-recommend vs escalate." If the intended design allows deterministic approval for low-risk items, update requirements, Step 4, Step 7, `proposals.checker`, `decision_record.kind`, and `satisfies` to model that checker as a distinct control principal with versioned policy evidence.
+The prose and data model now include `payment_instructions`, callback dedupe, provider references, and asynchronous settlement. That is a major improvement. The main architecture and Step 5 visuals still show `Ledger -> PaymentRail`, and the Step 5 sequence is `Broker -> GL -> Payment Rail` with no outbox, callback, payment event store, or reconciliation worker.
 
-### 2. The intake requirement is not actually designed as a step
+Why it matters: diagrams teach the candidate what is first-class. In production, the risky part is not just "release payment"; it is submission, ambiguous outcome, callback dedupe, status transitions, returns, and reconciliation. Keeping that mostly in prose makes the visual story weaker than the actual design.
 
-The first functional requirement covers email, portal, EDI, PDF, bank feeds, POs, and contracts. The final design has `Source` and `Gateway`, but the step sequence starts at extraction and matching. That skips important finance-specific work:
+Concrete fix: add a `PaymentOutbox` or `PaymentExecutor` node and a `PaymentEvents`/`Reconciler` component, or relabel the existing edge so it is not interpreted as the GL directly paying. The `/v1/proposals/{id}/approve` response should also avoid implying that approval synchronously returns `posted` unless the side-effect worker really completed; prefer `approved` plus queued/in-progress side-effect status and a separate status query.
 
-- ingress idempotency and duplicate document detection
-- source authentication, sender/vendor mapping, and EDI vs PDF normalization
-- malware/prompt-injection quarantine before the extract node sees untrusted documents
-- OCR quality, schema validation, and evidence versioning
-- malformed document routing and resubmission workflow
+### 3. The interview script still says "Auto-execute vs escalate thresholds"
 
-Concrete fix: add an intake/normalization step before `pipeline`, or expand Step 3 so `Gateway`, `Source`, and `TaskQueue` are not just final-design nodes. The step should show a normalized `DocumentEnvelope` or `EvidenceBundle` feeding the deterministic pipeline.
+The updated Step 7 correctly says "Auto means auto-routed and auto-recommended, never auto-authorized." The interview script's final phase still says: "Auto-execute vs escalate thresholds, fraud (vendor bank-change), and eval against ground-truth bookings."
 
-### 3. Proposal lifecycle and transactional boundaries are underspecified
+Why it matters: this is the exact ambiguity the recent changes otherwise fixed. Interview scripts often become the spoken path, so this wording can lead the interviewer back to the old contradiction with "never post or pay autonomously."
 
-The data model has `proposals.status = awaiting_approval, posted, rejected, exception`, but the system needs a more explicit lifecycle because the hard failures happen between approval, posting, payment release, provider callback, and reconciliation. The current model does not distinguish:
+Concrete fix: change that script line to "Auto-route/auto-recommend vs escalate thresholds..." or "Risk-tier routing vs escalation..." and keep "execute" reserved for the post/payment path after checker approval.
 
-- extracted vs matched vs exception
-- awaiting approval vs approved
-- posting in progress vs posted
-- payment initiated vs settled vs failed vs reversed
-- accounting period locked vs reopened
-- duplicate/corrected proposal vs reversal/adjustment entry
+### 4. Accounting validity is named but not deeply modeled
 
-Concrete fix: add a state-machine concept, a transition table, or a step deep dive for proposal/post/payment states. Consider modeling journal posting and payment execution as separate controlled side effects with an outbox/event log rather than a single synchronous `POST /approve` response that returns `posted`.
+Step 2 now lists balanced debits/credits, chart-of-accounts validity, currency/entity consistency, open period, attached evidence, and reversal proposals. The data model still only includes proposals, journal lines, payment instructions, and decision records.
 
-### 4. "Exactly-once payment" is too optimistic without rail-specific reconciliation
+Why it matters: finance correctness often fails on master data and accounting policy, not just on agent extraction. Multi-entity, multi-currency, tax/VAT, vendor master controls, bank-account-change approval, chart-of-accounts versions, and period-close rules decide whether a journal is valid.
 
-The idempotency step is directionally right, but payments are not the same as database writes. Many rails and payment processors are asynchronous, have pending/settled/failed states, and may require callback/webhook reconciliation. Saying "the GL and the payment rail dedupe on it" makes the rail boundary sound cleaner than it is.
+Concrete fix: add a compact policy/master-data deep dive or a few fields/tables such as `accounting_periods`, `control_policy_version`, `vendor_account_version`, `entity_id`, `currency`, and `tax_code`. This does not need to become an ERP design, but the interview should show where validity rules live and how their versions enter the decision record.
 
-Concrete fix: split the side effect into two parts:
+### 5. Callback dedupe needs more than `last_callback_event_id`
 
-- GL journal post: transactional/idempotent inside the finance platform or ERP integration.
-- Payment instruction: idempotent submission plus asynchronous status reconciliation, callback dedupe, and exception handling for ambiguous outcomes.
+The `payment_instructions` table includes `last_callback_event_id`, which is useful but not enough if callbacks arrive duplicated, delayed, or out of order. Real providers can send multiple event types for the same instruction, and retries can replay older events.
 
-Add a `PaymentInstruction` or `PaymentOutbox` table and make the decision record capture provider reference IDs, callback event IDs, and reconciliation results.
+Why it matters: a single "last callback" field can make dedupe and audit weaker than the design promises. The platform needs to know every processed provider event, reject duplicate event IDs, and apply monotonic status transitions.
 
-### 5. Capacity is semantic, not capacity planning
-
-The `capacity` array currently lists posting semantics, autonomy, and failure posture. Those are useful constraints, but they do not answer capacity questions. A finance interviewer would expect at least rough order-of-magnitude numbers for:
-
-- invoices/documents per day and peak month-end close burst
-- bank-feed transactions per account per day
-- LLM extraction calls per document and retry/error rates
-- match-engine read/write amplification across POs, receipts, vendors, and bank statements
-- approval queue throughput and human SLA
-- decision-record storage and retention volume
-- backlog behavior when correctness halts throughput
-
-Concrete fix: add a real capacity section alongside the qualitative invariants. For example: 1M invoices/month, 10x month-end burst, 3 extraction attempts max, 100M retained decision events/year, checker SLA by risk tier, and queue depth/backpressure behavior.
-
-### 6. Some step diagrams reference link endpoints omitted from local views
-
-Global node and link IDs are valid, but local step views have links whose endpoints are not included in the same `view.nodes` list:
-
-- `naive`: `id-ledger` references missing endpoint `Identity`.
-- `ledger`: `pipe-proposals` references missing endpoint `Pipeline`.
-- `exceptions`: `pipe-match`, `pipe-guard`, and `pipe-obs` reference missing endpoint `Pipeline`; `proposals-checker` references missing endpoint `Proposals`.
-
-Mermaid can create implicit nodes for these endpoints, which makes the generated step diagram less controlled and can confuse node filtering/highlighting. Concrete fix: either add the missing endpoints to each step's `view.nodes`, or use links whose endpoints match the intended local diagram.
+Concrete fix: add a `payment_events` or `provider_events` table keyed by `(provider, callback_event_id)` with received time, provider reference, target instruction, raw status, normalized transition, and decision-record event ID. Then Step 5 can explain out-of-order handling and reconciliation queries.
 
 ## System Design Soundness
 
-The system's highest-level shape is credible. The separation between `Proposals`, `Ledger`, `Identity`, `Checker`, `DecisionLog`, and `Guardrail` is the right backbone for a finance agent. The `finalDesign` also correctly avoids direct agent mutation of the GL and ties approvals to scoped delegated authority.
+The high-level design is now sound. The separation of `Proposals`, `Ledger`, `Identity`, `Checker`, `DecisionLog`, `Guardrail`, and bounded `Pipeline` is the right backbone for an agentic finance platform. The final design now earns `Source`, `Gateway`, and `TaskQueue` through Step 3 rather than introducing them only at the end.
 
-The design needs more accounting-domain specificity. It does not discuss chart-of-accounts constraints, multi-entity or multi-currency posting, tax/VAT handling, fiscal-period locks, close/reopen controls, or reversal/correction entries. Those do not all need full implementation, but at least some should appear as constraints or follow-up deep dives because they shape whether a proposed journal is valid.
+The API is mostly aligned with the architecture: proposal creation writes proposed journals, approval is checker-driven, payment callbacks are idempotent, and decision records are fetched for audit. The approval endpoint should be slightly more careful about synchronous language. Returning `posted` from `POST /v1/proposals/{id}/approve` risks compressing approval, GL post, payment outbox submission, and settlement into one command even though the rest of the dataset correctly separates them.
 
-Security and compliance are present but thin. Prompt-injection defense appears as a pattern and `Guardrail` description, but there is no concrete document quarantine or data-boundary design. SOX/ICFR is mentioned, but evidence immutability is not tied to WORM storage, hash chaining, retention, legal hold, or access control. The decision record should include model version, prompt/template version, policy version, retrieved source versions, approval principal, and immutable event IDs.
+The data model is much better than before. It now has proposal states, reversals, period IDs, payment instruction states, callback IDs, and decision-record hash chaining. The next soundness improvement is to show where accounting policies and master data live, because "valid journal" depends on chart-of-accounts, entity, currency, tax, period-close, and vendor-bank-account versions.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: An Agent That Posts to the Ledger
 
-This is a strong baseline because it makes irreversibility concrete. The trap is useful and the transition to propose-only is clear. Fix the diagram link: `id-ledger` introduces `Identity`, which is not in this local view. For the naive baseline, a direct `ExtractAgent -> Ledger` link may teach the failure mode more cleanly than reusing the controlled identity link.
+This remains a strong baseline. It makes irreversibility concrete and motivates the rest of the case. The diagram is now coherent: the naive agent reads inference, posts to ledger, and releases payment. Keep this direct because it is the failure mode the candidate must reject.
 
 ### Step 2: The Ledger Is Ground Truth
 
-This step introduces the most important finance invariant. It would be stronger if it named the proposal invariants: balanced debits/credits, source evidence attached, no posting side effect, proposal versioning, and proposal status transitions. The diagram uses `pipe-proposals` without `Pipeline` in the local node list.
+This step now does more than state "propose, don't mutate." It lists balanced entries, source evidence, chart-of-accounts validity, currency/entity consistency, open period, status transitions, and reversal proposals. That is the right finance-specific turn. The only missing piece is where those policy/master-data validations are versioned and enforced.
 
 ### Step 3: A Deterministic Pipeline, Not a Loop
 
-The deterministic pipeline vs autonomous loop contrast is correct and well-timed. The option comparison is useful. The step should make the data contract between nodes more explicit: `DocumentEnvelope -> ExtractedFields -> MatchResult -> ProposedJournal`. This is also the best place to introduce source document intake, validation, prompt-injection quarantine, and queue admission.
+This is now one of the strongest steps. Intake, authentication, dedupe, normalization, quarantine, and malformed-document routing are explicit. The deterministic pipeline vs autonomous loop option pair is well-motivated, and the data contract `DocumentEnvelope -> ExtractedFields -> MatchResult -> ProposedJournal` is a good teaching device.
 
-### Step 4: Maker-Checker & Segregation of Duties
+### Step 4: The Gate: Maker-Checker & Segregation of Duties
 
-This is the best step in the interview. It correctly places segregation of duties in the identity broker and shows rejection when `checker == maker`. The step should clarify whether a deterministic threshold can be a checker, and if so how it is represented as a separate principal/control and how it avoids contradicting "never post or pay autonomously."
+This step now resolves the earlier auto-execute ambiguity by saying deterministic thresholds route work but never replace the checker. The sequence diagram is useful and compact. The next improvement is scale: show how checkers approve 45k/day plus burst without violating SoD or silently reintroducing auto-authorization.
 
-### Step 5: Idempotent Posting & Payment
+### Step 5: Exactly-Once: Idempotent Posting & Payment
 
-The retry framing is strong. The step needs a more realistic side-effect boundary: GL posting and payment execution are different operations with different failure modes. Add a payment outbox or payment instruction store, provider callback dedupe, and reconciliation of unknown outcomes. Also make clear that "exactly once" is an externally observable effect achieved through idempotency plus reconciliation, not a distributed-systems guarantee by assertion.
+The prose and concepts are now production-realistic: GL posting and payment submission are separate, payment settlement is asynchronous, callbacks are deduped, and unknown outcomes are reconciled before retry. The visual/sequence needs to catch up. Add the payment outbox and reconciliation callback path to the diagram so the learner sees that "exactly-once payment" is implemented through idempotent submission plus event reconciliation, not a direct ledger-to-rail call.
 
-### Step 6: Immutable Decision Record
+### Step 6: The Audit Artifact: An Immutable Decision Record
 
-The audit artifact section is strong and should be preserved. It would benefit from a clearer schema for what is stored: source document version, retrieved records and versions, match result, threshold/policy version, model version, prompt/template version, approval identity, idempotency key, journal ID, payment provider reference, and exception reason. A short note on tamper evidence and retention would make it production-grade.
+This step is strong and should be preserved. The deep dive names versions, source records, model/prompt/policy versions, control outcomes, approver identity, idempotency keys, provider references, hash chaining, WORM storage, retention, redaction, and auditor access. That is exactly the level of specificity that makes the case credible.
 
 ### Step 7: Thresholds, Exceptions, Fraud & Evaluation
 
-The ingredients are right, but too much is packed into one step: thresholds, exception routing, fraud controls, and evaluation. The most important fix is the auto-execute wording. After that, consider splitting this into either a deep dive or two concepts: one for exception/fraud workflow and one for offline/online evaluation. Vendor bank-account-change detection is a good concrete fraud example; add a remediation workflow and evidence requirements.
+The updated wording is much better: thresholds route and recommend; they do not authorize. The fraud example is concrete, and the exception/reversal workflow adds useful accounting realism. Keep this as the operations step. Consider adding approval backlog metrics and false-positive/miscoding dashboards here, because this is where the system proves it is working safely at scale.
 
 ## Final Design Review
 
-The final design integrates most introduced components and introduces `Source` and `Gateway` to satisfy document ingestion. The concern is that those ingress components appear only in the final design, so they feel bolted on rather than taught. Likewise, `TaskQueue` is introduced in Step 3 but capacity/backpressure behavior is not quantified.
+The final design now integrates the steps well. It includes intake, queueing, bounded extraction, deterministic matching, controls, proposals, maker-checker, identity-broker enforcement, idempotent GL posting, payment outbox semantics, callback reconciliation, decision record, WORM storage, and observability.
 
-The final diagram should likely distinguish journal posting from payment release. `Ledger -> PaymentRail` suggests the GL directly releases payment, which may be acceptable as shorthand, but a production finance platform usually has a payment instruction/outbox/executor boundary and separate reconciliation. If the book wants the interview to stay compact, the final design description should explicitly say this is shorthand for a controlled payment-execution path.
+The main visual gap is still payment execution. The final description says `Ledger -> Payment Rail` is shorthand, but the diagram is what many readers will remember. A first-class payment outbox/reconciler node would make the final design match the improved prose and data model.
 
 ## Concept Introduction and Learning Flow
 
-Concept staging is mostly good:
+The staging is coherent:
 
-- Step 1 motivates the control problem.
-- Step 2 introduces the ground-truth/proposal boundary.
-- Step 3 contains model nondeterminism inside a workflow.
-- Step 4 enforces SoD.
-- Step 5 makes retries safe.
-- Step 6 creates audit evidence.
-- Step 7 broadens to operations and evaluation.
+- Step 1 makes the unsafe baseline vivid.
+- Step 2 introduces the ledger/proposal boundary and accounting invariants.
+- Step 3 contains nondeterminism inside a deterministic, auditable pipeline.
+- Step 4 introduces the approval gate and SoD.
+- Step 5 handles retry/crash ambiguity for irreversible side effects.
+- Step 6 explains audit evidence.
+- Step 7 broadens to operations, fraud, exceptions, and evaluation.
 
-The main learning-flow issue is that ingestion and document trust are skipped. In finance, the input corpus is adversarial and operationally messy, so a candidate should be taught to treat PDFs, emails, bank feeds, and vendor updates as untrusted evidence before extraction.
+The concept flow is now book-ready with one caveat: the approval-scale issue should be introduced when Step 4 or Step 7 discusses risk tiers. Otherwise the candidate may design a correct but operationally impossible checker queue.
 
 ## Step-to-Final-Design Coherence
 
-The steps generally build toward `finalDesign`, but there are three coherence gaps:
-
-- `Source` and `Gateway` appear in the final design without a corresponding teaching step.
-- The Step 7 "auto-execute" language appears to weaken the Step 2/4 invariant unless clarified.
-- `PaymentRail` is introduced as a final irreversible side effect, but payment lifecycle and reconciliation are not developed before the final design.
-
-Fixing those would make the final design feel earned rather than compressed.
+Most components in `finalDesign` are now introduced before the final diagram. The previous gaps around `Source`, `Gateway`, `TaskQueue`, and intake have been closed. The remaining coherence issue is that `payment_instructions` and reconciliation appear in the data model/deep dive/final prose but not as visible architecture nodes. Promoting them to the graph would make Step 5 and the final design line up.
 
 ## Realism Compared With Production Systems
 
-The strongest production-realism points are SoD in the authorization path, idempotency, append-only audit evidence, and prompt-injection awareness. The biggest missing production concerns are:
+The strongest realism points are now:
 
-- close calendar, locked periods, reversal entries, and reclassification workflow
-- vendor master controls and bank-account-change approval
-- asynchronous payment statuses and callback reconciliation
-- ERP/GL integration limits, rate limits, and failure handling
-- tenancy/entity boundaries for multi-subsidiary finance orgs
-- data retention, legal hold, redaction, and auditor access workflows
-- operational dashboards for backlog, exception aging, approval SLA, false positives, and miscoding rate
+- source-document quarantine before extraction
+- idempotent ingress, proposal creation, GL post, and payment submission
+- maker-checker in the authorization path
+- reversal proposals instead of editing posted entries
+- vendor bank-account-change fraud control
+- immutable decision records with versions and WORM storage
+- realistic drills around duplicate invoices, lost responses, closed periods, and payment timeouts
 
-These do not all require new top-level steps, but the review strongly recommends at least one deep dive or final-design paragraph that names the controls.
+The remaining realism gaps are operational rather than architectural: approval staffing/batching, callback event history, monotonic payment state transitions, policy/master-data versioning, and dashboards that expose backlog, exception aging, approval SLA, miscoding rate, false positives, and provider reconciliation lag.
 
 ## Dataset and Renderer-Facing Observations
 
 - `interview.json` parses as valid JSON.
-- Global `view.nodes` and `view.links` references resolve to `highLevelArchitecture`.
-- `satisfies[*].steps[*]` references resolve to real step IDs.
-- Pattern `steps[]` references resolve to real step IDs.
-- Canonical node types are valid.
-- Local step views should be fixed where link endpoints are omitted from the local `view.nodes`.
-- The dataset has no `technologyChoices` and no `toProbeFurther`. That is schema-valid, but adjacent book cases such as `agentic-platform-foundations`, `agentic-developer-platform`, and `payment-system` include them. For a flagship book case, their absence makes the case feel less complete.
-- There are no generated AI visuals or explainer comic. That is optional, but if the rest of the Agentic Platforms chapter uses visuals, this case may look under-finished in the overview/wrap-up experience.
+- Global `view.nodes` references resolve to `highLevelArchitecture.nodes`.
+- Global `view.links` references resolve to `highLevelArchitecture.links`.
+- Local step views no longer have links whose endpoints are omitted from the local `view.nodes`.
+- `satisfies[*].steps[*]`, pattern `steps[]`, and `technologyChoices[].steps[]` references resolve to real step IDs.
+- Technology icon paths under `assets/tech-icons/` exist.
+- `toProbeFurther` is present and renderer-compatible.
+- The stale interview-script phrase "Auto-execute vs escalate thresholds" should be fixed.
+- The model-serving technology choice says "for the latest and most capable models, default to Claude (Opus/Sonnet)..." That is time-sensitive and provider-specific for a static book dataset. Prefer a stable sentence about managed frontier-model providers or the shared model gateway unless the project intentionally wants dated vendor guidance.
+- There are no generated AI visuals or explainer comic. That is optional, but if adjacent agentic-platform cases use them, this case may look less finished in the explorer.
 
 ## Recommended Edits, Prioritized
 
-### P1: Resolve the auto-execute vs never-autonomous-post contradiction
+### P1: Add approval capacity math
 
-Decide whether every ledger/payment mutation requires a human checker, or whether deterministic policy approval can act as a checker. Update requirements, Step 4, Step 7, API, data model, `satisfies`, and decision-record evidence accordingly.
+Quantify clean vs exception volume, checker throughput, batch approval size, dual-approval percentage, queue SLA, and backlog behavior for the 1M invoices/month target.
 
-### P1: Add proposal/payment state-machine detail
+### P1: Make payment outbox/reconciliation first-class in the architecture
 
-Add lifecycle states and side-effect boundaries for proposal creation, approval, journal posting, payment instruction, provider callback, settlement, failure, reversal, and reconciliation. This can be a data-model expansion plus one deep dive.
+Add an architecture node or explicit sequence for `payment_instructions`, payment submission worker, provider callback/event store, and reconciliation query. Align the approval API response with asynchronous side-effect processing.
 
-### P1: Fix local step view endpoint omissions
+### P1: Fix the stale interview-script wording
 
-Add missing endpoints or choose local links whose endpoints are present in the step diagram. This is the only clear renderer-facing defect found in the review.
+Replace "Auto-execute vs escalate thresholds" with "Auto-route/auto-recommend vs escalate thresholds" or "Risk-tier routing vs escalation."
 
-### P2: Add intake and evidence normalization
+### P2: Add accounting policy/master-data versioning
 
-Teach document intake explicitly: authn, dedupe, OCR/schema normalization, quarantine, source versioning, and prompt-injection screening before extraction.
+Show how chart-of-accounts, entity/currency, tax/VAT, accounting-period locks, vendor master data, and bank-account-change controls are versioned and included in the decision record.
 
-### P2: Replace qualitative capacity with real capacity planning
+### P2: Strengthen payment callback dedupe
 
-Keep the current semantic constraints, but add volume, burst, queue, LLM-call, approval-SLA, retention, and storage numbers.
+Replace or supplement `last_callback_event_id` with a provider event table and monotonic status-transition handling.
 
-### P2: Strengthen audit/control specificity
+### P2: Polish book resources and technology wording
 
-Add policy versioning, source versions, tamper evidence, WORM/hash-chain options, retention, redaction, auditor access, and raw-trace separation.
+Replace the Wikipedia maker-checker link with a stronger audit/control source if available, add step-level `probeLinks` for the most important links, and remove time-sensitive "latest/model default" language from static technology choices.
 
-### P3: Add book wrap-up completeness
+### P3: Add optional visual polish
 
-Add `technologyChoices` for ERP/GL integration, workflow engine, queue, OCR/document AI, model provider, WORM/audit storage, payment rail integration, and observability/evaluation. Add `toProbeFurther` links to authoritative docs/case studies if external research is in scope.
-
-### P3: Add drills or follow-up prompts around failures
-
-Good drills would include lost approval response, duplicate invoice, bank-account-change fraud, period closed after proposal creation, payment provider timeout, and auditor asks for evidence one year later.
+If this chapter's nearby agentic cases use generated AI visuals or an explainer comic, add them for consistency. This is presentation polish, not a design blocker.
 
 ## What Not To Change
 
-- Keep "agents propose; the GL is ground truth" as the core invariant.
-- Keep maker-checker enforcement inside the identity/authorization path.
-- Keep deterministic pipeline over autonomous loop as the default for this domain.
-- Keep the decision record vs chain-of-thought distinction.
-- Keep correctness/auditability over availability as the central finance inversion from the developer-platform case.
+- Keep "agents propose; the GL is ground truth" as the central invariant.
+- Keep maker-checker enforcement inside identity/authorization.
+- Keep deterministic workflow over autonomous loop as the default for finance.
+- Keep thresholding as routing/recommendation, not authorization.
+- Keep decision records separate from raw model reasoning.
+- Keep correctness and auditability above availability as the vertical's priority inversion.
 
 ## Bottom Line
 
-This dataset has the right architecture thesis and a clear teaching arc, but it needs more production finance mechanics before it feels book-ready. The most important fixes are clarifying the autonomy boundary, modeling lifecycle and payment ambiguity, adding real capacity math, and cleaning up the local diagram views.
+The recent changes moved this dataset from a strong draft with several production gaps to a credible book case. The remaining work is mostly sharpening: prove the human approval model scales, make payment outbox/reconciliation visible in diagrams and API shape, fix one stale script phrase, and add a little accounting-policy depth. The core design is sound and worth preserving.

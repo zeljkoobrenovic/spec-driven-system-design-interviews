@@ -5,382 +5,402 @@ Review date: 2026-06-23
 
 ## Executive Summary
 
-This is a strong, focused dataset for the agentic-platform vertical. It has a
-clear thesis - a fleet of coding agents is safe only when code changes stop at a
-draft PR and merge/deploy remains a separate human-owned gate - and the step
-sequence builds that thesis cleanly from baseline, to repo grounding, to fleet
-isolation, to verification, to prompt-injection defense, to operations.
+This review is updated after the recent dataset deepening. The earlier high
+impact findings are largely addressed: capacity now has numeric rows, the task
+lifecycle has leases/idempotency/attempt state, repo indexing has freshness and
+authorization metadata, parallel-agent conflict handling is in the mainline, and
+the gate has durable `gate_decisions`. The previous diagram endpoint warnings
+also no longer reproduce.
 
-The biggest gap is that several production-control planes are still compressed
-into prose. Capacity has no real sizing numbers, task scheduling lacks conflict
-and lease/idempotency detail, the repo index is modeled without freshness or
-authorization metadata, and merge/deploy governance is described but not carried
-by explicit entities. There are also three small diagram-view endpoint issues
-that can create implicit Mermaid nodes.
+The dataset is now a strong book-quality case. Its central thesis is clear and
+distinctive: a cloud fleet of coding agents can be useful only if agent autonomy
+stops at a draft PR, while merge and deploy remain a separate guarded gate
+because reverting code is not the same as reversing effects. The remaining
+issues are narrower: the public API has not caught up to the richer data model,
+one capacity calculation is internally inconsistent, gate evidence is modeled
+but not visible enough in the sequence flow, and the security/evaluation pieces
+would benefit from one more concrete workflow.
 
 | Axis | Rating | Notes |
 | --- | --- | --- |
-| System design soundness | 4.20/5 | Strong architecture spine; needs concrete capacity, task state, index freshness, and merge/deploy governance. |
-| Production realism | 4.05/5 | Good sandboxing, scoped credentials, prompt-injection framing, and gates; conflict handling, secret/egress policy, and provider workflows need more state. |
-| Pedagogical flow | 4.45/5 | The seven-step journey is coherent and interview-friendly; a few steps would benefit from more options or sequence flows. |
-| Dataset/rendering fit | 4.30/5 | JSON parses and most references resolve; three view links omit endpoint nodes. |
-| Overall | 4.25/5 | Strong book-quality case with specific production-depth edits left. |
+| System design soundness | 4.55/5 | Strong requirements, architecture, and state model; API and one capacity number need tightening. |
+| Production realism | 4.45/5 | Leases, idempotency, work intents, index jobs, gate decisions, quotas, and retention are now credible; external workflow evidence needs more visibility. |
+| Pedagogical flow | 4.50/5 | The seven-step sequence teaches one risk at a time; security and evaluation could use a little more structured flow. |
+| Dataset/rendering fit | 4.65/5 | JSON parses; step/final links, endpoint nodes, sequence participants, patterns, and `satisfies` references resolve. |
+| Overall | 4.55/5 | A strong flagship vertical with focused polish remaining. |
 
 ## What Works Well
 
-- The scope is sharp: it distinguishes an org-scale cloud fleet from a local AI
-  coding CLI and explicitly depends on the shared Agentic Platform Foundations
-  substrate instead of re-teaching it.
-- The two-stage gate is the right central invariant. The dataset repeatedly
-  reinforces that a draft PR is reversible, while merge/deploy can trigger
-  external effects that code revert does not undo.
-- The architecture contains the right major nodes: gateway, supervisor, queue,
-  coding agent, sandbox, inference, repo index, VCS, CI, guardrail, identity,
-  durable log, and observability.
-- The step recaps work well. Each step exposes the next risk, so the walkthrough
-  feels like an interview answer being assembled rather than a component dump.
-- The security step is appropriately specific for coding agents: repo text,
-  issue text, PR comments, dependency docs, and CI logs are attacker-reachable
-  input, not trusted internal context.
-- The wrap-up material is concise and aligned. `satisfies`, `interviewScript`,
-  `levelVariants`, and follow-ups reinforce the main teaching points.
+- The review-driven changes materially improved the dataset. Capacity is no
+  longer qualitative, and the data model now carries the state needed for
+  resumable async work, conflict handling, index freshness, and gate evidence.
+- The central invariant stays sharp: the agent may open a draft PR, but human
+  review, branch protection, CI, code ownership, rollout controls, and deploy
+  evidence form the second gate.
+- The architecture uses the right boundaries. It reuses Agentic Platform
+  Foundations for runtime, durability, identity, inference, and observability
+  instead of bloating this vertical with unrelated substrate design.
+- The step order is coherent: baseline, repo grounding, fleet isolation, gate,
+  verification, prompt-injection defense, and fleet operations.
+- The domain-specific problems are not generic "LLM app" points. They are
+  coding-agent problems: stale code context, branch/PR side effects, protected
+  branches, CI status ambiguity, poisoned repo text, scoped repo credentials,
+  and reviewer-owned merge.
+- The renderer-facing structure is clean. The earlier implicit-node problems in
+  option and step views are fixed.
 
 ## Highest-Impact Issues
 
-### 1. Capacity is qualitative, so the fleet cannot be sized
+### 1. The public API is much thinner than the new control-plane model
 
-The capacity section has only three qualitative rows: "fleet-scale",
-"ephemeral, per task", and "async". Those statements are directionally right,
-but they do not force the candidate to size the hard bottlenecks: concurrent
-sandboxes, task duration, queue depth, repo checkout/cache pressure, CI minutes,
-index update load, token spend, and trajectory storage.
+The data model now includes `tenant_id`, `repo_id`, `idempotency_key`,
+`base_sha`, `branch_name`, `head_sha`, `pr_id`, attempts, leases, retry policy,
+gate decisions, and trajectory retention. The API examples still expose a small
+shape: `POST /v1/tasks` accepts only `repo`, `issue`, and `base`, and
+`GET /v1/tasks/{id}` returns only status, PR URL, and checks.
 
-Why it matters: without numbers, admission control stays a slogan. A production
-agentic developer platform is dominated by expensive, stateful resources:
-microVMs, working copies, CI runners, LLM calls, and code-index storage. The
-design should make candidates translate task arrival rate and p95 task duration
-into concurrency and backpressure.
+Why it matters: the interview now teaches a production-grade control plane, but
+the external contract does not show how callers request idempotency, bind work
+to a base commit, declare tenant/repo scope, cancel work, observe lease/retry
+state, or read gate evidence. Candidates may design the right internals while
+leaving the platform API under-specified.
 
-Concrete fix: add capacity rows such as tasks/day, peak task submissions/min,
-average and p95 task duration, concurrent sandbox target, warm-pool size, repo
-checkout/cache footprint, index size per MLOC, incremental re-index events/day,
-CI runner minutes, trajectory/event storage, and per-tenant queue limits. Update
-`capacityDiagram` to show at least two bottleneck branches: sandbox/CI capacity
-and index/inference/trajectory capacity.
+Concrete fix: expand the API examples to include `tenantId`, `repoId`,
+`idempotencyKey`, `baseBranch`, optional `baseSha`, `taskSource`, `requestedPath`
+or file-intent hints, priority/risk class, and callback/webhook metadata. Extend
+task reads with `attempt`, `leaseState`, `baseSha`, `branchName`, `headSha`,
+`prId`, `terminalReason`, `retryAfter`, and a `gateDecisions` or
+`gateEvidenceUrl` link. Add a small cancel endpoint if cancellation remains in
+the task state model.
 
-### 2. The task lifecycle is under-modeled for exactly-once resume
+### 2. The sandbox concurrency math conflicts with the stated peak load
 
-`tasks` has only `queued,running,pr_open,merged,failed`, and `run_events.kind`
-only includes `plan,edit,test,push,pr_open`. The prose promises async,
-resumable, exactly-once execution, but the data model has no lease, attempt,
-heartbeat, idempotency key, dedup key, cancellation state, retry policy, branch
-name, commit SHA, PR id, lock ownership, timeout, or resume cursor.
+Capacity now gives useful numbers, but the concurrency row combines the peak
+arrival rate and p95 duration while still landing at `~500 concurrent target`.
+Task volume says peak `~120 submissions/min` and p95 duration is `~25 min`; at
+peak, Little's Law would put p95 occupancy near `120 * 25 = 3000` concurrent
+sandboxes. Using the average duration gives `120 * 6 = 720`; using daily
+average arrival rate (`50k/day ~= 35/min`) with p95 gives about `870`.
 
-Why it matters: long-running coding tasks fail in messy ways. A worker can die
-after pushing a branch but before recording the PR, a webhook can submit the
-same task twice, CI can finish after the task is marked failed, or two attempts
-can race on the same branch. Those are the cases where "exactly-once resume"
-needs real state.
+Why it matters: capacity is one of the most interview-relevant parts of this
+case. A wrong or ambiguous concurrency target weakens the admission-control
+story, because the queue cap, warm pool, CI budget, and tenant quotas depend on
+which arrival rate and duration percentile the design is sizing for.
 
-Concrete fix: expand `tasks` with `tenant_id`, `repo_id`, `request_id` or
-`idempotency_key`, `attempt`, `lease_owner`, `lease_expires_at`,
-`branch_name`, `head_sha`, `pr_id`, `last_event_seq`, `retry_policy`,
-`cancel_requested_at`, and terminal reason. Expand `run_events.kind` to cover
-checkout, retrieve, tool_call, patch, test_start, test_result, push_branch,
-ci_status, pr_opened, review_event, lease_renewed, and cancellation.
+Concrete fix: choose the intended sizing policy and make the row explicit. For
+example: "steady-state target ~500-900 concurrent using daily average plus
+headroom; overload bursts queue when peak would imply ~3000" or "provision
+~3000 for peak p95." Update `capacityDiagram` to match the chosen number.
 
-### 3. Parallel-agent conflict handling is a follow-up, but it should be in the mainline
+### 3. Gate evidence is modeled, but the gate flow does not write it
 
-The requirements say many agents run in parallel across repos, and the follow-up
-asks how to stop two parallel agents from producing conflicting PRs on the same
-files. That is an important question, but it is not only a follow-up: it is a
-core operating problem for the fleet.
+`gate_decisions` is the right data model addition, and the final design
+description now says each gate writes durable evidence. The step 4 sequence,
+however, still shows CodingAgent -> VCS -> CI -> Reviewer -> merge, without an
+explicit write of the gate decision, policy snapshot, head SHA binding, or
+downstream deploy evidence.
 
-Why it matters: without a conflict policy, the platform can be safe at the
-merge gate but still waste reviewer time by producing incompatible draft PRs,
-rebasing forever, or repeatedly touching the same hotspot files. This directly
-affects fairness, throughput, and merge rate quality.
+Why it matters: the strongest lesson in the dataset is the two-gate invariant.
+If the data model carries gate decisions but the flow does not show where they
+are produced, the invariant still reads partly as prose rather than an
+operational workflow.
 
-Concrete fix: add a short mainline treatment in `fleet` or `async-obs`: repo or
-path-level work-intent locks, branch naming and base-SHA capture, optimistic
-rebase before PR, duplicate task detection, stale-base refresh, and a policy for
-conflict cancellation versus retry. A small `work_intents` or `repo_locks` data
-model item would make this teachable without overloading the diagram.
+Concrete fix: update the gate sequence with one of these small additions: VCS or
+Supervisor writes `gate_decision(head_sha, policy_version, checks, actor)`;
+CI/CD writes or links `deploy_evidence_url`; rejected/changes-requested review
+writes a terminal or feedback event. If adding a new node is too much, use
+`DurableLog` in the sequence as the evidence sink.
 
-### 4. Repo indexing lacks freshness, authorization, and invalidation state
+### 4. Prompt-injection defense is conceptually strong but lacks a concrete flow
 
-`repo_index` stores chunk id, repo, path, symbol, embedding, and graph edges.
-That is enough to describe retrieval shape, but not enough to operate a
-multi-repo, multi-tenant code corpus.
+Step 6 names the right surfaces: issue text, PR comments, CI logs, dependency
+docs, and repo content are untrusted. It also correctly points to scoped tokens
+and egress constraints. But unlike context, fleet, gate, verify, and async-obs,
+the security step has no sequence flow. The deep dive also uses the phrase
+"remove a trifecta leg" without defining the trifecta in this dataset.
 
-Why it matters: code retrieval is the vertical-specific substrate in this case.
-If the index is stale or crosses authorization boundaries, the agent can edit
-against the wrong code or leak private repo context across tenants. Incremental
-re-index on push is mentioned, but the data model does not show commits,
-versions, visibility, language/parser versions, tombstones, or rebuild status.
+Why it matters: prompt-injection defense in coding agents is subtle because the
+platform must still let the agent read untrusted text and use powerful tools.
+The teachable boundary is not "filter text"; it is separation between untrusted
+data, plan/tool authority, credential brokering, and network egress.
 
-Concrete fix: add fields such as `repo_id`, `tenant_id`, `commit_sha`,
-`indexed_at`, `chunk_hash`, `language`, `parser_version`, `visibility_scope`,
-`deleted_at`, and `index_job_id`. Consider a separate `index_jobs` entity for
-webhook-triggered indexing state, retry, lag, and backfill.
+Concrete fix: add a short security flow: agent retrieves untrusted repo text,
+guardrail marks/partitions it, agent requests a tool call, policy checks the
+call against task scope, identity mints a scoped token, and sandbox/egress
+allows or denies execution. Either define "trifecta" in a concept chip or
+replace it with explicit wording: data access, tool authority, and exfiltration
+path.
 
-### 5. Merge/deploy governance is described but not represented as state
+### 5. Fleet quality is present, but evaluation criteria are still too thin
 
-The gate step correctly names branch protection, required CI, code owners,
-migration policy, progressive delivery, rollback, and constrained auto-merge.
-However, the data model has no approval record, policy snapshot, code-owner
-decision, deployment gate, rollout status, or audit event tied to the task.
+Step 7 adds trajectories, token/cost roll-ups, dead-letter inspection, and a
+warning that merge rate alone is weak. That is a good start. The platform still
+does not name enough quality signals for a reviewer or operator to judge whether
+the fleet is actually improving developer throughput.
 
-Why it matters: the central lesson is that draft PR and merge/deploy are
-different gates. If the model only stores `merged` on `tasks`, the strongest
-concept in the interview has no durable representation. Candidates may leave
-with a prose rule rather than a control-plane design.
+Why it matters: org-scale coding agents can look successful while producing PRs
+that reviewers heavily rewrite, revert, or avoid merging. A good system design
+answer should distinguish activity metrics from outcome and safety metrics.
 
-Concrete fix: add `pr_reviews` or `gate_decisions` with actor, role, decision,
-policy version, required checks, code-owner set, risk class, and timestamp. If
-deploy is in scope, add `deployment_gates` or explicitly state that deployment
-state belongs to the downstream CI/CD platform and this platform only links to
-its evidence.
+Concrete fix: add a small evaluation model or deep-dive bullets covering:
+reviewer edit distance, comments per PR, time to review, stale PR rate, CI
+rerun/flakiness rate, revert/regression rate, escaped incident links, duplicate
+task rate, conflict cancellation rate, cost per merged PR, and per-tenant
+fairness. Keep "LLM-as-judge" secondary to these externally grounded signals.
 
 ## System Design Soundness
 
-The requirements are well scoped. Functional requirements cover async task
-ingest, parallel agents, repo-context retrieval, draft PRs, and human-owned
-merge/deploy. Non-functional requirements cover isolation, verification,
-resumability, prompt-injection defense, and multi-tenant fairness.
+The requirements are strong and well scoped. Functional requirements cover
+async task ingest, parallel isolated agents, repo-context retrieval, draft PRs,
+and human-owned merge/deploy. Non-functional requirements cover sandboxing,
+verification-first behavior, resumability, prompt-injection defense, and
+multi-tenant fairness.
 
-The architecture is coherent and minimal. It avoids inventing a new CI/CD
-system, source control system, or model-serving tier; those are correctly shown
-as dependencies or inherited substrate. The main design path is sound: triggers
-enter through an API, the supervisor queues and admits work, agents run in
-isolated sandboxes with brokered credentials, retrieve repo context, verify
-changes, open a draft PR, and emit trajectories.
+The high-level architecture is sound. The key components are present:
+`Gateway`, `Supervisor`, `TaskQueue`, `CodingAgent`, `Sandbox`, `Inference`,
+`RepoIndex`, `VCS`, `CI`, `Guardrail`, `Identity`, `DurableLog`, and
+`Observability`. Node types are appropriate: `Dev` is an `actor`, `Trigger` is
+a `client`, `RepoIndex` is an `index`, `Inference` is a `model`, and VCS/CI are
+external dependencies.
 
-The main soundness gap is that several promises do not yet have enough state:
-exactly-once resume, admission control, repo-index freshness, and the second
-gate. These do not require many more components, but they do require a few more
-fields and one or two operational flows.
+The data model now supports the main promises. `tasks` has leases, attempts,
+branch/head/base identifiers, PR identity, cancellation, retry policy, and a
+resume cursor. `run_events` covers checkout, retrieval, tool calls, patches,
+test results, branch push, PR open, CI status, review events, and lease renewal.
+`work_intents` brings conflict handling into the mainline. `gate_decisions`
+makes the two-gate story durable. `repo_index` and `index_jobs` address commit
+binding, parser version, authorization scope, tombstones, lag, retry, and
+backfill.
+
+The main soundness gaps are now alignment issues rather than missing
+architecture: API examples should expose the new state, capacity math should be
+made internally consistent, and the gate/security/evaluation workflows should
+show the exact evidence and policy checks the prose promises.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: One Agent, Direct Commit
 
-This is a useful baseline. It makes the transition from local tool to platform
-visible: one user, one task, full credentials, no isolation, no async trigger,
-and no review gate. The trap is well chosen.
+This is still a useful baseline. It makes the contrast with the platform clear:
+one developer, one agent, full credentials, direct commits, no isolation, no
+queue, and no review gate.
 
-Improvement: the pattern tag points to orchestrator-workers even though the
-baseline does not yet have an orchestrator or worker fleet. Consider leaving
-step 1 untagged or using a "baseline/anti-pattern" pattern if the project ever
-adds one.
+Improvement: this step is intentionally simple, so no major change is needed.
+If the renderer feels sparse, add one sentence of step-level overview text that
+states the anti-pattern directly.
 
 ### Step 2: Ground the Agent in the Codebase
 
-This step correctly identifies repo context as the vertical-specific corpus.
-The hybrid Tree-sitter plus code-graph option is the right recommended answer,
-and the no-index option is useful as a realistic trade-off for small repos or
-freshness-sensitive work.
+This step is much stronger after the changes. It now teaches hybrid retrieval,
+code-graph retrieval, index freshness, commit binding, authorization scope, and
+webhook-driven index jobs. The no-index option is a useful counterpoint.
 
-Improvement: make index freshness and authorization visible here. A sequence
-flow could show VCS webhook, index job, chunk/graph update, retrieval query,
-and commit-SHA binding so the agent knows which version of the repo it used.
+Improvement: add the failure mode for index lag. A single note such as
+"if index_jobs lag exceeds the freshness SLO, fall back to direct VCS reads or
+delay PR creation" would make the freshness story operational.
 
 ### Step 3: Run a Fleet: Supervisor + Ephemeral Sandboxes
 
-This is the control-plane step and it mostly lands. Supervisor, queue, sandbox,
-identity broker, and durable log are the right components. The trap against
-shared sandboxes or shared tokens is production-relevant.
+This is now one of the strongest steps. It covers queueing, leases,
+idempotency, replay from `run_events`, scoped credentials, durable resume,
+tenant fairness, and work-intent locks. The new deep dive answers the previous
+review's core concern.
 
-Improvement: add leases and conflict handling. This is the best place to teach
-worker lease renewal, attempt numbering, queue fairness, per-tenant quotas,
-work-intent locks, branch/base-SHA capture, and cancellation. Without those,
-the fleet is safe in principle but not yet operable under retries and parallel
-edits.
+Improvement: the flow could show `work_intents` explicitly, either as a model
+call before sandbox execution or as part of the lease label. That would make
+conflict handling as visible as resume.
 
-### Step 4: The Gate: Draft PR, Then Merge/Deploy
+### Step 4: The Gate: Draft PR, Then a Distinct Merge/Deploy Gate
 
-This is the strongest step. It names the central invariant and the reason it
-exists: reverting source code is not the same as reversing deployed or data
-effects. The sequence flow is concise and useful.
+This remains the centerpiece of the interview. The concept "reverting code !=
+reversing effects" is exactly the right teaching point, and `gate_decisions`
+turns the rule into state.
 
-Improvement: represent the gate as durable state. The step would be stronger if
-it added gate decisions, policy snapshots, reviewer identity, required checks,
-code-owner review, risk class, and deploy evidence. If the actual deploy gate
-belongs to a CI/CD platform, say that explicitly and store only the link/evidence
-that proves the downstream gate passed.
+Improvement: make the sequence write gate evidence. Bind approval to `head_sha`,
+record the policy version and checks, and show deploy evidence as a link to the
+downstream CI/CD platform rather than implying this platform owns deployment.
 
 ### Step 5: Verify Before Proposing
 
-The distinction between fast in-sandbox verification and PR CI as the source of
-truth is correct. This prevents the common mistake of treating local checks as
-the merge gate.
+The verification step is correctly positioned before the prompt-injection step:
+once the agent can run tests and open PRs, the authority boundary matters. The
+deep dive now explains why verification evidence should include commands, exit
+codes, retry count, log artifact, changed files, and final `head_sha`.
 
-Improvement: make the verifier result more explicit. Add fields or events for
-test command, exit code, log artifact, retry count, changed files, and final
-commit SHA. That gives reviewers evidence and makes failed verification
-observable instead of just a loop inside the sandbox.
+Improvement: consider adding a `verification_results` model or making it clear
+that these details live in `run_events.payload`. Right now the deep dive says
+what to store, but the schema only implies where it lives.
 
-### Step 6: Untrusted Repo Text
+### Step 6: Untrusted Repo Text: Prompt-Injection Defense
 
-This is appropriately sharp. It names the exact injection surfaces and explains
-why scoped credentials and egress controls matter. The deep dive on blast radius
-is a good fit for the domain.
+The step has the right domain focus. It does not hand-wave "LLM safety"; it
+names the actual attacker-controlled inputs in coding workflows and ties them to
+tool authority, credential scope, and egress.
 
-Improvement: split policy from enforcement if this grows. `Guardrail / Policy`
-currently screens text and gates tool calls, while `Identity` mints tokens and
-`Sandbox` constrains execution. A tiny flow for untrusted text -> tainted plan
--> allowed tool call -> brokered credential would make the boundary easier to
-teach.
+Improvement: add a sequence flow. This is the one major step without one, and
+the boundary is important enough to draw: untrusted text in, policy-mediated
+tool call out, scoped token from Identity, sandbox/egress enforcement.
 
 ### Step 7: Async at Scale
 
-The step closes the interview well by shifting from components to operations:
-triggers, admission, trajectories, costs, and quality signals. The warning that
-merge rate alone is a weak quality metric is valuable.
+The final step now shows idempotency keys, tenant-aware admission, capacity
+limits, trajectories, token/cost roll-ups, retention class, and dead-letter
+inspection. It closes the interview in the right operational register.
 
-Improvement: this step is doing a lot with little structure. Consider adding a
-sequence flow for trigger ingestion, queue admission, sandbox allocation,
-trajectory emission, and reviewer audit. It is also the natural place for
-SLOs, queue depth, tenant fairness, dead-letter handling, and quality dashboards.
+Improvement: add stronger quality metrics. Merge rate should be explicitly
+subordinate to reviewer edit distance, regression/revert rate, stale PR rate,
+reviewer time, conflict cancellation, and cost per accepted change.
 
 ## Final Design Review
 
-The final design integrates the introduced components cleanly. It includes all
-major nodes from the steps and keeps the two gates visible in prose. It also
-correctly states that runtime, durability, identity, and observability come from
-Agentic Platform Foundations.
+The final design now integrates the steps cleanly. It includes the components
+introduced across the walkthrough and describes the missing-but-important state:
+leased task state machine, idempotency, work-intent locks, optimistic rebase,
+commit-bound repo retrieval, gate decisions, deploy evidence, trajectory
+retention, and Foundations substrate reuse.
 
-The final design would become more production-grade if it named the task
-state-machine and gate evidence explicitly. Right now, the final diagram has
-`DurableLog` and `Observability`, but not the specific evidence records that
-support exactly-once resume, reviewer audit, or deployment-gate proof.
+The final design would become even crisper if the diagram or sequence flows
+made the evidence sinks visible. `DurableLog` and `Observability` are present,
+but `gate_decisions`, `work_intents`, `index_jobs`, and verification evidence
+are currently data-model entities rather than visual control-plane surfaces.
+That is acceptable for a compact diagram, but the sequences should pick up the
+most important writes.
 
 ## Concept Introduction and Learning Flow
 
-The concept staging is strong: code-graph retrieval arrives when grounding is
-introduced, "reverting code != reversing effects" arrives at the gate, and
-untrusted repo text arrives once the agent has meaningful tool authority. That
-is the right order.
+The concept staging is strong:
 
-The dataset could use one or two more concept chips: idempotency/lease for the
-fleet, and index freshness/commit binding for repo grounding. Those concepts
-are already implied; naming them would make the later operational story easier
-to defend.
+- Code-graph retrieval and index freshness appear exactly when grounding is
+  introduced.
+- Lease/idempotency and work-intent locks appear when the fleet is introduced.
+- The two-gate invariant appears before verification and security.
+- Untrusted repo text appears after the agent has meaningful authority.
+- Evaluation appears last, once there is a running fleet to measure.
+
+The remaining concept gap is prompt-injection mechanics. The dataset names
+CaMeL/Dual-LLM/Plan-then-Execute in a pattern, but the step itself would benefit
+from a concrete "data versus authority" concept chip or flow.
 
 ## Step-to-Final-Design Coherence
 
 The final design includes the components introduced by the steps:
 
-- `context` introduces `RepoIndex`, which appears in the final view.
-- `fleet` introduces `Supervisor`, `TaskQueue`, `Sandbox`, `Identity`, and
-  `DurableLog`, all present in the final view.
-- `gate` and `verify` introduce `VCS`, `CI`, and reviewer ownership, all present
-  in the final view.
-- `security` introduces `Guardrail`, present in the final view.
-- `async-obs` introduces `Trigger`, `Gateway`, and `Observability`, all present
-  in the final view.
+- `context` introduces `RepoIndex`, commit-bound retrieval, and index jobs.
+- `fleet` introduces `Supervisor`, `TaskQueue`, `Sandbox`, `Identity`,
+  `DurableLog`, leases, idempotency, quotas, and work intents.
+- `gate` introduces `VCS`, `CI`, reviewer ownership, branch protection, and
+  durable gate decisions.
+- `verify` introduces in-sandbox verification and PR CI as source of truth.
+- `security` introduces `Guardrail`, scoped credentials, and egress limits.
+- `async-obs` introduces `Trigger`, `Gateway`, admission, trajectories, and
+  observability/evaluation.
 
-The coherence gap is not missing nodes; it is missing state. The final view has
-the right boxes, but the supporting data model does not yet carry enough
-information for retries, duplicate tasks, conflicting edits, index freshness,
-or gate evidence.
+The coherence gap is no longer missing components. It is that some operational
+records introduced in data model prose are not surfaced in API or sequence
+examples.
 
 ## Realism Compared With Production Systems
 
-Production systems in this space need to handle several messy workflows that
-are only lightly represented here:
+The dataset now handles many production concerns that were previously implicit:
 
-- Duplicate or replayed triggers from issues/webhooks/cron.
-- Worker crashes after external side effects such as branch push or PR create.
-- Parallel agents modifying the same files or generating incompatible PRs.
-- Stale repo context after the base branch changes.
-- Long-running sandboxes that need lease renewal, timeout, teardown, and
-  artifact retention policy.
-- CI provider ambiguity: pending checks, canceled runs, flaky tests, reruns, and
-  checks arriving after task state changes.
-- Secrets and egress policy per repo, task, tool, and tenant.
-- Audit retention for trajectories that may contain source code or secrets.
+- Duplicate or replayed triggers through idempotency keys.
+- Worker crash and resume through leases, attempts, and `last_event_seq`.
+- External side effects through branch/head/PR identifiers in task state.
+- Parallel edit conflicts through work-intent locks and optimistic rebase.
+- Stale retrieval through commit binding and `index_jobs` lag.
+- Gate audit through durable `gate_decisions`.
+- Tenant fairness through queue, token, and concurrency quotas.
+- Trajectory privacy through retention-class wording.
 
-The dataset does not need to solve every one in depth, but the top few should be
-visible in the mainline because they are central to an org-scale coding-agent
-platform.
+The remaining realism concerns are about explicit workflows:
+
+- API fields should expose the control-plane state callers actually need.
+- Capacity should distinguish steady-state sizing from peak overload behavior.
+- CI/CD deploy evidence should be shown as an external proof link, not only as
+  prose.
+- Security enforcement should show the path from untrusted text to allowed or
+  denied tool action.
+- Evaluation should emphasize externally grounded quality outcomes over model
+  judgment alone.
 
 ## Dataset and Renderer-Facing Observations
 
-JSON parsing succeeds. Step, pattern, and `satisfies` references resolve. Final
-design nodes and links resolve. Canonical node types are used appropriately:
-human reviewer is `actor`, trigger source is `client`, model is `model`, queue
-is `queue`, index is `index`, and external systems are `external`.
+Validation performed:
 
-There are three selected view links whose endpoint nodes are omitted:
+- `interview.json` parses as JSON.
+- The dataset has 17 top-level keys, 7 steps, 15 architecture nodes, 20
+  architecture links, 11 patterns, 6 data model entities, 12 technology-choice
+  concerns, 3 APIs, 5 follow-ups, and no `probeLinks`.
+- Step view nodes resolve to `highLevelArchitecture.nodes`.
+- Step, option, and final design view links resolve to
+  `highLevelArchitecture.links`.
+- Link endpoints used by step, option, and final views are present in each
+  selected view's node list.
+- Sequence participants and message endpoints resolve to architecture node IDs.
+- `patterns[].steps[]` and `satisfies[*].steps[]` references resolve.
 
-- `steps/context/options[1]` uses `sandbox-vcs`, whose source is `Sandbox`, but
-  the option view includes only `CodingAgent` and `VCS`.
-- `steps/async-obs` uses `dev-trigger`, whose source is `Dev`, but the view
-  omits `Dev`.
-- `steps/async-obs` uses `agent-obs`, whose source is `CodingAgent`, but the
-  view omits `CodingAgent`.
-
-Recommended fix: either add the missing endpoint nodes to those view `nodes`
-arrays or choose links whose endpoints are already visible. Otherwise Mermaid
-can render implicit nodes that do not carry the intended labels/types.
+No renderer-facing blockers were found. A browser/Mermaid visual pass would
+still be useful after future diagram changes, but there are no obvious schema or
+reference issues in the source JSON.
 
 ## Recommended Edits, Prioritized
 
-### P1: Add concrete fleet capacity and state-machine details
+### P1: Align the API with the richer task, gate, and trajectory model
 
-Add numeric capacity rows and expand `tasks` / `run_events` so async,
-resumable, exactly-once execution has leases, attempts, idempotency, branches,
-PR IDs, CI status, cancellation, and terminal reasons.
+Add request/response fields for idempotency, tenant/repo identity, base commit,
+branch/head/PR identifiers, attempt/lease status, cancellation, retry state,
+gate evidence, and trajectory retention/redaction metadata.
 
-### P1: Model gate evidence for review and deploy
+### P1: Fix the concurrency calculation and capacity diagram
 
-Add a compact `gate_decisions`, `pr_reviews`, or `deployment_evidence` model
-that records reviewer identity, policy version, required checks, risk class,
-approval state, and downstream deploy-gate proof.
+Decide whether the platform provisions for peak p95, average load plus queueing,
+or an explicit capped-overload mode. Then make the numeric row and
+`capacityDiagram` agree.
 
-### P2: Make repo-index freshness and authorization explicit
+### P2: Make gate evidence writes visible in the sequence
 
-Extend `repo_index` and/or add `index_jobs` so retrieval is tied to tenant,
-repo, commit SHA, parser version, index job state, and visibility scope.
+Show the policy snapshot, head SHA binding, required checks, reviewer/actor
+decision, and deploy evidence URL being written to `gate_decisions` or
+`DurableLog`.
 
-### P2: Bring parallel-edit conflict handling into the mainline
+### P2: Add a prompt-injection enforcement flow
 
-Add a step paragraph, deep dive, or data model for work-intent locks,
-duplicate-task detection, stale-base refresh, optimistic rebase, and conflict
-retry/cancel policy.
+Draw the boundary between untrusted repo text, guardrail/policy, Identity token
+brokering, sandbox execution, and egress denial/allowance. Define or remove the
+"trifecta" phrase.
 
-### P2: Add one or two operational sequence flows
+### P2: Strengthen fleet quality evaluation
 
-The most valuable flows would be task execution with lease/resume, index update
-and retrieval, and async trigger -> queue -> sandbox -> trajectory emission.
+Add metrics beyond merge rate and model judgment: reviewer edit distance, time
+to review, stale PRs, CI flakes/reruns, regressions/reverts, duplicate tasks,
+conflict cancellations, cost per accepted PR, and per-tenant fairness.
 
-### P3: Fix the three view endpoint omissions
+### P3: Add a little step-level narrative polish
 
-Add `Sandbox` to the no-index option view or use `agent-vcs`; add `Dev` and
-`CodingAgent` to the `async-obs` view or remove/replace `dev-trigger` and
-`agent-obs`.
+The steps currently rely mostly on recaps, diagrams, concepts, traps, and deep
+dives. One concise `overview` or `decision` sentence per step would make the
+rendered pages feel less abrupt.
 
-### P3: Consider scoped privacy/retention wording
+### P3: Consider optional book wrap-up sections
 
-Because trajectories and retrieved context can include source and secrets, add a
-sentence or field covering redaction, retention class, and who may view
-trajectory spans.
+If this case is meant to be as complete as the flagship book interviews, add
+curated `probeLinks`. The technology-choice section is now present, and both
+sections are optional, so this is not a correctness issue.
 
 ## What Not To Change
 
-- Keep the two-stage gate as the center of the case. It is the strongest and
-  most distinctive teaching point.
-- Keep CI/CD and model serving as dependencies rather than re-building those
-  systems inside this interview.
-- Keep the step order. It introduces each risk just in time and makes the final
-  design easy to reconstruct.
-- Keep the prompt-injection section focused on repo text and tool authority; it
-  is sharper than a generic "LLM safety" discussion.
+- Keep the two-gate invariant as the center of the case.
+- Keep Agentic Platform Foundations as inherited substrate; do not re-teach the
+  generic runtime, identity, inference, and observability platform here.
+- Keep the seven-step order. It builds the design naturally.
+- Keep work-intent locks and gate decisions in the mainline, not as follow-up
+  trivia.
+- Keep CI/CD and source control as external systems with clear contracts rather
+  than re-implementing them inside the platform.
 
 ## Bottom Line
 
-This is already a credible and teachable book dataset. The next revision should
-not add more boxes for their own sake; it should make the existing promises
-operational by adding capacity numbers, task lifecycle state, repo-index
-freshness, conflict handling, and durable gate evidence.
+The recent changes moved this dataset from "strong but under-modeled" to a
+credible production-oriented vertical. The next pass should focus on alignment:
+make the API match the control plane, fix the capacity math, show gate evidence
+and security enforcement in flows, and sharpen the fleet-quality metrics.

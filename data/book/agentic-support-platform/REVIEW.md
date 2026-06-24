@@ -482,12 +482,13 @@ Remaining production realism opportunities:
 
 - `interview.json` parses successfully.
 - Top-level keys are coherent for this repo: requirements, capacity, API,
-  data model, patterns, steps, final design, satisfies, interview script,
-  level variants, and follow-ups.
-- The dataset does not include `technologyChoices`; that is optional, but a
-  managed-vs-self-hosted section could help this case because channel gateway,
-  contact-center integration, vector search, workflow/orchestration, policy
-  engine, and observability choices are realistic design discussion points.
+  data model, patterns, technology choices, steps, final design, satisfies,
+  interview script, level variants, and follow-ups.
+- `technologyChoices` now covers the key managed-vs-self-hosted discussion
+  points for this case: contact-center integration, API edge/admission,
+  session state, retrieval, model serving, guardrails, action policy,
+  identity/delegation, workflow/idempotency, provider adapters, human handoff,
+  audit retention, and observability/eval.
 - All `step.view.nodes` and option view nodes resolve to high-level
   architecture nodes.
 - All `step.view.links` and option view links resolve to high-level
@@ -544,12 +545,6 @@ does not need to change.
 Show how refund abuse, social engineering, account-takeover risk, prompt
 injection, repeated attempts, and suspicious account signals lower autonomy or
 trigger proofing/escalation.
-
-### P3: Add technology choices
-
-For book completeness, consider a `technologyChoices` section covering contact
-center/channel integration, vector search/KB, policy engine, workflow/durable
-execution, identity/delegation, observability/eval, and audit storage.
 
 ### P3: Expand capacityDiagram
 

@@ -169,7 +169,7 @@
         "traits": [
           "stateful"
         ],
-        "description": "Append-only record: enrichment sources, drafts, suppression checks, approvals, sends."
+        "description": "Append-only audit_events stream (actor, action, object, decision, policy/source provenance, ts): enrichment sources, drafts, suppression checks, approvals, sends — retained for compliance."
       },
       {
         "id": "Observability",
@@ -335,10 +335,28 @@
         "label": "emit trajectory"
       },
       {
-        "id": "email-rep",
+        "id": "email-orch",
         "from": "Email",
+        "to": "Orchestrator",
+        "label": "reply webhook (classify)"
+      },
+      {
+        "id": "orch-rep",
+        "from": "Orchestrator",
         "to": "Rep",
-        "label": "qualified reply -> handoff"
+        "label": "qualified handoff"
+      },
+      {
+        "id": "id-sendgate",
+        "from": "Identity",
+        "to": "SendGate",
+        "label": "scoped act-as-rep token"
+      },
+      {
+        "id": "id-crm",
+        "from": "Identity",
+        "to": "CRM",
+        "label": "scoped CRM write"
       }
     ],
     "types": [
@@ -420,13 +438,13 @@
     },
     {
       "label": "Enrichment fan-out",
-      "value": "~2.5 calls/prospect",
-      "note": "Waterfall hits ~2.5 providers/prospect on a cache miss; ~60% cache hit on warm prospects -> ~3M cache misses/day x 2.5 ≈ 7.5M provider calls/day (~90 QPS avg, ~300 peak). Provider QPS/cost caps force async enrichment + a refresh queue for low-priority prospects."
+      "value": "~2.5 calls/miss",
+      "note": "~60% cache hit on warm prospects -> ~1.2M cache misses/day; the waterfall hits ~2.5 providers/miss -> ~3M provider calls/day (~35 QPS avg, ~100-150 peak). Provider QPS/cost caps force async enrichment + a refresh queue for low-priority prospects."
     },
     {
       "label": "Send volume vs inbox caps",
       "value": "~40-50/inbox/day",
-      "note": "A warmed inbox safely sends ~40-50 cold emails/day; ramp starts ~10-20/day. ~3M messages/day ÷ ~45 ≈ ~67k warmed inboxes across rotated domains — the binding constraint, and why sends queue and pace rather than fire on approval."
+      "note": "A warmed inbox safely sends ~40-50 cold emails/day; ramp starts ~10-20/day. ~3M prospects/day enter as first-touch emails, and multi-step sequences (~2-3 follow-ups each) push total volume higher still. Even at ~3M sends/day, ÷ ~45 ≈ ~67k warmed inboxes across rotated domains — the inbox cap, not provider throughput, is the binding constraint, and why sends queue and pace rather than fire on approval."
     },
     {
       "label": "Reputation thresholds",
@@ -516,6 +534,20 @@
       "description": "Provider callback for delivery events (delivered, bounced, complained, unsubscribed). Deduplicated on provider event id; unsubscribes and hard bounces write the global suppression list immediately and out-of-order events are reconciled by event timestamp.",
       "request": "{ \"providerEventId\": \"...\", \"messageId\": \"...\", \"event\": \"bounce|complaint|unsubscribe|delivered\", \"ts\": \"...\" }",
       "response": "{ \"accepted\": true }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/webhooks/replies",
+      "description": "Provider callback for an inbound reply. Deduped on provider event id; the orchestrator classifies intent before any rep handoff — replies never route straight to a rep. Unsubscribe/angry intent writes suppression and stops the sequence; qualified/pricing intent updates the CRM and hands off to the owning rep. Every branch appends an audit event.",
+      "request": "{ \"providerEventId\": \"...\", \"messageId\": \"...\", \"from\": \"...\", \"body\": \"...\", \"ts\": \"...\" }",
+      "response": "{ \"accepted\": true, \"classification\": \"qualified|unsubscribe|out_of_office|other\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/fleet/pause",
+      "description": "Operator emergency kill switch. Pauses sending for a tenant, domain, or the whole fleet; queued attempts transition to blocked and the durable queue holds (work is paused, not dropped). Resumed via the same endpoint with action=resume. Audited with the operator identity.",
+      "request": "{ \"scope\": \"tenant|domain|fleet\", \"target\": \"...\", \"action\": \"pause|resume\", \"reason\": \"...\" }",
+      "response": "{ \"status\": \"paused|resumed\", \"heldAttempts\": 0 }"
     },
     {
       "method": "GET",
@@ -784,23 +816,101 @@
     },
     {
       "name": "suppression",
-      "note": "Global identity-resolved opt-out / do-not-contact list (tenant-global + platform-global).",
+      "note": "Identity-resolved opt-out / do-not-contact list. Composite unique on (scope, tenant_id, identity_key); tenant_id is NULL for platform scope. Gate blocks if a platform-scope row OR a matching tenant-scope row exists.",
       "fields": [
         {
-          "name": "identity_key",
-          "type": "varchar PK"
+          "name": "suppression_id",
+          "type": "uuid PK"
         },
         {
           "name": "scope",
-          "type": "enum(tenant,global)"
+          "type": "enum(tenant,platform)"
+        },
+        {
+          "name": "tenant_id",
+          "type": "uuid null (NULL=platform)"
+        },
+        {
+          "name": "identity_key",
+          "type": "varchar (resolved)"
         },
         {
           "name": "reason",
           "type": "enum(opt_out,bounce,complaint,manual)"
         },
         {
+          "name": "source_channel",
+          "type": "enum(email,sms,phone,manual)"
+        },
+        {
           "name": "source_event_id",
           "type": "varchar (provenance)"
+        },
+        {
+          "name": "actor",
+          "type": "varchar (rep/system)"
+        },
+        {
+          "name": "ts",
+          "type": "timestamptz"
+        },
+        {
+          "name": "uniq",
+          "type": "UNIQUE(scope,tenant_id,identity_key)"
+        }
+      ]
+    },
+    {
+      "name": "audit_events",
+      "note": "First-class append-only audit trail (never updated/deleted): who approved what, which source data was used, which checks ran, and why a send was allowed or blocked. Retained for compliance; partitioned by ts.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "tenant_id",
+          "type": "uuid"
+        },
+        {
+          "name": "actor_type",
+          "type": "enum(rep,agent,system)"
+        },
+        {
+          "name": "actor_id",
+          "type": "varchar"
+        },
+        {
+          "name": "action",
+          "type": "varchar (approve,send,block,suppress,...)"
+        },
+        {
+          "name": "object_type",
+          "type": "varchar (sequence,attempt,draft,...)"
+        },
+        {
+          "name": "object_id",
+          "type": "varchar"
+        },
+        {
+          "name": "draft_version",
+          "type": "int null"
+        },
+        {
+          "name": "decision",
+          "type": "varchar null (allow/block + reason)"
+        },
+        {
+          "name": "source_event_id",
+          "type": "varchar null (provenance)"
+        },
+        {
+          "name": "policy_version",
+          "type": "varchar null (compliance ruleset)"
+        },
+        {
+          "name": "metadata",
+          "type": "jsonb"
         },
         {
           "name": "ts",
@@ -832,6 +942,178 @@
           "name": "conflict",
           "type": "jsonb null"
         }
+      ]
+    }
+  ],
+  "technologyChoices": [
+    {
+      "concern": "Email sending / deliverability",
+      "steps": [
+        "deliverability"
+      ],
+      "selfHosted": [
+        "Postfix/Haraka MTA fleet",
+        "PowerMTA"
+      ],
+      "cloud": {
+        "aws": [
+          "Amazon SES"
+        ],
+        "gcp": [
+          "SendGrid (via GCP Marketplace)"
+        ],
+        "azure": [
+          "Azure Communication Services Email"
+        ]
+      },
+      "tradeoff": [
+        "Self-hosted MTAs give full control of IP warmup and rotation but make you own reputation, feedback loops, and abuse handling.",
+        "Managed senders bootstrap deliverability and feedback loops but cap per-IP/domain control and add per-message cost.",
+        "Cold-outreach volume often needs many warmed domains/inboxes regardless of provider — the inbox cap, not the provider, is the binding constraint."
+      ]
+    },
+    {
+      "concern": "Suppression / identity lookup (sub-10ms at send)",
+      "steps": [
+        "send-gate"
+      ],
+      "selfHosted": [
+        "Redis",
+        "RocksDB"
+      ],
+      "cloud": {
+        "aws": [
+          "Amazon ElastiCache (Redis)",
+          "DynamoDB"
+        ],
+        "gcp": [
+          "Memorystore (Redis)",
+          "Cloud Bigtable"
+        ],
+        "azure": [
+          "Azure Cache for Redis",
+          "Cosmos DB"
+        ]
+      },
+      "tradeoff": [
+        "An in-memory/indexed store hits the sub-10ms send-time check but needs a durable system of record behind it.",
+        "Keep the authoritative suppression table in the primary DB; replicate a hot index for the gate."
+      ]
+    },
+    {
+      "concern": "Send queue / scheduler",
+      "steps": [
+        "deliverability",
+        "send-gate"
+      ],
+      "selfHosted": [
+        "Kafka",
+        "RabbitMQ",
+        "Temporal"
+      ],
+      "cloud": {
+        "aws": [
+          "Amazon SQS",
+          "EventBridge Scheduler"
+        ],
+        "gcp": [
+          "Pub/Sub",
+          "Cloud Tasks"
+        ],
+        "azure": [
+          "Azure Service Bus",
+          "Azure Queue Storage"
+        ]
+      },
+      "tradeoff": [
+        "The queue must be durable and support per-inbox lease/pace, not just FIFO — leasing on reputation headroom is the core behavior.",
+        "A workflow engine (Temporal) makes the send-attempt state machine and retries explicit at the cost of more infra."
+      ],
+      "makesIrrelevant": [
+        "A reputation-aware lease scheduler removes the need to hand-tune provider-API rate limiters."
+      ]
+    },
+    {
+      "concern": "CRM integration (system of record)",
+      "steps": [
+        "enrichment",
+        "handoff"
+      ],
+      "selfHosted": [
+        "Direct CRM REST/bulk APIs",
+        "Debezium CDC"
+      ],
+      "cloud": {
+        "aws": [
+          "AppFlow (Salesforce/HubSpot connectors)"
+        ],
+        "gcp": [
+          "Application Integration connectors"
+        ],
+        "azure": [
+          "Logic Apps / Power Automate connectors"
+        ]
+      },
+      "tradeoff": [
+        "Native CRM APIs give field-level control and conflict metadata but you own rate limits and sync state.",
+        "Managed iPaaS connectors speed integration but hide conflict semantics you need for safe bidirectional writes."
+      ]
+    },
+    {
+      "concern": "Audit storage (append-only, long retention)",
+      "steps": [
+        "handoff",
+        "send-gate"
+      ],
+      "selfHosted": [
+        "Kafka + object storage",
+        "ClickHouse"
+      ],
+      "cloud": {
+        "aws": [
+          "Kinesis + S3",
+          "QLDB"
+        ],
+        "gcp": [
+          "Pub/Sub + BigQuery"
+        ],
+        "azure": [
+          "Event Hubs + Data Lake Storage"
+        ]
+      },
+      "tradeoff": [
+        "An append-only stream into cheap object/columnar storage is durable and queryable for compliance replay.",
+        "A ledger DB (QLDB) gives cryptographic immutability but is harder to query and operate at high event volume."
+      ]
+    },
+    {
+      "concern": "Observability & eval (trajectories, reputation, reply quality)",
+      "steps": [
+        "handoff",
+        "deliverability"
+      ],
+      "selfHosted": [
+        "Prometheus + Grafana",
+        "OpenTelemetry",
+        "Langfuse"
+      ],
+      "cloud": {
+        "aws": [
+          "CloudWatch",
+          "Amazon Managed Grafana"
+        ],
+        "gcp": [
+          "Cloud Monitoring",
+          "Cloud Trace"
+        ],
+        "azure": [
+          "Azure Monitor",
+          "Application Insights"
+        ]
+      },
+      "tradeoff": [
+        "Deliverability metrics (bounce/spam/reply) need both real-time alerting and historical trend analysis.",
+        "LLM trajectory/eval tooling (Langfuse) is separate from infra metrics; you generally run both."
       ]
     }
   ],
@@ -897,7 +1179,7 @@
       "what": "Evaluate reply quality and qualification, and watch deliverability metrics.",
       "whenToUse": "Measuring outreach quality and reputation.",
       "steps": [
-        "deliverability"
+        "handoff"
       ]
     }
   ],
@@ -907,7 +1189,7 @@
       "title": "1. Naive: An Agent That Blasts Outreach (the baseline)",
       "description": [
         "Start with the demo: an agent drafts an email per prospect and sends them all from one domain as fast as it can.",
-        "It burns the asset it depends on. One domain blasting unverified, un-personalized mail spikes bounces and spam complaints, tanks sender reputation, and lands future mail in spam \u2014 and it ignores opt-outs and compliance. Deliverability is the scarce resource, and the naive version destroys it.",
+        "It burns the asset it depends on. One domain blasting unverified, un-personalized mail spikes bounces and spam complaints, tanks sender reputation, and lands future mail in spam \u2014 and it ignores opt-outs and compliance. Deliverability is the scarce resource, and the naive version destroys it: a burned domain takes weeks to recover, if it recovers at all.",
         "The rest of the interview adds enrichment grounding, a send gate, and deliverability infrastructure."
       ],
       "view": {
@@ -950,7 +1232,7 @@
       "id": "enrichment",
       "title": "2. Ground in the CRM + Waterfall Enrichment",
       "description": [
-        "The grounding corpus is the prospect data: the CRM as system of record, enriched through a waterfall \u2014 query data providers in sequence (primary then fallbacks), with per-field gap detection and cost control, then identity-resolve and dedupe against the CRM.",
+        "The grounding corpus is the prospect data: the CRM as system of record, enriched through a waterfall \u2014 query data providers in sequence (primary then fallbacks), stopping at the first hit per field, with gap detection and cost control, then identity-resolve and dedupe against the CRM.",
         "Personalization is grounded in this resolved profile, not in the model's guesses; enriched and scraped text is treated as untrusted."
       ],
       "view": {
@@ -986,7 +1268,7 @@
           "cons": [
             "Provider latency and outages stall the whole pipeline.",
             "Burns provider budget even on low-priority prospects.",
-            "At ~90 QPS of provider calls it doesn't fit per-provider QPS caps."
+            "At ~35 QPS avg (and bursty peaks) of provider calls it doesn't fit per-provider QPS caps."
           ],
           "view": {
             "nodes": [
@@ -1078,7 +1360,7 @@
       "id": "send-gate",
       "title": "3. The Gate: Suppression, Compliance & Approve-Before-Send",
       "description": [
-        "This is the crux. Before any message leaves, a deterministic send gate runs: check the global, identity-resolved suppression list (opt-outs and do-not-contact survive across every domain and inbox), enforce compliance (CAN-SPAM address/opt-out, GDPR, TCPA), and require rep approval for the sequence.",
+        "This is the crux. Before any message leaves, a deterministic send gate runs three checks: the global, identity-resolved suppression list (opt-outs and do-not-contact survive across every domain and inbox), compliance (CAN-SPAM address/opt-out, GDPR, TCPA), and rep approval of the sequence.",
         "Only an approved, suppression-cleared, compliant message proceeds to delivery. The gate protects sender reputation and legal standing \u2014 the analogue of the finance and legal gates, on the reputation tier."
       ],
       "view": {
@@ -1188,9 +1470,9 @@
       "concepts": [
         {
           "term": "global identity-resolved suppression",
-          "definition": "A do-not-contact / opt-out list keyed to a resolved identity, enforced across all sending domains and inboxes.",
-          "whyItMatters": "Opt-outs are legal obligations and reputation-critical; per-inbox lists leak.",
-          "example": "An unsubscribe on domain A suppresses the same person on domains B and C."
+          "definition": "A do-not-contact / opt-out list keyed to a resolved identity and a scope (tenant or platform), enforced across all sending domains and inboxes. The gate blocks a send if a platform-scope row exists for the identity, OR a tenant-scope row exists for that identity and the sending tenant.",
+          "whyItMatters": "Opt-outs are legal obligations and reputation-critical; per-inbox lists leak. Scope makes ‘this tenant only’ vs ‘the whole platform’ enforceable and queryable.",
+          "example": "An unsubscribe on domain A suppresses the same person on domains B and C; a platform-scope abuse block suppresses them for every tenant."
         }
       ],
       "whyNow": [
@@ -1295,6 +1577,16 @@
             "A provider timeout after it accepted the message is resolved by the idempotency key on retry, not by re-sending blindly.",
             "Stopping a campaign or a reputation pause transitions queued attempts to blocked before they fire."
           ]
+        },
+        {
+          "title": "Where compliance state lives (so the gate is defensible)",
+          "points": [
+            "Lawful basis / consent provenance: prospects.consent_basis on the prospect, with the source recorded in audit_events.",
+            "Footer/physical-address template version: drafts.footer_template_version, snapshotted into the immutable approved version so you can prove which CAN-SPAM footer shipped.",
+            "Policy-versioned checks: every gate decision writes audit_events.policy_version, so you can replay which compliance ruleset allowed or blocked a send.",
+            "Deletion / DSR requests: a deletion erases enriched PII (enrichment_results, prospect fields) but preserves a minimal suppression row (identity_key + reason) so the person stays opted-out after their data is gone.",
+            "Suppression provenance: suppression rows carry reason, source_channel, source_event_id, and actor — enough to defend why someone is on the list."
+          ]
         }
       ],
       "recap": {
@@ -1325,7 +1617,7 @@
       "title": "4. Deliverability as First-Class Infrastructure",
       "description": [
         "Reputation is engineered, not assumed. The deliverability manager rotates sending domains and inboxes, warms them up, enforces per-inbox volume caps, monitors bounce and spam-complaint rates against hard thresholds, and maintains SPF/DKIM/DMARC.",
-        "These reputation-driven rate limits are distinct from API limits and bound how fast the fleet may send \u2014 the queue levels outreach against them."
+        "These reputation-driven rate limits are distinct from provider API limits: a fleet can sit well under its API quota and still burn a domain. They bound how fast the fleet may send, and the queue levels outreach against them."
       ],
       "view": {
         "nodes": [
@@ -1437,6 +1729,76 @@
       "whyNow": [
         "Deliverability infrastructure is what lets the platform send at volume without self-destructing."
       ],
+      "flows": [
+        {
+          "sequence": {
+            "participants": [
+              {
+                "id": "Email",
+                "label": "Provider Callback"
+              },
+              {
+                "id": "Deliverability"
+              },
+              {
+                "id": "SendQueue",
+                "label": "Send Queue"
+              },
+              {
+                "id": "Observability",
+                "label": "Observability / Alert"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Email",
+                "to": "Deliverability",
+                "arrow": "->>",
+                "label": "bounce/spam event (deduped on event id)"
+              },
+              {
+                "from": "Deliverability",
+                "to": "Deliverability",
+                "arrow": "->>",
+                "label": "update inbox health (bounce/spam rate)"
+              },
+              {
+                "type": "alt",
+                "label": "threshold crossed (>2% bounce / >0.1% spam)",
+                "messages": [
+                  {
+                    "from": "Deliverability",
+                    "to": "SendQueue",
+                    "arrow": "->>",
+                    "label": "quarantine inbox: block queued attempts"
+                  },
+                  {
+                    "from": "Deliverability",
+                    "to": "Observability",
+                    "arrow": "->>",
+                    "label": "alert + rotate to warm domain"
+                  }
+                ],
+                "else": {
+                  "label": "within thresholds",
+                  "messages": [
+                    {
+                      "from": "Deliverability",
+                      "to": "SendQueue",
+                      "arrow": "->>",
+                      "label": "adjust cap / lease next when headroom"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Deliverability",
+            "SendQueue"
+          ]
+        }
+      ],
       "deepDives": [
         {
           "title": "Deliverability control loop and pause runbook",
@@ -1471,7 +1833,7 @@
       "id": "handoff",
       "title": "5. Qualified Handoff, Audit & Evaluation",
       "description": [
-        "Close the loop with people and measurement. Qualified replies and out-of-scope objections hand off to a human rep; the CRM is updated as the system of record. Every enrichment source, draft, suppression check, approval, and send is recorded in an append-only audit.",
+        "Close the loop with people and measurement. Inbound replies are classified first — never routed straight to a rep: unsubscribe/angry intent suppresses and stops the sequence, while qualified replies and out-of-scope objections hand off to the CRM's owning rep, with the CRM updated as the system of record. Every enrichment source, draft, suppression check, approval, and send is recorded in an append-only audit.",
         "Evaluate reply quality and qualification accuracy with trajectory eval, and watch deliverability metrics, so a high send volume never hides a reputation slide or weak targeting."
       ],
       "view": {
@@ -1484,19 +1846,21 @@
           "Observability"
         ],
         "links": [
-          "email-rep",
+          "email-orch",
+          "orch-rep",
           "orch-crm",
           "orch-log",
           "orch-obs"
         ],
         "highlight": [
+          "Orchestrator",
           "Rep",
           "AuditLog"
         ],
         "groups": [
           "delivery"
         ],
-        "caption": "Inbound replies are classified by the orchestrator; qualified ones hand off to a rep, the CRM updates, and every action is appended to an immutable audit."
+        "caption": "Inbound replies hit the orchestrator as a webhook and are classified first; qualified ones hand off to the owning rep, the CRM updates, and every action is appended to an immutable audit. Replies never bypass classification straight to a rep."
       },
       "decisionPrompt": "When should the agent stop and hand a conversation to a human?",
       "patterns": [
@@ -1618,12 +1982,34 @@
         "before": "Replies and quality were unmanaged.",
         "after": "Qualified replies hand off, the CRM updates, and quality is evaluated.",
         "newRisk": "Other verticals (HR) gate on fairness rather than reputation \u2014 see the rest of the series."
-      }
+      },
+      "traps": [
+        {
+          "trap": "Routing the handoff to the campaign owner instead of the account owner.",
+          "why": "The rep who launched the campaign often isn't the rep who owns the account in the CRM; the prospect gets a stranger and the real owner is blindsided.",
+          "instead": "Route to the CRM's owning rep for the account, not whoever started the sequence."
+        },
+        {
+          "trap": "Treating an out-of-office auto-reply as positive intent.",
+          "why": "An OOO bounce-back is not a human reply; qualifying it creates a false positive and a premature handoff.",
+          "instead": "Detect OOO, don't classify it as a reply \u2014 pause the sequence and retry after the return date."
+        },
+        {
+          "trap": "Missing an unsubscribe expressed inside a normal reply.",
+          "why": "\u2018take me off your list\u2019 in free text is a legal opt-out even without clicking unsubscribe; ignoring it keeps mailing a suppressed person.",
+          "instead": "Classify reply intent for opt-out/\u2018remove me\u2019 and suppress globally + stop the sequence before any handoff."
+        },
+        {
+          "trap": "Overwriting CRM fields during handoff.",
+          "why": "Blindly writing stage/owner/notes can clobber a rep's hand-curated data and create sync conflicts.",
+          "instead": "Write through the CRM conflict-resolution path (external version check); append context, don't overwrite curated fields."
+        }
+      ]
     }
   ],
   "finalDesign": {
     "title": "Final Design \u2014 Agentic Sales Platform",
-    "description": "Intent signals and ICP lists enter through the sales API; the SDR orchestrator enriches each prospect through an async provider waterfall (cached, provenance-bearing), identity-resolves and dedupes against the CRM (the system of record), and drafts a personalized sequence in a research agent. A rep approves a specific immutable draft version, which enqueues the send on a durable send queue rather than delivering directly. A deterministic send gate then re-checks the global identity-resolved suppression list and compliance (CAN-SPAM/GDPR; TCPA when SMS/phone is enabled) immediately before delivery, with idempotency keys on the send attempt. The deliverability manager rotates and warms domains/inboxes, derives per-inbox caps from warmup state and live bounce/spam rates, auto-pauses domains that cross thresholds, and leases queued work only when a warmed inbox has headroom. Provider callbacks (delivered/bounce/complaint/unsubscribe) are deduped and immediately update global suppression. Inbound replies are classified; qualified ones hand off to the owning rep, the CRM is updated with conflict resolution, every action is recorded in an append-only audit (with consent basis, opt-out source, and footer-template version for compliance defensibility), and reply quality plus deliverability are evaluated. The distinct queues — approval, send/scheduler, provider-retry, and the webhook/event stream — each carry different safety properties. CRM/identity, guardrails, and observability are the shared substrate from Agentic Platform Foundations, scoped per tenant; the gate protects sender reputation and compliance.",
+    "description": "Intent signals and ICP lists enter through the sales API; the SDR orchestrator enriches each prospect through an async provider waterfall (cached, provenance-bearing), identity-resolves and dedupes against the CRM (the system of record), and drafts a personalized sequence in a research agent. A rep approves a specific immutable draft version, which enqueues the send on a durable send queue rather than delivering directly. A deterministic send gate then re-checks the global identity-resolved suppression list and compliance (CAN-SPAM/GDPR; TCPA when SMS/phone is enabled) immediately before delivery, with idempotency keys on the send attempt. The deliverability manager rotates and warms domains/inboxes, derives per-inbox caps from warmup state and live bounce/spam rates, auto-pauses domains that cross thresholds, and leases queued work only when a warmed inbox has headroom. Provider callbacks (delivered/bounce/complaint/unsubscribe) are deduped and immediately update global suppression. Inbound replies arrive as their own webhook and are classified by the orchestrator before any handoff — they never route straight to a rep; qualified ones hand off to the CRM's owning rep, the CRM is updated with conflict resolution, every action is recorded in an append-only audit_events trail (actor, action, object, decision, policy/source provenance — plus consent basis, opt-out source, and footer-template version for compliance defensibility), and reply quality plus deliverability are evaluated. The identity/token broker issues scoped, short-lived act-as-rep tokens so CRM writes and sends carry delegated, attributable authority rather than the rep's own credentials. The distinct queues — approval, send/scheduler, provider-retry, and the webhook/event stream — each carry different safety properties. CRM/identity, guardrails, and observability are the shared substrate from Agentic Platform Foundations, scoped per tenant; the gate protects sender reputation and compliance.",
     "view": {
       "nodes": [
         "Rep",
@@ -1656,6 +2042,8 @@
         "orch-draft",
         "draft-rep",
         "rep-id",
+        "id-sendgate",
+        "id-crm",
         "orch-sendqueue",
         "sendqueue-sendgate",
         "sendgate-supp",
@@ -1669,7 +2057,8 @@
         "orch-guard",
         "orch-log",
         "orch-obs",
-        "email-rep"
+        "email-orch",
+        "orch-rep"
       ],
       "groups": [
         "research",
@@ -1748,7 +2137,7 @@
       },
       {
         "requirement": "Auditable",
-        "how": "Enrichment provenance, immutable approved drafts, suppression checks, approvals, send attempts, and deduped webhooks recorded append-only with retention for compliance defensibility.",
+        "how": "A first-class append-only audit_events trail (actor, action, object, decision, policy_version, source provenance) records enrichment sources, immutable approved drafts, suppression checks, approvals, send attempts, and deduped webhooks, retained for compliance defensibility.",
         "steps": [
           "handoff",
           "send-gate"

@@ -61,7 +61,7 @@
         currentFlowIndex: 0,    // per-step (reset on entry change)
         currentDiagramView: "focus",
         visualMode: "diagram",    // "diagram" | "ai" — Diagram vs AI Visual tab (reset per entry)
-        defaultVisual: "diagram", // "diagram" | "ai" — user Settings preference for which visual leads (persisted)
+        defaultVisual: "ai",      // "diagram" | "ai" — user Settings preference for which visual leads (persisted); defaults to AI visual, falling back to the Mermaid diagram when no AI visual exists
         diagramDirection: "TB",   // step/final-design layout; toggled TB<->LR (reset per entry)
         hiddenNodes: new Set(),   // node ids toggled off in the current diagram (reset per entry)
     };

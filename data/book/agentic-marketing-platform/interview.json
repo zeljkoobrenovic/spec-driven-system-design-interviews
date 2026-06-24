@@ -39,7 +39,7 @@
         "traits": [
           "stateless"
         ],
-        "description": "Plans the campaign and fans out per-channel asset generation; runs the optimization loop."
+        "description": "Plans the campaign and fans out per-channel asset generation; runs the optimization loop. Submits cleared, approved assets to the delivery workflow rather than calling channels directly, so retries, partial-failure, and publish-attempt state are durable."
       },
       {
         "id": "GenAgent",
@@ -80,7 +80,17 @@
         "traits": [
           "stateless"
         ],
-        "description": "Deterministic checks: prohibited/negative claims, regulatory claims, brand-voice conformance."
+        "description": "Deterministic claim/regulatory checks (negative-claim library, required disclosures, blocked phrases) plus model-judged brand-voice conformance with a threshold and evidence."
+      },
+      {
+        "id": "DeliveryWorkflow",
+        "label": "Delivery Workflow / Queue",
+        "type": "queue",
+        "category": "async",
+        "traits": [
+          "stateful"
+        ],
+        "description": "Durable publish state machine: holds publish_attempts per provider, enforces generation concurrency, per-tenant spend caps, and per-provider token buckets, and owns retries, backoff, and dead-letter handling."
       },
       {
         "id": "Provenance",
@@ -252,10 +262,34 @@
         "label": "approve launch"
       },
       {
+        "id": "orch-deliver",
+        "from": "Orchestrator",
+        "to": "DeliveryWorkflow",
+        "label": "submit publish attempt"
+      },
+      {
+        "id": "deliver-guard",
+        "from": "DeliveryWorkflow",
+        "to": "Guardrail",
+        "label": "final policy + approval re-check"
+      },
+      {
+        "id": "deliver-id",
+        "from": "DeliveryWorkflow",
+        "to": "Identity",
+        "label": "scoped channel token"
+      },
+      {
         "id": "id-channels",
         "from": "Identity",
         "to": "Channels",
         "label": "deliver approved asset"
+      },
+      {
+        "id": "channels-deliver",
+        "from": "Channels",
+        "to": "DeliveryWorkflow",
+        "label": "delivery callback (deduped)"
       },
       {
         "id": "channels-cdp",
@@ -329,7 +363,8 @@
           "ClaimGate",
           "Provenance",
           "AssetStore",
-          "Marketer"
+          "Marketer",
+          "DeliveryWorkflow"
         ]
       },
       {
@@ -389,7 +424,7 @@
     {
       "label": "Generation cost",
       "value": "~200k LLM + ~80k image calls/day",
-      "note": "Peak ~10 generations/sec; cap concurrent jobs (~500) and meter per-tenant token/image budget to bound spend."
+      "note": "Peak ~10 generations/sec; the delivery workflow admits jobs against a concurrency cap (~500) and meters per-tenant token/image budget to bound spend."
     },
     {
       "label": "Approval queue",
@@ -399,7 +434,7 @@
     {
       "label": "Channel delivery",
       "value": "provider rate-limited",
-      "note": "Each ad/email/SMS provider has its own QPS cap; level bursts through a delivery queue with per-provider token buckets and backoff."
+      "note": "Each ad/email/SMS provider has its own QPS cap; the delivery workflow levels bursts through per-provider token buckets, owns retry/backoff and dead-letter handling, and tracks each publish_attempt so partial failure across channels is recoverable."
     },
     {
       "label": "Performance events",
@@ -409,7 +444,7 @@
     {
       "label": "Bandit cadence",
       "value": "reallocate every ~15 min",
-      "note": "Budget reallocation runs per campaign on a fixed interval over only currently-cleared variants; regeneration re-enters the gate."
+      "note": "Budget reallocation runs per campaign on a fixed interval over only currently-cleared variants; stale analytics freezes allocation and low-traffic campaigns fall back to a fixed split; regeneration re-enters the gate."
     },
     {
       "label": "Audit retention",
@@ -482,6 +517,61 @@
       "description": "A brand owner approves a specific immutable asset version; the approval snapshots the claim-library version and expires if the library changes. Idempotent via Idempotency-Key.",
       "request": "{ \"decision\": \"approve|revise|reject\", \"comment\": \"...\" }",
       "response": "{ \"approvalId\": \"...\", \"status\": \"approved|returned|rejected\", \"expiresAt\": \"...\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/assets/{assetVersionId}/publish",
+      "description": "Submit an approved asset version to the delivery workflow, which opens a publish_attempt, re-checks policy/approval validity, and fans out per-provider deliveries. Idempotent via Idempotency-Key so a retried publish returns the same attempt rather than double-publishing.",
+      "request": "{ \"channels\": [\"email\",\"social\"], \"scheduleAt\": \"...\" }",
+      "response": "{ \"attemptId\": \"...\", \"state\": \"admitted\" }",
+      "sequence": {
+        "participants": [
+          {
+            "id": "Orchestrator"
+          },
+          {
+            "id": "DeliveryWorkflow",
+            "label": "Delivery Workflow"
+          },
+          {
+            "id": "Guardrail",
+            "label": "Policy & Compliance"
+          },
+          {
+            "id": "Identity",
+            "label": "Token Broker"
+          },
+          {
+            "id": "Channels"
+          }
+        ],
+        "messages": [
+          {
+            "from": "Orchestrator",
+            "to": "DeliveryWorkflow",
+            "arrow": "->>",
+            "label": "submit publish attempt (idempotency key)"
+          },
+          {
+            "from": "DeliveryWorkflow",
+            "to": "Guardrail",
+            "arrow": "->>",
+            "label": "re-check policy + approval validity"
+          },
+          {
+            "from": "DeliveryWorkflow",
+            "to": "Identity",
+            "arrow": "->>",
+            "label": "scoped channel token"
+          },
+          {
+            "from": "Identity",
+            "to": "Channels",
+            "arrow": "->>",
+            "label": "submit per provider (retry/backoff)"
+          }
+        ]
+      }
     },
     {
       "method": "POST",
@@ -675,12 +765,50 @@
       ]
     },
     {
+      "name": "publish_attempts",
+      "note": "Durable workflow state for one approved asset version's publish across channels; fans out to per-provider deliveries and survives retries, pause, and partial failure.",
+      "fields": [
+        {
+          "name": "attempt_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "asset_version_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "approval_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "state",
+          "type": "enum(admitted,policy_rechecked,submitting,partially_delivered,delivered,paused,failed,dead_letter)"
+        },
+        {
+          "name": "idempotency_key",
+          "type": "varchar UNIQUE"
+        },
+        {
+          "name": "next_retry_at",
+          "type": "timestamptz"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
       "name": "deliveries",
-      "note": "One channel delivery attempt per provider; webhook dedupe key makes callbacks idempotent.",
+      "note": "One channel delivery attempt per provider under a publish_attempt; webhook dedupe key makes callbacks idempotent.",
       "fields": [
         {
           "name": "delivery_id",
           "type": "uuid PK"
+        },
+        {
+          "name": "attempt_id",
+          "type": "uuid FK"
         },
         {
           "name": "asset_version_id",
@@ -718,7 +846,7 @@
     },
     {
       "name": "consent",
-      "note": "Per-recipient consent/suppression by channel and region; checked at activation.",
+      "note": "Per-recipient consent/suppression by channel, region, and purpose, with legal basis and suppression reason; checked at activation. Append-only; a deletion/DSR request tombstones the subject without rewriting audit history.",
       "fields": [
         {
           "name": "consent_id",
@@ -741,11 +869,57 @@
           "type": "varchar"
         },
         {
+          "name": "purpose",
+          "type": "enum(marketing,transactional,service)"
+        },
+        {
+          "name": "legal_basis",
+          "type": "enum(consent,legitimate_interest,contract)"
+        },
+        {
           "name": "state",
           "type": "enum(opted_in,opted_out,suppressed)"
         },
         {
+          "name": "suppression_reason",
+          "type": "enum(user_optout,bounce,complaint,dsr_deletion,provider_revoked,null)"
+        },
+        {
           "name": "updated_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "channel_policy_versions",
+      "note": "Versioned per-channel/region disclosure and template rules; activation snapshots the policy version it enforced, so a rule change re-checks in-flight publishes.",
+      "fields": [
+        {
+          "name": "policy_version_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "channel",
+          "type": "enum(email,sms,push,ads)"
+        },
+        {
+          "name": "region",
+          "type": "varchar"
+        },
+        {
+          "name": "rules",
+          "type": "jsonb (disclosure, opt-out, frequency caps)"
+        },
+        {
+          "name": "template_id",
+          "type": "varchar"
+        },
+        {
+          "name": "template_approval",
+          "type": "enum(pending,approved,revoked)"
+        },
+        {
+          "name": "effective_at",
           "type": "timestamptz"
         }
       ]
@@ -1043,10 +1217,12 @@
     },
     {
       "name": "Queue-based load leveling; admission control",
-      "what": "Level bursty generation and channel delivery.",
+      "what": "The delivery workflow levels bursty generation and channel delivery, admitting jobs against concurrency/spend caps and per-provider token buckets.",
       "whenToUse": "Large multi-channel campaigns.",
       "steps": [
-        "naive"
+        "naive",
+        "brand-gate",
+        "compliance"
       ]
     }
   ],
@@ -1057,6 +1233,7 @@
       "description": [
         "Start with the demo: an agent reads a brief and posts copy and images straight to the channels.",
         "It looks productive and is brand-unsafe. Nothing checks the assets against brand voice or the prohibited-claim list, synthetic images go out with no disclosure, and there's no human sign-off on a regulated claim. A bad asset published in the brand's name is public reputation damage.",
+        "There is a second, quieter failure too: unbounded generation across channels and variants runs up LLM/image spend and slams each provider's delivery API past its rate limit, with no concurrency cap, per-tenant budget, or queue to absorb the burst.",
         "The rest of the interview adds grounding, a claim gate, approval, and a measured optimization loop."
       ],
       "view": {
@@ -1191,7 +1368,7 @@
       ],
       "recap": {
         "before": "Assets used generic model style.",
-        "after": "Assets are grounded in brand voice and approved material.",
+        "after": "Assets are grounded in brand voice and approved material, and each records the brand-kit and claim-library version it used — the snapshot a later approval is tied to, so a kit/library change can expire pending approvals.",
         "newRisk": "Grounding biases toward on-brand but doesn't guarantee no prohibited claim slips through."
       }
     },
@@ -1199,7 +1376,7 @@
       "id": "brand-gate",
       "title": "3. The Gate: Brand & Claim Review + C2PA Provenance",
       "description": [
-        "This is the crux. A deterministic reviewer screens every asset against the negative-claim library and regulatory-claim rules, and checks brand-voice conformance; synthetic media is stamped with C2PA provenance for disclosure. High-risk (regulated/financial/claim) assets require a brand owner's approval; low-risk variants flow under policy.",
+        "This is the crux. The reviewer combines two distinct paths: deterministic claim/regulatory checks (the negative-claim library, required disclosures, and blocked phrases enforced as rules) plus model-judged brand-voice conformance with a threshold, evidence, and escalation on low scores. Synthetic media is stamped with C2PA provenance for disclosure. High-risk (regulated/financial/claim) assets require a brand owner's approval; low-risk variants flow under policy.",
         "Nothing publishes in the brand's name until it clears the gate \u2014 the reputational analogue of the finance and legal gates, one notch lower on the irreversibility gradient."
       ],
       "view": {
@@ -1327,8 +1504,8 @@
                 "label": "Brand Owner"
               },
               {
-                "id": "Identity",
-                "label": "Token Broker"
+                "id": "DeliveryWorkflow",
+                "label": "Delivery Workflow"
               },
               {
                 "id": "Channels"
@@ -1339,7 +1516,7 @@
                 "from": "Orchestrator",
                 "to": "ClaimGate",
                 "arrow": "->>",
-                "label": "review asset"
+                "label": "deterministic claim check + voice judge"
               },
               {
                 "type": "alt",
@@ -1349,25 +1526,25 @@
                     "from": "ClaimGate",
                     "to": "Marketer",
                     "arrow": "->>",
-                    "label": "require approval (snapshot version)"
+                    "label": "require approval (snapshot claim-lib version)"
                   },
                   {
                     "from": "Marketer",
                     "to": "Orchestrator",
                     "arrow": "-->>",
-                    "label": "approve"
+                    "label": "approve specific version"
                   },
                   {
                     "from": "Orchestrator",
-                    "to": "Identity",
+                    "to": "DeliveryWorkflow",
                     "arrow": "->>",
-                    "label": "scoped channel token"
+                    "label": "submit publish attempt (idempotent)"
                   },
                   {
-                    "from": "Identity",
+                    "from": "DeliveryWorkflow",
                     "to": "Channels",
                     "arrow": "->>",
-                    "label": "activate (idempotent)"
+                    "label": "re-check approval, then activate"
                   }
                 ],
                 "else": {
@@ -1375,12 +1552,12 @@
                   "messages": [
                     {
                       "from": "Orchestrator",
-                      "to": "Identity",
+                      "to": "DeliveryWorkflow",
                       "arrow": "->>",
-                      "label": "scoped channel token"
+                      "label": "submit publish attempt (idempotent)"
                     },
                     {
-                      "from": "Identity",
+                      "from": "DeliveryWorkflow",
                       "to": "Channels",
                       "arrow": "->>",
                       "label": "activate under policy"
@@ -1392,7 +1569,7 @@
           },
           "highlight": [
             "ClaimGate",
-            "Marketer"
+            "DeliveryWorkflow"
           ]
         }
       ],
@@ -1401,10 +1578,11 @@
           "title": "The publish-attempt lifecycle is a state machine, not a flag",
           "points": [
             "Asset versions are immutable: generated -> claim_checked -> awaiting_approval -> approved -> live, with paused/superseded/rejected as off-ramps; a regenerated variant is a new version that supersedes, never a mutation.",
+            "Publishing is its own durable workflow: a publish_attempt (admitted -> policy_rechecked -> submitting -> partially_delivered -> delivered, with paused/failed/dead_letter off-ramps) fans out to one delivery row per provider, so one channel succeeding while another fails is a recoverable partial state, not a lost publish.",
             "create/approve/publish are idempotent (idempotency keys), so retries don't double-publish and a provider accepting a request after a timeout is safe.",
             "Re-check compliance and approval validity immediately before activation: an approval expires if the negative-claim library changed since it was snapshotted.",
-            "Provider callbacks are deduped into append-only delivery events, so duplicate or out-of-order webhooks converge.",
-            "An emergency pause removes an asset version's arms from the bandit and stops new submissions; rollback reverts to a prior approved version."
+            "Provider callbacks are deduped into append-only delivery events, so duplicate or out-of-order webhooks converge; exhausted retries land in a dead-letter for operator attention.",
+            "An emergency pause removes an asset version's arms from the bandit and stops new submissions even mid-attempt; rollback reverts to a prior approved version."
           ]
         }
       ],
@@ -1564,18 +1742,31 @@
           "why": "It will reallocate budget to an arm that has since been paused, revoked, or whose claim status regressed — optimizing into a brand-safety incident.",
           "instead": "Restrict eligible arms to those with current cleared status and valid approval; remove an arm the moment its safety metrics regress."
         }
+      ],
+      "deepDives": [
+        {
+          "title": "Bandit guardrails: the loop must fail closed",
+          "points": [
+            "Eligible arms are materialized from current approvals/claim status at decision time, not cached; a paused, superseded, or regressed arm is dropped before allocation, never after.",
+            "Reward is conversions within a configured attribution window (not raw clicks); because conversions land late, the bandit discounts arms with too little settled data instead of overfitting a short window.",
+            "Exploration is bounded by hard constraints checked before each decision: per-campaign budget pacing, per-recipient frequency caps, and audience/segment exclusion and fairness caps so no segment is over-targeted.",
+            "Stale or missing analytics freezes allocation at the last safe split rather than exploring blind; the same applies if the brand-safety/eval feed is unavailable.",
+            "Low-traffic and cold-start campaigns fall back to a fixed A/B or rules-based split until each arm has enough settled data to estimate reward."
+          ]
+        }
       ]
     },
     {
       "id": "compliance",
       "title": "5. Channel Compliance, Personalization & Audit",
       "description": [
-        "Activation has rules. Email/SMS must honor CAN-SPAM/TCPA (suppression, opt-out), GDPR governs personalization data, and personalization pulls from the CDP at activation. Brief text and external content are untrusted input and are partitioned from channel authority.",
-        "Every asset, claim check, approval, provenance stamp, and delivery is recorded in an append-only audit, because brand liability stays with the company."
+        "Activation has rules. Compliance is not one boolean: it is consent scoped by recipient, channel, region, and purpose, with a legal basis (consent / legitimate interest / contract); a versioned channel policy (disclosure and frequency rules); and a provider template that can be pending, approved, or revoked. Email/SMS must honor CAN-SPAM/TCPA (suppression, opt-out), GDPR governs personalization data and deletion/DSR, and personalization pulls from the CDP at activation. Brief text and external content are untrusted input and are partitioned from channel authority.",
+        "Every asset, claim check, approval, provenance stamp, and delivery is recorded in an append-only audit, because brand liability stays with the company. A DSR/deletion request tombstones the recipient (suppression_reason = dsr_deletion) without rewriting the audit history that retention obligations require."
       ],
       "view": {
         "nodes": [
           "Orchestrator",
+          "DeliveryWorkflow",
           "Guardrail",
           "Identity",
           "CDP",
@@ -1584,15 +1775,18 @@
         ],
         "links": [
           "orch-guard",
-          "channels-cdp",
+          "orch-deliver",
+          "deliver-guard",
+          "deliver-id",
           "id-channels",
+          "channels-cdp",
           "orch-log"
         ],
         "highlight": [
           "Guardrail",
           "AuditLog"
         ],
-        "caption": "Channel rules (CAN-SPAM/TCPA/GDPR) and CDP personalization run under policy via a delegated channel token; everything is audited."
+        "caption": "Cleared assets enter the delivery workflow, which re-checks channel rules (CAN-SPAM/TCPA/GDPR) and approval validity before a delegated channel token activates them; everything is audited."
       },
       "decisionPrompt": "Where do channel-compliance rules live so the bandit can't optimize past them?",
       "patterns": [
@@ -1647,11 +1841,11 @@
                 "from": "Orchestrator",
                 "to": "Guardrail",
                 "arrow": "->>",
-                "label": "final policy check (consent, region, template)"
+                "label": "final check (consent+purpose, policy version, template approval, approval validity)"
               },
               {
                 "type": "alt",
-                "label": "consent / approval still valid",
+                "label": "consent / approval / template still valid",
                 "messages": [
                   {
                     "from": "Guardrail",
@@ -1673,13 +1867,13 @@
                   }
                 ],
                 "else": {
-                  "label": "opted out / approval expired",
+                  "label": "opted out / approval expired / template revoked",
                   "messages": [
                     {
                       "from": "Guardrail",
                       "to": "AuditLog",
                       "arrow": "->>",
-                      "label": "suppress + record reason"
+                      "label": "suppress + record suppression_reason"
                     }
                   ]
                 }
@@ -1705,7 +1899,9 @@
           "points": [
             "Audit trails are mandatory because the brand owns what publishes.",
             "C2PA provenance supports synthetic-media disclosure obligations.",
-            "Treat scraped/competitive content and brief text as untrusted."
+            "Treat scraped/competitive content and brief text as untrusted.",
+            "Compliance has versioned semantics: consent is scoped by purpose and legal basis, channel policy and provider templates are versioned and can be revoked, and the activation snapshot records which versions it enforced.",
+            "DSR/deletion and append-only audit retention conflict only superficially: tombstone the recipient (suppression_reason = dsr_deletion) and drop personal data from the operational consent record, while keeping the de-identified audit events retention requires."
           ]
         }
       ],
@@ -1759,7 +1955,7 @@
         {
           "trap": "Treating brand-safety eval as a dashboard to watch.",
           "why": "Monitoring tells you after the fact; a model, prompt, reviewer, retrieval, or brand-kit change can quietly raise claim-violation or off-brand rates.",
-          "instead": "Make offline/shadow eval a release gate: block a rollout that increases claim-violation or off-brand rates beyond a threshold."
+          "instead": "Make offline/shadow eval a release gate with concrete numbers — e.g. block a prompt/model/reviewer rollout if shadow eval raises the claim-violation rate above 0.1% or drops the median brand-voice score below 0.8 against the held-out set."
         }
       ],
       "recap": {
@@ -1771,7 +1967,7 @@
   ],
   "finalDesign": {
     "title": "Final Design \u2014 Agentic Marketing Platform",
-    "description": "A brief enters through the marketing API; the campaign orchestrator fans per-channel generation out to content agents grounded in the brand kit / DAM. A deterministic reviewer screens every asset against the negative-claim library and regulatory rules and checks brand voice; synthetic media is stamped with C2PA provenance. High-risk assets require a brand owner's approval; cleared assets activate on channels with CDP personalization under channel-compliance rules (CAN-SPAM/TCPA/GDPR). A bandit reallocates budget from live analytics and regenerates around winners \u2014 each new variant re-entering the claim gate. Everything is recorded in an append-only audit, and brand-safety (claim-violation rate) and performance are evaluated. Generation, guardrails, identity, and observability are the shared substrate from Agentic Platform Foundations; the gate protects the brand's public reputation.",
+    "description": "A brief enters through the marketing API; the campaign orchestrator fans per-channel generation out to content agents grounded in the brand kit / DAM. The reviewer applies deterministic claim/regulatory checks (negative-claim library, required disclosures, blocked phrases) plus model-judged brand-voice conformance; synthetic media is stamped with C2PA provenance. High-risk assets require a brand owner's approval; cleared, approved assets are submitted to a durable delivery workflow that owns publish-attempt state, re-checks policy and approval validity, enforces per-provider token buckets, and handles retries, partial failure, pause, and rollback. It activates on channels with CDP personalization under channel-compliance rules (CAN-SPAM/TCPA/GDPR), re-checking consent and template approval just before each provider submission. A policy-constrained bandit reallocates budget from live analytics over only currently-cleared, approved arms and regenerates around winners \u2014 each new variant re-entering the claim gate. Everything is recorded in an append-only audit, and brand-safety (claim-violation rate) and performance are evaluated. Generation, guardrails, identity, and observability are the shared substrate from Agentic Platform Foundations; the gate protects the brand's public reputation.",
     "view": {
       "nodes": [
         "Marketer",
@@ -1784,6 +1980,7 @@
         "ClaimGate",
         "Provenance",
         "AssetStore",
+        "DeliveryWorkflow",
         "Channels",
         "CDP",
         "Analytics",
@@ -1805,7 +2002,11 @@
         "orch-assets",
         "assets-marketer",
         "marketer-id",
+        "orch-deliver",
+        "deliver-guard",
+        "deliver-id",
         "id-channels",
+        "channels-deliver",
         "channels-cdp",
         "channels-analytics",
         "analytics-bandit",
@@ -1841,7 +2042,7 @@
       },
       {
         "requirement": "Review claims before launch",
-        "how": "Deterministic negative-claim and brand-voice review.",
+        "how": "Deterministic claim/regulatory checks plus model-judged brand-voice conformance.",
         "steps": [
           "brand-gate"
         ]
@@ -1878,14 +2079,14 @@
       },
       {
         "requirement": "Channel compliance",
-        "how": "CAN-SPAM/TCPA/GDPR enforced at activation.",
+        "how": "Consent (by recipient, channel, region, purpose), versioned channel policy, and template approval re-checked at activation; CAN-SPAM/TCPA/GDPR enforced before provider submission.",
         "steps": [
           "compliance"
         ]
       },
       {
         "requirement": "Auditable",
-        "how": "Append-only record of assets, checks, approvals, deliveries.",
+        "how": "Append-only record of assets, claim checks, approvals, provenance stamps, and deliveries.",
         "steps": [
           "compliance"
         ]
@@ -1934,7 +2135,7 @@
       "phase": "Operate",
       "time": "last 5 min",
       "say": [
-        "Brand-safety eval (claim-violation rate) alongside performance."
+        "Brand-safety eval (claim-violation rate) alongside performance, as a release gate on prompt/model/reviewer rollouts — not just a dashboard."
       ]
     }
   ],

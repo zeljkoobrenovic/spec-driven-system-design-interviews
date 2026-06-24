@@ -5,297 +5,394 @@ Review date: 2026-06-24
 
 ## Executive Summary
 
-This is a coherent and memorable agentic marketing case. The core teaching idea is strong: the dangerous action is not moving money or filing legal work, but publishing under the brand's name. The walkthrough correctly centers brand grounding, a deterministic claim gate, C2PA provenance, risk-tiered approval, channel compliance, and a generate -> serve -> measure -> reallocate loop.
+The recent changes materially improve this case. The dataset is no longer just
+a strong concept skeleton: it now has quantitative capacity assumptions,
+idempotent API endpoints, a durable workflow-oriented data model, real option
+branches in the grounding/gate/optimization steps, a publish-attempt lifecycle
+deep dive, a compliance activation flow, technology choices, and credible probe
+links.
 
-The current dataset is a strong skeleton, but it is not yet production-deep. Capacity is qualitative, the API and data model are too small for the workflow promised by the architecture, the bandit loop is under-specified, and compliance/consent state is mostly named rather than designed. The biggest renderer-facing problem is that several step views reference links whose endpoints are hidden in that step, so Mermaid may create implicit nodes or render confusing diagrams.
+The core teaching idea remains crisp: the dangerous action is publishing in the
+brand's name. The walkthrough now does a good job showing how brand grounding,
+claim review, C2PA provenance, approval, channel compliance, constrained
+optimization, and eval combine into a marketing-specific agentic platform.
+
+The remaining gaps are mostly depth and precision rather than missing blocks.
+The publish lifecycle is described in a deep dive but not fully surfaced in the
+architecture or API. Compliance has the right activation-time check, but the
+policy/consent model is still compact. The bandit is correctly constrained, but
+its reward model, pacing behavior, and low-traffic/cold-start behavior need
+more detail. The dataset is now renderer-clean in the structural checks I ran.
 
 | Axis | Rating | Notes |
 | --- | --- | --- |
-| System design soundness | 3.5/5 | Correct major components and risk boundary; missing state, workflow, and scaling detail. |
-| Production realism | 3/5 | Good instincts around brand safety and compliance; thin on provider callbacks, consent, idempotency, queues, attribution, and operations. |
-| Pedagogical flow | 3.5/5 | Clear baseline -> grounding -> gate -> optimization -> compliance -> eval arc, but almost no decision branches. |
-| Dataset/rendering fit | 3/5 | JSON and references parse, but several step diagrams include links with hidden endpoint nodes. |
-| Overall | 3.5/5 | A good vertical concept that needs production state and richer interview trade-offs to become a flagship book case. |
+| System design soundness | 4.2/5 | Strong component set, capacity math, state model, and safety invariant; lifecycle and compliance details can go deeper. |
+| Production realism | 4.0/5 | Much better on idempotency, callbacks, approval snapshots, pause, consent, and provider throttling; still needs fuller policy/version semantics. |
+| Pedagogical flow | 4.1/5 | Clear baseline -> grounding -> gate -> optimization -> compliance -> eval arc, now with useful options. |
+| Dataset/rendering fit | 4.5/5 | JSON parses, references resolve, step/option/final views are endpoint-complete, and supporting book fields are present. |
+| Overall | 4.2/5 | A strong book case after the recent pass; remaining edits are mostly about making operational edge cases explicit enough for a Staff-level answer. |
 
 ## What Works Well
 
-- The domain risk is crisp: public brand damage from off-brand, prohibited, or undisclosed synthetic content.
-- The naive baseline works because it makes auto-publishing visibly unsafe before adding controls.
-- The brand kit / DAM is the right marketing-specific grounding source, and it is scoped per tenant.
-- The claim gate is correctly outside the model. The model can draft, but deterministic policy decides what can publish.
-- The bandit loop is a good marketing-specific value driver, and the dataset correctly says regenerated variants must re-enter the gate.
-- C2PA provenance is introduced as a concrete vertical requirement instead of a generic "audit" phrase.
-- The final design integrates grounding, review, approval, activation, personalization, analytics, optimization, audit, and evaluation in a compact way.
+- The domain risk is memorable: not money movement or legal filing, but public
+  brand/reputation damage from a generated asset.
+- Capacity now drives design: tenants, campaigns/day, assets/campaign,
+  generation calls, approval queue, event volume, bandit cadence, and audit
+  retention are all concrete.
+- The API now includes idempotent campaign creation, version-specific approval,
+  delivery webhook dedupe, emergency pause, and performance reads.
+- The data model now supports the promised workflow with `campaigns`,
+  `asset_versions`, `claim_checks`, `approvals`, `deliveries`, `consent`,
+  `performance_events`, `bandit_decisions`, and `audit_record`.
+- The option branches are useful and non-strawman: versioned retrieval vs raw
+  prompt context, deterministic+judge gate vs model-only self-check, and
+  constrained bandit vs unconstrained bandit vs fixed A/B.
+- Step 3's lifecycle deep dive directly addresses the previous review's biggest
+  concern: immutable versions, idempotency, re-check before activation, callback
+  dedupe, pause, and rollback.
+- Step 5's sequence flow now shows a real activation path: fetch audience,
+  final policy check, scoped token, idempotent submit, deduped delivery webhook,
+  and suppression when consent/approval is invalid.
+- `technologyChoices` and `toProbeFurther` are now present and relevant to this
+  vertical: DAM/search, C2PA signing, workflow/queues, event analytics, consent,
+  bandits, and prompt-injection safety.
 
 ## Highest-Impact Issues
 
-### 1. Capacity is qualitative, so it does not drive architecture
+### 1. The publish lifecycle is still mostly a deep dive, not a first-class path
 
-The `capacity` section has useful labels, but no numbers. It says asset fan-out is "many per brief", approval is "risk-tiered", and optimization is "live". That does not tell a candidate what must be queued, cached, throttled, or stored.
+The lifecycle deep dive is good, but the main architecture still jumps from
+generation/gate/approval to channels. There is no explicit delivery workflow
+node, publish-attempt entity, or publish endpoint. The data model has
+`deliveries`, but the candidate has to infer the state machine from scattered
+API descriptions, the Step 3 deep dive, and the Step 5 flow.
 
-Why it matters: this system's hard constraints are generated variants per campaign, model/image-generation cost, channel-provider rate limits, approval latency, event volume, attribution delay, and bandit decision cadence. Without sizing, the architecture can mention batch generation and live optimization without proving that it can survive bursts or avoid runaway spend.
+Why it matters: the hardest production bugs live in the publish attempt:
+approval expires after a claim-library update, a provider accepts after timeout,
+callbacks arrive twice or out of order, a pause races with delivery, or one
+channel succeeds while another fails.
 
-Concrete fix: add interview-scale assumptions and derived workloads:
+Concrete fix: add either a small delivery workflow node or a Step 3/5 diagram
+variant that explicitly models `publish_attempts` / workflow state. Consider a
+`POST /v1/campaigns/{id}/publish` or `POST /v1/assets/{assetVersionId}/deliver`
+endpoint if the interview wants the submit/approve/publish boundary to be
+clearer.
 
-- tenants, campaigns/day, channels/campaign, and variants/channel
-- assets generated per brief and regenerated per optimization cycle
-- expected LLM/image calls, token/image cost, and max concurrent generation jobs
-- approval queue volume and high-risk percentage
-- channel delivery rate limits and provider callback volume
-- impressions/click/conversion event rate feeding analytics
-- bandit decision interval and budget-reallocation frequency
-- audit/event retention size and query pattern
+### 2. Compliance is directionally right but still compressed
 
-### 2. The API and data model cannot support the promised workflow
+The dataset now models consent and final activation checks, which is a major
+improvement. The remaining issue is that real marketing compliance is not just
+recipient/channel/region. It also depends on purpose, legal basis, policy
+version, provider template approval, suppression source, deletion/DSR state, and
+audit-retention exceptions.
 
-The API has only create campaign, approve campaign, and get performance. The data model has only `assets`, `variants`, and `audit_record`. That is enough to explain the idea, but not enough to implement risk-tiered approval, compliance, channel delivery, provenance, and optimization.
+Why it matters: a candidate can say "check consent at activation" and still miss
+the hard edge cases: opted-out after approval, regional disclosure changes,
+template revoked by provider, user deletion request, or conflicting retention
+requirements.
 
-Missing state includes:
+Concrete fix: enrich the compliance section with policy versioning and purpose:
+`channel_policy_versions`, `suppression_reason`, `legal_basis`, `purpose`, and
+a note on DSR/deletion vs append-only audit. This does not need many more
+tables, but the semantics should be explicit.
 
-- `campaigns` with tenant, goal, budget, schedule, locale/region, status, and idempotency key
-- brand-kit and negative-claim library versions used for generation and review
-- generated asset versions with prompt/model provenance, risk tier, reviewer version, and approval snapshot
-- claim-check results as first-class evidence, not just `claim_status`
-- approval decisions with approver identity, asset version, timestamp, comments, and expiry/revocation behavior
-- channel deliveries with provider id, status, retry count, failure reason, template approval, and webhook dedupe key
-- consent, suppression, unsubscribe, and preference records by tenant/channel/region
-- performance events and attribution windows, not only aggregate counters on `variants`
-- bandit decisions with policy constraints, budget allocation, exploration rate, and decision timestamp
+### 3. The constrained bandit needs operational guardrails
 
-Concrete fix: expand `dataModel` so each required behavior has durable state. Then map those entities to steps and `satisfies`.
+The recommended option correctly allocates only among currently cleared,
+approved arms and logs reversible decisions. The remaining gap is the control
+loop itself: reward definition, delayed attribution, pacing, cold start,
+frequency caps, audience exclusions, fairness/segment caps, and fail-closed
+behavior when analytics is stale.
 
-### 3. The publish lifecycle needs an explicit state machine and idempotency story
+Why it matters: the bandit is where business value and brand risk collide. A
+bandit can overspend, over-target a segment, overfit a short attribution window,
+or keep exploring when the safety/eval feed is unavailable.
 
-The current lifecycle jumps from generated asset to `awaiting_approval` to `live` or `returned`. The asset status enum is `draft,awaiting_approval,live,rejected`. It does not model queued generation, claim review, approval snapshots, scheduled activation, provider submission, partial channel failure, pause, rollback, superseded variants, or expired approvals.
+Concrete fix: add a short deep dive or trap for "bandit guardrails": eligible
+arms are materialized from current approvals; stale analytics freezes
+allocation; exploration is bounded by budget/frequency/audience caps; delayed
+conversions use configured attribution windows; low-traffic campaigns fall back
+to fixed A/B or rules.
 
-Why it matters: the dangerous bugs are race conditions:
+### 4. Queue/admission control is mentioned but not fully represented
 
-- an asset is approved, then the negative-claim library changes before publish
-- a user opts out after approval but before channel activation
-- the approve request is retried
-- an ad/email/social provider accepts a publish request after timing out
-- a callback arrives twice or out of order
-- the bandit reallocates budget to an asset that has since been paused or revoked
+Capacity and technology choices now call out generation concurrency, provider
+QPS caps, delivery queues, token buckets, and workflow engines. The architecture
+still has only an `orch-queue` link from Orchestrator to Inference, not a queue
+or workflow component.
 
-Concrete fix: add a step, flow, or deep dive for the publish state machine. Use idempotency keys for create/approve/publish, persist immutable asset versions, re-check compliance immediately before activation, and dedupe provider callbacks into append-only events.
+Why it matters: the capacity section says peak generation and provider limits
+are design drivers. Without a visible queue/workflow node, candidates may not
+connect the numbers to backpressure, retries, spend caps, and provider-specific
+throttling.
 
-### 4. Channel compliance and consent are named but not designed
+Concrete fix: either add a `GenerationQueue` / `DeliveryWorkflow` node, or make
+the Orchestrator description and Step 5 flow explicitly say it owns durable
+workflow state, retry schedules, token buckets, and admission control.
 
-The requirements mention CAN-SPAM, TCPA, GDPR, template approval, tenant isolation, and untrusted text. Step 5 says compliance rules live at activation. That is directionally correct, but the dataset does not model the data or control points needed to enforce those rules.
+### 5. The claim gate wording blurs deterministic rules and model judgment
 
-Why it matters: marketing compliance is per tenant, region, channel, audience, campaign purpose, and provider. "Compliant" is not a single boolean. A customer may consent to email but not SMS, a region may require different disclosure text, an ad platform may require approved templates, and deletion/DSR workflows may conflict with audit retention.
+The options correctly say prohibited claims, required disclosures, and blocked
+phrases are deterministic while brand-voice conformance is model-judged with
+thresholds and evidence. Some other text still says the "deterministic reviewer"
+also checks brand voice.
 
-Concrete fix: add consent/preference/suppression entities, channel-policy versions, regional policy selection, template approval status, and retention/deletion behavior. Make the activation path perform a final policy check using those records before provider submission.
+Why it matters: this distinction is a core interview lesson. Deterministic
+policy can block known-bad claims; subjective brand voice needs scoring,
+evidence, tuning, escalation, and false-positive handling.
 
-### 5. The bandit loop is under-specified as a safety-critical control loop
-
-The dataset correctly says the bandit reallocates budget and regenerated variants re-enter the gate. It does not define the inputs, constraints, attribution model, or rollback behavior.
-
-Why it matters: a naive bandit can optimize into borderline claims, misleading copy, audience fatigue, unfair treatment of segments, or spend spikes. Brand safety needs to be a hard constraint, not just another metric in the dashboard.
-
-Concrete fix: make the bandit own constrained decisions:
-
-- eligible variants are only those with current cleared status and valid approval
-- brand-safety and compliance failures remove arms from allocation
-- budget, frequency caps, audience caps, and channel policies bound exploration
-- delayed conversions use explicit attribution windows
-- decision events are auditable and reversible
-- cold-start and low-traffic behavior is named
-
-### 6. The pedagogy lacks real decision branches
-
-All six steps have zero `options`. The story is clean, but candidates are mostly handed the final answer instead of being asked to compare trade-offs.
-
-Good option branches to add:
-
-- brand grounding: raw prompt context vs indexed brand kit vs versioned retrieval with citation/evidence
-- claim gate: model-only check vs deterministic rules plus model judge vs external legal review queue
-- activation: direct channel publish vs channel-adapter layer with final policy recheck
-- optimization: fixed A/B testing vs unconstrained bandit vs policy-constrained contextual bandit
-- approval: campaign-level approval vs asset-version approval vs reusable policy approval for low-risk variants
-- performance ingestion: synchronous polling vs provider webhooks plus event stream
-
-### 7. Several step diagrams reference links whose endpoints are hidden
-
-The link IDs resolve globally, but the visible step node lists omit one endpoint for several links:
-
-- `naive`: `id-channels` references `Identity -> Channels`, but `Identity` is not in the view.
-- `grounding`: `orch-guard` references `Orchestrator -> Guardrail`, but `Orchestrator` is not in the view.
-- `brand-gate`: `gen-prov` references `GenAgent -> Provenance`, but `GenAgent` is not in the view.
-- `compliance`: `id-channels` references `Identity -> Channels`, but `Identity` is not in the view.
-- `eval`: `channels-analytics` references `Channels -> Analytics`, but `Channels` is not in the view.
-
-Why it matters: the renderer may create implicit nodes or show links whose source is not part of the intended incremental reveal. That undermines the teaching walkthrough.
-
-Concrete fix: either add the missing endpoint nodes to each `view.nodes` list or replace those links with step-local links whose endpoints are visible.
+Concrete fix: normalize wording across `ClaimGate` descriptions, final design,
+and satisfies text: "deterministic claim/regulatory checks plus model-judged
+brand-voice conformance."
 
 ## System Design Soundness
 
-The architecture has the right major components: API gateway, orchestrator, content agent, inference backend, brand kit / DAM, claim reviewer, provenance service, asset store, activation channels, CDP, analytics stream, bandit optimizer, compliance guardrail, identity/token broker, audit log, and observability. The central risk boundary is well placed at the claim/compliance gate rather than inside the LLM prompt.
+The architecture has the right major components: API gateway, orchestrator,
+content agent, inference backend, brand kit / DAM, claim reviewer, provenance
+service, asset store, activation channels, CDP, analytics stream, bandit
+optimizer, compliance guardrail, identity/token broker, audit log, and
+observability.
 
-The weak point is durable state. The final design promises approval, provenance, compliance, delivery, audit, and optimization, but the data model only captures a small slice of that. A production answer needs explicit state transitions and immutable evidence for every publish decision.
+The state model now backs the workflow much better than before. Campaign,
+asset-version, claim-check, approval, delivery, consent, performance-event,
+bandit-decision, and audit records are all appropriate for this domain. The
+strongest improvement is that asset versions are immutable and approval is tied
+to a specific version and claim-library snapshot.
 
-The capacity section should drive queueing and cost decisions. The high-level architecture even has an `orch-queue` link labelled "batch generation", and the pattern list includes "Queue-based load leveling; admission control", but there is no queue node, queue state, or admission policy in the walkthrough. If bursty campaign generation is in scope, add a task queue and worker/admission-control story.
+The capacity section is now useful. It gives enough scale to justify async
+generation, approval queues, per-provider throttling, event streaming, fixed
+bandit cadence, and long audit retention. The only missing piece is making the
+queue/workflow component visible in the architecture that the capacity section
+motivates.
 
-The brand/claim gate is directionally right, but the wording should distinguish deterministic checks from subjective checks. Prohibited claims, required disclosures, blocked phrases, and template rules can be deterministic. Brand-voice conformance is usually heuristic or model-judged and should have thresholds, evidence, false-positive handling, and escalation.
-
-The C2PA story is useful but shallow. The dataset should say what is signed, where the manifest is stored, whether transformed media preserves provenance, and what happens when a channel strips metadata.
+The C2PA/provenance story is also stronger because technology choices now say
+what to think about: what is signed, where the manifest lives, signing keys, and
+channel metadata stripping. That should be referenced more directly in Step 3 or
+the final design so it is not only in wrap-up material.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: An Agent That Generates and Publishes
 
-This is an effective baseline. It immediately exposes the public-brand-risk failure mode and motivates the rest of the interview.
+This remains an effective baseline. It exposes the core failure in one diagram:
+the content agent can publish polished but unsafe material straight to channels.
 
-Improvement: the diagram uses `id-channels`, which introduces `Identity` implicitly even though the baseline is supposed to be unsafe direct publishing. Use a direct unsafe publish link, or include `Identity` and explain that credentials exist but no policy gate exists.
+Improvement: because capacity now includes generation concurrency and spend
+caps, Step 1 could briefly mention the second failure mode of the naive design:
+unbounded generation cost and channel API throttling, not only brand safety.
 
 ### Step 2: Ground in the Brand Kit / DAM
 
-This step introduces the right marketing corpus: voice, style, approved assets, and negative claims. It also correctly mentions tenant scoping.
+This step is much stronger after adding options. "Versioned retrieval with
+citation" is the right recommended answer, and the raw-prompt alternative
+teaches why versioning and evidence matter.
 
-Improvement: add versioning and retrieval semantics. A candidate should know whether the asset was generated against brand-kit version N, whether approved assets are retrieved by channel/locale/audience, and how a changed negative-claim library affects pending assets.
+Improvement: add one line connecting the selected brand-kit version to later
+approval expiry. That would make the Step 3 lifecycle feel like a direct result
+of Step 2 rather than a separate deep dive.
 
 ### Step 3: The Gate: Brand & Claim Review + C2PA Provenance
 
-This is the strongest conceptual step. The gate is the right crux for the case, and the high-risk vs low-risk flow is useful.
+This is the strongest step. It has a clear decision prompt, meaningful options,
+a risk-tiered approval flow, and a lifecycle deep dive that covers idempotency,
+immutable versions, final re-check, callback dedupe, pause, and rollback.
 
-Improvements: separate claim review, brand-voice review, provenance stamping, approval, and activation into clearer persisted events. The sequence flow currently has `ClaimGate` or `Marketer` activating directly to `Channels`, which hides the orchestrator/identity/channel-adapter path that should enforce final compliance and idempotency.
+Improvements: make the deterministic-vs-judged boundary consistent in wording,
+and surface the publish lifecycle in the main flow/diagram a bit more. The
+current sequence activates through Identity and Channels, but it still hides the
+durable workflow state that makes retries and partial failures safe.
 
 ### Step 4: The Optimization Loop: Bandits Over Variants
 
-The loop is the distinctive marketing-platform capability. Requiring regenerated variants to pass through the gate is the right safety invariant.
+This step now teaches the right trade-off. The policy-constrained bandit option
+is realistic, and the unconstrained bandit / fixed A/B alternatives make the
+candidate compare value, safety, and complexity.
 
-Improvement: add the policy-constrained nature of the bandit. It should allocate only among eligible, currently cleared variants; log each decision; respect budget and frequency caps; and stop or quarantine arms when brand-safety metrics regress.
+Improvement: add one operational guardrail detail: stale analytics freezes
+allocation, low-traffic campaigns fall back to fixed splits, or budget/frequency
+caps are enforced before each decision.
 
 ### Step 5: Channel Compliance, Personalization & Audit
 
-This step brings in the right concerns: opt-out, consent, GDPR, CDP data, untrusted input, and append-only audit.
+The new sequence flow is a major improvement. It shows the correct ordering:
+fetch audience/preferences, final policy check, scoped token, idempotent submit,
+webhook audit, or suppression when consent/approval is invalid.
 
-Improvement: this step is too compressed. Channel compliance, personalization, prompt-injection isolation, and audit could each carry important state. Add a flow showing activation: fetch audience/preferences, evaluate channel policy, re-check approval, submit to provider, receive webhook, write audit event.
+Improvement: expand the consent/policy vocabulary just enough to prevent
+"compliant boolean" thinking: purpose, legal basis, policy version, suppression
+reason, and DSR/deletion handling.
 
 ### Step 6: Brand-Safety & Performance Evaluation
 
-The step correctly says conversion metrics are insufficient and that claim-violation/off-brand rates must be measured.
+This step correctly separates brand-safety metrics from conversion metrics, and
+the trap about release gates is strong.
 
-Improvement: distinguish monitoring from release gates. A model, prompt, reviewer, retrieval strategy, or brand-kit update should not roll out if offline or shadow eval increases claim-violation or off-brand rates beyond a threshold.
+Improvement: give one concrete threshold or gate example. For example: "block a
+prompt/reviewer rollout if shadow eval increases claim-violation rate above X
+or lowers brand-voice score below Y." That would make evaluation feel
+operational rather than advisory.
 
 ## Final Design Review
 
-The final design description is concise and coherent. It integrates the major components from the walkthrough and makes the central invariant clear: every new variant re-enters the claim gate before publishing.
+The final design is coherent and now much better supported by the rest of the
+dataset. The final diagram includes the major components introduced across the
+steps, and the final description preserves the key invariant: every new variant
+re-enters the claim gate before publishing.
 
-The final design currently looks more complete than the supporting API and data model. It promises tenant isolation, delegated identity, channel compliance, CDP personalization, provenance, audit, analytics, and optimization, but most of those are not represented as durable entities or flows.
+The main final-design gap is that workflow/queue responsibility is implied
+rather than visible. Given the capacity assumptions and the lifecycle deep dive,
+the final design should either show a delivery workflow/queue explicitly or say
+that the Orchestrator owns durable workflow execution, retries, provider token
+buckets, and publish-attempt state.
 
-The final diagram includes all endpoint nodes for its links, which is good. The step diagrams need the same endpoint-completeness cleanup.
+The final design should also adopt the more precise gate wording from the
+recommended Step 3 option: deterministic claim/regulatory checks plus
+model-judged brand-voice conformance.
 
 ## Concept Introduction and Learning Flow
 
-The concept sequence is sensible:
+The concept sequence is now strong:
 
 - unsafe auto-publish baseline
-- brand grounding
-- brand/claim/provenance gate
-- optimization loop
+- brand grounding and versioned retrieval
+- claim/provenance gate with risk-tiered approval
+- immutable publish lifecycle
+- policy-constrained optimization
 - channel compliance and audit
-- brand-safety and performance evaluation
+- brand-safety and performance eval
 
-The missing teaching concept is "publish attempt lifecycle." It should appear before or during the gate step because it connects approval, consent, final compliance recheck, provider submission, callbacks, audit, and rollback.
+The best pedagogical improvement would be to thread "version snapshots" through
+the story more explicitly: brand-kit version in Step 2, claim-library version in
+Step 3, approval expiry before activation in Step 5, and eval/release gates in
+Step 6.
 
-The patterns are relevant to the broader agentic-platform series, but several are tagged more than taught. "Delegation not impersonation" should include scoped OAuth/token exchange semantics. "Prompt-injection defense" should include an example of untrusted brief or scraped content being isolated from channel authority. "Queue-based load leveling" should be backed by an actual queue/admission-control component.
+The pattern tags mostly align with the steps. One small issue: "Queue-based load
+leveling; admission control" is listed but not taught with a visible queue or
+workflow component. Either promote it in the architecture or make it a lighter
+technology-choice note.
 
 ## Step-to-Final-Design Coherence
 
-The progression mostly builds toward the final design:
+The progression builds well:
 
-- Step 1 exposes the publish risk.
-- Step 2 adds brand grounding.
-- Step 3 adds review, provenance, approval, and asset state.
-- Step 4 adds analytics and the bandit.
-- Step 5 adds channel policy, CDP personalization, and audit.
-- Step 6 adds eval and observability.
+- Step 1 exposes unsafe direct publishing.
+- Step 2 adds versioned brand grounding.
+- Step 3 adds review, provenance, approval, immutable versions, and lifecycle
+  safety.
+- Step 4 adds analytics and constrained bandit optimization.
+- Step 5 adds channel policy, consent, CDP personalization, identity, delivery
+  callback dedupe, and audit.
+- Step 6 adds brand-safety and performance evaluation.
 
-The main coherence issue is that some diagrams borrow final-design links before the relevant endpoint nodes are introduced. Fixing those step views will make the incremental reveal cleaner.
-
-The final design also includes `Brief` and `Gateway`, but those appear mostly in the API section rather than the step sequence. That is acceptable, though Step 1 or Step 2 could show ingress explicitly if the dataset wants a more complete start-to-finish journey.
+The final design includes the components from those steps, and the structured
+views now use only visible endpoint nodes for each link. The one coherence gap
+is that workflow state is more detailed in prose/data model than in the final
+diagram.
 
 ## Realism Compared With Production Systems
 
-A production marketing automation platform would need more explicit handling for:
+The current dataset is production-realistic enough for a strong interview. It
+now covers the major operational hazards: idempotent submit/approve, immutable
+asset versions, approval snapshots, provider webhook dedupe, pause/kill switch,
+consent re-check, attribution windows, and audit retention.
 
-- provider outages, partial activation, and retry/backoff by channel
-- ad/email/social provider rate limits and callback deduplication
-- consent, suppression, unsubscribe, and preference propagation
-- per-tenant data isolation and deletion/retention policy
-- campaign budget pacing, frequency caps, audience exclusions, and ad fatigue
-- attribution windows and delayed conversion events
-- asset/version approval snapshots and rollback to prior approved versions
-- negative-claim library updates that invalidate pending/live assets
-- channel metadata stripping C2PA provenance
-- emergency pause/kill switch for a bad campaign or broken reviewer
-- operator dashboards for approval backlog, blocked assets, spend, and violation rates
+The remaining realism gaps are narrower:
 
-Not all of these need full implementation detail, but the interview should deliberately scope the most important ones in or out.
+- partial activation across multiple providers/channels
+- retry/backoff schedules and dead-letter handling
+- provider template approval expiry/revocation
+- stale analytics or missing conversion feed behavior
+- low-traffic/cold-start bandit behavior
+- budget pacing and frequency caps as hard constraints
+- policy versioning for consent, region, purpose, and disclosure rules
+- DSR/deletion workflows versus append-only audit retention
+- operator dashboards for approval backlog, blocked assets, delivery failures,
+  spend, and violation rates
+
+Not all of these need full detail, but the interview should deliberately expose
+the few most important ones as follow-up prompts or Staff-level expectations.
 
 ## Dataset and Renderer-Facing Observations
 
 - `interview.json` parses as valid JSON.
-- Top-level keys are conventional for this repo: requirements, capacity, API, data model, patterns, steps, final design, satisfies, script, level variants, and follow-ups.
-- All `view.nodes` references resolve to declared high-level architecture nodes.
-- All `view.links` references resolve to declared high-level architecture links.
-- All `satisfies[*].steps[*]` references resolve to real step IDs.
-- All `patterns[*].steps[*]` references resolve to real step IDs.
-- The final design view includes both endpoints for every displayed link.
-- Several step views display links whose endpoint nodes are hidden; fix these before relying on the generated diagrams.
-- Sequence flow participants resolve for the Step 3 flow.
-- Every step has zero `options`. This is schema-valid but pedagogically thin for a book case.
-- Only one step has a sequence flow, and only one step has a deep dive. That is sparse for a workflow with approval, provider callbacks, consent, and optimization loops.
-- `technologyChoices`, `toProbeFurther`, AI visuals, and an explainer comic are absent. That is valid, but the neighboring agentic book cases increasingly use those fields for polish and external grounding.
+- Top-level keys are conventional for this repo, including capacity, API, data
+  model, patterns, steps, final design, satisfies, interview script, level
+  variants, technology choices, probe links, and follow-ups.
+- All step `view.nodes` references resolve to declared high-level architecture
+  nodes.
+- All step `view.links` references resolve to declared high-level architecture
+  links.
+- Step, option, and final-design views are endpoint-complete: every displayed
+  link has both endpoint nodes visible in that view.
+- Sequence flow message participants resolve for the Step 3 and Step 5 flows.
+- `satisfies[*].steps[*]`, `patterns[*].steps[*]`, and
+  `technologyChoices[*].steps[*]` references resolve to real step IDs.
+- The previous review's warnings about zero options, qualitative capacity,
+  missing technology choices, missing probe links, and hidden link endpoints are
+  no longer accurate.
+- There are still no AI visuals or explainer comic, which is valid. Add them
+  only if this case needs the same visual polish as the most media-rich book
+  datasets.
 
 ## Recommended Edits, Prioritized
 
-### P1: Fix step diagram endpoint completeness
+### P1: Promote the publish lifecycle into the main architecture path
 
-Update the `view.nodes` or `view.links` for `naive`, `grounding`, `brand-gate`, `compliance`, and `eval` so every displayed link has both endpoint nodes visible.
+Add a visible delivery workflow/queue or publish-attempt state owner, and make
+partial failure, retry, callback dedupe, pause, and rollback responsibilities
+obvious from the diagram/flow.
 
-### P1: Add concrete capacity and workload math
+### P1: Normalize claim-gate wording
 
-Replace qualitative capacity labels with example assumptions and derived throughput for generation, approval, delivery, event ingestion, optimization decisions, and audit retention.
+Use "deterministic claim/regulatory checks plus model-judged brand-voice
+conformance" everywhere. Avoid implying that subjective brand voice is
+deterministic.
 
-### P1: Expand the data model around campaign, asset, approval, delivery, consent, event, and bandit state
+### P1: Add compliance policy semantics
 
-The current three tables do not support the final design's operational claims. Add durable records for workflow state and evidence.
+Extend consent/channel compliance with purpose, legal basis, policy version,
+suppression reason, template approval lifecycle, and DSR/deletion vs audit
+retention notes.
 
-### P1: Add a publish-attempt state machine
+### P2: Make the bandit fail-closed
 
-Model idempotent create/approve/publish, immutable asset versions, final policy recheck, provider submission, callback dedupe, retry behavior, pause/rollback, and terminal failures.
+Add a compact trap or deep dive covering stale analytics, low traffic, budget
+pacing, frequency caps, audience caps, and frozen allocation when safety signals
+are unavailable.
 
-### P2: Make channel compliance concrete
+### P2: Tie capacity to explicit workflow/admission control
 
-Add consent/preference/suppression data, regional/channel policy versions, template approval, and final activation checks. Clarify how GDPR deletion and audit retention coexist.
+If queue-based load leveling remains a pattern, show the queue/workflow node or
+state that enforces generation concurrency, per-tenant spend caps, provider
+token buckets, retries, and dead-letter handling.
 
-### P2: Constrain the bandit explicitly
+### P3: Add concrete eval thresholds
 
-Make brand safety and compliance hard eligibility gates for allocation. Add attribution windows, cold-start handling, budget/frequency caps, and auditable decision events.
+Give Step 6 one example release gate threshold for prompt/model/reviewer
+rollouts so "brand-safety eval" feels actionable.
 
-### P2: Add option branches
+### P3: Consider AI visuals/comic only after content stabilizes
 
-Add at least three options across grounding, gate, activation, and optimization so candidates compare real alternatives instead of reading a single path.
-
-### P3: Add more flows, traps, and deep dives
-
-Good additions: approval race trap, C2PA metadata stripping trap, "brand voice judge is not deterministic" trap, provider timeout/idempotency flow, consent update during queued activation flow, and emergency campaign pause runbook.
-
-### P3: Add external probe links and technology choices
-
-If this case is meant to match the more polished agentic book cases, add `toProbeFurther` and `technologyChoices` for DAM/brand assets, content authenticity, analytics/event streams, activation providers, consent tooling, and model/eval infrastructure.
+The dataset is already structurally strong. Generated visuals would polish the
+case, but they are not needed to fix correctness.
 
 ## What Not To Change
 
 - Keep the brand-reputation gate as the central teaching idea.
 - Keep the deterministic prohibited-claim check outside the model.
 - Keep regenerated variants re-entering the gate before activation.
-- Keep C2PA provenance in the brand-safety story.
-- Keep the connection to Agentic Platform Foundations, but make the marketing-specific workflow state stand on its own.
+- Keep the risk-tiered approval model for high-risk claims.
+- Keep C2PA provenance as a concrete vertical requirement.
+- Keep the constrained bandit option; it is the right marketing-specific value
+  driver.
+- Keep the connection to Agentic Platform Foundations, but preserve the
+  marketing-specific workflow state introduced in this dataset.
 
 ## Bottom Line
 
-This dataset has the right story and the right core architecture. To become a strong book case, it needs concrete capacity, durable workflow state, explicit consent/channel operations, constrained bandit semantics, and corrected step diagrams. The fastest high-value pass is to fix the hidden diagram endpoints, then add the publish lifecycle and expanded data model that make the brand gate credible in production.
+The recent changes moved this from a promising skeleton to a strong book case.
+It now has enough capacity, state, API, options, flows, technology choices, and
+external grounding to teach a realistic agentic marketing platform. The next
+best pass is not broad expansion; it is precision: make publish workflow state
+visible, tighten compliance semantics, make the bandit fail-closed, and align
+claim-gate wording across the dataset.

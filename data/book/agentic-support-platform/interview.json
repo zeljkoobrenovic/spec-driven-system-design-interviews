@@ -98,7 +98,7 @@
         "traits": [
           "stateful"
         ],
-        "description": "Executes refunds, cancels, reschedules idempotently, with compensating actions for rollback."
+        "description": "Executes refunds, cancels, reschedules with provider-scoped idempotency, reconciliation for ambiguous outcomes, and compensating actions where reversal is possible."
       },
       {
         "id": "Payments",
@@ -128,7 +128,7 @@
         "traits": [
           "stateful"
         ],
-        "description": "Live conversation state plus a durable log so an action resumes exactly-once."
+        "description": "Live conversation state plus a durable log so an action resumes without duplicating a committed side effect."
       },
       {
         "id": "Guardrail",
@@ -339,11 +339,19 @@
   ],
   "capacityDiagram": [
     "graph LR",
-    "  Latency[Real-time turn budget]",
-    "  Reversible[Reversibility-tiered actions]",
-    "  Rollback[Idempotent + compensating]",
-    "  Latency --> Reversible",
-    "  Reversible --> Rollback"
+    "  Conns[~50k concurrent convos]",
+    "  Turns[~1.7k turns/sec peak]",
+    "  Retr[policy + 1-2 account reads/turn]",
+    "  LLM[LLM serving p95]",
+    "  Actions[~15% turns propose actions]",
+    "  Approve[~20% need human approval]",
+    "  Provider[commerce QPS-limited]",
+    "  Conns --> Turns",
+    "  Turns --> Retr",
+    "  Retr --> LLM",
+    "  LLM --> Actions",
+    "  Actions --> Approve",
+    "  Actions --> Provider"
   ],
   "requirements": {
     "functional": [
@@ -355,7 +363,7 @@
     ],
     "nonFunctional": [
       "Real-time: each turn must respond within a latency budget; the gate runs inside the loop, not before it.",
-      "Transactional side effects are idempotent and reversible (compensating actions for rollback).",
+      "Transactional side effects use provider-scoped idempotency (effectively-once with reconciliation); reversal is by compensation where possible, manual repair where not.",
       "Higher-risk / less-reversible actions require human approval; low-risk reversible ones can auto-execute.",
       "Act only with scoped, delegated authority; customer input is untrusted.",
       "Auditable: every turn, action decision, approval, transaction, and handoff is recorded."
@@ -363,28 +371,48 @@
   },
   "capacity": [
     {
-      "label": "Turn latency",
-      "value": "real-time budget",
-      "note": "Each turn (retrieve + reason + maybe act) must fit a conversational latency budget."
+      "label": "Active load",
+      "value": "~50k concurrent convos",
+      "note": "~2 active turns/min/convo -> ~1.7k turns/sec peak; channel split skews chat-heavy with a smaller voice tail that needs partial responses."
     },
     {
-      "label": "Action autonomy",
-      "value": "reversibility-tiered",
-      "note": "Low-risk reversible actions auto-execute; high-risk / hard-to-reverse ones need human approval."
+      "label": "Action mix",
+      "value": "~15% of turns",
+      "note": "Of turns that propose actions: ~70% low-risk auto-execute, ~20% need human approval, ~10% escalate. Approval adds a human queue with its own SLA."
+    },
+    {
+      "label": "Retrieval fan-out",
+      "value": "1 + 1-2 reads",
+      "note": "~1 policy/KB search plus 1-2 account/order reads per actionable turn, run in parallel under the turn deadline."
+    },
+    {
+      "label": "Turn latency",
+      "value": "p95 < 2.5s text",
+      "note": "Text turn p95 < 2.5s, stream first token < 800ms; voice uses partial verbal responses and async action status."
+    },
+    {
+      "label": "Provider limits",
+      "value": "QPS-capped",
+      "note": "Commerce/payment/account systems have stricter QPS, retries, and circuit breakers than the chat frontend; back-pressure and timeouts protect them."
+    },
+    {
+      "label": "Audit volume",
+      "value": "~5-10 events/turn",
+      "note": "Turn + retrieval + gate + transaction + handoff events; retention 1-7 years depending on tenant policy."
     },
     {
       "label": "Side effects",
-      "value": "exactly-once",
-      "note": "Refunds/cancels carry idempotency keys; a retry never double-refunds."
+      "value": "effectively-once",
+      "note": "Provider-scoped idempotency keys dedupe retries; ambiguous timeouts reconcile via provider lookup/webhook, with a manual-repair queue for unknown outcomes."
     }
   ],
   "api": [
     {
       "method": "POST",
       "path": "/v1/conversations/{id}/turn",
-      "description": "Process one live turn: understand, retrieve, and decide deflect/act/escalate within the latency budget.",
-      "request": "{ \"message\": \"...\" }",
-      "response": "{ \"reply\": \"...\", \"action\": \"none|executed|awaiting_approval|escalated\" }",
+      "description": "Process one live turn: understand, retrieve, and decide deflect/act/escalate within the latency budget. Fields are illustrative of the controls a safe live turn needs, not an exhaustive contract.",
+      "request": "{ \"turnId\": \"...\", \"idempotencyKey\": \"...\", \"channel\": \"chat|voice|messaging\", \"tenantId\": \"...\", \"customerAuthContext\": \"<scoped token>\", \"message\": \"...\", \"attachments\": [], \"locale\": \"en-US\", \"stateCursor\": \"...\" }",
+      "response": "{ \"turnId\": \"...\", \"reply\": \"...\", \"decision\": \"none|executed|awaiting_approval|escalated\", \"proposedActionId\": \"...|null\", \"riskTier\": \"low|high\", \"reversibility\": \"reversible|compensatable|irreversible\", \"approvalRequired\": false, \"escalationReason\": \"...|null\", \"eventStreamUrl\": \"...\", \"auditEventId\": \"...\" }",
       "sequence": {
         "participants": [
           {
@@ -440,16 +468,16 @@
     {
       "method": "POST",
       "path": "/v1/actions/{id}/approve",
-      "description": "A human agent approves a high-risk action proposed mid-conversation; only then does it execute.",
-      "request": "{ \"decision\": \"approve|reject\", \"idempotencyKey\": \"...\" }",
-      "response": "{ \"status\": \"executed|rejected\" }"
+      "description": "A human agent approves or rejects a high-risk action proposed mid-conversation; only an approval mints a scoped action token and executes. The proposed action expires if not decided in time.",
+      "request": "{ \"decision\": \"approve|reject\", \"idempotencyKey\": \"...\", \"approverPrincipal\": \"...\", \"policyVersion\": \"...\", \"reasonCode\": \"in_policy|over_threshold|fraud_suspected|...\" }",
+      "response": "{ \"status\": \"executed|rejected|expired\", \"actionId\": \"...\", \"transactionId\": \"...|null\", \"auditEventId\": \"...\" }"
     },
     {
       "method": "POST",
       "path": "/v1/conversations/{id}/escalate",
-      "description": "Hand the conversation to a human agent with full context.",
-      "request": "{ \"reason\": \"...\" }",
-      "response": "{ \"status\": \"handed_off\", \"agentId\": \"...\" }"
+      "description": "Hand the conversation to a human agent with a full context package: transcript pointer, summary, attempted actions, and an account snapshot.",
+      "request": "{ \"reason\": \"...\", \"reasonCode\": \"low_confidence|policy_conflict|customer_ask|rejected_action|fraud_suspected\", \"transcriptPointer\": \"...\", \"summary\": \"...\", \"attemptedActions\": [], \"accountSnapshot\": \"...\", \"priority\": \"low|normal|high\", \"routingSkill\": \"...\" }",
+      "response": "{ \"status\": \"handed_off|queued\", \"handoffId\": \"...\", \"agentId\": \"...|null\", \"queue\": \"...\", \"sla\": \"...\" }"
     }
   ],
   "dataModel": [
@@ -463,6 +491,10 @@
         },
         {
           "name": "customer_id",
+          "type": "varchar"
+        },
+        {
+          "name": "tenant_id",
           "type": "varchar"
         },
         {
@@ -480,8 +512,46 @@
       ]
     },
     {
-      "name": "actions",
-      "note": "A transactional action proposed or taken in a conversation.",
+      "name": "conversation_turns",
+      "note": "One turn of the live loop; durable so a turn resumes after a restart.",
+      "fields": [
+        {
+          "name": "turn_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "conversation_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "seq",
+          "type": "int"
+        },
+        {
+          "name": "channel",
+          "type": "enum(chat,voice,messaging)"
+        },
+        {
+          "name": "message_hash",
+          "type": "varchar"
+        },
+        {
+          "name": "model_version",
+          "type": "varchar"
+        },
+        {
+          "name": "latency_ms",
+          "type": "int"
+        },
+        {
+          "name": "status",
+          "type": "enum(streamed,completed,timed_out,failed)"
+        }
+      ]
+    },
+    {
+      "name": "action_proposals",
+      "note": "An action the agent proposes inside a turn, before it is executed.",
       "fields": [
         {
           "name": "action_id",
@@ -492,26 +562,236 @@
           "type": "uuid FK"
         },
         {
-          "name": "kind",
-          "type": "enum(refund,cancel,reschedule,order)"
+          "name": "turn_id",
+          "type": "uuid FK"
         },
         {
-          "name": "risk",
+          "name": "kind",
+          "type": "enum(refund,cancel,reschedule,address_change,order,resend_receipt)"
+        },
+        {
+          "name": "target_resource",
+          "type": "varchar"
+        },
+        {
+          "name": "risk_tier",
           "type": "enum(low,high)"
         },
         {
+          "name": "reversibility",
+          "type": "enum(reversible,compensatable,irreversible)"
+        },
+        {
+          "name": "required_authority",
+          "type": "varchar"
+        },
+        {
+          "name": "policy_version",
+          "type": "varchar"
+        },
+        {
+          "name": "proposed_payload",
+          "type": "jsonb"
+        },
+        {
           "name": "status",
-          "type": "enum(executed,awaiting_approval,rejected,rolled_back)"
+          "type": "enum(proposed,blocked_by_policy,awaiting_approval,approved,executing,executed,rejected,compensating,compensated,escalated)"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "approval_decisions",
+      "note": "A human agent's decision on a proposed action, bound to a policy snapshot.",
+      "fields": [
+        {
+          "name": "decision_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "action_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "approver_principal",
+          "type": "varchar"
+        },
+        {
+          "name": "decision",
+          "type": "enum(approve,reject,expire)"
+        },
+        {
+          "name": "reason_code",
+          "type": "varchar"
+        },
+        {
+          "name": "policy_snapshot",
+          "type": "jsonb"
+        },
+        {
+          "name": "audit_event_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "transaction_attempts",
+      "note": "One attempt to execute an action against a provider; idempotency is per attempt key.",
+      "fields": [
+        {
+          "name": "attempt_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "action_id",
+          "type": "uuid FK"
         },
         {
           "name": "idempotency_key",
           "type": "varchar unique"
+        },
+        {
+          "name": "provider_request_id",
+          "type": "varchar null"
+        },
+        {
+          "name": "provider_response",
+          "type": "jsonb null"
+        },
+        {
+          "name": "state",
+          "type": "enum(pending,succeeded,failed,provider_timeout,unknown_external_state,reconciled)"
+        },
+        {
+          "name": "retry_count",
+          "type": "int"
+        },
+        {
+          "name": "terminal_reason",
+          "type": "varchar null"
+        }
+      ]
+    },
+    {
+      "name": "compensations",
+      "note": "A compensating action that reverses a committed side effect.",
+      "fields": [
+        {
+          "name": "compensation_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "action_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "kind",
+          "type": "varchar"
+        },
+        {
+          "name": "state",
+          "type": "enum(pending,succeeded,failed)"
+        },
+        {
+          "name": "provider_response",
+          "type": "jsonb null"
+        },
+        {
+          "name": "manual_repair",
+          "type": "bool"
+        }
+      ]
+    },
+    {
+      "name": "handoffs",
+      "note": "A human-handoff package and its routing/SLA state.",
+      "fields": [
+        {
+          "name": "handoff_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "conversation_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "summary",
+          "type": "text"
+        },
+        {
+          "name": "transcript_pointer",
+          "type": "varchar"
+        },
+        {
+          "name": "attempted_actions",
+          "type": "jsonb"
+        },
+        {
+          "name": "account_snapshot",
+          "type": "jsonb"
+        },
+        {
+          "name": "reason_code",
+          "type": "varchar"
+        },
+        {
+          "name": "queue",
+          "type": "varchar"
+        },
+        {
+          "name": "priority",
+          "type": "enum(low,normal,high)"
+        },
+        {
+          "name": "assigned_agent",
+          "type": "varchar null"
+        },
+        {
+          "name": "sla_due_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "knowledge_sources",
+      "note": "Retrieval evidence captured per turn for grounding and audit.",
+      "fields": [
+        {
+          "name": "evidence_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "turn_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "kb_version",
+          "type": "varchar"
+        },
+        {
+          "name": "document_ids",
+          "type": "jsonb"
+        },
+        {
+          "name": "account_snapshot_version",
+          "type": "varchar"
+        },
+        {
+          "name": "access_decision",
+          "type": "enum(allowed,denied)"
         }
       ]
     },
     {
       "name": "audit_record",
-      "note": "Append-only conversation audit.",
+      "note": "Append-only, hash-chained conversation audit with retention policy.",
       "fields": [
         {
           "name": "event_id",
@@ -522,12 +802,32 @@
           "type": "uuid FK"
         },
         {
+          "name": "actor_principal",
+          "type": "varchar"
+        },
+        {
           "name": "kind",
-          "type": "enum(turn,action_decision,approval,transaction,handoff)"
+          "type": "enum(turn,retrieval,action_decision,approval,transaction,compensation,handoff)"
+        },
+        {
+          "name": "correlation_ids",
+          "type": "jsonb"
+        },
+        {
+          "name": "prev_hash",
+          "type": "varchar"
         },
         {
           "name": "payload",
           "type": "jsonb"
+        },
+        {
+          "name": "retention_class",
+          "type": "varchar"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz"
         }
       ]
     }
@@ -559,7 +859,7 @@
     },
     {
       "name": "Durable execution / checkpointing (resume after crash)",
-      "what": "Idempotent transactions with compensating actions so a mid-action failure resumes exactly-once.",
+      "what": "Provider-scoped idempotency with reconciliation and compensating actions so a mid-action failure resumes effectively-once (manual repair for unknown outcomes).",
       "whenToUse": "Any refund/cancel/reschedule side effect.",
       "steps": [
         "txn-safety"
@@ -605,7 +905,7 @@
       "description": [
         "Start with the classic chatbot: it answers FAQs from a script or the model, but the moment a customer wants something done \u2014 a refund, a cancellation \u2014 it dead-ends to a human queue.",
         "It deflects but doesn't resolve, so it frustrates customers and offloads every real task. The opposite failure (an agent that freely refunds and cancels) is worse: unlike every other vertical so far, the dangerous action happens live, in the middle of a conversation, on the customer's money and orders.",
-        "The rest of the interview turns this into a real-time agent that can safely act inside the conversation, with the gate inside the loop."
+        "This baseline deliberately ignores auth, customer scope, and account state — which is exactly why the next steps matter: grounding in the scoped account, a latency budget, and an in-loop gate are what turn this into a real-time agent that can safely act inside the conversation."
       ],
       "view": {
         "nodes": [
@@ -648,8 +948,8 @@
       "id": "grounding",
       "title": "2. Ground in Policy + the Customer's Account",
       "description": [
-        "The grounding corpus is two-sided: product/policy/help documents (what's allowed) and the customer's own scoped account and order record (what's true for them). A refund answer depends on both the refund policy and this customer's order status.",
-        "Account retrieval is scoped to the authenticated customer; customer messages are treated as untrusted input."
+        "The grounding corpus is two-sided: product/policy/help documents (what's allowed) and the customer's own scoped account and order record (what's true for them). A refund answer depends on both the refund policy and this customer's order status. Each side carries evidence — the KB version and source document IDs, the account snapshot version — so a reply (and any action) can be traced back to exactly what it was grounded in.",
+        "The trust boundary starts here, not only when a transaction happens: account retrieval is scoped to the authenticated customer (the Gateway resolves scope before any account read), and customer messages are untrusted input — data the model reads, never authority that can widen scope or change the beneficiary."
       ],
       "view": {
         "nodes": [
@@ -684,6 +984,17 @@
       "whyNow": [
         "Grounding determines both what the agent says and which actions are even valid."
       ],
+      "deepDives": [
+        {
+          "title": "When policy and account state disagree, or a read times out",
+          "points": [
+            "Capture evidence: KB version + source doc IDs and the account snapshot version, so the answer is auditable and reproducible.",
+            "Policy says yes but the account says no (out of window, already refunded) -> the account state wins; the agent explains why, not just 'policy allows it'.",
+            "Account read times out -> never guess eligibility: respond 'let me check that', retry/escalate, and don't let an action proceed on stale or missing account data.",
+            "Customer text is untrusted from turn one: it can describe a problem but can't assert an entitlement the account record doesn't show."
+          ]
+        }
+      ],
       "recap": {
         "before": "The bot answered generically.",
         "after": "Replies are grounded in policy and the customer's record.",
@@ -700,6 +1011,7 @@
       "view": {
         "nodes": [
           "Channel",
+          "Gateway",
           "ConvAgent",
           "Inference",
           "SessionStore"
@@ -734,9 +1046,128 @@
       "whyNow": [
         "The real-time loop is the substrate the in-loop action gate plugs into."
       ],
+      "flows": [
+        {
+          "sequence": {
+            "participants": [
+              {
+                "id": "Channel",
+                "label": "Channel"
+              },
+              {
+                "id": "Gateway",
+                "label": "Support API"
+              },
+              {
+                "id": "ConvAgent",
+                "label": "Conversation Agent"
+              },
+              {
+                "id": "KB",
+                "label": "Policy KB"
+              },
+              {
+                "id": "Account",
+                "label": "Account"
+              },
+              {
+                "id": "Inference",
+                "label": "Inference"
+              },
+              {
+                "id": "SessionStore",
+                "label": "Session Store"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Channel",
+                "to": "Gateway",
+                "arrow": "->>",
+                "label": "turn (deadline, seq)"
+              },
+              {
+                "from": "Gateway",
+                "to": "ConvAgent",
+                "arrow": "->>",
+                "label": "authenticated, scope resolved"
+              },
+              {
+                "type": "par",
+                "label": "policy",
+                "messages": [
+                  {
+                    "from": "ConvAgent",
+                    "to": "KB",
+                    "arrow": "->>",
+                    "label": "policy search"
+                  }
+                ],
+                "branches": [
+                  {
+                    "label": "account",
+                    "messages": [
+                      {
+                        "from": "ConvAgent",
+                        "to": "Account",
+                        "arrow": "->>",
+                        "label": "order read (timeout)"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "type": "alt",
+                "label": "data ready in budget",
+                "messages": [
+                  {
+                    "from": "ConvAgent",
+                    "to": "Inference",
+                    "arrow": "->>",
+                    "label": "stream grounded reply"
+                  }
+                ],
+                "else": {
+                  "label": "account read missed deadline",
+                  "messages": [
+                    {
+                      "from": "ConvAgent",
+                      "to": "Inference",
+                      "arrow": "->>",
+                      "label": "stream 'I'm checking that' / ask to confirm"
+                    }
+                  ]
+                }
+              },
+              {
+                "from": "ConvAgent",
+                "to": "SessionStore",
+                "arrow": "->>",
+                "label": "persist turn + timeout/retry state"
+              }
+            ]
+          },
+          "highlight": [
+            "ConvAgent",
+            "Account"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Channels degrade differently under the budget",
+          "points": [
+            "Text chat can stream partial tokens and show a 'working on it' state while slow reads finish.",
+            "Voice can't hold silence: it needs partial verbal feedback and can report action status asynchronously.",
+            "Async messaging (email/SMS/WhatsApp) tolerates delayed action completion, so slow actions can finish out-of-band.",
+            "Staying in budget: run retrieval and account reads in parallel under a deadline, time out slow account reads, cache policy results, and circuit-break commerce systems."
+          ]
+        }
+      ],
       "recap": {
         "before": "Answers weren't time-bounded.",
-        "after": "Each turn responds within a latency budget over durable session state.",
+        "after": "Each turn responds within a latency budget over durable session state, degrading gracefully when reads are slow.",
         "newRisk": "Within that live loop, the agent now needs to take real account actions safely."
       }
     },
@@ -745,7 +1176,7 @@
       "title": "4. The Gate: Take Actions Inside the Loop, by Reversibility",
       "description": [
         "This is the crux, and it's where support diverges from the rest of the series: the gate lives inside the live conversation. When the agent wants to act, an in-loop action gate classifies the action by reversibility and risk \u2014 low-risk reversible actions (resend a receipt, a small in-policy refund) auto-execute; high-risk or hard-to-reverse ones (large refund, account change) require a human agent's approval mid-conversation.",
-        "Identity grants scoped, delegated authority to act on the customer's behalf. Agentic checkout/commerce is an option here: the same gate authorizes a purchase the agent makes for the customer (where a commerce protocol like ACP carries delegated payment authority)."
+        "An approval is bound to the proposed action ID, the resource and amount, the policy version, and the approver's identity \u2014 a customer message can request an action but can never approve a policy bypass. Only after the gate decision (and approval, when required) does the action gate ask Identity to mint a scoped, delegated, action-bound token: tied to that action ID, resource, amount, expiry, approver, and policy version, so it can't be reused for a different action."
       ],
       "view": {
         "nodes": [
@@ -753,7 +1184,8 @@
           "ActionGate",
           "TxnEngine",
           "Agent2",
-          "Identity"
+          "Identity",
+          "Account"
         ],
         "links": [
           "conv-gate",
@@ -771,6 +1203,82 @@
         ],
         "caption": "An in-loop gate classifies each action by reversibility: low-risk auto-executes; high-risk needs a human agent's approval."
       },
+      "options": [
+        {
+          "name": "Policy-rule tiers + deterministic guardrails (default)",
+          "description": "A deterministic policy engine maps each (action kind, resource, amount, reversibility) to a tier — auto / approve / escalate — with hard guardrails the agent can't override.",
+          "pros": [
+            "Auditable and explainable: every decision traces to a versioned rule.",
+            "Hard guardrails can't be talked past by an injected message.",
+            "Easy to quarantine or roll back a bad rule version."
+          ],
+          "cons": [
+            "Coarse tiers can mis-classify novel or borderline actions.",
+            "Rule maintenance grows with action types and tenant policies."
+          ],
+          "view": {
+            "nodes": [
+              "ConvAgent",
+              "ActionGate",
+              "TxnEngine",
+              "Agent2",
+              "Identity",
+              "Account"
+            ],
+            "links": [
+              "conv-gate",
+              "gate-txn",
+              "gate-agent",
+              "agent-id",
+              "id-acct"
+            ],
+            "highlight": [
+              "ActionGate"
+            ],
+            "groups": [
+              "action-gate"
+            ],
+            "caption": "A deterministic policy engine assigns the tier; guardrails are hard limits the model can't override."
+          }
+        },
+        {
+          "name": "Learned risk classifier behind deterministic guardrails",
+          "description": "A learned model scores action risk for nuance, but its output is still clamped by deterministic guardrails and hard ceilings, so it can lower autonomy but never raise it past policy.",
+          "pros": [
+            "Catches nuanced / novel risk a static rule misses.",
+            "Adapts as eval surfaces wrong-action patterns."
+          ],
+          "cons": [
+            "Less explainable; the score must be logged and reviewable.",
+            "A model regression could mis-tier — guardrails must cap it, and eval must gate rollout.",
+            "Adds a model dependency inside the latency budget."
+          ],
+          "view": {
+            "nodes": [
+              "ConvAgent",
+              "ActionGate",
+              "TxnEngine",
+              "Agent2",
+              "Identity",
+              "Account"
+            ],
+            "links": [
+              "conv-gate",
+              "gate-txn",
+              "gate-agent",
+              "agent-id",
+              "id-acct"
+            ],
+            "highlight": [
+              "ActionGate"
+            ],
+            "groups": [
+              "action-gate"
+            ],
+            "caption": "A learned risk score adds nuance but is clamped by deterministic guardrails — it can only lower autonomy, never raise it past policy."
+          }
+        }
+      ],
       "decisionPrompt": "Which actions can the agent auto-execute live, and which must pause for human approval?",
       "patterns": [
         "Human-in-the-loop approval (gate)",
@@ -805,6 +1313,10 @@
                 "label": "Human Agent"
               },
               {
+                "id": "Identity",
+                "label": "Identity"
+              },
+              {
                 "id": "TxnEngine",
                 "label": "Txn Engine"
               }
@@ -814,7 +1326,7 @@
                 "from": "ConvAgent",
                 "to": "ActionGate",
                 "arrow": "->>",
-                "label": "propose action"
+                "label": "propose action (kind, resource, amount)"
               },
               {
                 "type": "alt",
@@ -828,9 +1340,9 @@
                   },
                   {
                     "from": "Agent2",
-                    "to": "TxnEngine",
+                    "to": "ActionGate",
                     "arrow": "-->>",
-                    "label": "approve -> execute"
+                    "label": "approve (bound to action id + policy ver)"
                   }
                 ],
                 "else": {
@@ -838,12 +1350,24 @@
                   "messages": [
                     {
                       "from": "ActionGate",
-                      "to": "TxnEngine",
+                      "to": "ActionGate",
                       "arrow": "->>",
-                      "label": "auto-execute"
+                      "label": "auto: in-policy tier"
                     }
                   ]
                 }
+              },
+              {
+                "from": "ActionGate",
+                "to": "Identity",
+                "arrow": "->>",
+                "label": "mint action-bound scoped token"
+              },
+              {
+                "from": "Identity",
+                "to": "TxnEngine",
+                "arrow": "->>",
+                "label": "execute with scoped token"
               }
             ]
           },
@@ -870,11 +1394,13 @@
       "id": "txn-safety",
       "title": "5. Transactional Safety: Idempotency & Rollback",
       "description": [
-        "Acting live means failures happen mid-action: a refund call times out, the session drops, the customer retries. So every action is idempotent (keyed, deduped) and reversible via compensating actions, with a durable log so a crashed turn resumes exactly-once.",
-        "This is the Foundations durable-execution discipline applied to a live, customer-facing side effect \u2014 and customer input is treated as untrusted so an injected message can't drive an unintended action."
+        "Acting live means failures happen mid-action: a refund call times out, the session drops, the customer retries. So every action carries a provider-scoped idempotency key (a retry never double-refunds), and a durable log lets a crashed turn resume \u2014 effectively-once where the provider gives idempotency, with reconciliation (provider lookup / webhook) and a manual-repair queue for ambiguous timeouts whose external outcome is unknown.",
+        "Idempotency is not reversibility: an action can be safely re-tried yet still be impossible to undo. Reversibility is a per-action policy attribute \u2014 reversible (resend receipt, in-window address change, small goodwill credit), compensatable (refund-then-recharge, cancel-then-rebook), or not safely reversible (account closure, high-value refund, shipped order, identity change, regulatory notice). The gate and handoff rules key off these classes.",
+        "This is the Foundations durable-execution discipline applied to a live, customer-facing side effect. Customer input is treated as untrusted: the Guardrail partitions the message text (data) from tool/action authority, so an injected message can request an action but can never expand scope, change the beneficiary, or bypass policy."
       ],
       "view": {
         "nodes": [
+          "ConvAgent",
           "TxnEngine",
           "Payments",
           "SessionStore",
@@ -907,9 +1433,93 @@
       "whyNow": [
         "Transactional safety must wrap the action gate before live acting is trustworthy."
       ],
+      "flows": [
+        {
+          "sequence": {
+            "participants": [
+              {
+                "id": "TxnEngine",
+                "label": "Txn Engine"
+              },
+              {
+                "id": "Payments",
+                "label": "Provider"
+              },
+              {
+                "id": "SessionStore",
+                "label": "Durable Log"
+              }
+            ],
+            "messages": [
+              {
+                "from": "TxnEngine",
+                "to": "SessionStore",
+                "arrow": "->>",
+                "label": "record attempt (idempotency key)"
+              },
+              {
+                "from": "TxnEngine",
+                "to": "Payments",
+                "arrow": "->>",
+                "label": "execute with key"
+              },
+              {
+                "type": "alt",
+                "label": "provider responds",
+                "messages": [
+                  {
+                    "from": "Payments",
+                    "to": "TxnEngine",
+                    "arrow": "-->>",
+                    "label": "success (provider request id)"
+                  },
+                  {
+                    "from": "TxnEngine",
+                    "to": "SessionStore",
+                    "arrow": "->>",
+                    "label": "mark succeeded"
+                  }
+                ],
+                "else": {
+                  "label": "timeout / unknown",
+                  "messages": [
+                    {
+                      "from": "TxnEngine",
+                      "to": "Payments",
+                      "arrow": "->>",
+                      "label": "reconcile: lookup by key"
+                    },
+                    {
+                      "from": "Payments",
+                      "to": "TxnEngine",
+                      "arrow": "-->>",
+                      "label": "found -> reuse; not found -> retry; still unknown -> manual repair"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "TxnEngine",
+            "Payments"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "Reversibility is a policy attribute, not a guarantee",
+          "points": [
+            "Reversible: resend receipt, in-window address change, small in-policy goodwill credit.",
+            "Compensatable: refund-then-recharge, cancel-then-rebook, apply replacement credit.",
+            "Not safely reversible: account closure, high-value refund, shipped order, identity change, regulatory notice \u2014 these bias toward human approval or escalation.",
+            "Prompt-injection defense lives on the execution path: the message text is data, the action authority is separate, so an injected instruction can't widen scope or skip the gate."
+          ]
+        }
+      ],
       "recap": {
         "before": "A failed or retried action could double-apply.",
-        "after": "Actions are idempotent and reversible via compensation, resumable exactly-once.",
+        "after": "Actions use provider-scoped idempotency with reconciliation; reversal is by compensation where possible and manual repair where not.",
         "newRisk": "Some conversations still need a human \u2014 handoff must be smooth and contextful."
       }
     },
@@ -961,11 +1571,98 @@
             "Hand off the full transcript, attempted actions, and customer context.",
             "A rejected high-risk action is a natural escalation point."
           ]
+        },
+        {
+          "title": "Routing criteria and what the human receives",
+          "points": [
+            "Route on: low confidence, policy conflict, explicit customer ask, repeated failure, a rejected high-risk action, suspected fraud/abuse, or an angry customer.",
+            "Handoff package: transcript summary, attempted actions, account snapshot, retrieved policy evidence, customer sentiment, priority, and target queue/skill.",
+            "Priority and SLA travel with the package, so the right human picks it up in time."
+          ]
+        },
+        {
+          "title": "After handoff and approval expiry",
+          "points": [
+            "Once a human owns the conversation, the agent goes read-only (assists/drafts, takes no autonomous action) until handed back.",
+            "A proposed high-risk action that isn't approved before it expires is dropped, not silently executed; the agent tells the customer and continues or escalates.",
+            "If the approver doesn't respond within the SLA, the action expires and the conversation re-routes rather than holding the customer indefinitely."
+          ]
+        }
+      ],
+      "flows": [
+        {
+          "sequence": {
+            "participants": [
+              {
+                "id": "ActionGate",
+                "label": "Action Gate"
+              },
+              {
+                "id": "Agent2",
+                "label": "Human Agent"
+              },
+              {
+                "id": "Escalation",
+                "label": "Escalation Router"
+              },
+              {
+                "id": "ConvAgent",
+                "label": "Conversation Agent"
+              }
+            ],
+            "messages": [
+              {
+                "from": "ActionGate",
+                "to": "Agent2",
+                "arrow": "->>",
+                "label": "request approval (SLA timer)"
+              },
+              {
+                "type": "alt",
+                "label": "approved in SLA",
+                "messages": [
+                  {
+                    "from": "Agent2",
+                    "to": "ActionGate",
+                    "arrow": "-->>",
+                    "label": "approve -> execute"
+                  }
+                ],
+                "else": {
+                  "label": "expired / rejected",
+                  "messages": [
+                    {
+                      "from": "ActionGate",
+                      "to": "Escalation",
+                      "arrow": "->>",
+                      "label": "expire action + escalate with package"
+                    },
+                    {
+                      "from": "Escalation",
+                      "to": "Agent2",
+                      "arrow": "->>",
+                      "label": "route to queue (priority, SLA)"
+                    },
+                    {
+                      "from": "Escalation",
+                      "to": "ConvAgent",
+                      "arrow": "-->>",
+                      "label": "agent goes read-only"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Escalation",
+            "Agent2"
+          ]
         }
       ],
       "recap": {
         "before": "The agent either resolved or dead-ended.",
-        "after": "It deflects what it should and escalates the rest with context.",
+        "after": "It deflects what it should and escalates the rest with a full context package, going read-only after handoff.",
         "newRisk": "Quality, compliance, and reputation must be measured across live conversations."
       }
     },
@@ -980,6 +1677,7 @@
         "nodes": [
           "ConvAgent",
           "ActionGate",
+          "TxnEngine",
           "AuditLog",
           "Observability"
         ],
@@ -1012,16 +1710,34 @@
       "whyNow": [
         "Action-aware evaluation is what keeps a live, acting agent trustworthy."
       ],
+      "deepDives": [
+        {
+          "title": "What an audit event actually carries",
+          "points": [
+            "Per event: timestamp, actor/principal, event type, action ID, policy version, retrieved source IDs (KB version), prompt/model version, provider request IDs, and a prev-hash so the log is tamper-evident.",
+            "Correlation IDs tie turn -> proposal -> approval -> transaction -> compensation -> handoff into one traceable chain.",
+            "PII redaction and per-tenant retention are enforced because transcripts hold addresses, payment hints, account IDs, and sensitive complaints."
+          ]
+        },
+        {
+          "title": "Evaluation that closes the loop back to the gate",
+          "points": [
+            "Online metrics: p50/p95 turn latency, timeout rate, deflection/escalation rate, approval wait time, wrong-action rate, duplicate-action rate, compensation rate, provider-error rate, human-override rate.",
+            "Offline/QA: policy adherence, groundedness, missed escalation, action-payload correctness, PII leakage, hallucinated policy, sentiment.",
+            "Workflow: sample actions by risk tier, label against policy/account ground truth, feed rule/risk updates back into the action gate, and quarantine a policy/model version when error rates cross a threshold."
+          ]
+        }
+      ],
       "recap": {
         "before": "Only CSAT was measured.",
-        "after": "Resolution quality, action correctness, latency, and deflection are evaluated and audited.",
-        "newRisk": "Other phase-3 verticals add contestability and physical-experiment gates \u2014 see the plan."
+        "after": "Resolution quality, action correctness, latency, and deflection are evaluated and audited, with PII redaction and per-tenant retention.",
+        "newRisk": "Policy, model, and provider changes can silently shift action correctness, so evals must gate gate-policy rollout and rollback."
       }
     }
   ],
   "finalDesign": {
     "title": "Final Design \u2014 Agentic Support Platform",
-    "description": "A live message enters through the support API, which resolves the customer's scope. The conversation agent runs a real-time turn loop within a latency budget, grounded in product/policy docs and the customer's scoped account/order record, over durable session state. When it wants to act, an in-loop action gate classifies the action by reversibility: low-risk reversible actions auto-execute through the transaction engine (idempotent, with compensating rollback); high-risk or hard-to-reverse actions pause for a human agent's approval, with identity granting scoped on-behalf-of authority (and agentic checkout as an option). A deflect-vs-escalate decision hands conversations to a human with full context when the agent shouldn't resolve them. Every turn, decision, transaction, and handoff is audited, and evaluation weights resolution quality and action correctness over raw CSAT. Identity/delegation, durable execution, guardrails, and observability are the shared substrate from Agentic Platform Foundations; uniquely, the gate lives inside a live conversation.",
+    "description": "A live message enters through the support API, which resolves the customer's scope. The conversation agent runs a real-time turn loop within a latency budget, grounded in product/policy docs and the customer's scoped account/order record, over durable session state. When it wants to act, an in-loop action gate classifies the action by reversibility: low-risk reversible actions auto-execute through the transaction engine (provider-scoped idempotency with reconciliation, compensating rollback where reversible); high-risk, compensatable, or not-safely-reversible actions pause for a human agent's approval, with identity minting an action-bound, scoped on-behalf-of token only after the policy and approval checks pass. A deflect-vs-escalate decision hands conversations to a human with full context when the agent shouldn't resolve them. Every turn, decision, transaction, and handoff is audited, and evaluation weights resolution quality and action correctness over raw CSAT. Identity/delegation, durable execution, guardrails, and observability are the shared substrate from Agentic Platform Foundations; uniquely, the gate lives inside a live conversation.",
     "view": {
       "nodes": [
         "Customer",
@@ -1119,7 +1835,7 @@
       },
       {
         "requirement": "Idempotent reversible side effects",
-        "how": "Keyed transactions with compensating rollback.",
+        "how": "Provider-scoped idempotency keys with reconciliation; compensating rollback where reversible, manual repair where not.",
         "steps": [
           "txn-safety"
         ]
@@ -1129,6 +1845,15 @@
         "how": "Reversibility-tiered in-loop gate.",
         "steps": [
           "action-gate"
+        ]
+      },
+      {
+        "requirement": "Scoped delegated authority",
+        "how": "Gateway resolves customer scope; Guardrail treats customer text as untrusted; Identity mints action-bound delegated tokens after policy and approval checks.",
+        "steps": [
+          "grounding",
+          "action-gate",
+          "txn-safety"
         ]
       },
       {
@@ -1206,6 +1931,7 @@
     "How do you keep a turn within budget when it needs retrieval, reasoning, and an action?",
     "How do you classify an action's reversibility to decide auto vs approve?",
     "How do compensating actions roll back a partially-completed multi-step resolution?",
-    "How does an in-the-loop gate differ from the before-the-action gates in finance and legal?"
+    "How does an in-the-loop gate differ from the before-the-action gates in finance and legal?",
+    "Agentic checkout: if the agent makes a purchase for the customer, how do you carry delegated payment authority (e.g. a commerce protocol like ACP) and which action tier should it sit in?"
   ]
 }

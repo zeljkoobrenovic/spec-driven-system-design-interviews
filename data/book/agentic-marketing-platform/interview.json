@@ -304,6 +304,12 @@
         "from": "Orchestrator",
         "to": "Inference",
         "label": "batch generation"
+      },
+      {
+        "id": "gen-channels",
+        "from": "GenAgent",
+        "to": "Channels",
+        "label": "publish directly (no gate)"
       }
     ],
     "types": [
@@ -376,27 +382,47 @@
   },
   "capacity": [
     {
-      "label": "Asset fan-out",
-      "value": "many per brief",
-      "note": "One brief generates per-channel, per-variant assets; the bandit prunes losers."
+      "label": "Tenants & campaigns",
+      "value": "2k tenants, ~5k campaigns/day",
+      "note": "~5 channels/campaign and ~8 variants/channel => ~40 assets/campaign, ~200k assets generated/day."
     },
     {
-      "label": "Approval",
-      "value": "risk-tiered",
-      "note": "High-risk regulatory/claim assets need human approval; low-risk variants flow under policy."
+      "label": "Generation cost",
+      "value": "~200k LLM + ~80k image calls/day",
+      "note": "Peak ~10 generations/sec; cap concurrent jobs (~500) and meter per-tenant token/image budget to bound spend."
     },
     {
-      "label": "Optimization",
-      "value": "live",
-      "note": "Bandit reallocates budget from live performance, then regenerates around winners."
+      "label": "Approval queue",
+      "value": "~15% high-risk => ~30k approvals/day",
+      "note": "Risk-tiered: regulated/claim assets queue for a brand owner (minutes-to-hours latency); low-risk variants flow under policy."
+    },
+    {
+      "label": "Channel delivery",
+      "value": "provider rate-limited",
+      "note": "Each ad/email/SMS provider has its own QPS cap; level bursts through a delivery queue with per-provider token buckets and backoff."
+    },
+    {
+      "label": "Performance events",
+      "value": "~50k impressions/sec peak",
+      "note": "Impression/click/conversion events stream into analytics; conversions land late (hours-to-days) within an attribution window."
+    },
+    {
+      "label": "Bandit cadence",
+      "value": "reallocate every ~15 min",
+      "note": "Budget reallocation runs per campaign on a fixed interval over only currently-cleared variants; regeneration re-enters the gate."
+    },
+    {
+      "label": "Audit retention",
+      "value": "~1M events/day, 7-year retention",
+      "note": "Append-only assets/checks/approvals/deliveries; partitioned by tenant+month, queried by campaign for audit and DSR."
     }
   ],
   "api": [
     {
       "method": "POST",
       "path": "/v1/campaigns",
-      "description": "Submit a brief; the orchestrator generates per-channel assets, reviews claims, and queues them for approval.",
-      "request": "{ \"audience\": \"...\", \"channels\": [\"email\",\"social\"], \"goal\": \"...\" }",
+      "description": "Submit a brief; the orchestrator generates per-channel assets, reviews claims, and queues them for approval. Idempotent via Idempotency-Key so a retried submit returns the same campaign.",
+      "request": "{ \"audience\": \"...\", \"channels\": [\"email\",\"social\"], \"goal\": \"...\", \"region\": \"...\" }",
       "response": "{ \"campaignId\": \"...\", \"status\": \"awaiting_approval\" }",
       "sequence": {
         "participants": [
@@ -452,79 +478,341 @@
     },
     {
       "method": "POST",
-      "path": "/v1/campaigns/{id}/approve",
-      "description": "A brand owner approves high-risk assets; only then are they activated on channels.",
-      "request": "{ \"decision\": \"approve|revise|reject\" }",
-      "response": "{ \"status\": \"live|returned\" }"
+      "path": "/v1/assets/{assetVersionId}/approve",
+      "description": "A brand owner approves a specific immutable asset version; the approval snapshots the claim-library version and expires if the library changes. Idempotent via Idempotency-Key.",
+      "request": "{ \"decision\": \"approve|revise|reject\", \"comment\": \"...\" }",
+      "response": "{ \"approvalId\": \"...\", \"status\": \"approved|returned|rejected\", \"expiresAt\": \"...\" }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/webhooks/{provider}/delivery",
+      "description": "Provider delivery callback. Deduped by webhook_dedupe_key and written as an append-only event, so duplicate or out-of-order callbacks are safe.",
+      "request": "{ \"providerRef\": \"...\", \"event\": \"delivered|bounced|failed\", \"dedupeKey\": \"...\" }",
+      "response": "{ \"accepted\": true }"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/campaigns/{id}/pause",
+      "description": "Emergency kill switch: pause a campaign or a single asset version across all channels and remove its arms from bandit allocation.",
+      "request": "{ \"scope\": \"campaign|assetVersion\", \"assetVersionId\": \"...\", \"reason\": \"...\" }",
+      "response": "{ \"status\": \"paused\" }"
     },
     {
       "method": "GET",
       "path": "/v1/campaigns/{id}/performance",
-      "description": "Fetch live performance per variant feeding the bandit.",
+      "description": "Fetch live performance per variant feeding the bandit, with attribution windows applied.",
       "request": "(campaign id in path)",
-      "response": "{ \"variants\": [ { \"id\": \"...\", \"ctr\": 0, \"conv\": 0, \"allocation\": 0 } ] }"
+      "response": "{ \"variants\": [ { \"id\": \"...\", \"ctr\": 0, \"conv\": 0, \"allocation\": 0, \"eligible\": true } ] }"
     }
   ],
   "dataModel": [
     {
-      "name": "assets",
-      "note": "A generated asset awaiting approval or live.",
+      "name": "campaigns",
+      "note": "One campaign per brief, scoped to a tenant; idempotency key dedupes retried submits.",
       "fields": [
         {
-          "name": "asset_id",
+          "name": "campaign_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "tenant_id",
+          "type": "uuid"
+        },
+        {
+          "name": "goal",
+          "type": "varchar"
+        },
+        {
+          "name": "budget",
+          "type": "numeric"
+        },
+        {
+          "name": "schedule",
+          "type": "tstzrange"
+        },
+        {
+          "name": "region",
+          "type": "varchar"
+        },
+        {
+          "name": "locale",
+          "type": "varchar"
+        },
+        {
+          "name": "brand_kit_version",
+          "type": "int"
+        },
+        {
+          "name": "status",
+          "type": "enum(draft,generating,awaiting_approval,live,paused,completed)"
+        },
+        {
+          "name": "idempotency_key",
+          "type": "varchar UNIQUE"
+        }
+      ]
+    },
+    {
+      "name": "asset_versions",
+      "note": "Immutable generated asset version with prompt/model provenance; supersession instead of mutation.",
+      "fields": [
+        {
+          "name": "asset_version_id",
           "type": "uuid PK"
         },
         {
           "name": "campaign_id",
-          "type": "uuid"
+          "type": "uuid FK"
         },
         {
           "name": "channel",
           "type": "varchar"
         },
         {
+          "name": "model_id",
+          "type": "varchar"
+        },
+        {
+          "name": "prompt_hash",
+          "type": "varchar"
+        },
+        {
+          "name": "brand_kit_version",
+          "type": "int"
+        },
+        {
+          "name": "claim_lib_version",
+          "type": "int"
+        },
+        {
+          "name": "risk_tier",
+          "type": "enum(low,high)"
+        },
+        {
+          "name": "c2pa_manifest",
+          "type": "jsonb"
+        },
+        {
           "name": "status",
-          "type": "enum(draft,awaiting_approval,live,rejected)"
+          "type": "enum(generated,claim_checked,awaiting_approval,approved,live,paused,superseded,rejected)"
         },
         {
-          "name": "provenance",
-          "type": "jsonb (C2PA)"
-        },
-        {
-          "name": "claim_status",
-          "type": "enum(cleared,flagged)"
+          "name": "supersedes",
+          "type": "uuid (self FK, nullable)"
         }
       ]
     },
     {
-      "name": "variants",
-      "note": "Bandit arms with live allocation.",
+      "name": "claim_checks",
+      "note": "First-class evidence of a deterministic claim/brand-voice review, tied to library version.",
       "fields": [
         {
-          "name": "variant_id",
+          "name": "check_id",
           "type": "uuid PK"
         },
         {
-          "name": "asset_id",
+          "name": "asset_version_id",
           "type": "uuid FK"
         },
         {
-          "name": "impressions",
-          "type": "bigint"
+          "name": "claim_lib_version",
+          "type": "int"
         },
         {
-          "name": "conversions",
-          "type": "bigint"
+          "name": "result",
+          "type": "enum(cleared,flagged)"
+        },
+        {
+          "name": "violations",
+          "type": "jsonb (matched rules)"
+        },
+        {
+          "name": "voice_score",
+          "type": "numeric"
+        },
+        {
+          "name": "checked_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "approvals",
+      "note": "Approval decision snapshotting the exact asset version; expires if the claim library changes.",
+      "fields": [
+        {
+          "name": "approval_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "asset_version_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "approver_id",
+          "type": "uuid"
+        },
+        {
+          "name": "decision",
+          "type": "enum(approve,revise,reject)"
+        },
+        {
+          "name": "comment",
+          "type": "text"
+        },
+        {
+          "name": "snapshot_claim_lib_version",
+          "type": "int"
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamptz"
+        },
+        {
+          "name": "decided_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "deliveries",
+      "note": "One channel delivery attempt per provider; webhook dedupe key makes callbacks idempotent.",
+      "fields": [
+        {
+          "name": "delivery_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "asset_version_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "provider",
+          "type": "varchar"
+        },
+        {
+          "name": "provider_ref",
+          "type": "varchar"
+        },
+        {
+          "name": "template_approval",
+          "type": "enum(pending,approved,rejected)"
+        },
+        {
+          "name": "status",
+          "type": "enum(queued,submitted,delivered,failed,paused)"
+        },
+        {
+          "name": "retry_count",
+          "type": "int"
+        },
+        {
+          "name": "failure_reason",
+          "type": "varchar"
+        },
+        {
+          "name": "webhook_dedupe_key",
+          "type": "varchar UNIQUE"
+        }
+      ]
+    },
+    {
+      "name": "consent",
+      "note": "Per-recipient consent/suppression by channel and region; checked at activation.",
+      "fields": [
+        {
+          "name": "consent_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "tenant_id",
+          "type": "uuid"
+        },
+        {
+          "name": "subject_hash",
+          "type": "varchar"
+        },
+        {
+          "name": "channel",
+          "type": "enum(email,sms,push,ads)"
+        },
+        {
+          "name": "region",
+          "type": "varchar"
+        },
+        {
+          "name": "state",
+          "type": "enum(opted_in,opted_out,suppressed)"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "performance_events",
+      "note": "Append-only impression/click/conversion events with attribution window.",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "asset_version_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "kind",
+          "type": "enum(impression,click,conversion)"
+        },
+        {
+          "name": "attribution_window",
+          "type": "interval"
+        },
+        {
+          "name": "occurred_at",
+          "type": "timestamptz"
+        }
+      ]
+    },
+    {
+      "name": "bandit_decisions",
+      "note": "Auditable, reversible budget reallocation over only cleared/approved arms.",
+      "fields": [
+        {
+          "name": "decision_id",
+          "type": "uuid PK"
+        },
+        {
+          "name": "campaign_id",
+          "type": "uuid FK"
+        },
+        {
+          "name": "eligible_arms",
+          "type": "jsonb (cleared asset_version_ids)"
         },
         {
           "name": "allocation",
+          "type": "jsonb (arm -> budget)"
+        },
+        {
+          "name": "exploration_rate",
           "type": "numeric"
+        },
+        {
+          "name": "constraints",
+          "type": "jsonb (frequency/audience caps)"
+        },
+        {
+          "name": "decided_at",
+          "type": "timestamptz"
         }
       ]
     },
     {
       "name": "audit_record",
-      "note": "Append-only campaign audit.",
+      "note": "Append-only campaign audit across every workflow event.",
       "fields": [
         {
           "name": "event_id",
@@ -536,13 +824,163 @@
         },
         {
           "name": "kind",
-          "type": "enum(asset,claim_check,approval,delivery)"
+          "type": "enum(asset,claim_check,approval,provenance,delivery,bandit,pause)"
         },
         {
           "name": "payload",
           "type": "jsonb"
         }
       ]
+    }
+  ],
+  "technologyChoices": [
+    {
+      "concern": "Brand kit / DAM and approved-asset retrieval",
+      "steps": [
+        "grounding",
+        "brand-gate"
+      ],
+      "selfHosted": [
+        "PostgreSQL + pgvector",
+        "OpenSearch",
+        "MinIO",
+        "Weaviate"
+      ],
+      "cloud": {
+        "aws": [
+          "S3",
+          "OpenSearch Service",
+          "Bedrock Knowledge Bases"
+        ],
+        "gcp": [
+          "Cloud Storage",
+          "Vertex AI Search"
+        ],
+        "azure": [
+          "Blob Storage",
+          "AI Search"
+        ]
+      },
+      "tradeoff": [
+        "The DAM stores approved assets and brand guidelines and must be versioned so each generation records the brand-kit version it used.",
+        "Self-hosted vector + object stores give exact control over per-tenant isolation and version pinning; managed search reduces index operations."
+      ],
+      "makesIrrelevant": "A managed vector-search service removes hand-rolled embedding pipelines, but not the per-tenant version pinning the gate depends on."
+    },
+    {
+      "concern": "Content authenticity / provenance (C2PA)",
+      "steps": [
+        "brand-gate"
+      ],
+      "selfHosted": [
+        "c2pa-rs (Content Authenticity SDK)",
+        "Self-managed signing keys (HSM)"
+      ],
+      "cloud": {
+        "aws": [
+          "KMS / CloudHSM"
+        ],
+        "gcp": [
+          "Cloud KMS"
+        ],
+        "azure": [
+          "Key Vault Managed HSM"
+        ]
+      },
+      "tradeoff": [
+        "Decide what is signed (rendered media + generation metadata), where the manifest lives (embedded plus a copy in the asset store), and what happens when a channel strips metadata.",
+        "Managed HSMs protect signing keys with less operational burden than self-managed HSMs."
+      ],
+      "makesIrrelevant": "Provenance signing does not remove the need for the claim gate — a signed asset can still make a prohibited claim."
+    },
+    {
+      "concern": "Generation queue & delivery throttling",
+      "steps": [
+        "naive",
+        "compliance"
+      ],
+      "selfHosted": [
+        "Kafka",
+        "RabbitMQ",
+        "Temporal",
+        "Redis token buckets"
+      ],
+      "cloud": {
+        "aws": [
+          "SQS",
+          "EventBridge",
+          "Step Functions"
+        ],
+        "gcp": [
+          "Pub/Sub",
+          "Workflows"
+        ],
+        "azure": [
+          "Service Bus",
+          "Durable Functions"
+        ]
+      },
+      "tradeoff": [
+        "Bursty generation and per-provider rate limits both need leveling; a durable queue plus per-provider token buckets and backoff bounds spend and respects channel QPS caps.",
+        "A workflow engine (Temporal/Step Functions) makes the publish state machine and retries explicit and auditable."
+      ],
+      "makesIrrelevant": "A managed workflow engine removes hand-rolled retry/state bookkeeping for the publish lifecycle."
+    },
+    {
+      "concern": "Performance events & attribution",
+      "steps": [
+        "optimize",
+        "eval"
+      ],
+      "selfHosted": [
+        "Kafka",
+        "ClickHouse",
+        "Flink"
+      ],
+      "cloud": {
+        "aws": [
+          "Kinesis",
+          "Redshift"
+        ],
+        "gcp": [
+          "Pub/Sub",
+          "BigQuery"
+        ],
+        "azure": [
+          "Event Hubs",
+          "Synapse"
+        ]
+      },
+      "tradeoff": [
+        "Impression/click/conversion volume is high and conversions land late; a stream plus columnar store supports attribution windows and the bandit's reallocation reads.",
+        "Managed streaming/warehouse reduces operations but couples cost to event volume."
+      ]
+    },
+    {
+      "concern": "Consent, suppression & preference management",
+      "steps": [
+        "compliance"
+      ],
+      "selfHosted": [
+        "PostgreSQL preference store",
+        "Open Policy Agent"
+      ],
+      "cloud": {
+        "aws": [
+          "Pinpoint (channel preferences)"
+        ],
+        "gcp": [
+          "Cloud SQL + policy service"
+        ],
+        "azure": [
+          "Communication Services"
+        ]
+      },
+      "tradeoff": [
+        "Consent is per recipient, channel, region, and purpose; the activation path must read it just before provider submission.",
+        "A policy engine (OPA) keeps regional disclosure and template rules versioned and testable."
+      ],
+      "makesIrrelevant": "A managed messaging service with built-in suppression removes some opt-out bookkeeping, but DSR/deletion vs audit-retention reconciliation stays."
     }
   ],
   "patterns": [
@@ -623,20 +1061,19 @@
       ],
       "view": {
         "nodes": [
-          "Marketer",
           "GenAgent",
           "Inference",
           "Channels"
         ],
         "links": [
           "gen-infer",
-          "id-channels"
+          "gen-channels"
         ],
         "highlight": [
           "GenAgent",
           "Channels"
         ],
-        "caption": "An agent generates and publishes directly \u2014 the brand-unsafe baseline."
+        "caption": "An agent generates and publishes directly to channels with no gate \u2014 the brand-unsafe baseline."
       },
       "decisionPrompt": "What's the cost of one off-brand or false-claim asset published automatically?",
       "patterns": [
@@ -667,15 +1104,15 @@
       ],
       "view": {
         "nodes": [
+          "Orchestrator",
           "GenAgent",
           "BrandKit",
-          "Inference",
-          "Guardrail"
+          "Inference"
         ],
         "links": [
+          "orch-gen",
           "gen-brand",
-          "gen-infer",
-          "orch-guard"
+          "gen-infer"
         ],
         "highlight": [
           "BrandKit"
@@ -683,6 +1120,61 @@
         "caption": "Assets are generated grounded in the brand kit / DAM (voice, approved assets, negative-claim library)."
       },
       "decisionPrompt": "How do you make generated copy reliably sound like this brand and not a generic model?",
+      "options": [
+        {
+          "name": "Versioned retrieval with citation (recommended)",
+          "pros": [
+            "Each asset records the brand-kit and negative-claim-library version it was generated against.",
+            "Approved assets are retrieved by channel/locale/audience and cited as evidence.",
+            "A changed negative-claim library can re-flag pending assets by version diff."
+          ],
+          "cons": [
+            "Needs a versioned DAM and retrieval index, not just a prompt.",
+            "More moving parts than stuffing context."
+          ],
+          "view": {
+            "nodes": [
+              "Orchestrator",
+              "GenAgent",
+              "BrandKit",
+              "Inference"
+            ],
+            "links": [
+              "orch-gen",
+              "gen-brand",
+              "gen-infer"
+            ],
+            "highlight": [
+              "BrandKit"
+            ]
+          }
+        },
+        {
+          "name": "Raw prompt context",
+          "pros": [
+            "Simplest: paste brand voice notes into the prompt.",
+            "No retrieval infrastructure."
+          ],
+          "cons": [
+            "No versioning, no evidence of which guidance was used.",
+            "Drifts off-brand as the kit grows past the context window."
+          ],
+          "view": {
+            "nodes": [
+              "Orchestrator",
+              "GenAgent",
+              "Inference"
+            ],
+            "links": [
+              "orch-gen",
+              "gen-infer"
+            ],
+            "highlight": [
+              "GenAgent"
+            ]
+          }
+        }
+      ],
       "patterns": [
         "Memory: short-term vs long-term (semantic/episodic/procedural)"
       ],
@@ -713,6 +1205,7 @@
       "view": {
         "nodes": [
           "Orchestrator",
+          "GenAgent",
           "ClaimGate",
           "BrandKit",
           "Provenance",
@@ -720,6 +1213,7 @@
           "Marketer"
         ],
         "links": [
+          "orch-gen",
           "orch-claim",
           "claim-brand",
           "gen-prov",
@@ -736,6 +1230,71 @@
         "caption": "Every asset is claim-checked and brand-conformance-checked; synthetic media gets C2PA provenance; high-risk needs approval."
       },
       "decisionPrompt": "Which assets can publish automatically and which must a brand owner approve?",
+      "options": [
+        {
+          "name": "Deterministic rules + model judge + risk-tiered approval (recommended)",
+          "pros": [
+            "Prohibited claims, required disclosures, and blocked phrases are deterministic rules, not prompt hopes.",
+            "Brand-voice conformance is a model judge with a threshold, evidence, and escalation on low scores.",
+            "High-risk assets route to a brand owner; low-risk flow under policy."
+          ],
+          "cons": [
+            "Two review paths (deterministic + heuristic) to maintain.",
+            "Voice-judge false positives need a tuning loop."
+          ],
+          "view": {
+            "nodes": [
+              "Orchestrator",
+              "GenAgent",
+              "ClaimGate",
+              "BrandKit",
+              "Provenance",
+              "AssetStore",
+              "Marketer"
+            ],
+            "links": [
+              "orch-gen",
+              "orch-claim",
+              "claim-brand",
+              "gen-prov",
+              "orch-assets",
+              "assets-marketer"
+            ],
+            "highlight": [
+              "ClaimGate",
+              "Marketer"
+            ],
+            "groups": [
+              "brand-gate"
+            ]
+          }
+        },
+        {
+          "name": "Model-only self-check",
+          "pros": [
+            "One prompt asks the model to police its own claims.",
+            "No separate rule engine."
+          ],
+          "cons": [
+            "A prompt can't guarantee a prohibited claim never appears across thousands of variants.",
+            "No deterministic evidence for audit or approval."
+          ],
+          "view": {
+            "nodes": [
+              "Orchestrator",
+              "GenAgent",
+              "Inference"
+            ],
+            "links": [
+              "orch-gen",
+              "gen-infer"
+            ],
+            "highlight": [
+              "GenAgent"
+            ]
+          }
+        }
+      ],
       "patterns": [
         "Human-in-the-loop approval (gate)",
         "Bounded autonomy (agent + deterministic gate)",
@@ -768,6 +1327,10 @@
                 "label": "Brand Owner"
               },
               {
+                "id": "Identity",
+                "label": "Token Broker"
+              },
+              {
                 "id": "Channels"
               }
             ],
@@ -786,20 +1349,38 @@
                     "from": "ClaimGate",
                     "to": "Marketer",
                     "arrow": "->>",
-                    "label": "require approval"
+                    "label": "require approval (snapshot version)"
                   },
                   {
                     "from": "Marketer",
-                    "to": "Channels",
+                    "to": "Orchestrator",
                     "arrow": "-->>",
-                    "label": "approve -> activate"
+                    "label": "approve"
+                  },
+                  {
+                    "from": "Orchestrator",
+                    "to": "Identity",
+                    "arrow": "->>",
+                    "label": "scoped channel token"
+                  },
+                  {
+                    "from": "Identity",
+                    "to": "Channels",
+                    "arrow": "->>",
+                    "label": "activate (idempotent)"
                   }
                 ],
                 "else": {
                   "label": "low-risk, cleared",
                   "messages": [
                     {
-                      "from": "ClaimGate",
+                      "from": "Orchestrator",
+                      "to": "Identity",
+                      "arrow": "->>",
+                      "label": "scoped channel token"
+                    },
+                    {
+                      "from": "Identity",
                       "to": "Channels",
                       "arrow": "->>",
                       "label": "activate under policy"
@@ -812,6 +1393,18 @@
           "highlight": [
             "ClaimGate",
             "Marketer"
+          ]
+        }
+      ],
+      "deepDives": [
+        {
+          "title": "The publish-attempt lifecycle is a state machine, not a flag",
+          "points": [
+            "Asset versions are immutable: generated -> claim_checked -> awaiting_approval -> approved -> live, with paused/superseded/rejected as off-ramps; a regenerated variant is a new version that supersedes, never a mutation.",
+            "create/approve/publish are idempotent (idempotency keys), so retries don't double-publish and a provider accepting a request after a timeout is safe.",
+            "Re-check compliance and approval validity immediately before activation: an approval expires if the negative-claim library changed since it was snapshotted.",
+            "Provider callbacks are deduped into append-only delivery events, so duplicate or out-of-order webhooks converge.",
+            "An emergency pause removes an asset version's arms from the bandit and stops new submissions; rollback reverts to a prior approved version."
           ]
         }
       ],
@@ -859,6 +1452,92 @@
         "caption": "A bandit reallocates budget from live performance and regenerates around winners \u2014 re-entering the claim gate each time."
       },
       "decisionPrompt": "How do you let the bandit chase conversions without ever shipping an unreviewed variant?",
+      "options": [
+        {
+          "name": "Policy-constrained bandit (recommended)",
+          "pros": [
+            "Allocates only among arms with current cleared claim status and valid approval.",
+            "Brand-safety/compliance regressions remove arms from allocation; budget, frequency, and audience caps bound exploration.",
+            "Each decision is logged and reversible; delayed conversions use explicit attribution windows."
+          ],
+          "cons": [
+            "Eligibility checks add latency to each reallocation.",
+            "Cold-start / low-traffic arms need an explicit fallback."
+          ],
+          "view": {
+            "nodes": [
+              "Channels",
+              "Analytics",
+              "Bandit",
+              "Orchestrator",
+              "ClaimGate"
+            ],
+            "links": [
+              "channels-analytics",
+              "analytics-bandit",
+              "bandit-orch",
+              "orch-claim"
+            ],
+            "highlight": [
+              "Bandit",
+              "ClaimGate"
+            ],
+            "groups": [
+              "optimize"
+            ]
+          }
+        },
+        {
+          "name": "Unconstrained bandit",
+          "pros": [
+            "Maximizes raw conversion lift fastest.",
+            "Simplest objective: one metric."
+          ],
+          "cons": [
+            "Optimizes into borderline claims, audience fatigue, or spend spikes.",
+            "Can reallocate to a paused or revoked arm."
+          ],
+          "view": {
+            "nodes": [
+              "Channels",
+              "Analytics",
+              "Bandit",
+              "Orchestrator"
+            ],
+            "links": [
+              "channels-analytics",
+              "analytics-bandit",
+              "bandit-orch"
+            ],
+            "highlight": [
+              "Bandit"
+            ]
+          }
+        },
+        {
+          "name": "Fixed A/B test",
+          "pros": [
+            "Predictable, easy to reason about and report.",
+            "No runaway allocation."
+          ],
+          "cons": [
+            "Wastes budget on losers for the whole test window.",
+            "No continuous optimization."
+          ],
+          "view": {
+            "nodes": [
+              "Channels",
+              "Analytics"
+            ],
+            "links": [
+              "channels-analytics"
+            ],
+            "highlight": [
+              "Analytics"
+            ]
+          }
+        }
+      ],
       "patterns": [
         "Bounded autonomy (agent + deterministic gate)",
         "LLM-as-judge / trajectory evaluation"
@@ -878,7 +1557,14 @@
         "before": "Campaigns were static after launch.",
         "after": "Budget reallocates live to winners; new variants are re-reviewed.",
         "newRisk": "Personalization and channels carry their own compliance rules and untrusted data."
-      }
+      },
+      "traps": [
+        {
+          "trap": "Letting the bandit allocate over every variant by performance alone.",
+          "why": "It will reallocate budget to an arm that has since been paused, revoked, or whose claim status regressed — optimizing into a brand-safety incident.",
+          "instead": "Restrict eligible arms to those with current cleared status and valid approval; remove an arm the moment its safety metrics regress."
+        }
+      ]
     },
     {
       "id": "compliance",
@@ -891,6 +1577,7 @@
         "nodes": [
           "Orchestrator",
           "Guardrail",
+          "Identity",
           "CDP",
           "Channels",
           "AuditLog"
@@ -905,7 +1592,7 @@
           "Guardrail",
           "AuditLog"
         ],
-        "caption": "Channel rules (CAN-SPAM/TCPA/GDPR) and CDP personalization run under policy; everything is audited."
+        "caption": "Channel rules (CAN-SPAM/TCPA/GDPR) and CDP personalization run under policy via a delegated channel token; everything is audited."
       },
       "decisionPrompt": "Where do channel-compliance rules live so the bandit can't optimize past them?",
       "patterns": [
@@ -921,6 +1608,96 @@
       ],
       "whyNow": [
         "Compliance and audit are the floor under the optimization loop."
+      ],
+      "flows": [
+        {
+          "sequence": {
+            "participants": [
+              {
+                "id": "Orchestrator"
+              },
+              {
+                "id": "Guardrail",
+                "label": "Policy & Compliance"
+              },
+              {
+                "id": "CDP",
+                "label": "CDP / Audience"
+              },
+              {
+                "id": "Identity",
+                "label": "Token Broker"
+              },
+              {
+                "id": "Channels"
+              },
+              {
+                "id": "AuditLog",
+                "label": "Audit"
+              }
+            ],
+            "messages": [
+              {
+                "from": "Orchestrator",
+                "to": "CDP",
+                "arrow": "->>",
+                "label": "fetch audience + preferences"
+              },
+              {
+                "from": "Orchestrator",
+                "to": "Guardrail",
+                "arrow": "->>",
+                "label": "final policy check (consent, region, template)"
+              },
+              {
+                "type": "alt",
+                "label": "consent / approval still valid",
+                "messages": [
+                  {
+                    "from": "Guardrail",
+                    "to": "Identity",
+                    "arrow": "->>",
+                    "label": "request scoped channel token"
+                  },
+                  {
+                    "from": "Identity",
+                    "to": "Channels",
+                    "arrow": "->>",
+                    "label": "submit (idempotency key)"
+                  },
+                  {
+                    "from": "Channels",
+                    "to": "AuditLog",
+                    "arrow": "-->>",
+                    "label": "delivery webhook (deduped)"
+                  }
+                ],
+                "else": {
+                  "label": "opted out / approval expired",
+                  "messages": [
+                    {
+                      "from": "Guardrail",
+                      "to": "AuditLog",
+                      "arrow": "->>",
+                      "label": "suppress + record reason"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "highlight": [
+            "Guardrail",
+            "AuditLog"
+          ]
+        }
+      ],
+      "traps": [
+        {
+          "trap": "Treating \"compliant\" as a single boolean checked once.",
+          "why": "Consent is per recipient, channel, region, and purpose; a user may consent to email but not SMS, and approval can expire when the claim library changes.",
+          "instead": "Re-check consent, region policy, template approval, and approval validity at activation time, immediately before provider submission."
+        }
       ],
       "deepDives": [
         {
@@ -949,6 +1726,7 @@
         "nodes": [
           "Orchestrator",
           "ClaimGate",
+          "Channels",
           "Analytics",
           "Observability"
         ],
@@ -976,6 +1754,13 @@
       ],
       "whyNow": [
         "Measurement is what keeps the optimization loop safe at scale."
+      ],
+      "traps": [
+        {
+          "trap": "Treating brand-safety eval as a dashboard to watch.",
+          "why": "Monitoring tells you after the fact; a model, prompt, reviewer, retrieval, or brand-kit change can quietly raise claim-violation or off-brand rates.",
+          "instead": "Make offline/shadow eval a release gate: block a rollout that increases claim-violation or off-brand rates beyond a threshold."
+        }
       ],
       "recap": {
         "before": "Only performance was measured.",
@@ -1104,6 +1889,14 @@
         "steps": [
           "compliance"
         ]
+      },
+      {
+        "requirement": "Tenant isolation; untrusted input",
+        "how": "Per-tenant scoping of brand kit, consent, and delivery; brief/scraped text partitioned from channel authority.",
+        "steps": [
+          "grounding",
+          "compliance"
+        ]
       }
     ]
   },
@@ -1169,10 +1962,95 @@
       ]
     }
   ],
+  "toProbeFurther": {
+    "links": [
+      {
+        "id": "c2pa-spec",
+        "group": "Content Authenticity & Synthetic-Media Disclosure",
+        "groupDescription": "Provenance standards and tooling for disclosing AI-generated media.",
+        "title": "C2PA Content Credentials Specification",
+        "url": "https://c2pa.org/specifications/specifications/2.1/index.html",
+        "source": "Coalition for Content Provenance and Authenticity",
+        "type": "Specification",
+        "year": "2024",
+        "why": "Defines what a provenance manifest records and how it is signed — the basis for the gate's synthetic-media disclosure."
+      },
+      {
+        "id": "content-authenticity-sdk",
+        "group": "Content Authenticity & Synthetic-Media Disclosure",
+        "groupDescription": "Provenance standards and tooling for disclosing AI-generated media.",
+        "title": "Content Authenticity Initiative — c2pa-rs / Tooling",
+        "url": "https://opensource.contentauthenticity.org/",
+        "source": "Content Authenticity Initiative",
+        "type": "Tooling",
+        "year": "2024",
+        "why": "Open-source libraries for stamping and verifying C2PA manifests, including how transformed media and stripped metadata are handled."
+      },
+      {
+        "id": "vowpal-bandits",
+        "group": "Constrained Bandits & Online Optimization",
+        "groupDescription": "Contextual-bandit and constrained-allocation methods for the optimization loop.",
+        "title": "Vowpal Wabbit — Contextual Bandits",
+        "url": "https://vowpalwabbit.org/docs/vowpal_wabbit/python/latest/tutorials/python_Contextual_bandits_and_Vowpal_Wabbit.html",
+        "source": "Vowpal Wabbit",
+        "type": "Tooling",
+        "year": "2023",
+        "why": "Practical contextual-bandit implementation showing exploration, off-policy evaluation, and how to bound allocation — the engine behind the constrained loop."
+      },
+      {
+        "id": "bandits-book",
+        "group": "Constrained Bandits & Online Optimization",
+        "groupDescription": "Contextual-bandit and constrained-allocation methods for the optimization loop.",
+        "title": "Bandit Algorithms (Lattimore & Szepesvári)",
+        "url": "https://tor-lattimore.com/downloads/book/book.pdf",
+        "source": "Cambridge University Press",
+        "type": "Book",
+        "year": "2020",
+        "why": "Reference text for regret, exploration, and constrained bandits — grounds the cold-start and eligibility constraints the brand-safe loop needs."
+      },
+      {
+        "id": "can-spam",
+        "group": "Channel Compliance & Consent",
+        "groupDescription": "Regulatory rules that the activation gate must enforce per channel and region.",
+        "title": "CAN-SPAM Act: A Compliance Guide for Business",
+        "url": "https://www.ftc.gov/business-guidance/resources/can-spam-act-compliance-guide-business",
+        "source": "U.S. Federal Trade Commission",
+        "type": "Guide",
+        "year": "2024",
+        "why": "Defines opt-out, sender identification, and suppression duties that the activation path enforces before email delivery."
+      },
+      {
+        "id": "gdpr-text",
+        "group": "Channel Compliance & Consent",
+        "groupDescription": "Regulatory rules that the activation gate must enforce per channel and region.",
+        "title": "GDPR — Regulation (EU) 2016/679",
+        "url": "https://gdpr-info.eu/",
+        "source": "European Union",
+        "type": "Regulation",
+        "year": "2018",
+        "why": "Governs personalization data, consent, and DSR/deletion — which must be reconciled with append-only audit retention."
+      },
+      {
+        "id": "owasp-llm",
+        "group": "Prompt-Injection & Agent Safety",
+        "groupDescription": "Threats and mitigations for untrusted brief/scraped content reaching channel authority.",
+        "title": "OWASP Top 10 for LLM Applications",
+        "url": "https://owasp.org/www-project-top-10-for-large-language-model-applications/",
+        "source": "OWASP",
+        "type": "Reference",
+        "year": "2025",
+        "why": "Catalogs prompt-injection and excessive-agency risks, motivating partitioning untrusted brief text from channel-publish authority."
+      }
+    ]
+  },
   "followUps": [
     "How do you keep a bandit from optimizing into a borderline claim?",
-    "What exactly does C2PA provenance record and where is it checked?",
+    "What exactly does C2PA provenance record, and what happens when a channel strips the metadata?",
     "How do you enforce per-channel opt-out across an optimization loop?",
+    "What happens to a pending approval when the negative-claim library is updated before publish?",
+    "How do you make create/approve/publish idempotent under retries and duplicate provider callbacks?",
+    "How do GDPR deletion/DSR requests coexist with mandatory append-only audit retention?",
+    "What is the emergency pause/kill switch path for a bad campaign or a broken reviewer?",
     "How does the brand-reputation gate compare to the finance money-movement gate?"
   ]
 }

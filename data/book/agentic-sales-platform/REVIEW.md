@@ -5,240 +5,244 @@ Review date: 2026-06-24
 
 ## Executive Summary
 
-This is a coherent, sales-specific agentic-system case. The central teaching arc is clear: a naive SDR agent destroys sender reputation, then the design adds CRM and waterfall enrichment, a deterministic send gate, deliverability infrastructure, and human handoff. The framing around the "reputation tier" of irreversible action is strong and fits the surrounding agentic vertical series.
+The recent revision materially strengthened this case. The old review's biggest gaps - qualitative capacity, thin data model, missing send lifecycle, email-vs-multichannel ambiguity, absent option branches, and broken step-view endpoints - are now mostly addressed. The case now reads as a strong book chapter on the "reputation tier" of agentic risk: the agent can draft and coordinate, but the deterministic send gate, global suppression, approval snapshot, send queue, and deliverability control loop decide whether anything leaves the company.
 
-The main gap is depth. The interview states the right components but does not yet make enough design-driving choices around scale, state, retries, channel scope, approval races, identity resolution, and deliverability operations. It also has renderer-facing diagram issues: several step views include links whose endpoints are not included in that step's node list, so Mermaid may create implicit nodes or produce confusing diagrams.
+The remaining issues are narrower but still worth fixing before treating this as flagship-quality. The most important are a capacity arithmetic inconsistency, suppression keying that cannot represent tenant and platform scope correctly, audit claims without a first-class audit-events model, and a handoff diagram/API mismatch where replies bypass the classifier in the architecture even though the flow says they are classified.
 
 | Axis | Rating | Notes |
 | --- | --- | --- |
-| System design soundness | 3.5/5 | Correct conceptual architecture, but capacity, state model, and multi-channel semantics are thin. |
-| Production realism | 3/5 | Good reputation/compliance instincts; missing send-attempt lifecycle, provider failure handling, idempotency, consent provenance, and operational runbooks. |
-| Pedagogical flow | 3.5/5 | Nice baseline-to-gate progression, but no option branches and limited flows make it read more like a reference answer than an interview journey. |
-| Dataset/rendering fit | 3/5 | JSON is valid and references mostly resolve, but step diagrams contain links with hidden endpoints. |
-| Overall | 3.5/5 | Strong skeleton; needs production state and decision points to become a flagship book case. |
+| System design soundness | 4/5 | Strong core architecture; remaining concerns are state semantics, suppression scope, audit modeling, and a few API gaps. |
+| Production realism | 4/5 | Much better: idempotency, provider callbacks, webhook dedupe, warmup, caps, pause/quarantine, and CRM conflicts are now present. |
+| Pedagogical flow | 4/5 | Good baseline -> enrichment -> gate -> deliverability -> handoff progression with real options in the middle steps. |
+| Dataset/rendering fit | 4.5/5 | JSON is valid; step, option, and final views have endpoint-complete links. A few semantic diagram refinements remain. |
+| Overall | 4/5 | Strong and usable; a focused pass on state tables, handoff surfaces, and capacity math would make it book-ready. |
 
 ## What Works Well
 
-- The case has a crisp domain risk: sender reputation and compliance, not money movement or legal work product.
-- The naive baseline is effective because it immediately exposes the scarce resource: deliverability.
-- The CRM plus waterfall enrichment step introduces the right grounding source for sales, and it ties personalization to authoritative prospect data instead of model memory.
-- The deterministic send gate is the right control boundary for agentic sales: suppression, compliance, approval, and reputation-aware rate limiting belong outside the model.
-- The final design integrates enrichment, approval, suppression, deliverability, audit, and handoff in a compact way.
-- The top-level pattern set is relevant to the broader agentic-platform series: bounded autonomy, delegation not impersonation, prompt-injection defense, queue-based load leveling, and trajectory evaluation.
+- The description now scopes the case as email-first outbound and explicitly defers SMS/phone behind channel-specific consent and throttling. That resolves the earlier multichannel ambiguity.
+- Capacity is now design-driving: tenant/campaign/prospect volume, provider fan-out, inbox caps, reputation thresholds, suppression lookup latency, and audit/event volume all motivate queues and control loops.
+- The data model now includes the important sales-platform state: enrichment provenance, immutable drafts, approvals, send attempts, inbox health, provider events, suppression, and CRM sync.
+- The send-gate step now teaches the right race: approval is not delivery; approval snapshots a version, queues work, and the gate re-checks suppression and reputation at send time.
+- Option branches were added where they matter most: sync vs async enrichment, check-once vs approval-plus-recheck, and API-quota vs reputation-aware scheduling.
+- The deliverability step is now domain-specific rather than generic rate limiting. It correctly separates provider API quota from sender reputation.
+- Sequence flows now cover both gated sending and reply handoff, making the risky asynchronous paths easier to discuss.
+- The previous renderer defect is fixed: step views and option views no longer reference links whose endpoint nodes are hidden.
 
 ## Highest-Impact Issues
 
-### 1. Capacity is qualitative, so it does not drive architecture
+### 1. Capacity math has an internal inconsistency
 
-The `capacity` section has useful labels, but it never converts workload into design pressure. There are no assumptions for prospects/day, enrichment provider calls/prospect, send volume, inbox warmup ramp, queue depth, provider latency, bounce/complaint thresholds, or CRM write volume.
+The capacity section says 3M prospects/day, a 60% cache hit rate, and "~3M cache misses/day x 2.5 = 7.5M provider calls/day." With 3M prospects/day and 60% cache hits, cache misses should be about 1.2M/day, which implies roughly 3M provider calls/day at 2.5 calls per miss. If the intent is 7.5M provider calls/day, then either the cache hit rate should be near 0% or the total prospect volume should be higher.
 
-Why it matters: the core sales-platform trade-off is not "can we call an API" but "how fast can we safely enrich and send without exhausting provider budgets or sender reputation." Without numbers, the queueing, worker pools, deliverability manager, data retention, and observability thresholds are not justified.
+Why it matters: this case uses capacity to justify async enrichment, provider QPS shaping, and cost controls. A visible arithmetic mismatch weakens the teaching value.
 
-Concrete fix: add a capacity model with example interview math:
+Concrete fix: pick one consistent model and propagate it:
 
-- tenant count and campaigns per tenant
-- prospects/day and messages/prospect
-- waterfall fan-out and cache hit assumptions
-- enrichment provider QPS/cost limits
-- per-inbox daily caps, warmup ramp, and cap reductions on bad signals
-- bounce/spam thresholds that trigger automatic pause
-- audit and event volume
+- 3M prospects/day, 60% cache hit -> 1.2M misses/day -> 3M provider calls/day -> about 35 QPS average before peak multiplier.
+- Or 3M misses/day -> 7.5M provider calls/day -> say the 3M figure is post-cache-miss volume.
 
-### 2. The data model cannot support the promised behavior
+Also clarify whether the 3M messages/day send-volume estimate is one first-touch email per prospect or includes follow-up sequence attempts.
 
-The current model has only `prospects`, `sequences`, and `suppression`. That is enough to describe the idea but not enough to implement the final design.
+### 2. Suppression cannot represent scoped opt-outs correctly
 
-Missing state includes:
+The `suppression` table has `identity_key` as the primary key plus `scope: enum(tenant,global)`, but no `tenant_id`. That cannot distinguish a tenant-scoped suppression from a platform-global suppression for the same identity, nor can it represent different tenant-specific suppressions for the same identity.
 
-- campaign or sequence step definitions
-- sequence messages and generated drafts
-- approval records with approver, decision, timestamp, and version approved
-- send attempts with idempotency key, provider message id, selected inbox/domain, status, retry count, and failure reason
-- inboxes/domains with warmup state, SPF/DKIM/DMARC status, daily cap, current usage, and health
-- deliverability events for bounces, complaints, unsubscribes, replies, and provider webhooks
-- enrichment results per provider/field with provenance, confidence, cost, and freshness
-- CRM sync state, external object version, and conflict metadata
-- audit events as a first-class append-only table or stream, not only a diagram node
+Why it matters: the requirements promise "global, identity-resolved suppression" and the final design says tenant-global plus platform-global. The key shape must make the scope enforceable, queryable, and auditable.
 
-Concrete fix: expand `dataModel` with these objects, then map each to steps and final design. This would make the "auditable", "deliverability", "bidirectional CRM", and "global suppression" claims verifiable.
+Concrete fix: model suppression as something like:
 
-### 3. The send gate needs an explicit state machine and idempotency story
+- `scope: enum(tenant,platform)`
+- `tenant_id nullable`
+- `identity_key`
+- composite uniqueness on `(scope, tenant_id, identity_key)`
+- provenance fields for source event, source channel, reason, timestamp, and actor/system
 
-The gate is described as deterministic, but the lifecycle is underspecified. The API returns `sending|rejected`, while the sequence status enum has `awaiting_approval,sending,replied,stopped`. It does not model `approved`, `queued`, `blocked`, `sent`, `bounced`, `complained`, `unsubscribed`, `failed`, or `paused_for_reputation`.
+Then state the gate lookup rule: block if either a platform-level entry exists or a matching tenant-level entry exists.
 
-Why it matters: the hard bugs in this system are races and retries:
+### 3. Audit is promised but not modeled as a first-class append-only record
 
-- a prospect opts out after a rep approves but before the queued send fires
-- the same approval request is retried
-- an email provider times out after accepting a message
-- a webhook arrives twice or out of order
-- reputation drops while messages are already queued
-- a campaign is stopped while send attempts are in flight
+The final design and `satisfies` section claim enrichment sources, immutable approved drafts, suppression checks, approvals, send attempts, and webhooks are recorded append-only with retention. The data model has several source tables, but no `audit_events` or equivalent append-only audit table/stream. The `AuditLog` node exists in the architecture, but the model does not define its schema.
 
-Concrete fix: add a step or deep dive for the sequence/send-attempt state machine. Make the gate re-check suppression and cap availability at send time, use idempotency keys for approve/send requests, persist immutable approval snapshots, and treat provider callbacks as deduplicated events.
+Why it matters: this platform's defensibility depends on reconstructing who approved what, which source data was used, which checks ran, and why a send was allowed or blocked. Operational tables alone are not a durable audit trail.
 
-### 4. The requirements say multi-channel, but the design is effectively email-only
+Concrete fix: add an `audit_events` model with fields such as `event_id`, `tenant_id`, `actor_type`, `actor_id`, `action`, `object_type`, `object_id`, `sequence_id`, `attempt_id`, `draft_version`, `decision`, `source_event_id`, `policy_version`, `metadata`, and `ts`. Keep it append-only and link it to retention/deletion rules.
 
-The functional requirement says "multi-channel outreach" and the compliance requirement mentions TCPA for phone/SMS, but the architecture only has `Email` as the delivery surface, the deliverability section is email-specific, and the API example is `channel: "email"`.
+### 4. Reply handoff is clearer in the sequence flow than in the architecture/API
 
-This creates an ambiguity: either the interview is really about outbound email, or it must support channel-specific consent, throttling, approval, handoff, provider callbacks, and compliance for SMS/phone/social.
+The handoff flow correctly shows `Email -> Orchestrator -> CRM/Rep/AuditLog`, with an alternate path for unsubscribe or angry replies. The architecture link, however, is `Email -> Rep` (`email-rep`) labelled "qualified reply -> handoff", and there is no API surface for reply webhooks. The only webhook API is `/v1/webhooks/delivery`, whose request enum covers bounce, complaint, unsubscribe, and delivered, but not reply.
 
-Concrete fix: choose one:
+Why it matters: a production system should not route raw replies directly to reps before classification, ownership checks, unsubscribe handling, and audit. The diagram and API should reflect the controlled path.
 
-- Scope the case explicitly to email-first sales outreach and remove or defer the multi-channel/TCPA language.
-- Or add a `ChannelRouter` and channel adapters, with separate consent/suppression rules for email, SMS, and calls.
+Concrete fix: add architecture links such as `email-orch` ("reply webhook") and `orch-rep` ("qualified handoff"), use those in the handoff/final views, and either extend `/v1/webhooks/delivery` to include `reply` or add `/v1/webhooks/replies`.
 
-### 5. The pedagogy lacks real decision branches
+### 5. The send-attempt lifecycle is present but not yet explicit as a state machine
 
-Every step has zero `options`. The story is clear, but candidates do not get many places to compare designs. Neighboring book cases such as finance and legal use options to teach important architecture forks; this case would benefit from the same treatment.
+The data model now has statuses for sequences and send attempts, and the send-gate flow covers approve, block, lease, and deliver. What is still missing is a compact transition table that states legal transitions and the event that causes each one.
 
-Good option branches to add:
+Why it matters: this is where most production bugs live: retries after provider timeouts, duplicate callbacks, late opt-outs, domain quarantine, campaign stop, and out-of-order provider events.
 
-- enrichment strategy: synchronous waterfall vs async enrichment queue vs cached profile refresh
-- suppression identity: exact email key vs identity graph with confidence thresholds
-- send gate placement: approval before queue vs approval plus final pre-send recheck
-- delivery scheduler: provider API limit scheduler vs reputation-aware per-inbox scheduler
-- CRM sync: CRM as synchronous source of truth vs local projection with conflict resolution
+Concrete fix: add a short deep dive under the send-gate or deliverability step:
 
-### 6. Several step diagrams reference links whose endpoints are not in the step view
-
-The link IDs resolve globally, but the endpoints are absent from the individual step's `view.nodes`:
-
-- `naive`: `sendgate-email` references `SendGate -> Email`, but `SendGate` is not in the view.
-- `enrichment`: `orch-guard` references `Orchestrator -> Guardrail`, but `Orchestrator` is not in the view.
-- `send-gate`: `draft-rep` references `DraftStore -> Rep`, but `DraftStore` is not in the view.
-- `deliverability`: `orch-obs` references `Orchestrator -> Observability`, but `Orchestrator` is not in the view.
-- `handoff`: `orch-crm`, `orch-log`, and `orch-obs` reference `Orchestrator`, but `Orchestrator` is not in the view.
-
-Why it matters: Mermaid can implicitly create missing nodes or the renderer can produce diagrams whose visible components do not match the authored intent. This is especially confusing in a teaching walkthrough where each step is supposed to reveal a controlled subset of the final architecture.
-
-Concrete fix: either add the missing endpoint nodes to each `view.nodes` list or replace those links with links whose endpoints are intentionally visible in that step.
+- `awaiting_approval -> approved -> queued -> sent -> delivered`
+- `queued -> blocked` on suppression, cap exhaustion, campaign stop, or domain quarantine
+- `sent -> bounced|complained|unsubscribed|replied`
+- callback dedupe by provider event id
+- provider timeout handling by idempotency key plus provider message id reconciliation
 
 ## System Design Soundness
 
-The architecture has the right major components: trigger/API, orchestrator, research worker, inference, enrichment, CRM, suppression, send gate, deliverability manager, draft store, identity/token broker, audit, and observability. The risk boundary is also correctly placed at the send gate, not inside the LLM.
+The architecture is now credible. It has the right split between agentic drafting and deterministic authority: the model can research and personalize, while the send gate enforces suppression, compliance, approval, and reputation-aware rate limits. The introduction of `SendQueue` is especially important because it separates approval from delivery and gives deliverability a place to apply leases, pauses, and retries.
 
-The weak point is state. The final design depends on durable state transitions, deduped callbacks, approval snapshots, suppression updates, and provider-specific delivery events, but most of these are only described in prose. The design should make the queue and stateful send-attempt store explicit because those are what make "approved but not yet sent" safe.
+The strongest design choice is treating deliverability as the binding constraint. The capacity section, options, traps, and final design all reinforce the idea that provider API quota is not the real limit. The warmed-inbox cap math makes the queue and per-inbox scheduler feel necessary rather than ornamental.
 
-The compliance story names CAN-SPAM, GDPR, and TCPA, but it should define the data the system stores to prove compliance: consent or lawful-basis metadata, unsubscribe source, address/footer template version, DSR/deletion handling, retention policy, and tenant-level isolation boundaries.
+The remaining design gaps are mostly about making promised guarantees mechanically enforceable. Suppression needs a better primary key. Audit needs an explicit append-only schema. Reply routing needs to go through the classifier in both the graph and API. The send-attempt statuses need a state machine so edge cases are not left to prose.
 
-The deliverability manager is the best domain-specific component. It would be stronger if it owned explicit inputs and outputs: inbox health events in, cap decisions out, pause/resume commands, and scheduler leases for send attempts.
+Compliance is improved but could still be made more concrete. The model has `consent_basis` and `footer_template_version`, and the final design mentions retention/deletion. It should also name where deletion requests, lawful-basis provenance, footer/address template versions, and policy-versioned compliance checks are stored.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: An Agent That Blasts Outreach
 
-The baseline is effective: it frames deliverability as the scarce resource and makes the rest of the interview necessary. The diagram should not use `sendgate-email` unless `SendGate` is shown; at this stage the point is probably `ResearchAgent -> Email` or `Orchestrator -> Email` as an unsafe direct send.
+This is an effective baseline. It exposes sender reputation as the scarce asset and explains why the rest of the system exists. The diagram is now self-contained: `ResearchAgent -> Inference` and `ResearchAgent -> Email` clearly show unsafe direct sending without accidentally introducing the later send gate.
 
 ### Step 2: Ground in the CRM + Waterfall Enrichment
 
-This step introduces the right sales-specific corpus. It should add one practical tension: waterfall enrichment is costly and latency-prone, so the system needs cache/freshness rules, provider fallbacks by field, confidence/provenance, and async refresh for lower-priority prospects. This is also the best place to explain prompt-injection isolation in concrete terms: untrusted web/enrichment text can inform a draft but cannot carry tool instructions or bypass the send gate.
+This step is much stronger than before. It now includes CRM dedupe, provider waterfall, provenance, cost/freshness pressure, and prompt-injection isolation. The sync-vs-async option is a useful interview fork because it connects capacity math to architecture.
+
+One improvement: make the "async enrichment queue" a visible queue node if this step is meant to teach queue-based decoupling before send scheduling. Today the recommended option says queue, but the view only shows `Enrichment`, not a queue. This is not a renderer defect, just a teaching opportunity.
 
 ### Step 3: The Gate: Suppression, Compliance & Approve-Before-Send
 
-This is the core step, and the concept is correct. It needs more precision about ordering. Approval should not be treated as equivalent to delivery; it should create an approved immutable draft/version, then the send path should perform a final suppression and reputation check immediately before provider submission.
+This is now the best step in the case. The check-once option creates the right contrast, and the recommended option teaches immutable draft versions, idempotency, late opt-out races, and final pre-send checks. The sequence flow is concrete and production-relevant.
 
-The flow currently sends from `Rep` to `Email` in the success branch. That hides the actual gate/scheduler/provider path. A better sequence is `Rep -> Orchestrator` approval, `Orchestrator -> SendGate`, `SendGate -> Suppression`, `SendGate -> Deliverability`, `SendGate -> Email`.
+The next improvement is to add the state-machine deep dive described above. The step already contains the ingredients; a transition table would make the safety story precise.
 
 ### Step 4: Deliverability as First-Class Infrastructure
 
-This is a strong domain step. It correctly separates reputation limits from API limits. To make it production-realistic, add the control loop: ingest bounces/complaints/replies, compute health and caps, assign messages to warmed inboxes, pause bad domains, and emit alerts. Also show where queued work waits when caps are exhausted.
+This step now teaches a sales-specific system design idea rather than generic throttling. The API-limit scheduler option is a good foil, and the recommended reputation scheduler correctly introduces warmup, live bounce/spam signals, leases, and auto-pause/quarantine.
+
+Consider adding one sequence flow for the control loop: provider callback -> dedupe event -> update inbox health -> cap reduction or quarantine -> queued attempts blocked/held -> alert. That would make the operational feedback path as vivid as the send-gate path.
 
 ### Step 5: Qualified Handoff, Audit & Evaluation
 
-The closing step is directionally right but too compressed. It combines reply classification, human handoff, CRM writeback, audit, and evaluation. It would benefit from one flow showing an inbound reply webhook becoming a qualification decision, CRM update, rep task, and audit event. Add failure cases such as ambiguous intent, out-of-office, unsubscribe, angry reply, and account-owner mismatch.
+The added flow improves this step substantially. It handles unsubscribe/angry replies separately from qualified or pricing asks, updates CRM, hands off to the owning rep, and appends audit provenance.
+
+The architecture should be brought into alignment with this flow. Replace the direct `Email -> Rep` handoff link with `Email -> Orchestrator` and `Orchestrator -> Rep`, and expose a reply webhook API. Also add at least one trap here: common failures include routing to the wrong account owner, treating out-of-office as positive intent, missing unsubscribe intent in a reply, and overwriting CRM fields during handoff.
 
 ## Final Design Review
 
-The final design integrates the steps cleanly and includes all major nodes. It is a good overview diagram. Its main weakness is that it looks more complete than the underlying data model and flows. The final design promises audit, CRM sync, delegated identity, suppression, deliverability, and evaluation, but only a subset has supporting API/data-model detail.
+The final design now integrates the major steps well. It explicitly includes async provider waterfall, immutable approval snapshots, durable send queue, send-time suppression/reputation recheck, idempotency keys, webhook dedupe, inbox warmup/caps, CRM conflict resolution, audit, and evaluation. That is a meaningful jump from the earlier skeleton.
 
-The final design should also clarify where queues live. The description says sequences queue for approval, and deliverability paces sends, but the diagram has `DraftStore` and no send queue or scheduler-owned durable queue. For this domain, the distinction matters: approval queue, send queue, provider retry queue, and webhook/event stream have different safety properties.
+The diagram is structurally valid and endpoint-complete. Its remaining weakness is semantic: `Email -> Rep` makes reply handoff look direct, while the text and sequence correctly say replies are classified first. The identity broker is also under-connected visually; the final design mentions scoped delegated access, but the graph only shows `Rep -> Identity`. A link from `Identity` into the gate/CRM/send authority path would help candidates see where delegated authority is enforced.
 
 ## Concept Introduction and Learning Flow
 
-Concepts are introduced in the right order:
+The concept order works:
 
-- deliverability risk first
-- CRM/waterfall grounding second
-- deterministic send gate third
-- reputation-aware pacing fourth
-- handoff/audit/eval last
+- start with reputation failure
+- ground in CRM and enrichment
+- add the deterministic send gate
+- introduce reputation-aware scheduling
+- close with handoff, audit, and evaluation
 
-The missing concept is "send attempt lifecycle." It should be introduced before or during the gate step because it connects approval, suppression, idempotency, provider callbacks, and audit.
+The recent option branches make the interview much more interactive. Candidates can now compare real design alternatives instead of passively receiving the final answer.
 
-The current concepts are concise and useful, but some patterns are only tagged rather than taught. "Delegation not impersonation" needs at least a sentence about scoped OAuth tokens and an `act`/approved-by claim. "Prompt-injection defense" needs an example of enriched web text being treated as untrusted content rather than executable instructions.
+The remaining learning gap is that some core state ideas are distributed across API, data model, flow, traps, and final-design prose. A single state-machine deep dive would pull them together and make the case easier to teach.
 
 ## Step-to-Final-Design Coherence
 
-The final design contains all step-introduced components, but the step diagrams sometimes use final-design links before their endpoint nodes have been introduced. That weakens the incremental reveal. The clearest fix is to make each step view self-contained and make each newly introduced node/link visibly motivated by the `recap.newRisk` from the previous step.
+The step-to-final-design coherence is now strong. Every major final-design component is introduced before the final design: enrichment and CRM in step 2, send gate and suppression in step 3, send queue and deliverability in step 4, and CRM handoff/audit/eval in step 5.
 
-The strongest transition is from naive sending to enrichment and gate. The weakest transition is from deliverability to handoff: the handoff step introduces several operational concerns at once without a prior problem statement or sequence flow.
+The previous link-endpoint issue is resolved. Step views and option views are now self-contained, so the incremental diagram reveal should render predictably.
+
+Two coherence nits remain:
+
+- The top-level pattern `LLM-as-judge / trajectory evaluation` lists `deliverability` in `patterns[].steps`, but the step tag appears on `handoff`. Include `handoff` or move the tag so the pattern cross-link matches where it is taught.
+- The handoff step's view and final design should show the same controlled reply path as the sequence flow.
 
 ## Realism Compared With Production Systems
 
-A production sales platform would have more explicit handling for:
+This is now fairly realistic for an interview case. It covers:
 
-- provider outages, partial enrichment, stale enrichment, and cost budgets
-- CRM sync conflicts, field-level permissions, and ownership/account routing
-- unsubscribe and complaint webhooks that immediately update global suppression
-- idempotent sends and provider callback deduplication
-- tenant-specific suppression and global suppression interaction
-- data retention, deletion, and PII access controls
-- manual override workflows and emergency pause/kill switch
-- deliverability runbooks for warming, pausing, quarantining, and rotating domains
-- user-facing explanations for why a prospect was blocked, delayed, or handed off
+- provider waterfall cost and QPS pressure
+- cache/freshness trade-offs
+- CRM as system of record with conflict metadata
+- immutable approval snapshots
+- idempotent approval/send APIs
+- provider webhook dedupe
+- late opt-out and reputation races
+- per-inbox warmup and caps
+- bounce/complaint thresholds and quarantine
+- global suppression
+- tenant isolation and untrusted enrichment text
 
-These are not all required in the first version, but the interview should name which are in scope and which are deliberately deferred.
+Production systems would still need more detail in a few areas:
+
+- suppression scope and tenant/global keying
+- audit-event schema and retention/deletion behavior
+- reply webhook handling and ownership routing
+- emergency pause API and operator workflow
+- provider-specific message-id reconciliation after ambiguous timeouts
+- policy versioning for compliance checks
+- DSR/deletion handling for enriched PII while preserving minimal suppression records
+
+These are good follow-up topics rather than fundamental flaws.
 
 ## Dataset and Renderer-Facing Observations
 
 - `interview.json` parses as valid JSON.
-- Top-level keys are conventional for this repo: requirements, capacity, API, data model, patterns, steps, final design, satisfies, script, level variants, and follow-ups.
+- Top-level fields are conventional for this repo: requirements, capacity, API, data model, patterns, steps, final design, satisfies, interview script, level variants, and follow-ups.
 - High-level architecture link endpoints resolve to declared nodes.
+- Step views, option views, and the final design have endpoint-complete links.
+- `view.highlight` IDs are visible in their corresponding views.
+- Sequence participants and message endpoints resolve to canonical node IDs.
 - `satisfies[*].steps[*]` references resolve to real step IDs.
-- Pattern `steps[]` references resolve to real step IDs.
-- Final design links are endpoint-complete.
-- Every step has zero options. This is valid, but weaker pedagogically for a book case.
-- Only one step has a sequence flow, and only one step has a deep dive. That is sparse for a domain with rich state and failure modes.
-- Several step views include links whose endpoints are not included in the step's visible node list; fix these before relying on the generated diagrams.
+- `patterns[*].steps[*]` references resolve to real step IDs, though the LLM-as-judge pattern is semantically attached to the wrong step.
+- Canonical node types are used; no unknown custom node types appear.
+- No docs rebuild is needed for `REVIEW.md`, since it is repo-only.
 
 ## Recommended Edits, Prioritized
 
-### P1: Fix step diagram endpoint completeness
+### P1: Fix the capacity arithmetic
 
-Update each step `view.nodes` or `view.links` so every displayed link has both endpoints visible. This is the only clear renderer-facing defect.
+Correct the cache-hit/cache-miss/provider-call calculation and clarify whether send volume counts first touches only or all sequence attempts.
 
-### P1: Add production state for the send lifecycle
+### P1: Fix suppression scope modeling
 
-Expand the data model and at least one flow around approval, queued send, final gate check, provider submission, webhook callback, reply, stop, bounce, complaint, and unsubscribe.
+Add `tenant_id` and composite uniqueness for tenant-vs-platform suppression. State the lookup rule the send gate uses.
 
-### P1: Make capacity design-driving
+### P1: Add a first-class audit-events model
 
-Add concrete numbers and derived workloads. Use them to justify async enrichment, queue depth, send scheduler behavior, provider/cost limits, and deliverability thresholds.
+Define the append-only audit schema promised by the final design and `satisfies` section.
 
-### P2: Resolve the multi-channel ambiguity
+### P2: Align reply handoff across graph, flow, and API
 
-Either make the case explicitly email-first, or add channel adapters and channel-specific consent/suppression/compliance.
+Route replies through the orchestrator/classifier in the architecture and expose a reply webhook or extend the delivery webhook to include replies.
 
-### P2: Add option branches
+### P2: Add a send-attempt state-machine deep dive
 
-Add options to the enrichment, send gate, deliverability scheduler, and CRM sync steps so candidates compare real trade-offs instead of receiving a single path.
+Make legal transitions, retries, late opt-outs, campaign stops, provider timeouts, and callback dedupe explicit.
 
-### P2: Strengthen compliance and tenant-isolation details
+### P2: Make delegated identity visible in the graph
 
-Add consent/lawful-basis fields, retention/deletion behavior, tenant partitioning, access control, and audit query examples.
+Connect `Identity` to the components that consume scoped authority, such as CRM writes, approval, and sending.
 
-### P3: Add more traps and deep dives
+### P3: Add handoff traps and one deliverability control-loop flow
 
-Good additions would be: per-inbox suppression trap, approval snapshot trap, "API limit is not reputation limit", CRM overwrite trap, provider timeout/idempotency trap, and warmup emergency pause runbook.
+Use these to teach wrong-owner routing, out-of-office classification, unsubscribe-in-reply handling, and domain quarantine.
+
+### P3: Add book polish fields if desired
+
+Technology choices would be useful here: CRM provider integration, enrichment providers, email sending providers, queue/scheduler, event stream, cache/index for suppression, warehouse/observability, and audit storage.
 
 ## What Not To Change
 
-- Keep deliverability as the central scarce resource; that is the strongest teaching idea in the case.
-- Keep the deterministic gate outside the model. The agent may draft, but it should not decide whether sending is legally and reputationally safe.
-- Keep CRM as the system of record and enrichment as a grounded, provenance-bearing input rather than model memory.
-- Keep the connection to Agentic Platform Foundations, but make sales-specific state explicit enough that the case stands alone.
+- Keep the case email-first. The deferred SMS/phone framing is clearer than trying to teach every channel at once.
+- Keep the deterministic send gate outside the model. The agent drafts; the gate authorizes.
+- Keep approval separate from delivery. That is the key safety lesson.
+- Keep deliverability as first-class infrastructure, not a generic rate limiter.
+- Keep CRM as the system of record and enrichment as provenance-bearing input, not model memory.
 
 ## Bottom Line
 
-This is a strong outline for an agentic sales interview, with the right domain risk and control boundary. To make it production-grade and book-ready, add quantitative capacity, durable send-state modeling, explicit idempotency/retry behavior, channel-scope clarity, option branches, and self-contained step diagrams.
+The recent changes moved this from a strong outline to a strong interview dataset. It now teaches the core sales-platform risks with concrete state, capacity, options, and flows. Fix the capacity math, suppression keying, audit schema, and reply-handoff surface, then this will be ready to stand alongside the stronger book cases.

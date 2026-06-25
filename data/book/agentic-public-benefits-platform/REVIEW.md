@@ -219,7 +219,7 @@ Clean checks:
 
 Observations:
 
-- The dataset has no `technologyChoices` section. That is optional, but this case would benefit from choices around rules engines, workflow queues, identity, case management, notice delivery, and analytics.
+- The dataset now has a `technologyChoices` section covering rules engines, workflow queues, identity, evidence intake, notice delivery, audit retention, fairness analytics, and observability.
 - Generated AI visuals are absent. Also optional; not needed for correctness.
 - The API examples use an em dash for empty request bodies. Existing datasets use this style, so it is not a blocker.
 
@@ -244,10 +244,6 @@ Clarify access controls, partitioning, auditability, and remediation authority f
 ### P3: Add more option trade-offs
 
 Add options for caseworker review model, appeal-record shape, notice ownership, or fairness-analysis approach.
-
-### P3: Consider technology choices
-
-A compact `technologyChoices` section could compare DMN/rules engines, workflow/queue systems, identity brokers, case-management integrations, notice delivery, and analytics platforms.
 
 ## What Not To Change
 

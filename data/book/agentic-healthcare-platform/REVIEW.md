@@ -5,199 +5,356 @@ Review date: 2026-06-25
 
 ## Executive Summary
 
-This is a strong high-stakes agentic-system walkthrough. The case has a clear thesis: healthcare decision support must be grounded, calibrated, safety-checked, and clinician-authorized, with abstention as a successful safe output. The step order is coherent and the final design mostly integrates the components introduced along the way.
+The recent revision materially improved this case. The earlier gaps around API
+context, reproducible safety-case storage, capacity sizing, clinician worklist
+states, options, technology choices, and broken step-diagram links have mostly
+been addressed. The interview now reads like a credible high-stakes clinical
+decision-support platform rather than a generic agentic workflow with healthcare
+terms layered on top.
 
 | Area | Rating | Notes |
 | --- | --- | --- |
-| System design soundness | 4 | The safety framing is strong, but API, data model, state transitions, capacity, and operational controls are too thin for the claims. |
-| Production realism | 3 | Good HIPAA/BAA, SaMD, no-train, audit, and clinician-gate language; missing concrete EHR integration, idempotency, retry, rate-limit, alert-fatigue, and incident workflows. |
-| Pedagogical flow | 4 | The naive-to-safe progression works well, though zero step options reduces trade-off teaching. |
-| Dataset/rendering fit | 3 | IDs mostly resolve, but several step diagrams select links whose endpoint nodes are omitted, so important edges are filtered out at render time. |
-| Overall | 4 | Usable and compelling, with a few concrete edits needed before it feels production-grade. |
+| System design soundness | 4.5 | Strong safety boundary, richer API/schema, task/risk-tier thresholds, deterministic checks, and clinician sign-off. Remaining gaps are mostly operational contracts. |
+| Production realism | 4 | Much better EHR, PHI, worklist, BAA/no-train, audit, and SaMD framing; still needs sharper concurrency, retry, retention, and incident/change-control detail. |
+| Pedagogical flow | 4.5 | The naive-to-safe progression is clear, and the new trade-off options improve the interview. Option labels and a few operations transitions could teach more explicitly. |
+| Dataset/rendering fit | 4.5 | Structural references now resolve cleanly. One visible node is isolated in the privacy step, and option tabs would benefit from explicit titles. |
+| Overall | 4.5 | Strong and usable. The next pass should refine production edge cases, not rework the core design. |
 
 ## What Works Well
 
-The dataset is unusually clear about the safety boundary. "Recommend, never act", "abstain over guess", deterministic safety checks, and clinician sign-off are repeated in requirements, steps, final design, and satisfies mappings.
+The review's biggest former concerns were addressed. `POST /v1/recommendations`
+now carries idempotency, tenant, clinician, patient, encounter, care-team,
+task-type, risk-tier, urgency, and consent context. The data model now has a
+first-class `recommendation_case` plus evidence, model-run, calibration,
+safety-check, sign-off, and audit records, which supports the promised safety
+case.
 
-The step progression is easy to teach: naive answer, grounding, calibration/abstention, deterministic safety, clinician gate, PHI/safety case, then eval. Each step exposes the next risk through `recap.newRisk`, which makes the walkthrough feel intentional rather than a list of components.
+Capacity is now concrete enough to discuss. It gives clinician count, daily
+queries, peak QPS, EHR fanout, guideline latency, interactive p95 latency,
+inference budget, worklist age, EHR write limits, and backpressure. That is a
+large improvement over treating safety invariants as "capacity".
 
-The final design is compact and readable. It keeps the agent as a bounded node inside a deterministic pipeline instead of implying autonomous clinical action.
+The clinician gate is now a real workflow. `RecStore`, `Worklist`, explicit case
+states, modify/reject/request-evidence paths, expiry, and `ehr_write_failed`
+make the human-in-the-loop design operational instead of a single approval
+button.
 
-The case correctly names healthcare-specific concerns that generic agentic cases often miss: PHI scoping, BAA/no-train terms, SaMD/FDA framing, source traceability, clinician ground truth, and harm-avoidance evaluation.
+The safety teaching is strong. The case distinguishes model reasoning from
+grounding sufficiency, calibrated uncertainty, risk-tier thresholds, and hard
+deterministic checks. It also correctly treats missing or stale chart facts as a
+reason to abstain or escalate, not as a pass.
+
+The dataset now includes useful `technologyChoices` for EHR integration,
+guideline indexing, model hosting under BAA/no-train terms, deterministic rule
+engines, audit storage, and eval/observability. Those choices are practical and
+well tied to the relevant steps.
 
 ## Highest-Impact Issues
 
-### 1. The API and data model do not yet support the safety story
+### 1. State transitions and concurrent review semantics need one more level of detail
 
-The API surface is intentionally small, but it is now too small for the stated requirements. `POST /v1/recommendations` accepts only `patientId` and `query`; it does not carry clinician identity, tenant/organization, encounter/care-team context, intended use case, urgency, idempotency key, required output type, or consent/break-glass context. The sign-off endpoint accepts only `decision` and `note`; it does not model modification, rejection reason, second review, clinician attestation, or the exact EHR action being authorized.
+The current model has the right states, but it mostly stores the current state.
+Production review workflows need transition history and concurrency control:
+which clinician claimed or opened the case, what version they reviewed, whether
+two clinicians raced to decide, whether a case was reassigned or escalated, and
+which transition emitted which audit event.
 
-The data model has the same gap. `recommendations`, `safety_checks`, and `audit_record` are a good start, but they cannot reconstruct the safety case promised by the narrative. Add fields/entities for request type, tenant/org, encounter, care-team scope, retrieval snapshot, guideline/formulary version, patient facts used, citation spans, model/prompt/tool versions, abstention reason, calibrated confidence details, safety-rule version, clinician decision metadata, and immutable EHR write outcome.
+The sign-off endpoint mentions idempotence on `caseVersion`, but the request has
+no explicit sign-off idempotency key or transition/correlation id. For EHR
+writes, this matters: the platform must distinguish "clinician clicked twice",
+"request retried after timeout", "EHR accepted but response was lost", and "EHR
+rejected the write".
 
-Concrete fix: expand the API and schema around a first-class `recommendation_case` or `clinical_decision_support_case`, with child records for retrieved evidence, safety checks, calibration result, sign-off decision, and EHR write/audit events.
+Concrete fix: add a `case_transition` or `decision_event` record with
+`from_status`, `to_status`, `actor_id`, `case_version`, `transition_id`,
+`idempotency_key`, `reason`, and timestamp. Add worklist claim/assignment fields
+or explain why the product uses optimistic review without claims.
 
-### 2. Capacity is not actually capacity
+### 2. EHR integration is named well but still underspecified at the failure boundary
 
-The `capacity` section lists qualitative safety invariants: default abstention, recommend-only autonomy, and deterministic override. Those are important requirements, but they do not help a candidate size or operate the system. The dataset also includes a "Queue-based load leveling; admission control" pattern, but there is no queue/admission node, capacity math, or step that teaches load shedding.
+The revised capacity and technology choices correctly mention FHIR/HL7, EHR
+rate limits, and idempotent retry. The architecture still compresses the hard
+part into `Identity -> EHR`. In real integrations, the risky details are write
+semantics, partial success, downstream validation, order/note/message schemas,
+FHIR resource versions, patient/encounter mismatch, and reconciliation when the
+EHR state changes between recommendation and sign-off.
 
-Concrete fix: add a real capacity model. Include daily active clinicians, clinical queries/day, peak QPS, average EHR retrieval fanout, guideline index latency, model-token budget, inference concurrency, sign-off queue depth, EHR write rate limits, target p95 latency for interactive recommendations, and async timeout behavior. If queue-based load leveling remains in patterns, add a queue/admission-control step or remove the pattern.
+Concrete fix: add a short note in the gate or technology section on EHR write
+contracts: compare-and-set or resource-version checks, per-action schemas,
+write correlation ids, retry policy, reconciliation after unknown outcome, and
+what happens when the chart changed after the recommendation was drafted.
 
-### 3. The clinician workflow is under-modeled
+### 3. PHI access policy is directionally strong but not yet fully operational
 
-The gate is the core of the case, but it is represented mostly as a single sign-off call. In production, the hard part is the worklist and decision workflow: pending recommendations, abstentions needing review, modified recommendations, rejected recommendations, urgent vs non-urgent triage, alert fatigue, escalation, and timeouts. A clinician may authorize an order, edit a note, request more evidence, or reject the recommendation entirely.
+The privacy step now distinguishes PHI-access audit from recommendation audit,
+which is exactly right. The remaining gap is policy detail. `consent.breakGlass`
+appears in the API, but the dataset does not explain who may break glass, what
+extra audit or attestation it creates, how minimum-necessary fields are selected
+per task, how access is revoked when the clinician leaves the care team, or what
+retention/deletion policy applies to raw model traces and evidence bundles.
 
-Concrete fix: add a `Clinician Worklist / Review UI` node or make `RecStore` explicitly back that workflow. Add states such as `drafted`, `blocked_by_safety`, `abstained`, `awaiting_signoff`, `modified_by_clinician`, `authorized`, `rejected`, `expired`, and `ehr_write_failed`. Include a sequence flow that shows create -> evidence/safety -> review -> authorize/reject/modify -> EHR write -> audit.
+Concrete fix: add a privacy sub-point or deep dive covering care-team
+membership freshness, break-glass workflow, minimum-necessary field policy,
+retention tiers, and separation of raw PHI traces from derived safety-case
+records.
 
-### 4. Calibration and deterministic safety are plausible but underspecified
+### 4. Option titles are missing, which weakens trade-off teaching in the UI
 
-The calibrator is called "deterministic", but confidence calibration for model output is not inherently deterministic in the same sense as a drug-interaction rule. The current text does not explain what the calibrator measures, how thresholds are set, how task risk changes thresholds, or how drift is detected. The deterministic safety layer names contraindications, interactions, allergies, and dose limits, but not source-of-truth systems, rule versioning, stale chart handling, or what happens when patient data is missing.
+Steps 3, 4, and 5 now have meaningful two-option trade-offs, but every option's
+`title` is `null`. The renderer will fall back to generic option labels, so the
+candidate sees "Option 1" and "Option 2" rather than the actual decision being
+made.
 
-Concrete fix: split "calibration" into grounded-evidence sufficiency, model uncertainty/score, and risk-tier policy. Split "safety layer" into rule sources, patient facts, versions, pass/block/warn result, and fail-closed behavior when required facts are absent.
+Concrete fix: title the options, for example:
 
-### 5. Several step diagrams silently drop important links
+- Step 3: "Risk-tiered calibrated evaluator" vs "Single model self-score".
+- Step 4: "Fail closed on missing facts" vs "Treat missing facts as pass".
+- Step 5: "Recommend-only clinician sign-off" vs "Autonomous low-risk writes".
 
-The renderer only emits selected links when both endpoints are present in `view.nodes`. Several step views select links whose endpoint nodes are omitted:
+### 5. One privacy-step diagram node is isolated
 
-- `naive`: `id-ehr` needs `Identity`, which is absent.
-- `grounding`: `phi-ehr` needs `PHIScope`, which is absent.
-- `privacy`: `pipe-phi`, `pipe-guard`, and `pipe-log` need `Pipeline`, which is absent.
-- `eval`: `gate-clin` needs `AbstainGate`, which is absent.
+Structural checks now pass: step nodes resolve, selected links resolve, link
+endpoints are visible, `satisfies` steps resolve, and pattern/technology-choice
+step references resolve. The remaining rendering issue is smaller: the privacy
+step includes `Identity` in `view.nodes`, but none of that step's selected links
+touch `Identity`, so it will render as an isolated node while the text discusses
+identity-scoped retrieval.
 
-Those links resolve to real high-level architecture links, but they are filtered out of the generated Mermaid, so the rendered diagrams omit connections that the captions rely on. This is especially damaging in the grounding and privacy steps, where the missing edges are the concept being taught.
-
-Concrete fix: either add the missing endpoint nodes to each step view or change the selected links to connect only visible nodes. Also reconsider the naive diagram: it includes `EHR` and an EHR write link even though the text says the baseline has no patient-chart grounding and no clinician gate.
+Concrete fix: either remove `Identity` from that view, or add a visible identity
+relationship such as clinician-to-identity authorization or identity-to-PHI
+scope. If the intent is to show access enforcement, the diagram should connect
+`Identity` to `PHIScope` or the clinical API boundary.
 
 ## System Design Soundness
 
-The requirements are directionally right: grounded clinical support, deterministic checks, abstention, licensed clinician authorization, PHI privacy, auditability, and SaMD framing. The main missing requirement is explicit scope control by clinical task and risk tier. Dosing, differential diagnosis, chart summarization, and guideline lookup have very different risk profiles and should not share one threshold or one approval path.
+The requirements now cover the domain well: decision-support queries, grounding
+in guidelines and chart data, deterministic safety checks, abstention, clinician
+authorization, and task/risk-tier-specific behavior. The non-functional
+requirements keep the safety invariant front and center: abstain by default,
+protect PHI, enforce hard rules outside the model, document a safety case, and
+audit sources, confidence, safety checks, abstentions, and decisions.
 
-The architecture has the right components, but some boundaries are vague. `Gateway` says it resolves care-team scope, `PHIScope` performs scoped retrieval, and `Identity` binds the clinician principal, but the flow does not clearly define which component authorizes chart access, which enforces minimum-necessary retrieval, and which emits access audit events.
+The API is much stronger than the previous version. It carries the context the
+architecture later needs, and the worklist and safety-case record endpoints make
+the human review and audit surfaces explicit. The main API improvement would be
+to make sign-off retries and worklist pagination/claiming more explicit.
 
-The data model should capture a reproducible safety case. Today it stores a recommendation, safety checks, and generic audit events. It should also store the exact evidence bundle, guideline/formulary versions, model/tool/prompt versions, confidence/calibration features, safety-rule versions, clinician decision, EHR write result, and retention/access policy.
+The data model now supports reproducibility. Evidence versions, citation spans,
+patient facts used, model/prompt/tool versions, calibration scores, safety-rule
+versions, sign-off decisions, EHR write status, and separate PHI/recommendation
+audit categories all fit the safety-case story. The next refinement is event
+history: do not rely only on the current status enum plus append-only generic
+audit payloads for the state machine.
 
-The final design says "nothing acts on the patient autonomously", which is the right invariant. It should make the authorized action explicit: order, note, recommendation-only message, or chart summary. The sign-off response should not just be `authorized|rejected`; it should identify what action was authorized and whether the EHR write succeeded.
+The architecture has the right boundary: the agent recommends, deterministic
+services gate, and a clinician decides. The final design includes the components
+introduced by the steps, including the new Worklist and Patient link. It should
+avoid implying that the EHR write path is simple; that path is where many
+production failures happen.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: An Agent That Answers Clinical Questions
 
-This is a strong baseline because it makes the harm concrete. The trap is useful and the agent-harness concept connects the case to Foundations.
+This is now a clean baseline. The diagram correctly shows clinician -> agent ->
+inference without chart grounding or EHR writes. The harm framing is specific
+and the agent-harness concept ties the case back to Foundations.
 
-The diagram should be simplified. Including `EHR` and selecting `id-ehr` confuses the baseline because the text explicitly says there is no chart grounding and no clinician gate. Show clinician -> agent -> inference, then let step 2 introduce chart/guideline grounding.
+Potential improvement: briefly name which tasks are deliberately unsafe in this
+baseline, such as dosing and differential diagnosis, because the rest of the
+case later uses task/risk tiers.
 
 ### Step 2: Ground in Guidelines + the Patient Record
 
-The conceptual point is strong: a guideline-correct answer can still be wrong for this patient. This is one of the strongest teaching moments in the dataset.
+This step is much stronger after adding `PHIScope` and stale/incomplete snapshot
+language. It now teaches that the right guideline can still be wrong for this
+patient and that missing chart facts should trigger abstention or review.
 
-The diagram currently drops the `phi-ehr` link because `PHIScope` is not visible. Add `PHIScope` here or create a direct visible retrieval link. Also consider naming guideline versions, formularies, drug-interaction data, and patient-fact snapshots in the description or schema.
+Potential improvement: mention resource freshness or chart-version checks as an
+input to later sign-off. If the chart changes after the recommendation is
+drafted, the system should revalidate before write.
 
 ### Step 3: Calibration & Abstention
 
-The abstention framing is excellent. Treating "I cannot determine this" as a successful output is the right interview lesson.
+This is one of the strongest steps. It correctly rejects model self-score as
+sufficient, separates grounding sufficiency from calibrated uncertainty, and
+uses task/risk-tier thresholds. The option trade-off is realistic.
 
-The improvement is precision. Explain what "confidence" means here: retrieval sufficiency, contradiction checks, calibrated score, out-of-distribution signal, or task-specific risk threshold. Make clear that a model self-score alone is not sufficient.
+Potential improvement: give the options titles so the UI teaches the decision
+without requiring the user to read the pros/cons first.
 
 ### Step 4: The Deterministic Safety Layer
 
-This step lands well because it separates probabilistic reasoning from hard clinical checks. The trap is specific and useful.
+The fail-closed framing is strong and practical. The step now distinguishes
+`pass`, `block`, `warn`, and `missing_data`, and records rule/formulary versions.
+That is exactly the line a high-stakes agentic design should draw.
 
-The step should show what the safety layer consumes and returns: patient facts, rules/formulary versions, pass/block/warn, missing-data fail-closed behavior, and override policy. For example, a contraindication block and a missing-lab abstention are different operational outcomes.
+Potential improvement: name ownership/update workflow for rule content. Clinical
+rule updates are not just deployments; they need review, versioning, rollback,
+and sometimes urgent release.
 
 ### Step 5: The Gate: Clinician Sign-off
 
-This is the crux of the case and the sequence flow is a good start. It correctly binds authorization to a clinician principal before an EHR write.
+The revision fixed the biggest previous weakness. The worklist, state machine,
+modify/reject/request-evidence paths, expiry, EHR write failure, and alert
+fatigue metrics make the gate credible.
 
-The flow needs more production states. Add reject, modify, request-more-evidence, expired, and EHR-write-failed paths. Also add the review surface or worklist as an explicit component; otherwise the "human in the loop" is architecturally thin.
+Potential improvement: specify concurrent review and assignment semantics. The
+case should say whether clinicians claim work, whether cases are assigned by
+care team, and how stale case versions are rejected at sign-off.
 
 ### Step 6: PHI Scoping, Confidentiality & the Safety Case
 
-The text names the right concerns: care-team scoping, HIPAA/BAA, no-train, untrusted note text, and SaMD/FDA framing.
+This step now makes a valuable distinction between PHI access audit and
+recommendation audit. It also correctly treats notes and records as untrusted
+input and names HIPAA/BAA/no-train and SaMD/FDA framing.
 
-The diagram does not currently show the pipeline connections because `Pipeline` is omitted from the view. Add it. This step should also distinguish access audit from recommendation audit, because PHI access itself is regulated and auditable even when no recommendation is authorized.
+Potential improvement: connect `Identity` in the diagram or remove it from this
+view. Also add break-glass/minimum-necessary/retention details, because those
+are the operational heart of healthcare privacy.
 
 ### Step 7: Workflows & Safety Evaluation
 
-The metric direction is correct: confident-wrong rate, abstention precision/recall, calibration, and harm avoidance matter more than average accuracy.
+The eval step is strong. It prioritizes confident-wrong rate, calibration,
+abstention quality, harm avoidance, per-task/per-specialty slices, drift,
+incident review, staged rollout, and clinician adjudication over LLM-as-judge.
 
-This step should include monitoring and governance loops: drift detection, per-specialty/per-task evaluation slices, incident review, threshold changes, model/version rollout, and post-deployment surveillance. If LLM-as-judge remains a pattern, qualify it as an auxiliary evaluator, not the source of truth for clinical safety.
+Potential improvement: add one operational metric for worklist health here, such
+as queue-age p95 by urgency/risk tier, override/reject rate, or rubber-stamp
+rate, so the eval loop covers the human gate as well as the model.
 
 ## Final Design Review
 
-The final design integrates the main components and repeats the right invariant: the system recommends, while the clinician decides. It includes the gateway, pipeline, reasoning agent, inference backend, guidelines, EHR, calibrator, deterministic safety layer, abstain/sign-off gate, recommendation store, PHI scope, guardrail, identity, audit log, and observability.
+The final design now coherently integrates the full story: clinical query,
+gateway, deterministic pipeline, reasoning agent, inference, guideline index,
+PHI-scoped EHR retrieval, calibration, deterministic safety, abstain/sign-off
+gate, recommendation store, worklist, identity, EHR write, audit, and
+observability. The Patient node is now connected to EHR, fixing the previous
+isolated-node concern.
 
-Two issues remain. First, `Patient` is included in the final view but has no high-level architecture link, so it will render as an isolated node. Either connect it to the clinical context/EHR boundary or omit it from the final diagram. Second, the final design has no explicit queue/worklist/admission-control path despite the pattern list mentioning load leveling.
+The final design's strongest property is that it keeps the model inside a
+bounded decision-support pipeline. It does not imply autonomous clinical action,
+and it places deterministic safety and clinician authority outside the model.
+
+The remaining final-design gap is operational depth around EHR writes and review
+state transitions. That does not require adding many new boxes; a few sharper
+contracts in the API/data model/step text would be enough.
 
 ## Concept Introduction and Learning Flow
 
-The concepts are introduced just in time: agent harness in the baseline, patient-specific grounding, abstain-don't-guess, deterministic safety, decision support, safety case, and harm-avoidance eval. This sequencing works.
+Concept staging is now excellent: unsafe direct answer, patient-specific
+grounding, abstain-don't-guess, deterministic safety, decision support rather
+than decision, review worklist as state machine, safety case, and harm-avoidance
+eval. The concepts are introduced when the candidate needs them.
 
-The main pedagogical weakness is the absence of options. Every step has a single path, so the candidate is not asked to choose between realistic alternatives. Add options around fail-open vs fail-closed, direct EHR action vs recommend-only, single global threshold vs risk-tiered thresholds, model self-score vs calibrated evaluator, synchronous request vs queued review workflow, and full chart retrieval vs minimum-necessary retrieval.
+The new options improve the teaching flow because they compare real choices:
+risk-tiered calibration vs one self-score, fail-closed vs treating missing facts
+as safe, and recommend-only sign-off vs autonomous low-risk writes. Add option
+titles and this will land much better in the rendered explorer.
 
 ## Step-to-Final-Design Coherence
 
-Most components in the final design are introduced by the steps. The best transitions are grounding -> calibration -> safety -> gate; each step solves the risk exposed by the previous recap.
+Coherence is high. Almost every final-design node is introduced by the steps,
+and the transitions solve the previous risk: generic answer -> grounded answer
+-> calibrated abstention -> deterministic safety -> clinician gate -> privacy
+and audit -> continuous eval.
 
-The weaker transitions are operations-oriented. `RecStore`, `AuditLog`, `Identity`, and `Observability` appear in the architecture, but the steps do not deeply teach their operational contracts. The final design says they exist, but the interview does not yet make candidates design their schemas, retention rules, failure behavior, or ownership boundaries.
-
-The `satisfies.functional[0]` mapping points to `naive` and `eval` for "Answer decision-support queries". Since `naive` is explicitly the unsafe baseline, it should not be credited as satisfying the requirement. Map that requirement to the safe pipeline steps instead.
+The only weak transition is from privacy/identity policy to the actual
+authorization and EHR write boundary. Identity is discussed in multiple places,
+but the operational contract among clinician principal, PHI retrieval scope,
+break-glass access, and signed EHR writes is still partly implicit.
 
 ## Realism Compared With Production Systems
 
-The production realism is strongest around safety posture and weakest around integration and operations. Real healthcare systems need EHR rate-limit handling, FHIR/HL7 integration boundaries, retry/idempotency around writes, explicit no-autonomous-order enforcement, access audit, minimum-necessary retrieval, data retention policy, and incident/change-control procedures.
+The case is now much closer to production reality. It names EHR fanout, EHR rate
+limits, BAA/no-train model hosting, FHIR/HL7 technology choices, licensed rule
+content, WORM audit storage, clinician-labeled ground truth, drift detection,
+incident review, and alert fatigue.
 
-The case should also address stale or incomplete patient data. A model may have a grounded answer, but if the medication list or allergy data is stale, the correct action may be abstain or request review. That is a healthcare-specific failure mode worth adding.
-
-The sign-off workflow should account for clinician workload. A safe system can still fail operationally if it creates too many low-value recommendations, alerts, or abstention reviews. Include queue depth, prioritization, and alert-fatigue metrics.
+The remaining realism gaps are about the edges where production systems fail:
+unknown EHR write outcomes, stale chart versions, concurrent clinician actions,
+care-team membership changes, break-glass access, raw PHI trace retention,
+clinical rule updates, and post-incident threshold/model rollback. These can be
+covered with targeted text rather than a major redesign.
 
 ## Dataset and Renderer-Facing Observations
 
-The JSON parses cleanly. Top-level architecture nodes use canonical node types, and step IDs referenced by patterns and `satisfies` resolve.
+JSON parsing succeeds. Step IDs referenced by `satisfies`, `patterns`, and
+`technologyChoices` resolve. Step view nodes and links resolve. Selected step
+links have visible endpoints, so the former issue where key links disappeared
+at render time is fixed.
 
-Several selected links are filtered out because endpoint nodes are absent from the step view, as listed above. Fix these before relying on browser screenshots or generated docs.
+`highLevelArchitecture.types` defines the groups used by step and final views,
+so group references are valid. The final view includes all major components and
+no longer leaves `Patient` isolated.
 
-`Request` is typed as `client`, but it represents a clinical query rather than a software client surface. If the diagram needs a client node, consider `Clinician Portal`, `EHR App`, or `Clinical UI`; otherwise model the query as a label/edge rather than a node.
+Remaining fit issues are minor:
 
-The dataset has no `technologyChoices`, `probeLinks`, AI visuals, or explainer comic. Those are optional, but for a flagship healthcare case, technology choices could be valuable: EHR integration, vector/indexing strategy, model hosting under BAA/no-train terms, audit-log storage, policy/rule engine, and observability/eval stack.
+- `steps[privacy].view.nodes` includes `Identity`, but no selected link touches
+  it, so it will render isolated.
+- Options in steps 3, 4, and 5 have `title: null`; the UI will use generic
+  labels instead of meaningful trade-off names.
+- `Request` is typed as `client`, but it represents a clinical query rather
+  than an actual software client. This is acceptable if intentional, though a
+  `Clinical UI` or `EHR App` client node would be more literal.
 
 ## Recommended Edits, Prioritized
 
-### P1: Expand API and data model for a reproducible safety case
+### P1: Add explicit review-state transition and sign-off idempotency detail
 
-Add request context, clinician/tenant/care-team identity, idempotency, evidence snapshots, guideline/rule/model versions, calibrated confidence details, abstention reasons, safety-check details, sign-off decisions, and EHR write outcomes.
+Add a transition/event record or fields that show case version, actor, from/to
+state, assignment/claim, transition id, sign-off idempotency key, and retry
+correlation. Clarify how stale case versions and concurrent review are handled.
 
-### P1: Replace qualitative capacity with real sizing and operational limits
+### P1: Sharpen EHR write contracts
 
-Add traffic estimates, EHR fanout, model latency/cost, queue/worklist depth, p95 targets, rate limits, and backpressure/admission-control behavior.
+Describe resource-version checks, per-action schemas, retry/unknown-outcome
+handling, correlation ids, and revalidation when chart state changes after the
+recommendation was drafted.
 
-### P1: Fix step diagram link endpoints
+### P2: Operationalize PHI policy
 
-Add missing nodes or remove invalid links in `naive`, `grounding`, `privacy`, and `eval`. Recheck the final design for the isolated `Patient` node.
+Add break-glass workflow, minimum-necessary field selection, care-team
+membership freshness, revocation behavior, and retention separation for raw PHI
+traces vs safety-case records.
 
-### P2: Model the clinician review workflow as a state machine
+### P2: Title the step options
 
-Include pending, abstained, blocked, modified, authorized, rejected, expired, and EHR-write-failed states. Add a worklist/review UI node or clarify that `RecStore` backs it.
+Give each option a short title so the rendered tabs teach the trade-off:
+risk-tiered calibrated evaluator, single model self-score, fail closed on
+missing facts, treat missing facts as pass, recommend-only clinician sign-off,
+and autonomous low-risk writes.
 
-### P2: Make calibration and safety checks concrete
+### P3: Fix the privacy diagram's isolated Identity node
 
-Define what the calibrator scores, how thresholds vary by task/risk, how rule sources are versioned, and how missing/stale chart facts fail closed.
+Either remove `Identity` from that step view or add a visible relationship that
+shows how identity controls PHI-scoped retrieval or clinician authorization.
 
-### P2: Add options to teach trade-offs
+### P3: Add one human-gate metric to the eval step
 
-Add at least two or three options across the case. Good candidates are synchronous vs queued review, single global threshold vs risk-tiered thresholds, model self-score vs calibrated evaluator, and recommend-only vs direct EHR write.
-
-### P3: Tune mappings and optional book features
-
-Remove `naive` from the satisfied requirement mapping, either add queue/admission-control architecture or remove that pattern, and consider adding `technologyChoices` for healthcare-specific implementation decisions.
+Include queue-age p95 by risk tier, reject/modify rate, override rate,
+rubber-stamp rate, or time-to-review so the evaluation loop measures clinician
+workflow health, not only model safety.
 
 ## What Not To Change
 
-Keep the central invariant: nothing acts on a patient autonomously. That is the strongest part of the case.
+Keep the central invariant: nothing acts on a patient autonomously.
 
-Keep abstention as a successful safe output. It is the right differentiator from lower-stakes agentic domains.
+Keep abstention as a successful safe output. That is the case's clearest
+teaching point and the right differentiator from lower-stakes agentic domains.
 
-Keep the deterministic safety layer outside the model. The interview should not imply that prompt instructions or model memory can enforce life-critical rules.
+Keep deterministic safety outside the model. Contraindications, interactions,
+allergies, dose limits, and missing required facts should never rely on prompt
+compliance or model memory.
 
-Keep the step order. The progression from naive answer to grounded, calibrated, safety-checked, clinician-authorized recommendation is pedagogically sound.
+Keep the step order. The sequence from naive answer to grounded, calibrated,
+safety-checked, clinician-authorized recommendation is coherent and teaches one
+risk at a time.
 
 ## Bottom Line
 
-This is a strong healthcare agentic-platform case with a clear safety thesis and a coherent teaching arc. The next revision should make the operational substrate as concrete as the safety language: richer API/schema, real capacity math, explicit clinician workflow states, and corrected step diagrams.
+This is now a strong healthcare agentic-platform interview. The major design
+deficiencies called out in the previous review have been fixed. The remaining
+work is refinement: make the review state machine and EHR write boundary more
+explicit, operationalize PHI policy, title the options, and clean up one small
+diagram issue.

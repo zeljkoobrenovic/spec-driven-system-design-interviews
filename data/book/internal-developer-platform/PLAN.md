@@ -223,22 +223,33 @@ steps }` cross-linked to the steps that use them:
 
 The build order follows the **maturity progression** the research surfaced: each
 stage breaks under load and *forces* the next. This is the interview's narrative
-spine. Aim for ~7 top-level steps (plus 1–2 sub-steps), most with `options`,
+spine. Aim for ~8 top-level steps (plus 1 sub-step), most with `options`,
 `recap`, `traps`, `flows` where temporal, `interviewerSignals`, and `concepts`.
 
 > Each step's `view` builds on the previous one's nodes (the highlight pipeline
 > auto-diffs new nodes). Define all nodes/links once in `highLevelArchitecture`
 > and reference them by id in each `view`.
 
-**Step 1 — Naive: tickets, shared scripts, and a wiki runbook (the baseline)**
-- *What:* Developers file tickets; ops runs shared bash/Terraform by hand;
-  knowledge lives in a wiki. No options — this is the strawman.
+**Step 1 — Startup mode: a wiki, runbooks, and self-serve (stage zero)**
+- *What:* No platform, no platform team. Developers themselves follow a wiki
+  runbook and provision by hand (`dev-wiki`, `dev-k8s`). Frame it as a *legitimate*
+  Thinnest Viable Platform, not a failure.
+- *Forcing function:* runbooks rot, manual steps drift between engineers, a
+  fat-fingered step takes prod down, no audit trail → the org adds an ops
+  gatekeeper, which becomes step 2's queue.
+- `traps`: "build a full IDP on day one (Google envy)"; "let the wiki stay the
+  long-term source of truth."
+
+**Step 2 — Growing pains: tickets, shared scripts, and an ops gatekeeper**
+- *What:* The team grew and self-serve caused outages, so changes now route
+  through an ops team via tickets; ops runs the same runbook by hand. No options
+  — this is the bottleneck strawman.
 - *Forcing function:* ticket-ops bottleneck — the queue grows linearly with
   adoption; lead times in days. (CNCF "Provisional" level.)
 - `recap.newRisk`: every new service multiplies ops toil.
 - `traps`: "rename Ops to 'platform team' without removing the ticket queue."
 
-**Step 2 — Automate delivery: CI/CD + Helm charts per service**
+**Step 3 — Automate delivery: CI/CD + Helm charts per service**
 - *What:* Pipelines build/test/deploy; Helm bundles manifests; copy-paste a chart
   per new service.
 - *Forcing function:* **YAML sprawl → config drift**. 10 services × 4 envs = 300+

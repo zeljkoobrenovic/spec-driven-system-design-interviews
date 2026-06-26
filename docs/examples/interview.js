@@ -2915,7 +2915,11 @@
         function safeType(s) {
             // erDiagram type token must match [A-Za-z][A-Za-z0-9_-]*. Take first word.
             const m = String(s || "string").match(/[A-Za-z][A-Za-z0-9_-]*/);
-            return m ? m[0] : "string";
+            const tok = m ? m[0] : "string";
+            // PK/FK/UK are erDiagram key-constraint keywords: as a *type* token
+            // (first column) they're tokenized as constraints, not attribute
+            // words, and break the parse. Fall back to "string" for those.
+            return /^(PK|FK|UK)$/i.test(tok) ? "string" : tok;
         }
 
         const lines = ["erDiagram"];

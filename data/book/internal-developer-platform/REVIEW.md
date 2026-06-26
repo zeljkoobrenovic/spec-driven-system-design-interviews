@@ -30,7 +30,7 @@ contract needs sharper SLO/RTO/RPO language.
 | System design soundness | 4.55/5 | Strong architecture with durable control-plane mechanics; needs tighter API/status and rollout-state contracts. |
 | Production realism | 4.45/5 | Much stronger on reliability, policy, audit, migration, and sizing; remaining gaps are degraded-mode boundaries and operational APIs. |
 | Pedagogical flow | 4.55/5 | Excellent maturity arc; new deep dives add real staff-level depth without losing the main story. |
-| Dataset/rendering fit | 4.60/5 | JSON parses and structural references resolve; some semantic drift remains in API flows, option views, and technology-choice columns. |
+| Dataset/rendering fit | 4.60/5 | JSON parses and structural references resolve; some semantic drift remains in API flows and option views; technology-choice SaaS caveats are now documented inline. |
 | Overall | 4.55/5 | Publishable, coherent, and close to flagship depth. |
 
 ## What Works Well
@@ -384,10 +384,10 @@ Remaining production questions a strong interviewer could still ask:
 - Several options mark defaults only in the `name` string, e.g. "(default)".
   This is acceptable for the current renderer, but a structured default marker
   would be easier for future tooling.
-- The `technologyChoices.cloud` provider columns still include vendor-neutral
-  SaaS tools such as Port, Cortex, OpsLevel, Atlassian Compass, and Humanitec.
-  If the UI cannot represent SaaS separately, add a note that those entries are
-  provider-adjacent choices rather than native AWS/GCP/Azure services.
+- The `technologyChoices.cloud` provider columns now use provider-native
+  services where the concern has native AWS/GCP/Azure equivalents. Vendor-neutral
+  SaaS remains for portal/orchestrator choices because the UI has no separate
+  SaaS column; those entries now explain the caveat inline.
 - Current vendor/tool claims should be source-checked before publication if the
   dataset is meant to make time-sensitive assertions. This review did not
   browse or externally verify vendor status.
@@ -428,10 +428,10 @@ schema.
 Add catalog freshness/ownership handling and workload-level migration state for
 brownfield services.
 
-### P3: Clean up technology-choice presentation
+### P3: Add a SaaS column to technology-choice presentation
 
-Represent SaaS choices separately from cloud-native provider choices, or add UI
-copy explaining why neutral SaaS products appear under provider columns.
+The data now explains why neutral SaaS products appear under provider columns,
+but the cleaner long-term renderer/schema fix is a separate SaaS column.
 
 ## What Not To Change
 

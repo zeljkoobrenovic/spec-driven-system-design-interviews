@@ -50,9 +50,10 @@ REQUIRED_TEMPLATE_FILES = (
 )
 
 
-# File extensions that are authoring/review notes or build helpers — kept in
-# the repo next to datasets but never copied into the deployed docs/ output.
-NON_DATA_SUFFIXES = (".md", ".markdown", ".py", ".mjs")
+# File extensions that are authoring/review notes, source briefs, or build
+# helpers — kept in the repo next to datasets but never copied into the
+# deployed docs/ output (e.g. INPUT.md / INPUT.pdf source briefs).
+NON_DATA_SUFFIXES = (".md", ".markdown", ".py", ".mjs", ".pdf")
 
 
 def _ignore_non_data(dirpath, names):

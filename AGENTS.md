@@ -133,9 +133,10 @@ datasets don't linger. Groups without an `index.json` are skipped with a
 notice. Loose files at a group root that aren't dataset directories (e.g.
 `data/book/BOOK-STRUCTURE.md`, `data/book/_buildlib.py`) are not copied — only
 `index.json` and dataset subdirectories ship. Within a dataset directory,
-authoring/review notes and build helpers (`*.md`, `*.py`, `*.mjs` — see
-`NON_DATA_SUFFIXES`) are skipped too, so `interview.json` (and assets like
-`icon.png`) ship but `INPUT.md` / `REVIEW.md` / `_build.py` stay repo-only.
+authoring/review notes, source briefs, and build helpers (`*.md`, `*.py`,
+`*.mjs`, `*.pdf` — see `NON_DATA_SUFFIXES`) are skipped too, so `interview.json`
+(and assets like `icon.png`) ship but `INPUT.md` / `INPUT.pdf` / `REVIEW.md` /
+`_build.py` stay repo-only.
 Developer `README.md`s in `_templates/` are likewise skipped from the template
 copy (`_ignore_template_docs`), so they don't ship into `docs/<group>/`. The
 `docs/README.md` at the `docs/` root is not touched by the build (only

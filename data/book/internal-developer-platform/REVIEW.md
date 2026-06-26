@@ -5,433 +5,452 @@ Review date: 2026-06-26
 
 ## Executive Summary
 
-This is a strong book-quality IDP case. The central thesis is clear:
-developer platforms are not just portals, and the decisive abstraction is a
-workload spec plus platform orchestrator that separates what developers need
-from how the platform fulfills it. The walkthrough has a good maturity arc:
-tickets and runbooks -> CI/CD plus Helm -> portal -> orchestrator -> IaC engine
-choice -> resource plane -> ephemeral environments -> observability, security,
-and adoption metrics.
+This is now a flagship-quality IDP case. The recent revision materially
+improves the core production story: the platform orchestrator is no longer a
+magic synchronous box, progressive delivery is separated from basic GitOps
+rollback, governance tables are first class, and capacity assumptions now map
+to component bottlenecks.
 
-The dataset is especially good at avoiding platform-engineering mythology. It
-states that Backstage is not the platform, calls out vendor marketing numbers,
-frames adoption as a product outcome, and includes the DORA tradeoff instead of
-pretending an IDP is automatically beneficial.
+The strongest teaching move is still the workload spec plus platform
+orchestrator: developers declare what a service needs, platform engineers
+declare how each environment fulfills those needs, and the orchestrator
+computes the concrete state. The dataset now supports that move with durable
+jobs, idempotency, a deploy/reconcile queue, an orchestrator state store,
+resource bindings, policy decisions, audit events, generated desired-state
+handoff, rollout control, and migration guidance.
 
-The main gaps are production depth around the control plane. The orchestrator
-is correctly named as a shared failure domain, but the design does not yet show
-the durable jobs, queues, idempotency, artifact storage, audit trail, degraded
-modes, or rollout mechanics that make that failure domain survivable. The data
-model is good for explaining concepts, but it is still thin for governance,
-policy, rollout, audit, adoption, and migration workflows.
+The remaining issues are no longer "missing the core design." They are mostly
+coherence and operational-contract issues: a few API examples and option
+diagrams still teach the older direct orchestrator-to-CD handoff, rollout state
+is described better than it is modeled, and the control-plane degraded-mode
+contract needs sharper SLO/RTO/RPO language.
 
 | Axis | Rating | Notes |
 | --- | --- | --- |
-| System design soundness | 4.15/5 | Strong core abstraction and architecture; needs more explicit control-plane reliability, rollout, and governance modeling. |
-| Production realism | 3.95/5 | Good vendor/build-buy realism; under-specifies failure recovery, audit, policy enforcement, migration, and operational runbooks. |
-| Pedagogical flow | 4.30/5 | Excellent maturity story with useful options; could use more sequence flows and concrete state transitions after the orchestrator step. |
-| Dataset/rendering fit | 4.35/5 | JSON parses and references resolve; one duplicate view link and a few rendering/technology-choice polish issues remain. |
-| Overall | 4.20/5 | Publishable and useful, with targeted edits needed to reach flagship depth. |
+| System design soundness | 4.55/5 | Strong architecture with durable control-plane mechanics; needs tighter API/status and rollout-state contracts. |
+| Production realism | 4.45/5 | Much stronger on reliability, policy, audit, migration, and sizing; remaining gaps are degraded-mode boundaries and operational APIs. |
+| Pedagogical flow | 4.55/5 | Excellent maturity arc; new deep dives add real staff-level depth without losing the main story. |
+| Dataset/rendering fit | 4.60/5 | JSON parses and structural references resolve; some semantic drift remains in API flows, option views, and technology-choice columns. |
+| Overall | 4.55/5 | Publishable, coherent, and close to flagship depth. |
 
 ## What Works Well
 
-- The case has a memorable forcing function: "Backstage + a pile of Helm charts"
-  is not an IDP until a real provisioning/configuration engine sits underneath.
-- Requirements are well scoped for an internal platform: low cognitive load,
-  self-service, no ticket-ops bottleneck, no config drift, multi-tenant
-  isolation, adoption, platform reliability, and measurable outcomes.
-- The capacity section uses the right kind of sizing for an IDP: developers,
-  services, deploys per day, clusters, platform-team ratio, preview env
-  lifetime, config-file reduction, and adoption.
-- The API section covers the important interfaces: `score.yaml`, deploy,
-  scaffolder, catalog, resource definitions, and ephemeral environments.
-- The step sequence introduces the concepts in the right order. Each step
-  exposes the next limitation rather than jumping directly to the final design.
-- Options are concrete and mostly non-strawman: GitHub Actions/Argo vs.
-  GitLab/Flux vs. Jenkins, Backstage vs. SaaS portals, Humanitec vs. Kratix vs.
-  own controllers, Terraform/OpenTofu vs. Crossplane vs. Pulumi, and isolation
-  models.
-- The traps are practical and memorable: bigger wiki, relabeled ops team,
-  golden cage, leaky abstraction, PR-close cleanup only, vanity metrics, and
-  mandated adoption.
-- `satisfies`, `patterns`, `technologyChoices`, and parent-step references all
-  resolve to real step IDs.
+- The case has a crisp thesis: an IDP is not a portal; it is a developer-facing
+  contract backed by a real provisioning/configuration engine.
+- The maturity arc is strong: tickets and runbooks -> CI/CD and Helm -> portal
+  -> workload spec and orchestrator -> IaC engine -> resource plane ->
+  ephemeral environments -> observability, security, and platform metrics.
+- Step 4 now carries the right production weight. Durable jobs, idempotency,
+  queue/outbox, provisioning locks, generated desired-state handoff, driver
+  ambiguity, HA state, DR, and degraded mode are all explicitly covered.
+- Progressive delivery is now correctly distinguished from "GitOps revert" and
+  tied to a rollout controller plus observability health gates.
+- The data model was expanded in the right direction: `teams`,
+  `resource_bindings`, `deployment_jobs`, `policy_decisions`, `audit_events`,
+  `migrations`, and `platform_metrics` make governance and operations concrete.
+- Capacity moved beyond organizational anecdotes. The derived notes now explain
+  worker concurrency, queue age, catalog sync, provider limits, GitOps scale,
+  preview environment quotas, and platform-team on-call.
+- The traps remain practical and memorable: bigger wiki, relabeled ops team,
+  golden cage, leaky abstraction, PR-close cleanup only, vanity metrics,
+  mandated adoption, and ivory-tower platform team.
+- The review-time reference checks pass: step nodes, step links, final-design
+  nodes/links, parents, `satisfies`, `patterns`, and `technologyChoices` all
+  resolve.
 
 ## Highest-Impact Issues
 
-### 1. Control-plane reliability is named but not designed
+### 1. The deploy API and API sequences lag behind the new durable handoff
 
-The dataset correctly says the orchestrator is a shared failure domain and that
-an outage can block every team's deploys. But the architecture still presents
-the orchestrator mostly as a synchronous box: CI submits spec + image, it
-matches resources, invokes drivers, and hands generated desired state to CD.
+The architecture now says the orchestrator persists a job, commits generated
+desired state to a repo/artifact store, and lets GitOps reconcile from that
+durable handoff. The main `/workloads/{id}/deploy` API example still returns a
+simple `{ deploymentId, status, resources }`, and its sequence goes directly
+from `Orchestrator` to `CD` with "generated desired state."
 
-Why it matters: the orchestrator is the most dangerous component in this case.
-It controls provisioning, config generation, secret binding, and delivery. A
-credible design needs to explain how it fails, resumes, and degrades.
+Why it matters: the API is where the candidate proves the control plane is not
+just a diagram. If the API hides idempotency, queue state, policy decisions, and
+generated commit identity, the strongest new production mechanics are easy to
+miss.
 
-Concrete fix: add a control-plane reliability deep dive or step expansion that
-shows:
+Concrete fix:
 
-- Durable deploy/reconcile jobs with idempotency keys per workload, environment,
-  spec version, and image digest.
-- A work queue or outbox between API intake, resource matching, provisioning,
-  config generation, and GitOps handoff.
-- Provisioning locks so two deploys do not race on the same resource binding.
-- A generated-artifact store or Git commit handoff so already-generated desired
-  state remains deployable if the orchestrator is down.
-- Driver retry policy, timeout behavior, reconciliation after ambiguous IaC
-  outcomes, and manual repair states.
-- HA, backup/restore, and disaster recovery for the orchestrator's own state.
-- Degraded modes: existing workloads keep running; CI can still build; GitOps
-  can continue reconciling already-committed desired state; only new provisioning
-  is blocked.
+- Add an idempotency key to the deploy request or document how one is derived
+  from workload, environment, spec version, and image digest.
+- Return durable job details: `jobId`, `phase`, `attempt`, `desiredStateRef`,
+  `policyDecisionIds`, `resourceBindingIds`, and links to status/errors.
+- Add `GET /deployments/{id}` or `GET /deployment-jobs/{id}` for polling the
+  queued -> matching -> provisioning -> handed_off -> reconciling -> healthy
+  lifecycle.
+- Add failure/repair fields such as `resumePoint`, `lastError`,
+  `manualRepairRequired`, and `ambiguousProviderOutcome`.
+- Update the deploy API sequence to include `JobQueue`, `OrchDB`,
+  `DesiredRepo`, and `CD` instead of the old direct `Orchestrator -> CD` path.
 
-The current trap text is good, but it is too small for the central production
-risk of the architecture.
+### 2. Some option diagrams still simplify away the new reliability model
 
-### 2. Progressive delivery and rollback are promised but underspecified
+The default Step 4 view now includes `JobQueue`, `OrchDB`, and `DesiredRepo`,
+but the orchestrator option views still use the older, smaller
+`Spec -> Orchestrator -> ResDef/Driver -> CD` shape. That is understandable for
+compact option comparison, but it can accidentally imply that buying Humanitec,
+operating Kratix, or assembling Score controllers removes the need for durable
+state and handoff mechanics.
 
-One functional requirement says progressive delivery and rollback are wired in
-by default via GitOps. The `satisfies` mapping points this to Step 2, but Step 2
-mostly explains immutable images and GitOps reconciliation. Reverting a commit
-is rollback, but it is not the same as progressive delivery.
+Concrete fix:
 
-Why it matters: canaries, blue/green, automated promotion, health gates, and
-automatic rollback are often the difference between "deploy automation" and a
-safe platform golden path.
+- Keep option diagrams compact, but include at least `DesiredRepo` in all three
+  orchestrator option views.
+- Add one sentence per option about who owns the reliability surface:
+  Humanitec vendor SLA and integration boundary, Kratix operational burden,
+  or in-house controller ownership.
+- If the visual must stay small, say explicitly in each caption that the
+  reliability queue/state/repo pattern still applies.
 
-Concrete fix: add a small delivery-state model and flow:
+### 3. Rollout safety is described well but under-modeled
 
-- Add rollout strategy to the workload spec or golden path defaults: rolling,
-  canary, blue/green, or manual approval.
-- Show a rollout controller such as Argo Rollouts, Flagger, or an equivalent CD
-  capability between GitOps and Kubernetes.
-- Define health signals from observability that gate promotion or trigger
-  rollback.
-- Distinguish app rollback from infrastructure rollback. Reverting a manifest is
-  not enough for schema migrations, resource-definition changes, or failed
-  provisioning.
-- Add data fields for rollout revision, health-check policy, promotion state,
-  and rollback reason.
+The progressive-delivery deep dive is a good correction. It names canary,
+blue/green, health gates, automatic rollback, app-vs-infra rollback, rollout
+revision, promotion state, and rollback reason. The data model only has
+`deployments.strategy`, `deployments.status`, and `deployment_jobs.phase`.
 
-### 3. The data model is too thin for governance and platform operations
+Why it matters: rollout safety is stateful. Without first-class rollout state,
+it is hard to answer "where is this canary stuck?", "which metric failed the
+promotion?", or "was this rollback automatic or manual?"
 
-The current model covers workloads, specs, environments, resource definitions,
-resources, deployments, catalog components, and golden paths. That is enough to
-teach the happy path, but it leaves several core IDP workflows implicit.
+Concrete fix:
 
-Missing or under-modeled objects:
+- Add a `rollout_runs` table or explicit deployment fields for
+  `rollout_revision`, `strategy`, `current_step`, `health_policy`,
+  `promotion_state`, `rollback_reason`, and `automated_decision`.
+- Add a small API or status response for rollout progress and rollback.
+- Change the functional requirement wording from "via GitOps" to "via GitOps
+  plus a rollout controller" so the top-level requirement matches the design.
 
-- `teams` / `ownership`: team identity, cost center, compliance tier, service
-  ownership, on-call route, and approvers.
-- `resource_bindings`: workload resource request -> concrete resource instance
-  per environment, including definition version, outputs, secret reference, and
-  lifecycle state.
-- `reconciliation_runs` or `deployment_jobs`: durable state for each
-  orchestrator attempt, retry, error, and resume point.
-- `policy_decisions`: which policy version accepted, rejected, mutated, or
-  warned on a spec/deploy request.
-- `audit_events`: who changed a golden path, resource definition, policy,
-  environment, or deployment.
-- `golden_path_versions` and `migrations`: compatibility, deprecation date,
-  adoption, exemptions, and services still pinned to older versions.
-- `platform_metrics`: time-to-first-deploy, lead time, change-fail rate,
-  adoption, scorecard health, and developer-feedback snapshots.
+### 4. The degraded-mode contract needs sharper boundaries
 
-Why it matters: IDPs fail operationally when ownership, policy, migration, and
-audit live in prose. These objects are also what make the "platform as a
-product" thesis measurable.
+The deep dive correctly says existing workloads keep running, CI can still
+build, GitOps continues reconciling committed desired state, and only new
+provisioning is blocked. The non-functional requirement still says an
+orchestrator outage blocks every team's deploys.
 
-### 4. Capacity numbers are not translated into component sizing
+This tension is useful, but it needs precise wording. In a real interview, the
+candidate should distinguish several cases:
 
-The capacity section is useful and honest, but it is still mostly a list of
-organizational assumptions. It does not yet connect those assumptions to the
-platform's bottlenecks and SLOs.
+- Existing workloads serving traffic.
+- App-only redeploys where desired state is already generated or can be
+  committed through a bypass.
+- New resource provisioning or changed resource definitions.
+- Preview environment creation.
+- Portal/catalog read paths.
+- Policy or secret binding changes.
 
-Concrete fix: add derived sizing notes:
+Concrete fix: add a short degraded-mode matrix with allowed, delayed, and
+blocked operations, plus platform-control-plane SLOs, RTO/RPO for `OrchDB`, and
+restore procedure from `OrchDB` plus `DesiredRepo`.
 
-- Portal/catalog: read QPS, catalog sync frequency, search/indexing needs, and
-  stale-owner handling for hundreds to thousands of services.
-- Orchestrator: deploy jobs per day, peak deploy bursts, worker concurrency,
-  queue depth alerts, and expected IaC runtime per resource.
-- IaC drivers: rate limits, state locks, provider API throttling, and maximum
-  concurrent applies per team/environment.
-- GitOps: number of applications, clusters, reconciliation interval, drift
-  detection latency, and controller scaling.
-- Ephemeral environments: concurrent PR envs, namespace/vcluster provisioning
-  latency, quota policy, and TTL-reaper throughput.
-- Observability: metrics/log/cardinality budget per service and managed
-  observability cost controls.
-- Platform team operations: on-call load, incident SLO for the platform itself,
-  and support queue targets.
+### 5. Governance is present, but platform-engineer workflows are still thin
 
-This does not need exact math everywhere. One sizing note per major component
-would make the architecture easier to defend in an interview.
+The model now includes teams, policy decisions, audit events, migrations, and
+platform metrics. That is a big improvement. The remaining gap is workflow:
+how a platform engineer safely changes a resource definition, golden path,
+policy version, or tenant quota.
 
-### 5. Security and policy are introduced late and remain broad
+Concrete fix:
 
-Step 7 covers secrets, policy-as-code, identity, and code analysis, but security
-should be threaded through the earlier control-plane path. The orchestrator is
-a privileged system that can provision infrastructure, bind secrets, generate
-deployment config, and trigger production changes.
-
-Concrete fix: show policy and identity checks in the main flow:
-
-- Authenticate CI/portal callers and authorize deploys by team, environment,
-  workload, and golden-path version.
-- Evaluate policy at spec submission and again before generated desired state is
-  committed or applied.
-- Keep secrets as references wherever possible; avoid materializing secret
-  values into generated config or logs.
-- Add supply-chain controls: image signing, SBOM/provenance, dependency
-  scanning, and deploy-only-signed-artifacts policy.
-- Add break-glass and exemption flows with expiry, audit, and platform-team
+- Add a short flow for resource-definition rollout: draft -> validate ->
+  canary on volunteer teams -> audit -> promote -> deprecate old version.
+- Add policy-version lifecycle: warn-only, enforce, exemption, expiry, and
   review.
-- Tie NetworkPolicies, quotas, and RBAC to tenant/team objects rather than only
-  naming them in prose.
-
-### 6. Migration and adoption are strong themes but light as workflows
-
-The dataset repeatedly says adoption is first class, and the follow-ups ask how
-to migrate 200 services without a big-bang cutover. That is the right concern,
-but the main design does not yet show the migration path.
-
-Concrete fix: add a migration deep dive or follow-up answer outline:
-
-- Inventory existing services into the catalog first.
-- Pick one golden path and one or two volunteer teams.
-- Support brownfield import of existing Helm/Terraform resources into workload
-  specs and resource bindings.
-- Run old and new paths in parallel with opt-in migration.
-- Track adoption, failed onboarding attempts, escape-hatch usage, time to first
-  deploy, and reasons teams reject the platform.
-- Define deprecation policy for old golden path versions and exception handling
-  for regulated or unusual teams.
-
-This would make the "platform as a product" message more operational, not just
-philosophical.
+- Show how teams discover pending golden-path migrations and request or renew
+  exemptions.
 
 ## System Design Soundness
 
-The high-level architecture is sound. The five-plane decomposition is a good
-teaching frame, and the core flow from developer intent to generated desired
-state is plausible. The dataset also makes the correct distinction between
-developer-facing abstraction and platform-engineer-owned realization.
+The architecture is sound. The five-plane decomposition works well for an IDP:
+Developer Control, Integration & Delivery, Resource, Observability, and
+Security. The final design now integrates the durable control-plane components
+introduced in Step 4 and avoids the earlier risk of treating the orchestrator
+as a stateless "submit spec, get manifests" box.
 
-The weakest soundness area is lifecycle state. Deployments, resources, resource
-definitions, and golden paths are represented, but their transitions are not.
-For example, a deployment should move through queued, matching, provisioning,
-generating, handed-off, reconciling, healthy, failed, rollback requested, and
-rolled back states. Resource bindings should have pending, active, drifted,
-orphaned, deleting, and failed states. Golden paths should have active,
-deprecated, blocked, and sunset states.
+The core path is credible:
 
-The other important gap is progressive delivery. GitOps gives reconciliation
-and auditability, but the case should distinguish GitOps from rollout safety.
+- Developers author a Score-style workload spec.
+- CI submits spec plus image.
+- The orchestrator authenticates, evaluates policy, persists job state, and
+  resolves abstract resources against environment-specific definitions.
+- Drivers provision or reconcile infrastructure.
+- Outputs and secret references are bound back to the workload.
+- Generated desired state is committed durably.
+- GitOps and a rollout controller reconcile the cluster with health-gated
+  promotion and rollback.
+
+That is the right shape for a production IDP case. The main soundness issue is
+that some public interfaces still look less mature than the architecture:
+deploy status, rollout state, repair state, resource-binding lifecycle, and
+policy decisions should be visible at API or status-query level.
+
+The data model is now strong enough to support the narrative. It still has a
+few places where adding state would improve defensibility:
+
+- `deployments`: add generated commit/artifact reference, rollout revision,
+  current rollout step, health-policy reference, and rollback reason.
+- `resource_definitions`: add lifecycle, compatibility, canary scope, and owner.
+- `policy_decisions`: add target object, request id, severity, and expiry for
+  warnings/exemptions.
+- `migrations`: consider workload-level state, not only team-level movement
+  between golden-path versions.
 
 ## Step-by-Step Pedagogical Review
 
 ### Step 1: Naive: Tickets, Shared Scripts, and a Wiki Runbook
 
-Strong baseline. It starts from a realistic operating model and explains why
-the queue grows with adoption. The traps are good because they separate naming
-from behavior. Consider adding one concrete symptom such as median ticket age,
-failed handoffs, or environment mismatch to make the pain measurable.
+This is a strong baseline. It starts from a realistic operating model and gives
+measurable pain: ticket age, skipped hand-run steps, environment mismatch, and
+multi-day onboarding. The traps cleanly separate "renamed ops" from actual
+self-service.
+
+No major change needed. Preserve this step's simplicity.
 
 ### Step 2: Automate Delivery: CI/CD Pipelines + Helm Charts per Service
 
-Good next step and good tool options. The CI/CD plus Helm solution is credibly
-better than tickets, and the config-drift forcing function is clear. The gap is
-that progressive delivery is later credited to this step without being designed
-here. Add canary/rollback health gates or narrow the requirement to "GitOps
-delivery and rollback by reverting desired state."
+This step is now clearer because it explicitly limits what GitOps rollback
+means: reverting desired state is useful, but it is not progressive delivery.
+The options are realistic, and the drift trap motivates the later workload spec
+without jumping too early.
 
-### Step 3: A Self-Service Portal over Existing Tooling
+Improvement: add a sentence to the API/sequence or recap that the direct
+`Orchestrator -> CD` path in later legacy diagrams is superseded by the
+generated desired-state repo once Step 4 is introduced.
 
-This is one of the best teaching steps. It correctly frames the portal as an
-interaction layer and explains why a catalog is not a provisioning engine. The
-build/buy options are realistic. To deepen it, show how the catalog stays fresh:
-source-of-truth sync, ownership validation, scorecards, dependency ingestion,
-and handling orphaned services.
+### Step 3: A Self-Service Portal over Existing Tooling (Backstage)
+
+This remains one of the best teaching steps. It correctly frames the portal as
+an interaction layer, not the platform itself. The build/buy options are
+realistic and the traps are useful.
+
+Improvement: catalog freshness could still be more operational. Add a small
+note about ownership validation, orphaned services, source-of-truth sync,
+scorecard updates, and stale dependency data.
 
 ### Step 4: The Workload Spec + Platform Orchestrator
 
-This is the centerpiece and it is strong. The Read-Match-Create-Deploy flow and
-config-as-data framing are exactly the right abstraction. The sequence diagram
-is useful, but it should show durable state writes and failure handling. This
-step should own the control-plane reliability story, because every later step
-depends on it.
+This is the centerpiece and now has the required production depth. The durable
+control-plane deep dive is especially strong: idempotency keys, queue/outbox,
+binding locks, durable desired-state handoff, driver retry/timeout handling,
+ambiguous IaC outcomes, DR, and degraded mode are all the right topics.
+
+The two sequence flows are useful, but the second one should include the
+deploy/reconcile queue explicitly. It currently persists to the state store,
+then provisions. Because the deep dive says workers lease from a queue and ack
+only on success, the sequence should show `JobQueue` as a participant.
 
 ### Step 4a: Choose the IaC Engine Under the Orchestrator
 
-Good focused sub-step. The apply-time vs. continuous-reconciliation tradeoff is
-the right axis. Add how state and drift are observed in either choice: state
-locks and plan/apply logs for Terraform/OpenTofu, provider health and
-reconcile status for Crossplane, and how the orchestrator normalizes errors
-back to developers.
+Good focused sub-step. The apply-time versus continuous-reconciliation axis is
+the right comparison. The option set is credible: Terraform/OpenTofu,
+Crossplane, and Pulumi.
+
+Improvement: add how each engine reports drift and ambiguous outcomes back into
+the orchestrator's common job model. This would connect Step 4a more tightly to
+the new `deployment_jobs` and repair-state story.
 
 ### Step 5: Resource Plane and Multi-Tenancy
 
-The isolation options are good and the cost-vs-isolation framing is correct.
-The step would be stronger if it tied isolation to concrete tenant policy:
-namespace naming, quota defaults, NetworkPolicy templates, cluster-scoped CRD
-rules, regulated workload escalation, noisy-neighbor alerts, and cost
-allocation.
+The isolation options are well framed: namespace-per-team, vcluster, and
+cluster-per-tenant. The step correctly treats this as a cost-vs-isolation
+choice, not a single best practice.
 
-### Step 6: Ephemeral Environments and Golden-Path Versioning
+Improvement: tie the isolation decision directly to the new `teams` table:
+compliance tier, cost center, on-call route, quota, NetworkPolicy template, and
+approval policy. That would make tenant policy flow from data, not prose.
 
-This step does useful work by combining preview environments with versioning
-and adoption. The TTL-reaper trap is important. Add the environment lifecycle:
-requested, provisioning, ready, idle, expired, deleting, failed, and orphaned.
-Also show how data seeding, secrets, DNS, and shared dependencies are handled in
-preview environments.
+### Step 6: Ephemeral Environments + Golden-Path Versioning
 
-### Step 7: Observability, Security, and Measuring the Platform
+The preview-environment and golden-path versioning combination works well.
+The reaper trap and "guardrail, not railroad" framing are strong.
 
-The outcome metrics are excellent, especially the warning against vanity
-metrics and the DORA caveat. The step currently packs several large domains
-into one page. It would benefit from splitting the production concerns into
-clearer buckets: workload telemetry, platform control-plane telemetry, security
-guardrails, supply-chain controls, cost controls, and product/adoption metrics.
+The added preview-environment sequence is useful. To deepen it further, include
+environment lifecycle state: requested, provisioning, ready, idle, expired,
+deleting, failed, and orphaned. Also consider mentioning data seeding, DNS, and
+secret scope for PR environments.
+
+### Step 7: Bake In Observability & Security - and Measure the Platform
+
+This step is strong and more production-realistic after the new security and
+migration deep dives. It now covers policy gates, secret references,
+supply-chain checks, break-glass, tenant-derived guardrails, brownfield import,
+parallel migration, and product-funnel measurement.
+
+The main risk is density. This step now carries observability, security,
+supply chain, platform product metrics, migration, and adoption. It is still
+readable, but if more content is added, split the material into clearer buckets
+or move migration into a dedicated follow-up answer.
 
 ## Final Design Review
 
-The final design integrates the components introduced in the steps and keeps
-the five-plane architecture coherent. It does not include the initial
-anti-pattern nodes, which is correct for a final design.
+The final design is coherent and now reflects the revised production model:
+`JobQueue`, `OrchDB`, `DesiredRepo`, and `Rollout` are present alongside the
+original IDP planes. The description correctly says the orchestrator runs
+durable jobs, persists state, commits generated desired state, and lets GitOps
+plus rollout control reconcile progressively.
 
-The final design should add or make explicit:
+The final design should keep these nodes. They are not implementation clutter;
+they are what makes the orchestrator credible as a shared control plane.
 
-- A durable orchestrator state store and work queue.
-- A generated desired-state repository or artifact handoff to GitOps.
-- A rollout controller or delivery policy component for progressive delivery.
-- Policy/audit as a first-class path, not only a security side component.
-- Platform telemetry feeding both operational alerts and product metrics.
+Remaining refinements:
 
-The current caption says "intent flows down; telemetry flows back up." That is
-a good summary. The design now needs the stateful mechanics behind that line.
+- Consider showing `JobQueue -> Orchestrator` in final design, not only
+  `Orchestrator -> JobQueue`, if the visual needs to communicate worker leasing
+  and retry.
+- Consider a lightweight policy/audit read path from `Sec` or `OrchDB` to the
+  portal/catalog so developers can see why a deploy was denied or mutated.
+- Keep `Rollout` visible in final design; it is the clearest way to avoid the
+  common "GitOps equals progressive delivery" mistake.
 
 ## Concept Introduction and Learning Flow
 
-The concept staging is strong. The case introduces one main idea at a time:
-ticket-ops, declarative delivery, portal/catalog, workload spec, orchestrator,
-resource definitions, IaC engine, multi-tenancy, ephemeral environments, and
-product metrics.
+The concept staging is excellent. The walkthrough introduces one abstraction at
+a time and gives each one a reason to exist:
 
-Two improvements would help:
+- Ticket-ops exposes the self-service need.
+- CI/CD exposes drift.
+- Portal/catalog exposes discovery but not provisioning.
+- Workload spec and orchestrator solve the what-vs-how split.
+- IaC engine choice teaches apply-time versus reconciliation.
+- Resource plane teaches isolation.
+- Ephemeral environments teach lifecycle and cost control.
+- Observability/security/product metrics teach platform maturity.
 
-- Add more sequence flows after Step 4. The current single sequence flow teaches
-  the heart of the system, but Step 6 and Step 7 would benefit from flows for
-  preview-env creation/reaping and policy-gated deploys.
-- Make state transitions explicit. The concepts are clear, but durable state is
-  how a candidate proves production maturity.
+The new "Durable control plane" and "Progressive delivery" patterns are good
+additions. They belong in Step 4 because they are not afterthoughts; they define
+whether the orchestrator can safely sit in the delivery path.
 
 ## Step-to-Final-Design Coherence
 
-The final design mostly matches the walkthrough. Each major final node appears
-in a preceding step, and the step views build toward the final architecture.
-Reference checks pass for step nodes, final nodes, step links, final links,
-parent IDs, pattern step IDs, technology-choice step IDs, and satisfies step
-IDs.
+Coherence is much improved. Each important final-design node is introduced
+before the final design, and the final design no longer over-promises mechanics
+that the steps never teach.
 
-The biggest coherence gap is that the final design includes progressive
-delivery and baked-in security/observability as broad planes, while the earlier
-steps do not show enough mechanics for rollout safety, policy decisioning,
-audit, and platform telemetry.
+The remaining semantic mismatches are specific:
+
+- The deploy API sequence still shows direct `Orchestrator -> CD`, while the
+  final design uses `Orchestrator -> DesiredRepo -> CD`.
+- Some orchestrator option views still use `orch-cd`, which visually hides the
+  durable desired-state handoff.
+- The top-level progressive-delivery requirement says "via GitOps", while the
+  design now correctly says "GitOps plus rollout controller."
+- The reliability requirement says an orchestrator outage blocks every team's
+  deploys, while the deep dive says already-committed state can keep deploying.
+  This should be reconciled as a degraded-mode matrix rather than left as
+  ambiguous wording.
 
 ## Realism Compared With Production Systems
 
-This dataset is better than many IDP treatments because it treats the platform
-as an internal product and is skeptical of vendor claims. It also acknowledges
-the hard adoption tradeoff.
+The dataset is now realistic in the places many IDP writeups are weak:
 
-The production realism gaps are mostly operational:
+- It treats platform adoption as a product outcome, not a mandate.
+- It distinguishes a portal from a platform.
+- It includes a real control-plane failure story.
+- It acknowledges vendor marketing caveats and the DORA platform tradeoff.
+- It models policy, audit, migration, and platform metrics.
+- It explains that GitOps rollback and progressive delivery are different
+  capabilities.
 
-- Control-plane outage handling and disaster recovery.
-- Provider/IaC ambiguity after timeouts or partial applies.
-- Policy decision audit and exemption workflow.
-- Supply-chain security for generated deployments.
-- Catalog correctness and stale ownership.
-- Brownfield migration from existing Helm/Terraform.
-- Cost controls for preview environments and managed observability.
-- Platform team on-call, incident response, and support workflow.
+Remaining production questions a strong interviewer could still ask:
+
+- What exact operations continue during orchestrator outage?
+- What are the platform control-plane SLO, RTO, and RPO?
+- How are timed-out Terraform/OpenTofu applies reconciled without double
+  provisioning?
+- How does a developer inspect a denied policy decision or failed mutation?
+- How are rollout health policies versioned and tested?
+- How are preview environment quotas enforced by team and cost center?
+- How are golden-path deprecations communicated, exempted, and eventually
+  enforced?
 
 ## Dataset and Renderer-Facing Observations
 
 - `interview.json` parses as valid JSON.
-- High-level link endpoints resolve.
-- Step view node/link references and final-design node/link references resolve.
+- High-level architecture link endpoints resolve.
+- Step view node/link references resolve.
+- Final-design node/link references resolve.
 - `satisfies[*].steps[*]`, `patterns[*].steps[*]`, `technologyChoices[*].steps[*]`,
   and `step.parent` references resolve.
-- Step `ephemeral` has duplicate `view.links` entry `envsvc-orch`. This should
-  be removed to avoid drawing the same edge twice.
-- Several options indicate defaults only in the `name` string, e.g.
-  "(default)". If the renderer or future tooling ever uses explicit selection,
-  consider adding a structured marker consistently.
-- The `technologyChoices.cloud` provider columns include vendor-neutral SaaS
-  tools such as Port, Cortex, OpsLevel, Atlassian Compass, and Humanitec. That
-  may render as if those tools are provider-specific AWS/GCP/Azure services. If
-  the UI cannot represent SaaS separately, add a note or repeat only where the
-  provider column is intentionally "runs with this cloud."
-- Current vendor/tool status claims should be source-checked before publication
-  because this topic changes quickly. This review did not browse or externally
-  verify those claims.
+- No duplicate `view.links` entries were found; the old `envsvc-orch` duplicate
+  is gone.
+- The legacy `orch-cd` link still exists and is used by API/option flows. It is
+  valid structurally, but semantically weaker than the updated
+  `orch-desiredrepo` + `desiredrepo-cd` path.
+- Several options mark defaults only in the `name` string, e.g. "(default)".
+  This is acceptable for the current renderer, but a structured default marker
+  would be easier for future tooling.
+- The `technologyChoices.cloud` provider columns still include vendor-neutral
+  SaaS tools such as Port, Cortex, OpsLevel, Atlassian Compass, and Humanitec.
+  If the UI cannot represent SaaS separately, add a note that those entries are
+  provider-adjacent choices rather than native AWS/GCP/Azure services.
+- Current vendor/tool claims should be source-checked before publication if the
+  dataset is meant to make time-sensitive assertions. This review did not
+  browse or externally verify vendor status.
 
 ## Recommended Edits, Prioritized
 
-### P1: Add a control-plane reliability deep dive
+### P1: Update deploy API and API sequence for durable jobs
 
-Show durable jobs, idempotency, queue/outbox, state store, generated artifact
-handoff, driver retries, ambiguous IaC outcomes, and degraded behavior during
-orchestrator outage.
+Expose idempotency, job phase, policy decisions, resource binding ids,
+generated desired-state reference, retry/repair state, and status polling.
+Update the sequence to include `JobQueue`, `OrchDB`, and `DesiredRepo`.
 
-### P1: Design progressive delivery rather than only naming GitOps
+### P1: Reconcile direct-CD diagrams with the desired-state handoff
 
-Add rollout strategy, health gates, promotion/rollback state, and a rollout
-controller or equivalent CD mechanism.
+Where option/API diagrams still use `orch-cd`, either replace it with
+`orch-desiredrepo` + `desiredrepo-cd` or make the caption explicitly say the
+durable handoff is omitted for compactness.
 
-### P1: Expand the data model for governance and operations
+### P2: Model rollout state explicitly
 
-Add resource bindings, reconcile/deploy jobs, policy decisions, audit events,
-golden path versions/migrations, ownership/team metadata, and platform product
-metrics.
+Add `rollout_runs` or deployment fields for rollout revision, current step,
+health policy, promotion state, rollback reason, and automated decision source.
 
-### P2: Turn capacity assumptions into sizing notes
+### P2: Add a degraded-mode matrix and platform SLOs
 
-Connect developers/services/deploys/clusters/preview-env numbers to queue depth,
-worker concurrency, GitOps scale, provider limits, catalog sync, telemetry cost,
-and platform on-call SLOs.
+Define what continues, what is delayed, and what is blocked during outages of
+the portal, orchestrator API, workers, state store, desired-state repo, GitOps,
+rollout controller, and policy/secrets plane.
 
-### P2: Add two more sequence flows
+### P2: Turn governance objects into platform-engineer workflows
 
-Add one for preview environment create/reap and one for policy-gated deploy or
-resource-definition rollout. Keep them small but stateful.
+Add a flow for resource-definition rollout, policy-version rollout, exemptions,
+and golden-path deprecation so the new tables are taught as operations, not only
+schema.
 
-### P2: Thread security through the main path
+### P3: Tighten catalog and migration details
 
-Show caller auth, team/environment authorization, policy decisions, secret
-reference handling, supply-chain checks, and break-glass/exemption audit.
+Add catalog freshness/ownership handling and workload-level migration state for
+brownfield services.
 
-### P3: Fix renderer polish
+### P3: Clean up technology-choice presentation
 
-Remove the duplicate `envsvc-orch` link from Step 6. Consider making defaults
-and SaaS-vs-cloud technology choices more structured.
+Represent SaaS choices separately from cloud-native provider choices, or add UI
+copy explaining why neutral SaaS products appear under provider columns.
 
 ## What Not To Change
 
 - Keep the maturity arc. It is the strongest teaching device in the case.
-- Keep the workload spec plus orchestrator as the central move.
+- Keep the workload spec plus orchestrator as the central design move.
 - Keep the "Backstage is not your platform" distinction.
-- Keep the vendor-claim caveats and the DORA tradeoff. They make the case more
-  credible, not less.
-- Keep adoption as a first-class requirement. It is what makes this a real IDP
-  interview rather than a Kubernetes tooling catalog.
+- Keep the durable control-plane deep dive in Step 4; it is now one of the
+  dataset's strongest sections.
+- Keep the GitOps-versus-progressive-delivery distinction.
+- Keep the DORA tradeoff and vendor-claim caveats; they make the case more
+  credible.
+- Keep adoption as a first-class requirement with escape hatches.
 
 ## Bottom Line
 
-This is a strong, coherent IDP interview with a clear thesis and useful
-tradeoffs. To make it flagship-level, deepen the operational story around the
-orchestrator: durable state, failure recovery, rollout safety, policy/audit, and
-governance. The design already teaches what an IDP should be; the next revision
-should show how it survives production.
+The recent changes fixed the most important review findings. This dataset now
+teaches both the concept and the production reality of an IDP: developer intent,
+platform-owned realization, durable orchestration, policy, audit, progressive
+delivery, migration, and measurement. The next polish pass should synchronize
+the API examples and compact option diagrams with the updated durable handoff
+model, then make rollout and degraded-mode state explicit enough for a strong
+staff-level interview answer.
